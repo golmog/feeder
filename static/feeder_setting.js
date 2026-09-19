@@ -271,7 +271,7 @@ function render_sites(data) {
     str += '  <td>';
     str += '    <div class="col-md-10 mx-auto px-0 text-left">' + descHtml;
     str += '      <div class="input-group input-group-sm">';
-    str += '        <input id="board_id_' + item.id + '" type="text" class="form-control col-md-5" placeholder="게시판 ID (예: 166 또는 166_875)">';
+    str += '        <input id="board_id_' + item.id + '" type="text" class="form-control col-md-5" placeholder="게시판 ID (예: 2_2, 103, 166:875)">';
     str += '        <div class="input-group-append">';
     str += '          <button type="button" class="btn btn-outline-info test_btn" data-site_id="' + item.id + '">수집 테스트</button>';
     str += '          <button type="button" class="btn btn-outline-primary site_edit_btn" data-site_id="' + item.id + '" data-index="' + i + '">규칙 수정</button>';

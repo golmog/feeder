@@ -491,11 +491,14 @@ class ModuleFeed(PluginModuleBase):
             if sub == 'board':
                 sitename = req.args.get('site')
                 boardname = req.args.get('board')
+                subcat = req.args.get('subcat')
                 scheduler_id = req.args.get('id')
                 if scheduler_id:
                     return self._handle_board_id_rss(scheduler_id)
                 if sitename and boardname:
-                    return self._handle_board_rss(sitename, boardname)
+                    from .task_feed import Task
+                    _, _, full_board_key = Task.parse_board_info(boardname, subcat)
+                    return self._handle_board_rss(sitename, full_board_key)
                 return jsonify({'ret': 'fail', 'msg': '파라미터 누락'}), 400
 
             elif sub == 'group':
@@ -744,9 +747,9 @@ class ModuleFeed(PluginModuleBase):
             site_name = item.get('site_name', '')
             board_id = item.get('board_id', '')
             subcat_id = item.get('subcat_id', '')
-            _, _, full_board_key = Task.parse_board_info(board_id, subcat_id)
 
             site_entity = ModelFeedSite.get(name=site_name)
+            _, _, full_board_key = Task.parse_board_info(board_id, subcat_id)
             last_bbs = ModelFeedBbs.get_last_bbs(site_name, full_board_key)
 
             info = dict(item)

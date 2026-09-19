@@ -44,12 +44,10 @@ class Task:
     @staticmethod
     def parse_board_info(board: str, subcat: str = None) -> tuple[str, str, str]:
         """
-        게시판 ID와 서브 카테고리 ID를 분리 및 통합 키 생성
+        게시판 ID와 서브 카테고리 ID를 분리 및 복합 키 생성
         반환: (board_id, subcat_id, full_board_key)
-        지원: '166', '875' -> ('166', '875', '166_875')
-              '166_875', None -> ('166', '875', '166_875')
-              '166:875', None -> ('166', '875', '166_875')
-              '166', None -> ('166', '', '166')
+        - 서브 카테고리 구분자는 콜론(':')으로 단일화
+        - 언더스코어('_')는 2_2, movie_kor와 같은 일반 게시판 ID의 일부로만 취급하여 충돌 원천 차단
         """
         board_str = str(board).strip() if board else ''
         subcat_str = str(subcat).strip() if subcat else ''
@@ -61,14 +59,11 @@ class Task:
                 board_str = m_fid.group('fid')
             if m_type:
                 subcat_str = m_type.group('typeid')
-        elif not subcat_str:
-            for sep in [':', '_']:
-                if sep in board_str:
-                    parts = board_str.split(sep, 1)
-                    board_str, subcat_str = parts[0].strip(), parts[1].strip()
-                    break
+        elif not subcat_str and ':' in board_str:
+            parts = board_str.split(':', 1)
+            board_str, subcat_str = parts[0].strip(), parts[1].strip()
 
-        full_key = f"{board_str}_{subcat_str}" if subcat_str else board_str
+        full_key = f"{board_str}:{subcat_str}" if subcat_str else board_str
         return board_str, subcat_str, full_key
 
     @staticmethod
@@ -76,7 +71,7 @@ class Task:
         site_url = site_info.get('TORRENT_SITE_URL', '').rstrip('/')
         board_id, subcat_id, full_key = Task.parse_board_info(board, subcat)
 
-        # 서브 카테고리가 지정되었고 전용 URL 룰이 존재하는 경우
+        # 서브 카테고리가 존재하고 전용 URL 규칙이 존재하는 경우
         if subcat_id and 'SUBCAT_URL_RULE' in site_info:
             rule = site_info['SUBCAT_URL_RULE']
             return rule.format(
@@ -88,19 +83,19 @@ class Task:
                 PAGE=page
             )
 
-        # 기본 URL 룰 포맷팅
+        # 기본 게시판 URL 규칙 포맷팅
         rule = site_info.get('BOARD_URL_RULE', '{URL}/bbs/board.php?bo_table={BOARD_NAME}&page={PAGE}')
         try:
             return rule.format(
                 URL=site_url,
-                BOARD_NAME=board_id if (subcat_id and '{SUBCAT}' in rule) else full_key,
+                BOARD_NAME=board_id if (subcat_id and '{SUBCAT}' in rule) else (full_key if not subcat_id else board_id),
                 FID=board_id,
                 SUBCAT=subcat_id or '',
                 TYPEID=subcat_id or '',
                 PAGE=page
             )
         except KeyError:
-            return rule.format(URL=site_url, BOARD_NAME=full_key, PAGE=page)
+            return rule.format(URL=site_url, BOARD_NAME=board_id, PAGE=page)
 
     @staticmethod
     def run_crawl(manual=False):
@@ -399,20 +394,42 @@ class Task:
     @staticmethod
     def extract_magnets(page_html: str, tree, site_info: dict) -> list[str]:
         magnets = []
+        seen_hashes = set()
         extra = site_info.get('EXTRA', [])
+
+        from .util_feed import extract_info_hash
 
         if 'MAGNET_REGAX' not in site_info:
             elements = tree.xpath("//a[starts-with(@href,'magnet')]")
             for elem in elements:
                 href = elem.attrib.get('href', '').strip()
-                if href and href.lower() not in magnets:
-                    magnets.append(href.lower()[:60])
+                if not href:
+                    continue
+
+                info_hash = extract_info_hash(href)
+                if info_hash:
+                    if info_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(info_hash)
+                    magnets.append(f"magnet:?xt=urn:btih:{info_hash}")
+                else:
+                    norm_mag = href.lower()[:60]
+                    if norm_mag not in magnets:
+                        magnets.append(norm_mag)
         else:
             pattern, template = site_info['MAGNET_REGAX']
             for m in re.findall(pattern, page_html):
                 formatted = (template % m).lower()
-                if formatted not in magnets:
-                    magnets.append(formatted)
+                info_hash = extract_info_hash(formatted)
+                if info_hash:
+                    if info_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(info_hash)
+                    magnets.append(f"magnet:?xt=urn:btih:{info_hash}")
+                else:
+                    norm_mag = formatted[:60]
+                    if norm_mag not in magnets:
+                        magnets.append(norm_mag)
 
         if 'MAGNET_ONLY_ONE_LAST' in extra and magnets:
             magnets = [magnets[-1]]
@@ -421,6 +438,7 @@ class Task:
     @staticmethod
     def extract_downloads(page_html: str, site_info: dict, post_item: dict) -> list[dict]:
         downloads = []
+        seen_links = set()
         if 'DOWNLOAD_REGEX' not in site_info:
             return downloads
 
@@ -433,6 +451,10 @@ class Task:
 
             if not link.startswith('http'):
                 link = f"{site_info.get('TORRENT_SITE_URL', '').rstrip('/')}/{link.lstrip('/')}"
+
+            if link in seen_links:
+                continue
+            seen_links.add(link)
 
             downloads.append({'link': link, 'filename': filename})
         return downloads
