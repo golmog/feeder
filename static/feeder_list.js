@@ -1,0 +1,248 @@
+var current_data = null;
+var site_info = null;
+
+$(document).ready(function(){
+  globalRequestSearch('1');
+});
+
+$("#search").click(function(e) {
+  e.preventDefault();
+  globalRequestSearch('1');
+});
+
+$("body").on('click', '#page', function(e){
+  e.preventDefault();
+  globalRequestSearch($(this).data('page'));
+});
+
+$("#reset_btn").click(function(e){
+  e.preventDefault();
+  $("#site_radio").prop('checked', true).trigger('change');
+  $("#site_select").val('all').trigger('change');
+  $("#order").val('desc');
+  $("#page_size").val('25');
+  $("#search_select").val('title');
+  $("#search_word").val('');
+  globalRequestSearch('1');
+});
+
+$("body").on('change', '#site_select', function(e){
+  e.preventDefault();
+  update_board_select($(this).val());
+  globalRequestSearch('1');
+});
+
+$("body").on('change', '#board_select', function(e){
+  e.preventDefault();
+  globalRequestSearch('1');
+});
+
+$("body").on('change', '#group_select', function(e){
+  e.preventDefault();
+  globalRequestSearch('1');
+});
+
+$("body").on('change', '#order', function(e){
+  e.preventDefault();
+  globalRequestSearch('1');
+});
+
+$("body").on('change', '#page_size', function(e){
+  e.preventDefault();
+  globalRequestSearch('1');
+});
+
+$("body").on('change', '#site_radio', function(e){
+  if ($(this).is(':checked')) {
+    $('#group_select').attr('disabled', 'disabled');
+    $('#site_select').removeAttr('disabled');
+    $('#board_select').removeAttr('disabled');
+    globalRequestSearch('1');
+  }
+});
+
+$("body").on('change', '#group_radio', function(e){
+  if ($(this).is(':checked')) {
+    $('#group_select').removeAttr('disabled');
+    $('#site_select').attr('disabled', 'disabled');
+    $('#board_select').attr('disabled', 'disabled');
+    globalRequestSearch('1');
+  }
+});
+
+function build_search_form(data) {
+  if (!data || site_info) return;
+  site_info = data;
+
+  var site_str = '<select id="site_select" name="site_select" class="form-control form-control-sm"><option value="all">전체 사이트</option>';
+  if (data.site) {
+    for (var i = 0; i < data.site.length; i++) {
+      site_str += '<option value="' + data.site[i] + '">' + data.site[i] + '</option>';
+    }
+  }
+  site_str += '</select>';
+  $('#site_select_div').html(site_str);
+
+  var group_str = '<select id="group_select" name="group_select" class="form-control form-control-sm" disabled><option value="all">전체 그룹</option>';
+  if (data.group) {
+    for (var j = 0; j < data.group.length; j++) {
+      group_str += '<option value="' + data.group[j].groupname + '">' + data.group[j].groupname + '</option>';
+    }
+  }
+  group_str += '</select>';
+  $('#group_select_div').html(group_str);
+
+  update_board_select('all');
+}
+
+function update_board_select(selected_site) {
+  var str = '<select id="board_select" name="board_select" class="form-control form-control-sm"><option value="all">전체 게시판</option>';
+  if (site_info && site_info.board) {
+    if (selected_site === 'all') {
+      var all_boards = [];
+      for (var s in site_info.board) {
+        var b_list = site_info.board[s] || [];
+        for (var k = 0; k < b_list.length; k++) {
+          if (all_boards.indexOf(b_list[k]) === -1) {
+            all_boards.push(b_list[k]);
+            str += '<option value="' + b_list[k] + '">' + b_list[k] + '</option>';
+          }
+        }
+      }
+    } else if (site_info.board[selected_site]) {
+      var b_list = site_info.board[selected_site];
+      for (var i = 0; i < b_list.length; i++) {
+        str += '<option value="' + b_list[i] + '">' + b_list[i] + '</option>';
+      }
+    }
+  }
+  str += '</select>';
+  $('#board_select_div').html(str);
+}
+
+function make_list(data) {
+  try {
+    if (current_data && current_data.info) {
+      build_search_form(current_data.info);
+    }
+
+    if (!data || data.length === 0) {
+      document.getElementById("list_div").innerHTML = '<div class="text-center py-4 text-muted">수집된 콘텐츠가 없습니다.</div>';
+      return;
+    }
+
+    var str = '';
+    for (var i = 0; i < data.length; i++) {
+      var item = data[i];
+      str += j_row_start();
+      str += j_col(1, item.id);
+
+      var site_col = '<small class="text-muted">' + (item.created_time || '') + '</small><br>';
+      site_col += '<span class="badge badge-info">' + item.site + '</span> ';
+      site_col += '<span class="badge badge-secondary">' + item.board + '</span>';
+      str += j_col(2, site_col);
+
+      var detail_col = '<div class="mb-2"><strong><a href="' + item.url + '" target="_blank">' + item.title + '</a></strong></div>';
+
+      if (item.magnet && item.magnet.length > 0) {
+        for (var j = 0; j < item.magnet.length; j++) {
+          var mag = item.magnet[j];
+          var mag_info = '';
+          var t_info = item.torrent_info;
+
+          if (typeof t_info === 'string') {
+            try { t_info = JSON.parse(t_info); } catch(e) { t_info = null; }
+          }
+
+          if (t_info && Array.isArray(t_info)) {
+            for (var k = 0; k < t_info.length; k++) {
+              if (t_info[k].info_hash && mag.indexOf(t_info[k].info_hash) !== -1) {
+                mag_info += '<div class="text-success font-weight-bold small mb-1">' + t_info[k].name + '</div>';
+              }
+            }
+          }
+
+          detail_col += '<div class="p-2 mb-2 rounded" style="background: rgba(128,128,128,0.1); font-size: 0.85rem;">';
+          detail_col +=   mag_info;
+          detail_col += '  <div class="text-truncate mb-2"><small><a href="' + mag + '">' + mag + '</a></small></div>';
+          detail_col += '  <div class="btn-group btn-group-sm">';
+          detail_col += '    <button type="button" class="btn btn-sm btn-secondary copy_magnet_btn text-white" data-hash="' + mag + '"><i class="fa fa-copy mr-1"></i>마그넷 복사</button>';
+          if (is_torrent_info_installed) {
+            detail_col += '  <button type="button" class="btn btn-sm btn-info global_torrent_info_btn text-white" data-hash="' + mag + '">Torrent Info</button>';
+          }
+          detail_col += '  </div>';
+          detail_col += '</div>';
+        }
+      }
+
+      if (item.files && item.files.length > 0) {
+        for (var f_idx = 0; f_idx < item.files.length; f_idx++) {
+          var file_url = ddns + '/' + package_name + '/api/download?id=' + item.id + '_' + f_idx + '&apikey=' + apikey;
+          var filename = item.files[f_idx][1] || '첨부파일';
+          detail_col += '<div class="p-2 mb-1 rounded d-flex justify-content-between align-items-center" style="background: rgba(128,128,128,0.06); font-size: 0.85rem;">';
+          detail_col += '  <span><i class="fa fa-file mr-1"></i><a href="' + file_url + '">' + filename + '</a></span>';
+          detail_col += '  <a href="' + file_url + '" class="btn btn-sm btn-primary text-white" download><i class="fa fa-download mr-1"></i>직접 다운로드</a>';
+          detail_col += '</div>';
+        }
+      }
+
+      str += j_col(9, detail_col);
+      str += j_row_end();
+      if (i != data.length - 1) str += j_hr();
+    }
+    document.getElementById("list_div").innerHTML = str;
+  } catch (err) {
+    console.error("make_list 렌더링 오류:", err);
+    document.getElementById("list_div").innerHTML = '<div class="alert alert-danger m-3">목록 렌더링 중 오류가 발생했습니다: ' + err.message + '</div>';
+  }
+}
+
+$(document).on('click', '.copy_magnet_btn', function(e){
+  e.preventDefault();
+  var magnet = $(this).data('hash');
+  var tempInput = $('<textarea>');
+  $('body').append(tempInput);
+  tempInput.val(magnet).select();
+  document.execCommand('copy');
+  tempInput.remove();
+  notify('마그넷 주소가 복사되었습니다.', 'success');
+});
+
+$(document).on('click', '.global_torrent_info_btn', function(e){
+  e.preventDefault();
+  var magnet_hash = $(this).data('hash');
+  notify('토렌트 정보 조회를 요청했습니다...', 'info');
+
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/torrent_info',
+    type: "POST",
+    data: {hash: magnet_hash},
+    dataType: "json",
+    success: function(data) {
+      if (data) {
+        $('#torrent_info_title').text(data.name || '토렌트 정보');
+        var html_str = '<p><strong>해시:</strong> <code>' + data.info_hash + '</code></p>';
+        if (data.total_size) {
+          var size_mb = (data.total_size / (1024 * 1024)).toFixed(2);
+          html_str += '<p><strong>전체 크기:</strong> ' + size_mb + ' MB</p>';
+        }
+        if (data.files && data.files.length > 0) {
+          html_str += '<hr><h6>포함된 파일 목록 (' + data.files.length + '개):</h6><ul class="list-group list-group-flush small" style="max-height: 350px; overflow-y: auto;">';
+          for (var i = 0; i < data.files.length; i++) {
+            var f = data.files[i];
+            var f_size = f.size ? ' (' + (f.size / (1024 * 1024)).toFixed(2) + ' MB)' : '';
+            html_str += '<li class="list-group-item py-1 px-2">' + (f.name || f) + f_size + '</li>';
+          }
+          html_str += '</ul>';
+        }
+        $('#torrent_info_content').html(html_str);
+        $('#torrent_info_modal').modal('show');
+      } else {
+        notify('토렌트 정보를 획득하지 못했습니다.', 'warning');
+      }
+    },
+    error: function(xhr, status, error) {
+      notify('정보 조회 실패: ' + error, 'danger');
+    }
+  });
+});

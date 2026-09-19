@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block content %}
+
+<link rel="stylesheet" href="{{ url_for('.static', filename='feeder.css') }}">
+
+<div>
+  <form id="form_search" class="form-inline mb-3" style="text-align:left">
+    <div class="container-fluid pl-0 pr-0">
+      <div class="row show-grid align-items-center">
+        <span class="col-md-6 form-inline">
+          <div class="custom-control custom-radio mr-2">
+            <input id="site_radio" type="radio" name="radio" value="site" class="custom-control-input" checked>
+            <label class="custom-control-label" for="site_radio">기본</label>
+          </div>
+          <div id="site_select_div" class="mr-1"></div>
+          <div id="board_select_div" class="mr-3">
+            <select id="board_select" name="board_select" class="form-control form-control-sm">
+              <option value="all">전체 게시판</option>
+            </select>
+          </div>
+          <div class="custom-control custom-radio mr-2">
+            <input id="group_radio" type="radio" name="radio" value="group" class="custom-control-input">
+            <label class="custom-control-label" for="group_radio">그룹</label>
+          </div>
+          <div id="group_select_div"></div>
+        </span>
+
+        <span class="col-md-6 text-right form-inline justify-content-end">
+          <select id="order" name="order" class="form-control form-control-sm mr-1">
+            <option value="desc">최근순</option>
+            <option value="asc">오래된순</option>
+          </select>
+          <select id="page_size" name="page_size" class="form-control form-control-sm mr-1">
+            <option value="10">10개씩</option>
+            <option value="25" selected>25개씩</option>
+            <option value="50">50개씩</option>
+            <option value="100">100개씩</option>
+          </select>
+          <select id="search_select" name="search_select" class="form-control form-control-sm mr-1">
+            <option value="title">제목</option>
+            <option value="filename">파일명</option>
+            <option value="magnet">마그넷</option>
+          </select>
+          <input id="search_word" name="search_word" class="form-control form-control-sm mr-1" style="width: 180px;" type="text" placeholder="검색어 입력">
+          <button id="search" class="btn btn-sm btn-primary mr-1">검색</button>
+          <button id="reset_btn" class="btn btn-sm btn-outline-secondary">리셋</button>
+        </span>
+      </div>
+    </div>
+  </form>
+
+  <div id='page1'></div>
+  {{ macros.m_hr_head_top() }}
+  {{ macros.m_row_start('0') }}
+  {{ macros.m_col(1, macros.m_strong('ID')) }}
+  {{ macros.m_col(2, macros.m_strong('수집일시 / 사이트')) }}
+  {{ macros.m_col(9, macros.m_strong('콘텐츠 정보')) }}
+  {{ macros.m_row_end() }}
+  {{ macros.m_hr_head_bottom() }}
+  <div id="list_div"></div>
+  <div id='page2'></div>
+</div>
+
+<!-- Torrent Info 결과 모달 -->
+<div class="modal fade" id="torrent_info_modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h4 class="modal-title" id="torrent_info_title">토렌트 정보</h4>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+      </div>
+      <div class="modal-body">
+        <div id="torrent_info_content" style="word-break: break-all; font-size: 0.9rem;"></div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="text/javascript">
+var package_name = "{{ arg['package_name'] }}";
+var sub = "{{ arg['sub'] }}";
+var ddns = "{{ arg['ddns'] }}";
+var apikey = "{{ arg['apikey'] }}";
+var is_torrent_info_installed = ("{{ arg.get('is_torrent_info_installed', True) }}" === 'True');
+</script>
+<script src="{{ url_for('.static', filename='feeder_list.js') }}"></script>
+
+{% endblock %}

@@ -1,0 +1,6 @@
+title: "Feeder"
+version: "1.0.0"
+package_name: "feeder"
+developer: "golmog"
+description: "토렌트 사이트 게시판 크롤링 및 커스텀 RSS 2.0 피드 생성기(FF Plugin)"
+home: "https://github.com/golmog/feeder"
