@@ -161,11 +161,18 @@ class Task:
                             last_bbs = ModelFeedBbs.get_last_bbs(site_name, full_board_key)
                             max_id = 0
                             extra = site_entity.info.get('EXTRA', []) if site_entity.info else []
-                            if 'USING_BOARD_CHAR_ID' not in extra and last_bbs and last_bbs.board_id:
+
+                            # 스케줄러 자동 실행 시에만 기존 수집 지점(max_id)을 적용하여 조기 종료
+                            # 수동 1회 실행 시에는 max_id를 0으로 두어 지정된 max_page까지 전체 탐색
+                            if not manual and 'USING_BOARD_CHAR_ID' not in extra and last_bbs and last_bbs.board_id:
                                 max_id = last_bbs.board_id
 
                             target_cfg.subcat_id = subcat_id
-                            logger.info(f"[Feeder] [{site_name}] 게시판 수집 진행: {full_board_key} (최근 수집 ID: {max_id})")
+
+                            if manual:
+                                logger.info(f"[Feeder] [{site_name}] 수동 실행: {full_board_key} (기존 수집 지점 무시, 최대 {max_page}p 전체 탐색)")
+                            else:
+                                logger.info(f"[Feeder] [{site_name}] 스케쥴 실행: {full_board_key} (최근 수집 ID: {max_id})")
 
                             crawled = Task.execute_board_crawl(
                                 site_entity.info,
