@@ -10,8 +10,14 @@ setting = {
         'uri': __package__,
         'name': 'Feeder',
         'list': [
-            {'uri': 'feed/list', 'name': '토렌트 리스트'},
-            {'uri': 'feed/setting', 'name': '설정 및 관리'},
+            {
+                'uri': 'feed',
+                'name': 'FEED',
+                'list': [
+                    {'uri': 'setting', 'name': '설정 및 관리'},
+                    {'uri': 'list', 'name': '토렌트 리스트'}
+                ]
+            },
             {
                 'uri': 'manual',
                 'name': '매뉴얼',
