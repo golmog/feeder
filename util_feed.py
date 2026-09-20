@@ -1255,7 +1255,7 @@ class FeedFilter:
         for r in (sched_regexp.get('accept') or []):
             comp, fields = cls.parse_rule(r)
             if comp and cls.check_match(item, comp, fields):
-                return True, f"SCHEDULE accept: '{comp.pattern}'"
+                return True, f"TASK accept: '{comp.pattern}'"
 
         # accept_all 검사
         accept_all_flag = sched_dict.get('accept_all')
@@ -1264,11 +1264,12 @@ class FeedFilter:
         if str(accept_all_flag).lower() in ['true', 'yes', '1', 'on']:
             return True, "accept_all 허용"
 
-        # 화이트리스트(accept/reject_excluding) 미충족 시 탈락
-        has_whitelist = bool(glob_regexp.get('accept') or sched_regexp.get('accept') or glob_re_ex or sched_re_ex)
-        if has_whitelist:
-            return False, "accept 또는 reject_excluding 조건 미충족"
+        # 명시적인 accept(화이트리스트) 규칙이 선언되어 있는 경우에만 미일치 항목 탈락
+        has_accept_rules = bool(glob_regexp.get('accept') or sched_regexp.get('accept'))
+        if has_accept_rules:
+            return False, "accept 조건 미충족"
 
+        # reject 및 reject_excluding을 모두 무사히 통과한 항목은 정상 허용
         return True, "기본 허용 (미거부 항목)"
 
 
