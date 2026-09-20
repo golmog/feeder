@@ -164,21 +164,26 @@ class FeedConfigUtil:
                         ]
                     }
                 },
-                'SCHEDULE': []
+                'TASKS': []
             }
             cls.save_yaml(default_data)
             return default_data
         try:
             with open(CONFIG_FILEPATH, 'r', encoding='utf-8') as f:
                 data = yaml.safe_load(f) or {}
-            if 'SCHEDULE' not in data or not isinstance(data['SCHEDULE'], list):
-                data['SCHEDULE'] = []
+
+            # 기존 SCHEDULE 키가 존재할 경우 TASKS로 자동 마이그레이션 및 하위 호환
+            if 'TASKS' not in data and 'SCHEDULE' in data:
+                data['TASKS'] = data.pop('SCHEDULE')
+
+            if 'TASKS' not in data or not isinstance(data['TASKS'], list):
+                data['TASKS'] = []
             if 'GLOBAL' not in data or not isinstance(data['GLOBAL'], dict):
                 data['GLOBAL'] = {}
             return data
         except Exception as e:
             logger.error(f"[Feeder] YAML 로드 실패: {e}")
-            return {'GLOBAL': {}, 'SCHEDULE': []}
+            return {'GLOBAL': {}, 'TASKS': []}
 
     @classmethod
     def get_global(cls) -> dict:
@@ -199,7 +204,7 @@ class FeedConfigUtil:
     @classmethod
     def get_schedules(cls) -> list[dict]:
         data = cls.load_yaml()
-        return data.get('SCHEDULE', [])
+        return data.get('TASKS', data.get('SCHEDULE', []))
 
     @classmethod
     def get_schedule(cls, target_id):
@@ -224,7 +229,7 @@ class FeedConfigUtil:
 
     @classmethod
     def get_schedule_by_board_key(cls, site_name: str, full_board_key: str):
-        """사이트명과 full_board_key(예: '166:875' 또는 '2_2')로 스케줄 검색"""
+        """사이트명과 full_board_key(예: '166:875' 또는 '2_2')로 스케줄 작업 검색"""
         from .task_feed import Task
         schedules = cls.get_schedules()
         for s in schedules:
@@ -237,16 +242,17 @@ class FeedConfigUtil:
     @classmethod
     def save_schedule(cls, item: dict) -> str:
         data = cls.load_yaml()
-        schedules = data.get('SCHEDULE', [])
+        tasks = data.get('TASKS', data.get('SCHEDULE', []))
         target_id = item.get('id')
 
         if target_id is not None and int(target_id) > 0:
-            for idx, s in enumerate(schedules):
+            for idx, s in enumerate(tasks):
                 if str(s.get('id')) == str(target_id):
-                    schedules[idx].update(item)
-                    data['SCHEDULE'] = schedules
+                    tasks[idx].update(item)
+                    data['TASKS'] = tasks
+                    data.pop('SCHEDULE', None)
                     cls.save_yaml(data)
-                    logger.info(f"[Feeder] YAML 스케쥴 수정 완료: ID={target_id}")
+                    logger.info(f"[Feeder] YAML 작업(Task) 수정 완료: ID={target_id}")
                     return 'success_update'
             return 'not_found'
 
@@ -255,34 +261,36 @@ class FeedConfigUtil:
         new_subcat = str(item.get('subcat_id', '')).strip()
 
         # 사이트명, 게시판ID, 서브카테고리ID가 모두 동일할 때만 중복으로 판정
-        for s in schedules:
+        for s in tasks:
             s_site = s.get('site_name', '')
             s_board = str(s.get('board_id', '')).strip()
             s_subcat = str(s.get('subcat_id', '')).strip()
 
             if s_site == new_site and s_board == new_board and s_subcat == new_subcat:
                 subcat_log = f" (서브카테고리: {new_subcat})" if new_subcat else ""
-                logger.warning(f"[Feeder] 동일 게시판 스케쥴 중복: {new_site} - {new_board}{subcat_log}")
+                logger.warning(f"[Feeder] 동일 게시판 작업(Task) 중복: {new_site} - {new_board}{subcat_log}")
                 return 'already_exist'
 
-        max_id = max([int(s.get('id', 0)) for s in schedules], default=0)
+        max_id = max([int(s.get('id', 0)) for s in tasks], default=0)
         item['id'] = max_id + 1
-        schedules.append(item)
-        data['SCHEDULE'] = schedules
+        tasks.append(item)
+        data['TASKS'] = tasks
+        data.pop('SCHEDULE', None)
         cls.save_yaml(data)
 
         subcat_info = f" (서브카테고리: {new_subcat})" if new_subcat else ""
-        logger.info(f"[Feeder] YAML 신규 스케쥴 추가 완료: ID={item['id']}, Site={new_site}, Board={new_board}{subcat_info}")
+        logger.info(f"[Feeder] YAML 신규 작업(Task) 추가 완료: ID={item['id']}, Site={new_site}, Board={new_board}{subcat_info}")
         return 'success'
 
     @classmethod
     def delete_schedule(cls, target_id) -> bool:
         data = cls.load_yaml()
-        schedules = data.get('SCHEDULE', [])
-        new_schedules = [s for s in schedules if str(s.get('id')) != str(target_id)]
-        data['SCHEDULE'] = new_schedules
+        tasks = data.get('TASKS', data.get('SCHEDULE', []))
+        new_tasks = [s for s in tasks if str(s.get('id')) != str(target_id)]
+        data['TASKS'] = new_tasks
+        data.pop('SCHEDULE', None)
         cls.save_yaml(data)
-        logger.info(f"[Feeder] YAML 스케쥴 삭제 완료: ID={target_id}")
+        logger.info(f"[Feeder] YAML 작업(Task) 삭제 완료: ID={target_id}")
         return True
 
 

@@ -164,27 +164,39 @@ GLOBAL:
       - \bCam\b: {from: title}            # CAM 버전 제외
 
 # 게시판별 수집 스케줄 설정
-SCHEDULE:
+TASKS:
   - id: 1
     site_name: sukebei
     board_id: '2_2'
     interval: 1
     enabled: true
-    # 해당 게시판은 4K(2160p) 이상만 전용 수집
-    quality: 2160p+
+    use_proxy: true
+    proxy_url: ''
+    use_flaresolverr: false
+    use_selenium: false
+    use_torrent_info: true
     use_rss_file: true
-    rss_file: sukebei_4k.xml
-    accept_all: true
+    rss_file: sukebei_2_2.xml
+    rss_file_path: ''
+    rss_file_days: ''
+    rss_file_items: ''
+    quality: 2160p+
+    regexp:
+      accept:
+        - 2160p: {from: [title, link]}
+    accept_all: false
 
   - id: 2
-    site_name: torrent_site
-    board_id: 'movie'
+    site_name: sehuatang
+    board_id: '166'
+    subcat_id: '875'
     interval: 2
     enabled: true
-    # 복수 화질 또는 범위 지정 예시
-    quality:
-      - 1080p
-      - 2160p+
+    use_proxy: true
+    use_flaresolverr: true
+    use_selenium: true
+    use_torrent_info: false
+    use_rss_file: false
     accept_all: true
 ```
 
@@ -223,7 +235,7 @@ SCHEDULE:
 * `[1080p, 2160p]`: 지정된 특정 해상도 목록에 해당하는 항목만 허용
 
 <br>
-##### `SCHEDULE` 항목 필드 상세 설명
+##### `TASKS` 항목 필드 상세 설명
 
 각 수집 대상 게시판의 스케줄러 구성 항목입니다.
 
