@@ -8,7 +8,7 @@ setting = {
     'home_module': 'feed',
     'menu': {
         'uri': __package__,
-        'name': 'Feeder',
+        'name': 'FEEDER',
         'list': [
             {
                 'uri': 'feed',
