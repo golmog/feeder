@@ -223,6 +223,18 @@ class FeedConfigUtil:
         return None
 
     @classmethod
+    def get_schedule_by_board_key(cls, site_name: str, full_board_key: str):
+        """사이트명과 full_board_key(예: '166:875' 또는 '2_2')로 스케줄 검색"""
+        from .task_feed import Task
+        schedules = cls.get_schedules()
+        for s in schedules:
+            if s.get('site_name') == site_name:
+                _, _, s_full_key = Task.parse_board_info(s.get('board_id', ''), s.get('subcat_id', ''))
+                if s_full_key == full_board_key:
+                    return s
+        return None
+
+    @classmethod
     def save_schedule(cls, item: dict) -> str:
         data = cls.load_yaml()
         schedules = data.get('SCHEDULE', [])
@@ -1253,21 +1265,34 @@ class FeedRssFileWriter:
                 limit_date = datetime.now() - timedelta(days=days_val)
                 query = query.filter(ModelFeedBbs.created_time >= limit_date)
 
-            records = query.order_by(ModelFeedBbs.id.desc()).limit(items_val).all()
+            # 필터링 후 목표 수량을 채우기 위해 충분한 후보 레코드를 조회
+            query_limit = max(items_val * 3, 300)
+            candidates = query.order_by(ModelFeedBbs.id.desc()).limit(query_limit).all()
+
+            # RSS 생성 시점에 정규식 및 화질 필터 적용
+            global_cfg = FeedConfigUtil.get_global()
+            filtered_records = []
+            for bbs in candidates:
+                bbs_dict = bbs.as_dict()
+                is_pass, _ = FeedFilter.evaluate(bbs_dict, sched, global_cfg)
+                if is_pass:
+                    filtered_records.append(bbs)
+                    if len(filtered_records) >= items_val:
+                        break
 
             feed_mod = P.get_module('feed')
             if not feed_mod:
                 return False
 
             title = f"{site_name} - {full_board_key} (Shared Feed)"
-            xml_content = feed_mod.generate_rss_feed(title, records, include_apikey=False)
+            xml_content = feed_mod.generate_rss_feed(title, filtered_records, include_apikey=False)
 
             os.makedirs(save_dir, exist_ok=True)
             target_filepath = os.path.join(save_dir, filename)
             with open(target_filepath, 'w', encoding='utf-8') as f:
                 f.write(xml_content)
 
-            logger.info(f"[FeedRssFile] 공유용 RSS 파일 생성 완료: {target_filepath} (보존: {days_val}일, 수록: {len(records)}/{items_val}개)")
+            logger.info(f"[FeedRssFile] 공유용 RSS 파일 생성 완료: {target_filepath} (필터 통과: {len(filtered_records)}/{items_val}개)")
             return True
         except Exception as e:
             logger.error(f"[FeedRssFile] RSS 파일 생성 실패 ({site_name} - {full_board_key}): {e}")

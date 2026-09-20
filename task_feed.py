@@ -331,17 +331,10 @@ class Task:
                     target_sched_dict.update(target_db_sched)
 
                 for idx, item in enumerate(raw_list):
+                    # 테스트 모드: 지정된 max_count(3개) 초과 시 목록 정보만 bbs_list에 보존
                     if is_test and detail_count >= max_count:
-                        bbs_list.append(item)
-                        continue
-
-                    # Flexget 정규식 필터 사전 검사 (불필요한 상세 페이지 요청 차단)
-                    is_pass, filter_reason = FeedFilter.evaluate(item, target_sched_dict, global_cfg)
-                    if not is_pass:
-                        logger.info(f"[Feeder] [필터 제외] ID={item.get('id')} / '{item.get('title')[:35]}' -> {filter_reason}")
-                        item['filter_status'] = f"REJECTED: {filter_reason}"
-                        if not is_test:
-                            continue
+                        is_pass, reason = FeedFilter.evaluate(item, target_sched_dict, global_cfg)
+                        item['filter_status'] = "ACCEPTED" if is_pass else f"REJECTED: {reason}"
                         bbs_list.append(item)
                         continue
 
@@ -399,11 +392,17 @@ class Task:
                         item['download'] = []
                         item['torrent_info'] = None
 
+                    # 테스트 모드 시 필터링 시뮬레이션 결과 표기
+                    if is_test:
+                        is_pass, reason = FeedFilter.evaluate(item, target_sched_dict, global_cfg)
+                        item['filter_status'] = "ACCEPTED" if is_pass else f"REJECTED: {reason}"
+
                     if not is_test and not allow_duplicate_magnet and item.get('magnet'):
                         if ModelFeedBbs.is_exist_magnet(item['magnet']):
-                            logger.info(f"[Feeder] 타 게시판/사이트에 이미 존재하는 마그넷이므로 수집 제외: {item['title'][:35]}...")
+                            logger.debug(f"[Feeder] 타 게시판/사이트에 이미 존재하는 마그넷이므로 수집 제외: {item['title'][:35]}...")
                             continue
 
+                    # 모든 게시글을 DB에 원본 그대로 영구 보존
                     if not is_test and (item.get('magnet') or 'ONLY_FILE' in site_info.get('EXTRA', [])):
                         Task.save_single_bbs(site_name, full_board_key, item)
 

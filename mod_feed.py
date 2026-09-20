@@ -548,8 +548,21 @@ class ModuleFeed(PluginModuleBase):
     def _handle_board_rss(self, sitename, boardname):
         try:
             feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
-            items = db.session.query(ModelFeedBbs).filter_by(site=sitename, board=boardname).order_by(ModelFeedBbs.id.desc()).limit(feed_count).all()
-            xml_content = self.generate_rss_feed(f"SITE: {sitename} / BOARD: {boardname}", items)
+            query_limit = max(feed_count * 3, 300)
+            items = db.session.query(ModelFeedBbs).filter_by(site=sitename, board=boardname).order_by(ModelFeedBbs.id.desc()).limit(query_limit).all()
+
+            # RSS 피드 요청 시점에 실시간 필터 적용
+            sched = FeedConfigUtil.get_schedule_by_board_key(sitename, boardname)
+            global_cfg = FeedConfigUtil.get_global()
+            filtered_items = []
+            for bbs in items:
+                is_pass, _ = FeedFilter.evaluate(bbs.as_dict(), sched, global_cfg)
+                if is_pass:
+                    filtered_items.append(bbs)
+                    if len(filtered_items) >= feed_count:
+                        break
+
+            xml_content = self.generate_rss_feed(f"SITE: {sitename} / BOARD: {boardname}", filtered_items)
             return Response(xml_content, mimetype='application/xml; charset=utf-8')
         except Exception as e:
             logger.error(f"[Feeder] _handle_board_rss 에러: {e}")
@@ -566,8 +579,20 @@ class ModuleFeed(PluginModuleBase):
             _, _, full_board_key = Task.parse_board_info(target.get('board_id', ''), target.get('subcat_id', ''))
 
             feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
-            items = db.session.query(ModelFeedBbs).filter_by(site=sitename, board=full_board_key).order_by(ModelFeedBbs.id.desc()).limit(feed_count).all()
-            xml_content = self.generate_rss_feed(f"SITE: {sitename} / BOARD: {full_board_key}", items)
+            query_limit = max(feed_count * 3, 300)
+            items = db.session.query(ModelFeedBbs).filter_by(site=sitename, board=full_board_key).order_by(ModelFeedBbs.id.desc()).limit(query_limit).all()
+
+            # RSS 피드 요청 시점에 실시간 필터 적용
+            global_cfg = FeedConfigUtil.get_global()
+            filtered_items = []
+            for bbs in items:
+                is_pass, _ = FeedFilter.evaluate(bbs.as_dict(), target, global_cfg)
+                if is_pass:
+                    filtered_items.append(bbs)
+                    if len(filtered_items) >= feed_count:
+                        break
+
+            xml_content = self.generate_rss_feed(f"SITE: {sitename} / BOARD: {full_board_key}", filtered_items)
             return Response(xml_content, mimetype='application/xml; charset=utf-8')
         except Exception as e:
             logger.error(f"[Feeder] _handle_board_id_rss 에러: {e}")
@@ -592,8 +617,20 @@ class ModuleFeed(PluginModuleBase):
                         .subquery()
                     )
                     feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
-                    items = db.session.query(ModelFeedBbs).join(subq, ModelFeedBbs.id == subq.c.max_id).order_by(ModelFeedBbs.id.desc()).limit(feed_count).all()
-                    logger.debug(f"[Feeder] 그룹 RSS 피드 추출 완료: 그룹명='{groupname}', 대상 게시글={len(items)}개")
+                    query_limit = max(feed_count * 3, 300)
+                    raw_items = db.session.query(ModelFeedBbs).join(subq, ModelFeedBbs.id == subq.c.max_id).order_by(ModelFeedBbs.id.desc()).limit(query_limit).all()
+
+                    # 그룹 RSS 생성 시 게시판별/전역 필터 실시간 적용
+                    global_cfg = FeedConfigUtil.get_global()
+                    for bbs in raw_items:
+                        bbs_sched = FeedConfigUtil.get_schedule_by_board_key(bbs.site, bbs.board)
+                        is_pass, _ = FeedFilter.evaluate(bbs.as_dict(), bbs_sched, global_cfg)
+                        if is_pass:
+                            items.append(bbs)
+                            if len(items) >= feed_count:
+                                break
+
+                    logger.debug(f"[Feeder] 그룹 RSS 피드 추출 완료: 그룹명='{groupname}', 필터 통과 게시글={len(items)}개")
 
             xml_content = self.generate_rss_feed(f"GROUP: {groupname}", items)
             return Response(xml_content, mimetype='application/xml; charset=utf-8')
