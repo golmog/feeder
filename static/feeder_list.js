@@ -65,7 +65,7 @@ function build_search_form(data) {
 function update_board_select(selected_site) {
   var str = '<select id="board_select" name="board_select" class="form-control form-control-sm"';
   
-  // 전체 사이트일 때는 게시판 선택을 비활성화하여 혼란 방지
+  // 전체 사이트 선택 시 게시판 드롭다운을 비활성화하여 혼란 방지
   if (selected_site === 'all') {
     str += ' disabled><option value="all">전체 게시판</option></select>';
     $('#board_select_div').html(str);
@@ -77,9 +77,9 @@ function update_board_select(selected_site) {
     var b_list = site_info.board[selected_site];
     for (var i = 0; i < b_list.length; i++) {
       var item = b_list[i];
-      if (typeof item === 'object' && item !== null) {
+      if (typeof item === 'object' && item !== null && item.key) {
         str += '<option value="' + item.key + '">' + item.name + '</option>';
-      } else {
+      } else if (item && item !== 'None' && item !== 'null') {
         str += '<option value="' + item + '">' + item + '</option>';
       }
     }
@@ -105,17 +105,21 @@ function make_list(data) {
       str += j_row_start();
       str += j_col(1, item.id);
 
-      // 사이트, 게시판, 서브카테고리 뱃지 세분화
+      // 사이트, 게시판, 서브카테고리 뱃지 분리 표기
       var site_col = '<small class="text-muted">' + (item.created_time || '') + '</small><br>';
       site_col += '<span class="badge badge-info">' + item.site + '</span> ';
 
       var bStr = String(item.board || '');
-      if (bStr.indexOf(':') !== -1) {
-        var parts = bStr.split(':');
-        site_col += '<span class="badge badge-secondary">' + parts[0] + '</span> ';
-        site_col += '<span class="badge badge-light border text-muted" title="서브카테고리">서브: ' + parts[1] + '</span>';
+      if (bStr && bStr !== 'None' && bStr !== 'null') {
+        if (bStr.indexOf(':') !== -1) {
+          var parts = bStr.split(':');
+          site_col += '<span class="badge badge-secondary">' + parts[0] + '</span> ';
+          site_col += '<span class="badge badge-light border text-muted" title="서브카테고리">서브: ' + parts[1] + '</span>';
+        } else {
+          site_col += '<span class="badge badge-secondary">' + bStr + '</span>';
+        }
       } else {
-        site_col += '<span class="badge badge-secondary">' + bStr + '</span>';
+        site_col += '<span class="badge badge-secondary">기본</span>';
       }
       str += j_col(2, site_col);
 

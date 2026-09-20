@@ -901,20 +901,28 @@ class ModuleFeed(PluginModuleBase):
     def get_search_form_info(self) -> dict:
         ret = {'site': [], 'board': {}}
 
-        # 등록된 수집기 기준 사이트 및 게시판 구성
+        from .task_feed import Task
+
+        # 등록된 수집기(CRAWLERS) 소속 게시판 순회
         for c in FeedConfigUtil.get_crawlers():
             s = c.get('site')
-            b = c.get('board')
-            sub = c.get('subcat', '').strip()
-            f_key = c.get('full_board_key') or b
-            display_name = f"{b} (서브: {sub})" if sub else str(b)
+            if not s:
+                continue
 
-            if s and s not in ret['site']:
+            if s not in ret['site']:
                 ret['site'].append(s)
                 ret['board'][s] = []
 
-            if s and not any(item['key'] == f_key for item in ret['board'][s]):
-                ret['board'][s].append({'key': f_key, 'name': display_name})
+            for b_item in c.get('boards', []):
+                b_val = b_item.get('board', '')
+                sub_val = str(b_item.get('subcat', '')).strip()
+                _, _, f_key = Task.parse_board_info(b_val, sub_val)
+                if not f_key:
+                    continue
+
+                display_name = f"{b_val} (서브: {sub_val})" if sub_val else str(b_val)
+                if not any(x['key'] == f_key for x in ret['board'][s]):
+                    ret['board'][s].append({'key': f_key, 'name': display_name})
 
         # 과거 DB 수집 이력이 있는 게시판 보완
         try:
@@ -926,12 +934,21 @@ class ModuleFeed(PluginModuleBase):
                     ret['site'].append(s)
                     ret['board'][s] = []
 
-                if not any(item['key'] == b for item in ret['board'][s]):
+                if not any(x['key'] == b for x in ret['board'][s]):
                     sub_str = b.split(':')[1] if ':' in b else ''
                     disp = f"{b.split(':')[0]} (서브: {sub_str})" if sub_str else str(b)
                     ret['board'][s].append({'key': b, 'name': disp})
         except Exception:
             pass
+
+        # 등록된 사이트 마스터 보완
+        all_sites = ModelFeedSite.get_list()
+        for s in all_sites:
+            s_name = s.name if hasattr(s, 'name') else s.get('name')
+            if s_name and s_name not in ret['site']:
+                ret['site'].append(s_name)
+            if s_name and s_name not in ret['board']:
+                ret['board'][s_name] = []
 
         return ret
 
