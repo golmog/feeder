@@ -315,6 +315,7 @@ function apply_site_defaults_to_modal(site_name) {
   set_modal_checkbox('use_flaresolverr', opts.use_flaresolverr);
   set_modal_checkbox('use_selenium', opts.use_selenium);
   set_modal_checkbox('use_torrent_info', opts.use_torrent_info);
+  $('#proxy_url').val('');
 }
 
 $(document).on('change', '#site_name', function(){
@@ -409,13 +410,10 @@ function set_modal_checkbox(id, is_checked) {
   }
 }
 
+// 프록시 체크박스 토글 시 입력창 영역 표시 (개별 프록시 입력창은 기본 빈 값 유지)
 $('#use_proxy').change(function(){
   if ($(this).is(':checked')) {
     $('#modal_use_proxy_div').collapse('show');
-    if (!$('#proxy_url').val().trim()) {
-      var defaultProxy = $('#feed_proxy_url').val() || '';
-      $('#proxy_url').val(defaultProxy);
-    }
   } else {
     $('#modal_use_proxy_div').collapse('hide');
   }
@@ -442,9 +440,6 @@ $(document).on('click', '.scheduler_edit_btn', function(e){
   var isProxy = (item.use_proxy === true || item.use_proxy === 'True' || item.use_proxy === 'true' || item.use_proxy === 'on');
   if (isProxy) {
     $('#modal_use_proxy_div').collapse('show');
-    if (!$('#proxy_url').val().trim()) {
-      $('#proxy_url').val($('#feed_proxy_url').val() || '');
-    }
   } else {
     $('#modal_use_proxy_div').collapse('hide');
   }
