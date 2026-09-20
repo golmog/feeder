@@ -320,6 +320,7 @@ class Task:
 
                 detail_count = 0
                 for idx, item in enumerate(raw_list):
+                    # 테스트 모드: 지정된 max_count(3개) 초과 시 상세 페이지를 방문하지 않고 목록 정보만 bbs_list에 보존
                     if is_test and detail_count >= max_count:
                         bbs_list.append(item)
                         continue
@@ -358,8 +359,11 @@ class Task:
                         item['download'] = Task.extract_downloads(detail_html, site_info, item)
                         item['torrent_info'] = FeedTorrentInfo.get_torrent_info(item['magnet'], target_cfg)
 
-                        mag_count = len(item.get('magnet', []))
-                        down_count = len(item.get('download', []))
+                        item['magnet'] = item.get('magnet') or []
+                        item['download'] = item.get('download') or []
+
+                        mag_count = len(item['magnet'])
+                        down_count = len(item['download'])
                         t_count = len(item.get('torrent_info') or [])
                         logger.info(f"[Feeder] [{site_name}] [{idx+1}/{total_targets}] 파싱 완료: 마그넷 {mag_count}개, 첨부파일 {down_count}개, 토렌트정보 {t_count}개")
 
@@ -396,6 +400,8 @@ class Task:
             logger.info(f"[Feeder] 크롤링 루프 종료: 총 {len(bbs_list)}개 항목 처리 완료")
         finally:
             FeedScraper.close_sessions()
+
+        return bbs_list
 
     @staticmethod
     def extract_magnets(page_html: str, tree, site_info: dict) -> list[str]:

@@ -555,16 +555,18 @@ class FeedScraper:
                         cls._cf_user_agents[host] = ua
                         logger.debug(f"[Scraper] FlareSolverr User-Agent 인가 동기화 ({host}): {ua}")
 
-                    if 'cookies' in solution:
+                    sol_cookies = solution.get('cookies') or []
+                    if sol_cookies:
                         if host not in cls._cf_cookies:
                             cls._cf_cookies[host] = {}
-                        for c in solution['cookies']:
+                        for c in sol_cookies:
                             cls._cf_cookies[host][c['name']] = c['value']
                         cls._cf_cookies[host]['_timestamp'] = time.time()
-                        logger.info(f"[Scraper] [{host}] FlareSolverr 쿠키 {len(solution['cookies'])}개 동기화 완료")
+                        logger.info(f"[Scraper] [{host}] FlareSolverr 쿠키 {len(sol_cookies)}개 동기화 완료")
 
                     cls._sync_clearance_to_sessions(host)
                     return tree, html_source
+
                 else:
                     logger.warning(f"[Scraper] FlareSolverr 오류 응답: {data.get('message')}")
         except Exception as e:

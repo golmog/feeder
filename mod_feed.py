@@ -183,9 +183,12 @@ class ModuleFeed(PluginModuleBase):
             logger.info(f"[{self.name}] ========================================================")
 
             test_results = Task.execute_board_crawl(site.info, board_id, is_test=True, max_count=test_count, target_cfg=test_target_cfg)
+            if test_results is None:
+                test_results = []
 
+            detailed_count = sum(1 for x in test_results if x.get('magnet') or x.get('download'))
             logger.info(f"[{self.name}] ========================================================")
-            logger.info(f"[{self.name}] [수집 테스트 완료] 사이트='{site.name}', 게시판='{full_board_key}', 최종 수집 항목={len(test_results)}개")
+            logger.info(f"[{self.name}] [수집 테스트 완료] 사이트='{site.name}', 게시판='{full_board_key}', 전체 항목={len(test_results)}개 (상세 파싱={detailed_count}개)")
             logger.info(f"[{self.name}] ========================================================")
             return jsonify(test_results)
 
