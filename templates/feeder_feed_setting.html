@@ -171,13 +171,41 @@
       <div class="modal-body">
         <form id="crawler_form" name="crawler_form">
           <input type="hidden" name="modal_crawler_id" id="modal_crawler_id" value="-1">
+          <input type="hidden" name="boards_json" id="crawler_boards_json" value="[]">
 
           {{ macros.setting_top('수집 사이트') }}
           <div id="crawler_site_select_div" class="input-group col-sm-8"></div>
           {{ macros.setting_bottom() }}
 
-          {{ macros.setting_input_text('crawler_board', '게시판 ID', col='8', placeholder='예: 2_2, offkab, 166', desc=['수집 대상 게시판의 식별자를 입력하세요.']) }}
-          {{ macros.setting_input_text('crawler_subcat', '서브 카테고리 ID', col='8', placeholder='선택 사항 (예: 875)', desc=['게시판 내 서브 카테고리(분류 필터)가 있는 경우 입력']) }}
+          <!-- 다중 게시판 동적 추가 빌더 영역 -->
+          <div class="form-group row mb-2">
+            <label class="col-sm-2 col-form-label text-right font-weight-bold">수집 대상 게시판</label>
+            <div class="col-sm-10">
+              <div class="input-group input-group-sm mb-2">
+                <input type="text" id="modal_crawler_board_input" class="form-control mr-1" placeholder="게시판 ID (예: 2_2, offkab, 166)">
+                <input type="text" id="modal_crawler_subcat_input" class="form-control mr-1" placeholder="서브카테고리 ID (선택, 예: 875)">
+                <div class="input-group-append">
+                  <button type="button" id="add_crawler_board_btn" class="btn btn-outline-primary">게시판 추가</button>
+                </div>
+              </div>
+              <div class="table-responsive rounded border" style="max-height: 160px; overflow-y: auto;">
+                <table class="table table-sm table-hover mb-0 text-center">
+                  <thead class="thead-light">
+                    <tr>
+                      <th style="width: 50%;">게시판 ID</th>
+                      <th style="width: 35%;">서브 카테고리 ID</th>
+                      <th style="width: 15%;">제외</th>
+                    </tr>
+                  </thead>
+                  <tbody id="modal_crawler_boards_tbody">
+                    <tr><td colspan="3" class="text-muted py-2">등록된 수집 대상 게시판이 없습니다.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <small class="form-text text-muted">동일 사이트 내에서 수집할 모든 게시판을 등록하세요. 단일 세션으로 연속 탐색됩니다.</small>
+            </div>
+          </div>
+
           {{ macros.setting_input_int('crawler_interval', '스케쥴 빈도', value='1', min='1', desc=['스케쥴러 몇 회 주기마다 1회 실행할지 설정 (기본: 1)']) }}
           {{ macros.setting_checkbox('crawler_enabled', '수집 활성화', value='On') }}
           {{ macros.setting_checkbox('crawler_use_torrent_info', 'Torrent Info 사용', value='', desc=['On: 마그넷 메타데이터를 사전 분석하여 원본 파일명을 취득합니다.']) }}

@@ -335,8 +335,11 @@ class ModuleFeed(PluginModuleBase):
         elif command == 'add_crawler':
             crawler_id = req.form.get('modal_crawler_id', '-1').strip()
             site = (req.form.get('site') or req.form.get('crawler_site', '')).strip()
-            board = (req.form.get('crawler_board') or req.form.get('board', '')).strip()
-            subcat = (req.form.get('crawler_subcat') or req.form.get('subcat', '')).strip()
+            boards_json = req.form.get('boards_json', '[]')
+            try:
+                boards = json.loads(boards_json)
+            except Exception:
+                boards = []
 
             try:
                 interval_val = int(req.form.get('crawler_interval') or req.form.get('interval', 1))
@@ -355,8 +358,7 @@ class ModuleFeed(PluginModuleBase):
             item_data = {
                 'id': int(crawler_id) if (crawler_id and crawler_id != '-1') else -1,
                 'site': site,
-                'board': board,
-                'subcat': subcat,
+                'boards': boards,
                 'interval': interval_val,
                 'enabled': enabled,
                 'use_proxy': use_proxy,
@@ -836,8 +838,9 @@ class ModuleFeed(PluginModuleBase):
     def delete_crawler_db(self, crawler: dict) -> str:
         try:
             site_val = crawler.get('site')
-            board_val = crawler.get('full_board_key') or crawler.get('board')
-            db.session.query(ModelFeedBbs).filter_by(site=site_val, board=board_val).delete()
+            for b in crawler.get('boards', []):
+                board_val = b.get('full_board_key') or b.get('board')
+                db.session.query(ModelFeedBbs).filter_by(site=site_val, board=board_val).delete()
             db.session.commit()
             self.db_vacuum()
             return 'success'
@@ -853,10 +856,19 @@ class ModuleFeed(PluginModuleBase):
         for c in crawlers:
             info = dict(c)
             site_name = c.get('site')
-            full_board_key = c.get('full_board_key') or c.get('board')
+            boards = c.get('boards', [])
 
-            last_bbs = ModelFeedBbs.get_last_bbs(site_name, full_board_key)
+            last_bbs = None
+            if boards:
+                board_conds = [
+                    and_(ModelFeedBbs.site == site_name, ModelFeedBbs.board == (b.get('full_board_key') or b.get('board')))
+                    for b in boards
+                ]
+                last_bbs = db.session.query(ModelFeedBbs).filter(or_(*board_conds)).order_by(ModelFeedBbs.id.desc()).first()
+
             info['last'] = last_bbs.as_dict() if last_bbs else None
+            info['boards'] = boards
+            info['board_count'] = len(boards)
             info['enabled'] = str(c.get('enabled', True)).lower() in ['true', 'on', '1']
             info['use_proxy'] = str(c.get('use_proxy', False)).lower() in ['true', 'on', '1']
             info['proxy_url'] = c.get('proxy_url', '')

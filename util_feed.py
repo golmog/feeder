@@ -183,13 +183,18 @@ class FeedConfigUtil:
 
             from .task_feed import Task
             for c in data['CRAWLERS']:
-                b_val = c.get('board', '')
-                s_val = c.get('subcat', '')
-                _, _, f_key = Task.parse_board_info(b_val, s_val)
-                c['full_board_key'] = f_key
+                if 'boards' not in c or not isinstance(c['boards'], list):
+                    c['boards'] = []
+                for b in c['boards']:
+                    b_val = b.get('board', '')
+                    s_val = b.get('subcat', '')
+                    _, _, f_key = Task.parse_board_info(b_val, s_val)
+                    b['full_board_key'] = f_key
 
             for f in data['FEEDS']:
-                for src in f.get('sources', []):
+                if 'sources' not in f or not isinstance(f['sources'], list):
+                    f['sources'] = []
+                for src in f['sources']:
                     b_val = src.get('board', '')
                     s_val = src.get('subcat', '')
                     _, _, f_key = Task.parse_board_info(b_val, s_val)
@@ -232,12 +237,16 @@ class FeedConfigUtil:
 
     @classmethod
     def get_crawler_by_board(cls, site_name: str, board_id: str, subcat_id: str = None):
+        """사이트명과 게시판/서브카테고리로 해당 게시판이 속한 수집기 검색"""
         from .task_feed import Task
         _, _, full_key = Task.parse_board_info(board_id, subcat_id)
         crawlers = cls.get_crawlers()
         for c in crawlers:
-            if c.get('site') == site_name and c.get('full_board_key') == full_key:
-                return c
+            if c.get('site') == site_name:
+                for b in c.get('boards', []):
+                    b_key = b.get('full_board_key') or b.get('board')
+                    if b_key == full_key:
+                        return c
         return None
 
     @classmethod
@@ -247,10 +256,18 @@ class FeedConfigUtil:
         target_id = item.get('id')
 
         from .task_feed import Task
-        b_val = item.get('board', '')
-        s_val = item.get('subcat', '')
-        _, _, f_key = Task.parse_board_info(b_val, s_val)
-        item['full_board_key'] = f_key
+        boards = item.get('boards', [])
+        normalized_boards = []
+        for b in boards:
+            b_val = b.get('board', '')
+            s_val = b.get('subcat', '')
+            _, _, f_key = Task.parse_board_info(b_val, s_val)
+            normalized_boards.append({
+                'board': str(b_val),
+                'subcat': str(s_val) if s_val else '',
+                'full_board_key': f_key
+            })
+        item['boards'] = normalized_boards
 
         if target_id is not None and int(target_id) > 0:
             for idx, c in enumerate(crawlers):
@@ -258,14 +275,14 @@ class FeedConfigUtil:
                     crawlers[idx].update(item)
                     data['CRAWLERS'] = crawlers
                     cls.save_yaml(data)
-                    logger.info(f"[Feeder] 수집기 수정 완료: ID={target_id}, Board={f_key}")
+                    logger.info(f"[Feeder] 수집기 수정 완료: ID={target_id}, Site={item.get('site')}, Boards={len(normalized_boards)}개")
                     return 'success_update'
             return 'not_found'
 
-        # 동일 사이트/게시판 중복 등록 차단
+        # 동일 사이트 수집기 중복 방지 (1 사이트 = 1 크롤러 권장)
         for c in crawlers:
-            if c.get('site') == item.get('site') and c.get('full_board_key') == f_key:
-                logger.warning(f"[Feeder] 동일 게시판 수집기 중복: {item.get('site')} - {f_key}")
+            if c.get('site') == item.get('site'):
+                logger.warning(f"[Feeder] 동일 사이트 수집기 이미 존재: {item.get('site')}")
                 return 'already_exist'
 
         max_id = max([int(c.get('id', 0)) for c in crawlers], default=0)
@@ -273,7 +290,7 @@ class FeedConfigUtil:
         crawlers.append(item)
         data['CRAWLERS'] = crawlers
         cls.save_yaml(data)
-        logger.info(f"[Feeder] 신규 수집기 추가 완료: ID={item['id']}, Site={item.get('site')}, Board={f_key}")
+        logger.info(f"[Feeder] 신규 수집기 추가 완료: ID={item['id']}, Site={item.get('site')}, Boards={len(normalized_boards)}개")
         return 'success'
 
     @classmethod
@@ -340,7 +357,6 @@ class FeedConfigUtil:
                     return 'success_update'
             return 'not_found'
 
-        # 동일 피드명 중복 등록 차단
         target_name = str(item.get('name', '')).strip().lower()
         for f in feeds:
             if str(f.get('name', '')).strip().lower() == target_name:

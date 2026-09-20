@@ -1,6 +1,7 @@
 var current_sites = [];
 var current_crawlers = [];
 var current_feeds = [];
+var modal_crawler_boards = [];
 var modal_feed_sources = [];
 
 var json_editor = null;
@@ -266,14 +267,22 @@ function render_crawlers(data) {
       proxyDisplay = item.proxy_url ? '<span class="text-warning font-weight-bold" title="' + item.proxy_url + '">개별</span>' : '<span class="text-warning font-weight-bold">기본</span>';
     }
 
-    var subTag = item.subcat ? ':' + item.subcat : '';
+    var boardsHtml = '';
+    var boards = item.boards || [];
+    if (boards.length > 0) {
+      boardsHtml += '<div class="mt-1">';
+      for (var b = 0; b < boards.length; b++) {
+        var subTag = boards[b].subcat ? ':' + boards[b].subcat : '';
+        boardsHtml += '<span class="badge badge-info mr-1 mb-1 font-weight-normal">' + boards[b].board + subTag + '</span>';
+      }
+      boardsHtml += '</div>';
+    } else {
+      boardsHtml += '<div class="text-muted small">등록된 게시판 없음</div>';
+    }
 
     str += '<tr>';
     str += '  <td class="font-weight-bold">' + item.id + '</td>';
-    str += '  <td class="text-left">';
-    str += '    <strong>' + item.site + '</strong><br>';
-    str += '    <span class="badge badge-info">' + item.board + subTag + '</span>';
-    str += '  </td>';
+    str += '  <td class="text-left"><strong>' + item.site + '</strong><br>' + boardsHtml + '</td>';
     str += '  <td class="text-left small" style="line-height: 1.6;">';
     str += '    상태: ' + (isEnabled ? '<span class="text-success font-weight-bold">활성</span>' : '<span class="text-muted">중지</span>') + ' / ' + (item.interval || 1) + '회당 1회<br>';
     str += '    Proxy: ' + proxyDisplay + ' | Flare: ' + (isFlare ? '<span class="text-danger">ON</span>' : '<span class="text-muted">OFF</span>') + '<br>';
@@ -429,6 +438,54 @@ $(document).on('change', '#crawler_site', function(){
   }
 });
 
+function render_modal_crawler_boards() {
+  var tbody = $('#modal_crawler_boards_tbody');
+  if (!modal_crawler_boards || modal_crawler_boards.length === 0) {
+    tbody.html('<tr><td colspan="3" class="text-muted py-2">등록된 수집 대상 게시판이 없습니다.</td></tr>');
+    $('#crawler_boards_json').val('[]');
+    return;
+  }
+  var str = '';
+  for (var i = 0; i < modal_crawler_boards.length; i++) {
+    var b = modal_crawler_boards[i];
+    str += '<tr>';
+    str += '  <td><strong>' + b.board + '</strong></td>';
+    str += '  <td>' + (b.subcat ? '<span class="badge badge-light">' + b.subcat + '</span>' : '<span class="text-muted">-</span>') + '</td>';
+    str += '  <td><button type="button" class="btn btn-xs btn-outline-danger remove_crawler_board_btn" data-index="' + i + '">삭제</button></td>';
+    str += '</tr>';
+  }
+  tbody.html(str);
+  $('#crawler_boards_json').val(JSON.stringify(modal_crawler_boards));
+}
+
+$(document).on('click', '#add_crawler_board_btn', function(e){
+  e.preventDefault();
+  var boardVal = $('#modal_crawler_board_input').val().trim();
+  var subcatVal = $('#modal_crawler_subcat_input').val().trim();
+  if (!boardVal) {
+    notify('게시판 ID를 입력하세요.', 'warning');
+    return;
+  }
+  var exists = modal_crawler_boards.some(function(item){
+    return item.board === boardVal && (item.subcat || '') === subcatVal;
+  });
+  if (exists) {
+    notify('이미 목록에 추가된 게시판입니다.', 'info');
+    return;
+  }
+  modal_crawler_boards.push({board: boardVal, subcat: subcatVal});
+  render_modal_crawler_boards();
+  $('#modal_crawler_board_input').val('');
+  $('#modal_crawler_subcat_input').val('');
+});
+
+$(document).on('click', '.remove_crawler_board_btn', function(e){
+  e.preventDefault();
+  var idx = $(this).data('index');
+  modal_crawler_boards.splice(idx, 1);
+  render_modal_crawler_boards();
+});
+
 $(document).on('click', '#crawler_add_btn', function(e){
   e.preventDefault();
   if (!current_sites || current_sites.length === 0) {
@@ -442,13 +499,20 @@ $(document).on('click', '#crawler_add_btn', function(e){
 
   $('#crawler_modal_title').text('수집기(Crawler) 추가');
   $('#modal_crawler_id').val('-1');
-  $('#crawler_board').removeAttr('readonly').val('');
-  $('#crawler_subcat').val('');
+  $('#modal_crawler_board_input').val('');
+  $('#modal_crawler_subcat_input').val('');
   $('#crawler_interval').val('1');
   $('#crawler_proxy_url').val('');
   $('#modal_crawler_proxy_div').collapse('hide');
 
   set_modal_checkbox('crawler_enabled', true);
+  set_modal_checkbox('crawler_use_torrent_info', false);
+  set_modal_checkbox('crawler_use_proxy', false);
+  set_modal_checkbox('crawler_use_flaresolverr', false);
+  set_modal_checkbox('crawler_use_selenium', false);
+
+  modal_crawler_boards = [];
+  render_modal_crawler_boards();
   apply_site_defaults_to_crawler_modal(current_sites[0].name);
 
   $('#crawler_modal').modal('show');
@@ -467,10 +531,10 @@ $(document).on('click', '.crawler_edit_btn', function(e){
   siteSelectHtml += '</select>';
   $('#crawler_site_select_div').html(siteSelectHtml);
 
-  $('#crawler_modal_title').text('수집기(Crawler) 수정: ' + item.site + ' [' + item.board + ']');
+  $('#crawler_modal_title').text('수집기(Crawler) 수정: ' + item.site);
   $('#modal_crawler_id').val(item.id);
-  $('#crawler_board').val(item.board).attr('readonly', 'readonly');
-  $('#crawler_subcat').val(item.subcat || '');
+  $('#modal_crawler_board_input').val('');
+  $('#modal_crawler_subcat_input').val('');
   $('#crawler_interval').val(item.interval || 1);
   $('#crawler_proxy_url').val(item.proxy_url || '');
 
@@ -482,6 +546,9 @@ $(document).on('click', '.crawler_edit_btn', function(e){
 
   if (item.use_proxy) $('#modal_crawler_proxy_div').collapse('show');
   else $('#modal_crawler_proxy_div').collapse('hide');
+
+  modal_crawler_boards = item.boards ? JSON.parse(JSON.stringify(item.boards)) : [];
+  render_modal_crawler_boards();
 
   $('#crawler_modal').modal('show');
 });
@@ -574,29 +641,35 @@ function render_modal_feed_sources() {
 function update_crawler_source_select_options() {
   var select = $('#feed_source_crawler_select');
   select.empty();
-  if (!current_crawlers || current_crawlers.length === 0) {
-    select.append('<option value="">-- 등록된 수집기 없음 --</option>');
-    return;
-  }
+  var count = 0;
   for (var i = 0; i < current_crawlers.length; i++) {
     var c = current_crawlers[i];
-    var subTag = c.subcat ? ':' + c.subcat : '';
-    select.append('<option value="' + i + '">[' + c.site + '] ' + c.board + subTag + '</option>');
+    for (var j = 0; j < (c.boards || []).length; j++) {
+      var b = c.boards[j];
+      var subTag = b.subcat ? ':' + b.subcat : '';
+      select.append('<option value="' + c.site + '|' + b.board + '|' + (b.subcat || '') + '">[' + c.site + '] ' + b.board + subTag + '</option>');
+      count++;
+    }
+  }
+  if (count === 0) {
+    select.append('<option value="">-- 등록된 수집기 게시판 없음 --</option>');
   }
 }
 
 $(document).on('click', '#add_feed_source_btn', function(e){
   e.preventDefault();
-  var selIdx = $('#feed_source_crawler_select').val();
-  if (selIdx === '' || selIdx === null) {
-    notify('추가할 수집기를 선택하세요.', 'warning');
+  var rawVal = $('#feed_source_crawler_select').val();
+  if (!rawVal) {
+    notify('추가할 수집기 게시판을 선택하세요.', 'warning');
     return;
   }
-  var c = current_crawlers[parseInt(selIdx)];
-  if (!c) return;
+  var parts = rawVal.split('|');
+  var site = parts[0];
+  var board = parts[1];
+  var subcat = parts[2] || '';
 
   var exists = modal_feed_sources.some(function(s){
-    return s.site === c.site && s.board === c.board && (s.subcat || '') === (c.subcat || '');
+    return s.site === site && s.board === board && (s.subcat || '') === subcat;
   });
   if (exists) {
     notify('이미 소스 목록에 포함되어 있습니다.', 'info');
@@ -604,10 +677,10 @@ $(document).on('click', '#add_feed_source_btn', function(e){
   }
 
   modal_feed_sources.push({
-    site: c.site,
-    board: c.board,
-    subcat: c.subcat || '',
-    full_board_key: c.full_board_key || c.board
+    site: site,
+    board: board,
+    subcat: subcat,
+    full_board_key: board + (subcat ? ':' + subcat : '')
   });
   render_modal_feed_sources();
 });

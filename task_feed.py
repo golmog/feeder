@@ -121,33 +121,27 @@ class Task:
                 total_crawled_count = 0
                 for crawler in crawlers:
                     if not crawler.get('enabled', True):
-                        logger.debug(f"[Feeder] 비활성화된 수집기 건너뜀: {crawler.get('site')} - {crawler.get('board')}")
+                        logger.debug(f"[Feeder] 비활성화된 수집기 건너뜀: {crawler.get('site')}")
                         continue
 
                     target_interval = int(crawler.get('interval', 1))
                     if not manual and target_interval > 1:
                         if (current_count % target_interval) != 0:
-                            logger.info(f"[Feeder] 스케쥴 빈도({target_interval}회당 1회) 미도래로 건너뜀: {crawler.get('site')} - {crawler.get('board')}")
+                            logger.info(f"[Feeder] 스케쥴 빈도({target_interval}회당 1회) 미도래로 건너뜀: {crawler.get('site')}")
                             continue
 
                     site_name = crawler.get('site')
-                    board_id = crawler.get('board')
-                    subcat_id = str(crawler.get('subcat', '')).strip()
-                    full_board_key = crawler.get('full_board_key') or board_id
-
                     site_entity = ModelFeedSite.get(name=site_name)
                     if not site_entity:
                         logger.warning(f"[Feeder] 등록되지 않은 사이트명: {site_name}")
                         continue
 
-                    last_bbs = ModelFeedBbs.get_last_bbs(site_name, full_board_key)
-                    max_id = 0
-                    extra = site_entity.info.get('EXTRA', []) if site_entity.info else []
-                    if 'USING_BOARD_CHAR_ID' not in extra and last_bbs and last_bbs.board_id:
-                        max_id = last_bbs.board_id
+                    boards = crawler.get('boards', [])
+                    if not boards:
+                        logger.debug(f"[Feeder] [{site_name}] 등록된 게시판이 없어 건너뜀")
+                        continue
 
                     target_cfg = SimpleNamespace(
-                        subcat_id=subcat_id,
                         use_proxy=crawler.get('use_proxy', False),
                         proxy_url=crawler.get('proxy_url', '').strip(),
                         use_flaresolverr=crawler.get('use_flaresolverr', False),
@@ -155,30 +149,50 @@ class Task:
                         use_torrent_info=crawler.get('use_torrent_info', False)
                     )
 
-                    logger.info(f"[Feeder] [Celery Task] 수집 진행: {site_name} - {full_board_key} (최근 ID: {max_id})")
+                    logger.info(f"[Feeder] [Celery Task] 사이트 크롤러 시작: [{site_name}] (대상 게시판={len(boards)}개, 기본 최대 탐색={max_page}p)")
 
-                    crawled = Task.execute_board_crawl(
-                        site_entity.info,
-                        board_id,
-                        max_page=max_page,
-                        max_id=max_id,
-                        is_test=False,
-                        max_count=0,
-                        target_cfg=target_cfg
-                    )
-                    if crawled:
-                        total_crawled_count += len(crawled)
-                        logger.info(f"[Feeder] {site_name} - {full_board_key}: {len(crawled)}개 항목 수집 완료")
+                    try:
+                        # 동일 사이트 내의 모든 게시판을 단일 세션으로 연속 탐색
+                        for b in boards:
+                            board_id = b.get('board')
+                            subcat_id = str(b.get('subcat', '')).strip()
+                            full_board_key = b.get('full_board_key') or board_id
+
+                            last_bbs = ModelFeedBbs.get_last_bbs(site_name, full_board_key)
+                            max_id = 0
+                            extra = site_entity.info.get('EXTRA', []) if site_entity.info else []
+                            if 'USING_BOARD_CHAR_ID' not in extra and last_bbs and last_bbs.board_id:
+                                max_id = last_bbs.board_id
+
+                            target_cfg.subcat_id = subcat_id
+                            logger.info(f"[Feeder] [{site_name}] 게시판 수집 진행: {full_board_key} (최근 수집 ID: {max_id})")
+
+                            crawled = Task.execute_board_crawl(
+                                site_entity.info,
+                                board_id,
+                                max_page=max_page,
+                                max_id=max_id,
+                                is_test=False,
+                                max_count=0,
+                                target_cfg=target_cfg
+                            )
+                            if crawled:
+                                total_crawled_count += len(crawled)
+                                logger.info(f"[Feeder] [{site_name}] {full_board_key}: {len(crawled)}개 항목 수집 완료")
+                    finally:
+                        # 해당 사이트의 모든 소속 게시판 수집 완료 후 단일 세션 정리
+                        FeedScraper.close_sessions()
 
                 logger.info(f"[Feeder] [Celery Task] 전체 수집 작업 완료: 총 {total_crawled_count}개 게시물 수집됨")
 
-                # 모든 수집 완료 후 등록된 FEEDS의 공유용 XML 파일 일괄 갱신
+                # 모든 크롤러 완료 후 등록된 FEEDS의 공유용 XML 파일 일괄 갱신
                 updated_feeds = FeedRssFileWriter.save_all_rss_files()
                 logger.info(f"[Feeder] 공유 피드 XML 파일 일괄 갱신 완료 (총 {updated_feeds}개 파일 생성됨)")
 
             except Exception as e:
                 logger.error(f"[Feeder] [Celery Task] 크롤링 수집 중 오류: {e}")
                 logger.error(traceback.format_exc())
+
 
     @staticmethod
     def get_crawl_delay(site_info: dict) -> float:
@@ -412,9 +426,12 @@ class Task:
 
             logger.info(f"[Feeder] 크롤링 루프 종료: 총 {len(bbs_list)}개 항목 처리 완료")
         finally:
-            FeedScraper.close_sessions()
+            # 단일 게시판 수집 테스트 시에만 즉시 세션 정리, 실제 수집 시에는 사이트 단위로 세션 유지
+            if is_test:
+                FeedScraper.close_sessions()
 
         return bbs_list
+
 
     @staticmethod
     def extract_magnets(page_html: str, tree, site_info: dict) -> list[str]:
