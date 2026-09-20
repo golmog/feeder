@@ -4,6 +4,7 @@ import base64
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from flask import Response, send_file, abort, request, jsonify
+from sqlalchemy import and_, or_, func, desc
 
 from .setup import *
 from .model_feed import ModelFeedSite, ModelFeedBbs, ModelFeedGroup
@@ -374,7 +375,9 @@ class ModuleFeed(PluginModuleBase):
             target_id = req.form.get('target_id')
             target = FeedConfigUtil.get_schedule(target_id)
             if target:
-                self.delete_scheduler_db(target.get('site_name'), target.get('board_id'))
+                from .task_feed import Task
+                _, _, full_board_key = Task.parse_board_info(target.get('board_id', ''), target.get('subcat_id', ''))
+                self.delete_scheduler_db(target.get('site_name'), full_board_key)
                 FeedConfigUtil.delete_schedule(target_id)
                 ret = 'success'
             else:
@@ -385,7 +388,9 @@ class ModuleFeed(PluginModuleBase):
             target_id = req.form.get('target_id')
             target = FeedConfigUtil.get_schedule(target_id)
             if target:
-                ret = self.delete_scheduler_db(target.get('site_name'), target.get('board_id'))
+                from .task_feed import Task
+                _, _, full_board_key = Task.parse_board_info(target.get('board_id', ''), target.get('subcat_id', ''))
+                ret = self.delete_scheduler_db(target.get('site_name'), full_board_key)
             else:
                 ret = 'fail'
             return jsonify({'ret': ret, 'site': ModelFeedSite.get_list(by_dict=True), 'scheduler': self.get_scheduler_list()})
@@ -523,7 +528,8 @@ class ModuleFeed(PluginModuleBase):
 
     def _handle_board_rss(self, sitename, boardname):
         try:
-            items = db.session.query(ModelFeedBbs).filter_by(site=sitename, board=boardname).order_by(desc(ModelFeedBbs.id)).limit(100).all()
+            feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
+            items = db.session.query(ModelFeedBbs).filter_by(site=sitename, board=boardname).order_by(ModelFeedBbs.id.desc()).limit(feed_count).all()
             xml_content = self.generate_rss_feed(f"SITE: {sitename} / BOARD: {boardname}", items)
             return Response(xml_content, mimetype='application/xml; charset=utf-8')
         except Exception as e:
@@ -537,9 +543,12 @@ class ModuleFeed(PluginModuleBase):
                 return jsonify({'ret': 'not_exist'}), 404
 
             sitename = target.get('site_name')
-            boardname = target.get('board_id')
-            items = db.session.query(ModelFeedBbs).filter_by(site=sitename, board=boardname).order_by(desc(ModelFeedBbs.id)).limit(100).all()
-            xml_content = self.generate_rss_feed(f"SITE: {sitename} / BOARD: {boardname}", items)
+            from .task_feed import Task
+            _, _, full_board_key = Task.parse_board_info(target.get('board_id', ''), target.get('subcat_id', ''))
+
+            feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
+            items = db.session.query(ModelFeedBbs).filter_by(site=sitename, board=full_board_key).order_by(ModelFeedBbs.id.desc()).limit(feed_count).all()
+            xml_content = self.generate_rss_feed(f"SITE: {sitename} / BOARD: {full_board_key}", items)
             return Response(xml_content, mimetype='application/xml; charset=utf-8')
         except Exception as e:
             logger.error(f"[Feeder] _handle_board_id_rss 에러: {e}")
@@ -563,7 +572,8 @@ class ModuleFeed(PluginModuleBase):
                         .group_by(group_key)
                         .subquery()
                     )
-                    items = db.session.query(ModelFeedBbs).join(subq, ModelFeedBbs.id == subq.c.max_id).order_by(desc(ModelFeedBbs.id)).limit(100).all()
+                    feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
+                    items = db.session.query(ModelFeedBbs).join(subq, ModelFeedBbs.id == subq.c.max_id).order_by(ModelFeedBbs.id.desc()).limit(feed_count).all()
                     logger.debug(f"[Feeder] 그룹 RSS 피드 추출 완료: 그룹명='{groupname}', 대상 게시글={len(items)}개")
 
             xml_content = self.generate_rss_feed(f"GROUP: {groupname}", items)
@@ -590,7 +600,14 @@ class ModuleFeed(PluginModuleBase):
             download_url = target_file[0]
             filename = target_file[1]
 
-            target = next((s for s in FeedConfigUtil.get_schedules() if s.get('site_name') == post.site and str(s.get('board_id')) == str(post.board)), None)
+            from .task_feed import Task
+            target = None
+            for s in FeedConfigUtil.get_schedules():
+                _, _, s_full_key = Task.parse_board_info(s.get('board_id', ''), s.get('subcat_id', ''))
+                if s.get('site_name') == post.site and str(s_full_key) == str(post.board):
+                    target = s
+                    break
+
             target_cfg = SimpleNamespace(
                 use_proxy=target.get('use_proxy', False) if target else P.ModelSetting.get_bool(f"{self.name}_use_proxy"),
                 proxy_url=target.get('proxy_url', '') if target else P.ModelSetting.get(f"{self.name}_proxy_url"),

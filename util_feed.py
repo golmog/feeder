@@ -80,20 +80,30 @@ def get_tmp_dir(sub_path: str = '') -> str:
 
 
 def extract_info_hash(magnet_uri: str) -> str | None:
-    """마그넷 URI에서 40자리 hex 또는 32자리 base32 info_hash 추출"""
-    if not magnet_uri or not magnet_uri.startswith('magnet:'):
+    """마그넷 URI(BTIH) 또는 ed2k 링크에서 고유 해시 추출"""
+    if not magnet_uri:
         return None
-    match = re.search(r'xt=urn:btih:([a-zA-Z0-9]+)', magnet_uri, re.IGNORECASE)
-    if match:
-        raw_hash = match.group(1).lower()
-        if len(raw_hash) == 40:
-            return raw_hash
-        elif len(raw_hash) == 32:
-            try:
-                decoded = base64.b32decode(raw_hash.upper())
-                return decoded.hex().lower()
-            except Exception:
+
+    # 마그넷 btih 해시 추출 (40자리 hex 또는 32자리 base32)
+    if magnet_uri.startswith('magnet:'):
+        match = re.search(r'xt=urn:btih:([a-zA-Z0-9]+)', magnet_uri, re.IGNORECASE)
+        if match:
+            raw_hash = match.group(1).lower()
+            if len(raw_hash) == 40:
                 return raw_hash
+            elif len(raw_hash) == 32:
+                try:
+                    decoded = base64.b32decode(raw_hash.upper())
+                    return decoded.hex().lower()
+                except Exception:
+                    return raw_hash
+
+    # ed2k 파일 해시 추출 (32자리 hex MD4)
+    elif magnet_uri.startswith('ed2k://'):
+        match = re.search(r'ed2k://\|file\|[^|]+\|[0-9]+\|([a-fA-F0-9]{32})', magnet_uri, re.IGNORECASE)
+        if match:
+            return match.group(1).lower()
+
     return None
 
 
@@ -259,24 +269,28 @@ class FeedCustomManager:
     @classmethod
     def sync_default_site_info(cls):
         try:
-            from .model_feed import ModelFeedSite
-            for site_key, hook_cls in cls._hooks.items():
-                default_info = getattr(hook_cls, 'DEFAULT_SITE_INFO', None)
-                if default_info and isinstance(default_info, dict):
-                    target_name = default_info.get('NAME') or getattr(hook_cls, 'SITE_NAME', '')
-                    if not target_name:
-                        continue
+            with F.app.app_context():
+                from .model_feed import ModelFeedSite
+                for site_key, hook_cls in cls._hooks.items():
+                    default_info = getattr(hook_cls, 'DEFAULT_SITE_INFO', None)
+                    if default_info and isinstance(default_info, dict):
+                        target_name = default_info.get('NAME') or getattr(hook_cls, 'SITE_NAME', '')
+                        if not target_name:
+                            continue
 
-                    existing = ModelFeedSite.get(name=target_name)
-                    if not existing:
-                        content_str = json.dumps(default_info, ensure_ascii=False, indent=2)
-                        new_site = ModelFeedSite('custom', default_info, content_str)
-                        db.session.add(new_site)
-                        db.session.commit()
-                        logger.info(f"[Feeder] 커스텀 훅 기반 사이트 템플릿 자동 등록: '{target_name}'")
+                        existing = ModelFeedSite.get(name=target_name)
+                        if not existing:
+                            content_str = json.dumps(default_info, ensure_ascii=False, indent=2)
+                            new_site = ModelFeedSite('custom', default_info, content_str)
+                            db.session.add(new_site)
+                            db.session.commit()
+                            logger.info(f"[Feeder] 커스텀 훅 기반 사이트 템플릿 자동 등록: '{target_name}'")
         except Exception as e:
             logger.error(f"[Feeder] sync_default_site_info 에러: {e}")
-            db.session.rollback()
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
 
     @classmethod
     def get_hook(cls, site_name: str):
@@ -692,6 +706,7 @@ class FeedScraper:
             return driver.page_source
         except Exception as e:
             logger.error(f"[Scraper] Remote Selenium 로딩 에러 ({url}): {e}")
+            cls.close_selenium_driver()
             return None
 
     @classmethod
@@ -777,6 +792,11 @@ class FeedTorrentInfo:
         results = []
 
         for magnet in magnet_list:
+            # 토렌트/마그넷 프로토콜이 아닌 ed2k 등의 링크는 메타데이터 취득 대상에서 제외
+            if not str(magnet).startswith('magnet:'):
+                logger.debug(f"[TorrentInfo] 토렌트 메타정보 취득 대상이 아닌 P2P 링크 건너뜀: {magnet[:50]}")
+                continue
+
             try:
                 info = None
                 if method == 'qbittorrent':
