@@ -741,9 +741,8 @@ class ModuleFeed(PluginModuleBase):
 
     def db_vacuum(self):
         try:
-            bind_key = f'{P.package_name}_{self.name}'
             try:
-                engine = db.get_engine(bind=bind_key)
+                engine = db.get_engine(bind=P.package_name)
             except Exception:
                 engine = db.engine
 
@@ -754,7 +753,7 @@ class ModuleFeed(PluginModuleBase):
                     cursor = raw_conn.cursor()
                     cursor.execute("VACUUM")
                     cursor.close()
-                    logger.info(f"[{self.name}] SQLite DB VACUUM 정리 완료 ({bind_key}.db)")
+                    logger.info(f"[{self.name}] SQLite DB VACUUM 정리 완료 ({P.package_name}.db)")
                 finally:
                     raw_conn.close()
         except Exception as e:
