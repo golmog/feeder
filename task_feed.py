@@ -324,15 +324,15 @@ class Task:
                 detail_count = 0
                 from .util_feed import FeedFilter, FeedConfigUtil
                 global_cfg = FeedConfigUtil.get_global()
-                target_sched_dict = vars(target_cfg) if target_cfg else {}
-                target_db_sched = FeedConfigUtil.get_schedule_by_board(site_name, board_id, subcat_id)
-                if target_db_sched:
-                    target_sched_dict.update(target_db_sched)
+                target_task_dict = vars(target_cfg) if target_cfg else {}
+                target_db_task = getattr(target_cfg, 'task_dict', None) or FeedConfigUtil.get_task_by_board(site_name, board_id, subcat_id)
+                if target_db_task:
+                    target_task_dict.update(target_db_task)
 
                 for idx, item in enumerate(raw_list):
                     # 테스트 모드: 지정된 max_count(3개) 초과 시 목록 정보만 bbs_list에 보존
                     if is_test and detail_count >= max_count:
-                        is_pass, reason = FeedFilter.evaluate(item, target_sched_dict, global_cfg)
+                        is_pass, reason = FeedFilter.evaluate(item, target_task_dict, global_cfg)
                         item['filter_status'] = "ACCEPTED" if is_pass else f"REJECTED: {reason}"
                         bbs_list.append(item)
                         continue

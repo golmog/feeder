@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
+import os
 import json
+import yaml
 import base64
+import traceback
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from flask import Response, send_file, abort, request, jsonify
@@ -12,6 +15,7 @@ from .util_feed import (
     get_ddns, get_system_apikey, clean_xml_string,
     FeedConfigUtil, FeedCustomManager, FeedScraper, FeedTorrentInfo, FeedFilter
 )
+from .task_feed import TaskBase, Task
 
 name = 'feed'
 
@@ -96,13 +100,13 @@ class ModuleFeed(PluginModuleBase):
             return super(ModuleFeed, self).process_ajax(sub, req)
         except Exception as e:
             logger.error(f"[{self.name}] process_ajax 에러: {e}")
+            logger.error(traceback.format_exc())
             return jsonify({'ret': 'error', 'msg': str(e)})
 
     def process_command(self, command, arg1, arg2, arg3, req):
         # 수동 1회 실행 명령
         if command == 'one_execute':
             logger.info(f"[{self.name}] 1회 실행 명령 수신 -> Celery 워커 전달")
-            from .task_feed import TaskBase
             self.start_celery(TaskBase.start, None, "manual")
             return jsonify({'ret': 'success', 'msg': '수집 작업을 Celery 워커에서 시작했습니다.'})
 
@@ -158,7 +162,6 @@ class ModuleFeed(PluginModuleBase):
                 logger.warning(f"[{self.name}] 수집 테스트 실패: 사이트 또는 게시판 ID가 올바르지 않음 (site_id={site_id}, board_id={board_input})")
                 return jsonify({'ret': 'fail', 'log': '사이트 또는 게시판 ID가 올바르지 않습니다.'})
 
-            from .task_feed import Task
             board_id, subcat_id, full_board_key = Task.parse_board_info(board_input)
 
             try:
@@ -400,11 +403,14 @@ class ModuleFeed(PluginModuleBase):
                 item_data['accept_all'] = accept_all
                 regexp_data = {}
                 rej = parse_filter_lines(filter_reject)
-                if rej: regexp_data['reject'] = rej
+                if rej:
+                    regexp_data['reject'] = rej
                 acc = parse_filter_lines(filter_accept)
-                if acc: regexp_data['accept'] = acc
+                if acc:
+                    regexp_data['accept'] = acc
                 rex = parse_filter_lines(filter_reject_excluding)
-                if rex: regexp_data['reject_excluding'] = rex
+                if rex:
+                    regexp_data['reject_excluding'] = rex
 
                 if regexp_data:
                     item_data['regexp'] = regexp_data
@@ -469,29 +475,24 @@ class ModuleFeed(PluginModuleBase):
 
         return super(ModuleFeed, self).process_command(command, arg1, arg2, arg3, req)
 
-    # FlaskFarm 표준 API 처리 엔드포인트
     def process_api(self, sub, req):
         try:
-            if sub == 'task':
+            # 태스크 통합 RSS 피드
+            if sub in ['task', 'board']:
                 task_id = req.args.get('id')
                 task_name = req.args.get('name')
-                if task_id or task_name:
-                    return self._handle_task_rss(task_id=task_id, task_name=task_name)
-                return jsonify({'ret': 'fail', 'msg': '태스크 식별자 누락'}), 400
-
-            elif sub == 'board':
-                # 단일 게시판 직접 쿼리 호환
                 sitename = req.args.get('site')
                 boardname = req.args.get('board')
                 subcat = req.args.get('subcat')
-                task_id = req.args.get('id')
-                if task_id:
-                    return self._handle_task_rss(task_id=task_id)
+
+                if task_id or task_name:
+                    return self._handle_task_rss(task_id=task_id, task_name=task_name)
+
                 if sitename and boardname:
-                    from .task_feed import Task
                     _, _, full_board_key = Task.parse_board_info(boardname, subcat)
                     return self._handle_board_rss(sitename, full_board_key)
-                return jsonify({'ret': 'fail', 'msg': '파라미터 누락'}), 400
+
+                return jsonify({'ret': 'fail', 'msg': '태스크 또는 게시판 식별자 누락'}), 400
 
             elif sub == 'download':
                 bbs_file_id = req.args.get('id')
@@ -506,6 +507,28 @@ class ModuleFeed(PluginModuleBase):
         except Exception as e:
             logger.error(f"[Feeder] process_api 에러 ({sub}): {e}")
             return jsonify({'ret': 'error', 'msg': str(e)}), 500
+
+    def _handle_board_rss(self, sitename, boardname):
+        try:
+            feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
+            query_limit = max(feed_count * 3, 300)
+            items = db.session.query(ModelFeedBbs).filter_by(site=sitename, board=boardname).order_by(ModelFeedBbs.id.desc()).limit(query_limit).all()
+
+            task = FeedConfigUtil.get_task_by_board_key(sitename, boardname)
+            global_cfg = FeedConfigUtil.get_global()
+            filtered_items = []
+            for bbs in items:
+                is_pass, _ = FeedFilter.evaluate(bbs.as_dict(), task, global_cfg)
+                if is_pass:
+                    filtered_items.append(bbs)
+                    if len(filtered_items) >= feed_count:
+                        break
+
+            xml_content = self.generate_rss_feed(f"SITE: {sitename} / BOARD: {boardname}", filtered_items)
+            return Response(xml_content, mimetype='application/xml; charset=utf-8')
+        except Exception as e:
+            logger.error(f"[Feeder] _handle_board_rss 에러: {e}")
+            return Response('Internal Error', status=500)
 
     def _handle_task_rss(self, task_id=None, task_name=None):
         try:
@@ -553,7 +576,6 @@ class ModuleFeed(PluginModuleBase):
             logger.error(f"[Feeder] _handle_task_rss 에러: {e}")
             return Response('Internal Error', status=500)
 
-    # 메서드 별칭 지원
     handle_task_rss = _handle_task_rss
 
     def _handle_download_stream(self, bbs_file_id):
@@ -574,18 +596,20 @@ class ModuleFeed(PluginModuleBase):
             download_url = target_file[0]
             filename = target_file[1]
 
-            from .task_feed import Task
-            target = None
-            for s in FeedConfigUtil.get_schedules():
-                _, _, s_full_key = Task.parse_board_info(s.get('board_id', ''), s.get('subcat_id', ''))
-                if s.get('site_name') == post.site and str(s_full_key) == str(post.board):
-                    target = s
+            target_task = None
+            for t in FeedConfigUtil.get_tasks():
+                for tgt in t.get('targets', []):
+                    t_board = tgt.get('full_board_key') or tgt.get('board')
+                    if tgt.get('site') == post.site and str(t_board) == str(post.board):
+                        target_task = t
+                        break
+                if target_task:
                     break
 
             target_cfg = SimpleNamespace(
-                use_proxy=target.get('use_proxy', False) if target else P.ModelSetting.get_bool(f"{self.name}_use_proxy"),
-                proxy_url=target.get('proxy_url', '') if target else P.ModelSetting.get(f"{self.name}_proxy_url"),
-                use_flaresolverr=target.get('use_flaresolverr', False) if target else False
+                use_proxy=target_task.get('use_proxy', False) if target_task else P.ModelSetting.get_bool(f"{self.name}_use_proxy"),
+                proxy_url=target_task.get('proxy_url', '') if target_task else P.ModelSetting.get(f"{self.name}_proxy_url"),
+                use_flaresolverr=target_task.get('use_flaresolverr', False) if target_task else False
             )
 
             byte_io = FeedScraper.download_file_stream(download_url, referer=post.url, scheduler_instance=target_cfg)
@@ -694,7 +718,6 @@ class ModuleFeed(PluginModuleBase):
                 logger.error(f"[Feeder] db auto delete 에러: {e}")
                 db.session.rollback()
 
-        from .task_feed import TaskBase
         self.start_celery(TaskBase.start, None, "default")
 
     def delete_task_db(self, task: dict) -> str:
@@ -710,6 +733,26 @@ class ModuleFeed(PluginModuleBase):
             logger.error(f"[Feeder] delete_task_db 에러: {e}")
             db.session.rollback()
         return 'fail'
+
+    def db_vacuum(self):
+        try:
+            try:
+                engine = db.get_engine(bind=P.package_name)
+            except Exception:
+                engine = db.engine
+
+            if engine.dialect.name == 'sqlite':
+                raw_conn = engine.raw_connection()
+                try:
+                    raw_conn.isolation_level = None
+                    cursor = raw_conn.cursor()
+                    cursor.execute("VACUUM")
+                    cursor.close()
+                    logger.info(f"[{self.name}] SQLite DB VACUUM 정리 완료")
+                finally:
+                    raw_conn.close()
+        except Exception as e:
+            logger.error(f"[{self.name}] db_vacuum 실행 오류: {e}")
 
     def get_task_list(self) -> list[dict]:
         ret = []

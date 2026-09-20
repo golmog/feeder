@@ -250,6 +250,32 @@ class FeedConfigUtil:
         return None
 
     @classmethod
+    def get_task_by_board(cls, site_name: str, board_id: str, subcat_id: str = None):
+        """사이트명과 게시판/서브카테고리 정보로 해당 타겟이 포함된 태스크 검색"""
+        from .task_feed import Task
+        _, _, full_key = Task.parse_board_info(board_id, subcat_id)
+        tasks = cls.get_tasks()
+        for t in tasks:
+            for tgt in t.get('targets', []):
+                if tgt.get('site') == site_name:
+                    t_key = tgt.get('full_board_key') or tgt.get('board')
+                    if t_key == full_key:
+                        return t
+        return None
+
+    @classmethod
+    def get_task_by_board_key(cls, site_name: str, full_board_key: str):
+        """사이트명과 full_board_key(예: '166:875' 또는 '2_2')로 해당 타겟이 포함된 태스크 검색"""
+        tasks = cls.get_tasks()
+        for t in tasks:
+            for tgt in t.get('targets', []):
+                if tgt.get('site') == site_name:
+                    t_key = tgt.get('full_board_key') or tgt.get('board')
+                    if t_key == full_board_key:
+                        return t
+        return None
+
+    @classmethod
     def save_task(cls, item: dict) -> str:
         data = cls.load_yaml()
         tasks = data.get('TASKS', [])
