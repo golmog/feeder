@@ -169,38 +169,41 @@ class ModelFeedBbs(ModelBase):
             return False
 
     @classmethod
-    def make_query(cls, req, order='desc', search='', site_radio='site', site_select='all', board_select='all', group_select='all', search_select='title'):
+    def make_query(cls, req, order='desc', search='', site_radio='site', site_select='all', board_select='all', task_select='all', search_select='title'):
         with F.app.app_context():
             query = F.db.session.query(cls)
 
-            # 사이트 또는 그룹 필터링
-            if site_radio == 'group':
-                if group_select and group_select != 'all':
-                    group_entity = F.db.session.query(ModelFeedGroup).filter_by(groupname=group_select).first()
-                    if group_entity:
-                        boards = group_entity.get_boards()
-                        if len(boards) == 0:
-                            query = query.filter(cls.site == '__empty_group__')
-                        elif len(boards) == 1:
-                            query = query.filter(cls.site == boards[0].get('site_name'), cls.board == boards[0].get('board_id'))
-                        else:
-                            group_conditions = []
-                            for b in boards:
-                                group_conditions.append(and_(cls.site == b.get('site_name'), cls.board == b.get('board_id')))
-                            query = query.filter(or_(*group_conditions))
+            # 태스크(Task) 단위 필터링: 선택된 태스크에 소속된 모든 타겟 게시판을 통합 조회
+            if site_radio == 'task' and task_select and task_select != 'all':
+                from .util_feed import FeedConfigUtil
+                task = FeedConfigUtil.get_task(task_select) or FeedConfigUtil.get_task_by_name(task_select)
+                if task:
+                    targets = task.get('targets', [])
+                    if len(targets) == 0:
+                        query = query.filter(cls.site == '__empty_task__')
+                    elif len(targets) == 1:
+                        t = targets[0]
+                        b_key = t.get('full_board_key', t.get('board'))
+                        query = query.filter(cls.site == t.get('site'), cls.board == b_key)
+                    else:
+                        target_conditions = []
+                        for t in targets:
+                            b_key = t.get('full_board_key', t.get('board'))
+                            target_conditions.append(and_(cls.site == t.get('site'), cls.board == b_key))
+                        query = query.filter(or_(*target_conditions))
 
-                            # 마그넷 존재 시 중복 제거, 비어있으면 고유 ID로 개별 보존
-                            group_key = func.coalesce(
-                                func.nullif(cls.magnet, ''),
-                                func.cast(cls.id, db.String)
-                            )
-                            subq = (
-                                F.db.session.query(func.max(cls.id).label("max_id"))
-                                .filter(or_(*group_conditions))
-                                .group_by(group_key)
-                                .subquery()
-                            )
-                            query = query.join(subq, cls.id == subq.c.max_id)
+                        # 다중 게시판 간 동일 마그넷 중복 통합
+                        group_key = func.coalesce(
+                            func.nullif(cls.magnet, ''),
+                            func.cast(cls.id, db.String)
+                        )
+                        subq = (
+                            F.db.session.query(func.max(cls.id).label("max_id"))
+                            .filter(or_(*target_conditions))
+                            .group_by(group_key)
+                            .subquery()
+                        )
+                        query = query.join(subq, cls.id == subq.c.max_id)
             else:
                 if site_select and site_select != 'all':
                     query = query.filter(cls.site == site_select)
@@ -252,10 +255,10 @@ class ModelFeedBbs(ModelBase):
                 search = req.form['search_word'].strip()
 
             order = req.form.get('order', 'desc')
-            site_radio = req.form.get('site_radio', req.form.get('radio', 'site'))
+            site_radio = req.form.get('radio', req.form.get('site_radio', 'site'))
             site_select = req.form.get('site_select', 'all')
             board_select = req.form.get('board_select', 'all')
-            group_select = req.form.get('group_select', 'all')
+            task_select = req.form.get('task_select', 'all')
             search_select = req.form.get('search_select', 'title')
 
             query = cls.make_query(
@@ -265,7 +268,7 @@ class ModelFeedBbs(ModelBase):
                 site_radio=site_radio,
                 site_select=site_select,
                 board_select=board_select,
-                group_select=group_select,
+                task_select=task_select,
                 search_select=search_select
             )
 
@@ -276,12 +279,11 @@ class ModelFeedBbs(ModelBase):
             ret['list'] = [item.as_dict() for item in lists]
             ret['paging'] = cls.get_paging_info(count, page, page_size)
 
-            # 검색 폼 동기화용 데이터 조회
             feed_mod = P.get_module('feed')
             if feed_mod and hasattr(feed_mod, 'get_search_form_info'):
                 ret['info'] = feed_mod.get_search_form_info()
             else:
-                ret['info'] = {'group': [], 'site': [], 'board': {}}
+                ret['info'] = {'tasks': [], 'site': [], 'board': {}}
 
             return ret
         except Exception as e:
@@ -289,47 +291,3 @@ class ModelFeedBbs(ModelBase):
             logger.error(traceback.format_exc())
             return {'ret': 'error', 'msg': str(e)}
 
-
-class ModelFeedGroup(db.Model):
-    __tablename__ = f'{PACKAGE_NAME}_group'
-    __table_args__ = {'mysql_collate': 'utf8_general_ci'}
-    __bind_key__ = PACKAGE_NAME
-
-    id = db.Column(db.Integer, primary_key=True)
-    created_time = db.Column(db.DateTime, default=datetime.now)
-    reserved = db.Column(db.JSON)
-
-    groupname = db.Column(db.String, unique=True, index=True)
-    query = db.Column(db.String, nullable=True)
-
-    def __init__(self, groupname):
-        self.created_time = datetime.now()
-        self.groupname = groupname
-        self.reserved = {'boards': []}
-
-    def get_boards(self) -> list[dict]:
-        if self.reserved and isinstance(self.reserved, dict):
-            return self.reserved.get('boards', [])
-        return []
-
-    def set_boards(self, boards_list: list[dict]):
-        from sqlalchemy.orm.attributes import flag_modified
-        data = dict(self.reserved) if (self.reserved and isinstance(self.reserved, dict)) else {}
-        data['boards'] = boards_list
-        self.reserved = data
-        flag_modified(self, 'reserved')
-
-    def as_dict(self):
-        ret = {x.name: getattr(self, x.name) for x in self.__table__.columns}
-        ret['created_time'] = self.created_time.strftime('%Y-%m-%d %H:%M:%S') if self.created_time else ''
-        ret['boards'] = self.get_boards()
-        return ret
-
-    @classmethod
-    def get_list(cls, by_dict=False):
-        try:
-            items = db.session.query(cls).order_by(cls.id.asc()).all()
-            return [x.as_dict() for x in items] if by_dict else items
-        except Exception as e:
-            logger.error(f"ModelFeedGroup.get_list error: {e}")
-            return []

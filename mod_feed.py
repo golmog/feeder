@@ -7,10 +7,10 @@ from flask import Response, send_file, abort, request, jsonify
 from sqlalchemy import and_, or_, func, desc
 
 from .setup import *
-from .model_feed import ModelFeedSite, ModelFeedBbs, ModelFeedGroup
+from .model_feed import ModelFeedSite, ModelFeedBbs
 from .util_feed import (
     get_ddns, get_system_apikey, clean_xml_string,
-    FeedConfigUtil, FeedCustomManager, FeedScraper, FeedTorrentInfo
+    FeedConfigUtil, FeedCustomManager, FeedScraper, FeedTorrentInfo, FeedFilter
 )
 
 name = 'feed'
@@ -132,7 +132,6 @@ class ModuleFeed(PluginModuleBase):
                 new_val = not current_val
                 info[target_key] = new_val
 
-                # EXTRA 배열 호환성 동기화
                 extra = list(info.get('EXTRA', []))
                 if new_val:
                     if target_key not in extra:
@@ -323,56 +322,64 @@ class ModuleFeed(PluginModuleBase):
                 logger.error(f"[{self.name}] custom_script_upload 에러: {e}")
                 return jsonify({'ret': 'error', 'log': str(e)})
 
-        # YAML 수집 스케쥴 관리 명령
-        elif command == 'load_scheduler':
+        # YAML 수집 작업(TASKS) 관리 명령
+        elif command == 'load_tasks':
             sites = ModelFeedSite.get_list(by_dict=True)
-            schedulers = self.get_scheduler_list()
-            return jsonify({'site': sites, 'scheduler': schedulers})
+            tasks = self.get_task_list()
+            return jsonify({'site': sites, 'tasks': tasks})
 
-        elif command == 'add_scheduler':
-            scheduler_id = req.form.get('modal_scheduler_id', '-1').strip()
-            site_name = req.form.get('site_name', '').strip()
-            board_id = req.form.get('board_id', '').strip()
-            subcat_id = req.form.get('subcat_id', '').strip()
+        elif command == 'add_task':
+            task_id = req.form.get('modal_scheduler_id', '-1').strip()
+            task_name = req.form.get('task_name', '').strip()
+            targets_json = req.form.get('targets_json', '[]')
+            try:
+                targets = json.loads(targets_json)
+            except Exception:
+                targets = []
+
+            interval_val = int(req.form.get('interval', 1))
             enabled = req.form.get('enabled') in ['True', 'on', 'true', True]
             use_proxy = req.form.get('use_proxy') in ['True', 'on', 'true', True]
+            proxy_url_val = req.form.get('proxy_url', '').strip()
             use_flaresolverr = req.form.get('use_flaresolverr') in ['True', 'on', 'true', True]
             use_selenium = req.form.get('use_selenium') in ['True', 'on', 'true', True]
             use_torrent_info = req.form.get('use_torrent_info') in ['True', 'on', 'true', True]
             use_rss_file = req.form.get('use_rss_file') in ['True', 'on', 'true', True]
-
             rss_file = req.form.get('rss_file', '').strip()
             rss_file_path = req.form.get('rss_file_path', '').strip()
             rss_file_days = req.form.get('rss_file_days', '').strip()
             rss_file_items = req.form.get('rss_file_items', '').strip()
+            quality = req.form.get('quality', '').strip()
 
-            try:
-                interval_val = int(req.form.get('interval', 1))
-                if interval_val < 1:
-                    interval_val = 1
-            except Exception:
-                interval_val = 1
+            # 정규식 필터 파싱
+            use_task_filter = req.form.get('use_task_filter') in ['True', 'on', 'true', True]
+            accept_all = req.form.get('accept_all') in ['True', 'on', 'true', True]
+            filter_reject = req.form.get('filter_reject', '').strip()
+            filter_accept = req.form.get('filter_accept', '').strip()
+            filter_reject_excluding = req.form.get('filter_reject_excluding', '').strip()
 
-            if scheduler_id and scheduler_id != '-1' and int(scheduler_id) > 0:
-                old_target = FeedConfigUtil.get_schedule(scheduler_id)
-                if old_target:
-                    if not site_name:
-                        site_name = old_target.get('site_name', '')
-                    if not board_id:
-                        board_id = old_target.get('board_id', '')
-                    if subcat_id == '':
-                        subcat_id = old_target.get('subcat_id', '')
-
-            proxy_url_val = req.form.get('proxy_url', '').strip()
-
-            from .task_feed import Task
-            b_id, s_id, _ = Task.parse_board_info(board_id, subcat_id)
+            def parse_filter_lines(text: str) -> list:
+                res = []
+                if not text:
+                    return res
+                for raw_line in text.splitlines():
+                    line = raw_line.strip().lstrip('-').strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    try:
+                        loaded = yaml.safe_load(line)
+                        if isinstance(loaded, (str, dict)):
+                            res.append(loaded)
+                        else:
+                            res.append(line)
+                    except Exception:
+                        res.append(line)
+                return res
 
             item_data = {
-                'id': int(scheduler_id) if (scheduler_id and scheduler_id != '-1') else -1,
-                'site_name': site_name,
-                'board_id': b_id,
-                'subcat_id': s_id,
+                'id': int(task_id) if (task_id and task_id != '-1') else -1,
+                'name': task_name or f"task_{task_id}",
+                'targets': targets,
                 'interval': interval_val,
                 'enabled': enabled,
                 'use_proxy': use_proxy,
@@ -386,93 +393,46 @@ class ModuleFeed(PluginModuleBase):
                 'rss_file_days': rss_file_days,
                 'rss_file_items': rss_file_items,
             }
+            if quality:
+                item_data['quality'] = quality
 
-            ret = FeedConfigUtil.save_schedule(item_data)
-            return jsonify({'ret': ret, 'site': ModelFeedSite.get_list(by_dict=True), 'scheduler': self.get_scheduler_list()})
+            if use_task_filter:
+                item_data['accept_all'] = accept_all
+                regexp_data = {}
+                rej = parse_filter_lines(filter_reject)
+                if rej: regexp_data['reject'] = rej
+                acc = parse_filter_lines(filter_accept)
+                if acc: regexp_data['accept'] = acc
+                rex = parse_filter_lines(filter_reject_excluding)
+                if rex: regexp_data['reject_excluding'] = rex
 
-        elif command == 'remove_scheduler':
+                if regexp_data:
+                    item_data['regexp'] = regexp_data
+            else:
+                item_data['accept_all'] = False
+
+            ret = FeedConfigUtil.save_task(item_data)
+            return jsonify({'ret': ret, 'tasks': self.get_task_list()})
+
+        elif command == 'remove_task':
             target_id = req.form.get('target_id')
-            target = FeedConfigUtil.get_schedule(target_id)
-            if target:
-                from .task_feed import Task
-                _, _, full_board_key = Task.parse_board_info(target.get('board_id', ''), target.get('subcat_id', ''))
-                self.delete_scheduler_db(target.get('site_name'), full_board_key)
-                FeedConfigUtil.delete_schedule(target_id)
+            task = FeedConfigUtil.get_task(target_id)
+            if task:
+                self.delete_task_db(task)
+                FeedConfigUtil.delete_task(target_id)
                 ret = 'success'
             else:
                 ret = 'fail'
-            return jsonify({'ret': ret, 'site': ModelFeedSite.get_list(by_dict=True), 'scheduler': self.get_scheduler_list()})
+            return jsonify({'ret': ret, 'tasks': self.get_task_list()})
 
-        elif command == 'remove_scheduler_db':
+        elif command == 'remove_task_db':
             target_id = req.form.get('target_id')
-            target = FeedConfigUtil.get_schedule(target_id)
-            if target:
-                from .task_feed import Task
-                _, _, full_board_key = Task.parse_board_info(target.get('board_id', ''), target.get('subcat_id', ''))
-                ret = self.delete_scheduler_db(target.get('site_name'), full_board_key)
+            task = FeedConfigUtil.get_task(target_id)
+            if task:
+                ret = self.delete_task_db(task)
             else:
                 ret = 'fail'
-            return jsonify({'ret': ret, 'site': ModelFeedSite.get_list(by_dict=True), 'scheduler': self.get_scheduler_list()})
-
-        # 그룹 관리 명령
-        elif command == 'load_group':
-            return jsonify({'group': self.get_group_list(), 'info': self.get_search_form_info()})
-
-        elif command == 'add_group':
-            groupname = req.form.get('groupname', '').strip()
-            if not groupname:
-                return jsonify({'ret': 'empty'})
-            if db.session.query(ModelFeedGroup).filter_by(groupname=groupname).first():
-                return jsonify({'ret': 'already_exist'})
-            entity = ModelFeedGroup(groupname)
-            db.session.add(entity)
-            db.session.commit()
-            return jsonify({'ret': 'success', 'group': self.get_group_list(), 'info': self.get_search_form_info()})
-
-        elif command == 'remove_group':
-            group_id = req.form.get('group_id')
-            entity = db.session.query(ModelFeedGroup).filter_by(id=group_id).first()
-            if entity:
-                db.session.delete(entity)
-                db.session.commit()
-                ret = 'success'
-            else:
-                ret = 'not_exist'
-            return jsonify({'ret': ret, 'group': self.get_group_list(), 'info': self.get_search_form_info()})
-
-        elif command == 'add_group_child':
-            group_id = req.form.get('group_id')
-            sitename = req.form.get('sitename')
-            boardname = req.form.get('boardname')
-            group_entity = db.session.query(ModelFeedGroup).filter_by(id=group_id).with_for_update().first()
-            if not group_entity or not sitename or not boardname:
-                return jsonify({'ret': 'fail'})
-
-            boards = group_entity.get_boards()
-            for b in boards:
-                if b.get('site_name') == sitename and str(b.get('board_id')) == str(boardname):
-                    return jsonify({'ret': 'already_exist'})
-            boards.append({'site_name': sitename, 'board_id': boardname})
-            group_entity.set_boards(boards)
-            db.session.commit()
-            return jsonify({'ret': 'success', 'group': self.get_group_list(), 'info': self.get_search_form_info()})
-
-        elif command == 'remove_group_child':
-            group_id = req.form.get('group_id')
-            child_id = int(req.form.get('child_id', -1))
-            group_entity = db.session.query(ModelFeedGroup).filter_by(id=group_id).with_for_update().first()
-            if not group_entity:
-                return jsonify({'ret': 'not_exist'})
-
-            boards = group_entity.get_boards()
-            if 0 <= child_id < len(boards):
-                boards.pop(child_id)
-                group_entity.set_boards(boards)
-                db.session.commit()
-                ret = 'success'
-            else:
-                ret = 'not_exist'
-            return jsonify({'ret': ret, 'group': self.get_group_list(), 'info': self.get_search_form_info()})
+            return jsonify({'ret': ret, 'tasks': self.get_task_list()})
 
         # DB 정리 명령
         elif command in ['db_delete', 'reset_db']:
@@ -512,24 +472,26 @@ class ModuleFeed(PluginModuleBase):
     # FlaskFarm 표준 API 처리 엔드포인트
     def process_api(self, sub, req):
         try:
-            if sub == 'board':
+            if sub == 'task':
+                task_id = req.args.get('id')
+                task_name = req.args.get('name')
+                if task_id or task_name:
+                    return self._handle_task_rss(task_id=task_id, task_name=task_name)
+                return jsonify({'ret': 'fail', 'msg': '태스크 식별자 누락'}), 400
+
+            elif sub == 'board':
+                # 단일 게시판 직접 쿼리 호환
                 sitename = req.args.get('site')
                 boardname = req.args.get('board')
                 subcat = req.args.get('subcat')
-                scheduler_id = req.args.get('id')
-                if scheduler_id:
-                    return self._handle_board_id_rss(scheduler_id)
+                task_id = req.args.get('id')
+                if task_id:
+                    return self._handle_task_rss(task_id=task_id)
                 if sitename and boardname:
                     from .task_feed import Task
                     _, _, full_board_key = Task.parse_board_info(boardname, subcat)
                     return self._handle_board_rss(sitename, full_board_key)
                 return jsonify({'ret': 'fail', 'msg': '파라미터 누락'}), 400
-
-            elif sub == 'group':
-                groupname = req.args.get('name')
-                if groupname:
-                    return self._handle_group_rss(groupname)
-                return jsonify({'ret': 'fail', 'msg': '그룹명 누락'}), 400
 
             elif sub == 'download':
                 bbs_file_id = req.args.get('id')
@@ -545,98 +507,54 @@ class ModuleFeed(PluginModuleBase):
             logger.error(f"[Feeder] process_api 에러 ({sub}): {e}")
             return jsonify({'ret': 'error', 'msg': str(e)}), 500
 
-    def _handle_board_rss(self, sitename, boardname):
+    def _handle_task_rss(self, task_id=None, task_name=None):
         try:
+            task = FeedConfigUtil.get_task(task_id) if task_id else FeedConfigUtil.get_task_by_name(task_name)
+            if not task:
+                return jsonify({'ret': 'not_exist', 'msg': '태스크를 찾을 수 없습니다.'}), 404
+
+            targets = task.get('targets', [])
+            if not targets:
+                xml_empty = self.generate_rss_feed(task.get('name', 'Task'), [])
+                return Response(xml_empty, mimetype='application/xml; charset=utf-8')
+
+            target_conditions = []
+            for t in targets:
+                target_conditions.append(and_(ModelFeedBbs.site == t.get('site'), ModelFeedBbs.board == t.get('full_board_key', t.get('board'))))
+
+            group_key = func.coalesce(
+                func.nullif(ModelFeedBbs.magnet, ''),
+                func.cast(ModelFeedBbs.id, db.String)
+            )
+            subq = (
+                db.session.query(func.max(ModelFeedBbs.id).label("max_id"))
+                .filter(or_(*target_conditions))
+                .group_by(group_key)
+                .subquery()
+            )
+
             feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
             query_limit = max(feed_count * 3, 300)
-            items = db.session.query(ModelFeedBbs).filter_by(site=sitename, board=boardname).order_by(ModelFeedBbs.id.desc()).limit(query_limit).all()
+            candidates = db.session.query(ModelFeedBbs).join(subq, ModelFeedBbs.id == subq.c.max_id).order_by(ModelFeedBbs.id.desc()).limit(query_limit).all()
 
-            # RSS 피드 요청 시점에 실시간 필터 적용
-            sched = FeedConfigUtil.get_schedule_by_board_key(sitename, boardname)
             global_cfg = FeedConfigUtil.get_global()
             filtered_items = []
-            for bbs in items:
-                is_pass, _ = FeedFilter.evaluate(bbs.as_dict(), sched, global_cfg)
+            for bbs in candidates:
+                is_pass, _ = FeedFilter.evaluate(bbs.as_dict(), task, global_cfg)
                 if is_pass:
                     filtered_items.append(bbs)
                     if len(filtered_items) >= feed_count:
                         break
 
-            xml_content = self.generate_rss_feed(f"SITE: {sitename} / BOARD: {boardname}", filtered_items)
+            feed_title = f"TASK: {task.get('name', 'Feeder')}"
+            xml_content = self.generate_rss_feed(feed_title, filtered_items)
             return Response(xml_content, mimetype='application/xml; charset=utf-8')
         except Exception as e:
-            logger.error(f"[Feeder] _handle_board_rss 에러: {e}")
+            logger.error(f"[Feeder] _handle_task_rss 에러: {e}")
             return Response('Internal Error', status=500)
 
-    def _handle_board_id_rss(self, scheduler_id):
-        try:
-            target = FeedConfigUtil.get_schedule(scheduler_id)
-            if not target:
-                return jsonify({'ret': 'not_exist'}), 404
-
-            sitename = target.get('site_name')
-            from .task_feed import Task
-            _, _, full_board_key = Task.parse_board_info(target.get('board_id', ''), target.get('subcat_id', ''))
-
-            feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
-            query_limit = max(feed_count * 3, 300)
-            items = db.session.query(ModelFeedBbs).filter_by(site=sitename, board=full_board_key).order_by(ModelFeedBbs.id.desc()).limit(query_limit).all()
-
-            # RSS 피드 요청 시점에 실시간 필터 적용
-            global_cfg = FeedConfigUtil.get_global()
-            filtered_items = []
-            for bbs in items:
-                is_pass, _ = FeedFilter.evaluate(bbs.as_dict(), target, global_cfg)
-                if is_pass:
-                    filtered_items.append(bbs)
-                    if len(filtered_items) >= feed_count:
-                        break
-
-            xml_content = self.generate_rss_feed(f"SITE: {sitename} / BOARD: {full_board_key}", filtered_items)
-            return Response(xml_content, mimetype='application/xml; charset=utf-8')
-        except Exception as e:
-            logger.error(f"[Feeder] _handle_board_id_rss 에러: {e}")
-            return Response('Internal Error', status=500)
-
-    def _handle_group_rss(self, groupname):
-        try:
-            group_entity = db.session.query(ModelFeedGroup).filter_by(groupname=groupname).first()
-            items = []
-            if group_entity:
-                boards = group_entity.get_boards()
-                if boards:
-                    group_conditions = [and_(ModelFeedBbs.site == b.get('site_name'), ModelFeedBbs.board == b.get('board_id')) for b in boards]
-                    group_key = func.coalesce(
-                        func.nullif(ModelFeedBbs.magnet, ''),
-                        func.cast(ModelFeedBbs.id, db.String)
-                    )
-                    subq = (
-                        db.session.query(func.max(ModelFeedBbs.id).label("max_id"))
-                        .filter(or_(*group_conditions))
-                        .group_by(group_key)
-                        .subquery()
-                    )
-                    feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
-                    query_limit = max(feed_count * 3, 300)
-                    raw_items = db.session.query(ModelFeedBbs).join(subq, ModelFeedBbs.id == subq.c.max_id).order_by(ModelFeedBbs.id.desc()).limit(query_limit).all()
-
-                    # 그룹 RSS 생성 시 게시판별/전역 필터 실시간 적용
-                    global_cfg = FeedConfigUtil.get_global()
-                    for bbs in raw_items:
-                        bbs_sched = FeedConfigUtil.get_schedule_by_board_key(bbs.site, bbs.board)
-                        is_pass, _ = FeedFilter.evaluate(bbs.as_dict(), bbs_sched, global_cfg)
-                        if is_pass:
-                            items.append(bbs)
-                            if len(items) >= feed_count:
-                                break
-
-                    logger.debug(f"[Feeder] 그룹 RSS 피드 추출 완료: 그룹명='{groupname}', 필터 통과 게시글={len(items)}개")
-
-            xml_content = self.generate_rss_feed(f"GROUP: {groupname}", items)
-            return Response(xml_content, mimetype='application/xml; charset=utf-8')
-        except Exception as e:
-            logger.error(f"[Feeder] _handle_group_rss 에러: {e}")
-            return Response('Internal Error', status=500)
+    # 메서드 별칭 지원
+    handle_task_rss = _handle_task_rss
 
     def _handle_download_stream(self, bbs_file_id):
         try:
@@ -779,125 +697,63 @@ class ModuleFeed(PluginModuleBase):
         from .task_feed import TaskBase
         self.start_celery(TaskBase.start, None, "default")
 
-    def delete_scheduler_db(self, site_name, board_id) -> str:
+    def delete_task_db(self, task: dict) -> str:
         try:
-            db.session.query(ModelFeedBbs).filter_by(site=site_name, board=board_id).delete()
+            for tgt in task.get('targets', []):
+                site_val = tgt.get('site')
+                board_val = tgt.get('full_board_key', tgt.get('board'))
+                db.session.query(ModelFeedBbs).filter_by(site=site_val, board=board_val).delete()
             db.session.commit()
             self.db_vacuum()
             return 'success'
         except Exception as e:
-            logger.error(f"[Feeder] delete_scheduler_db 에러: {e}")
+            logger.error(f"[Feeder] delete_task_db 에러: {e}")
             db.session.rollback()
         return 'fail'
 
-    def db_vacuum(self):
-        try:
-            try:
-                engine = db.get_engine(bind=P.package_name)
-            except Exception:
-                engine = db.engine
-
-            if engine.dialect.name == 'sqlite':
-                raw_conn = engine.raw_connection()
-                try:
-                    raw_conn.isolation_level = None
-                    cursor = raw_conn.cursor()
-                    cursor.execute("VACUUM")
-                    cursor.close()
-                    logger.info(f"[{self.name}] SQLite DB VACUUM 정리 완료")
-                finally:
-                    raw_conn.close()
-        except Exception as e:
-            logger.error(f"[{self.name}] db_vacuum 실행 오류: {e}")
-
-    def get_scheduler_list(self) -> list[dict]:
+    def get_task_list(self) -> list[dict]:
         ret = []
-        raw_schedules = FeedConfigUtil.get_schedules()
-        ddns = get_ddns()
+        raw_tasks = FeedConfigUtil.get_tasks()
+        ddns = get_ddns().rstrip('/')
         apikey = get_system_apikey()
-        from .task_feed import Task
 
-        for item in raw_schedules:
-            site_name = item.get('site_name', '')
-            board_id = item.get('board_id', '')
-            subcat_id = item.get('subcat_id', '')
+        for task in raw_tasks:
+            info = dict(task)
+            task_id = task.get('id')
+            targets = task.get('targets', [])
 
-            site_entity = ModelFeedSite.get(name=site_name)
-            _, _, full_board_key = Task.parse_board_info(board_id, subcat_id)
-            last_bbs = ModelFeedBbs.get_last_bbs(site_name, full_board_key)
+            last_bbs = None
+            if targets:
+                target_conds = [and_(ModelFeedBbs.site == t.get('site'), ModelFeedBbs.board == t.get('full_board_key', t.get('board'))) for t in targets]
+                last_bbs = db.session.query(ModelFeedBbs).filter(or_(*target_conds)).order_by(ModelFeedBbs.id.desc()).first()
 
-            info = dict(item)
             info['last'] = last_bbs.as_dict() if last_bbs else None
-            info['site_info'] = site_entity.as_dict() if site_entity else {}
-            info['full_board_key'] = full_board_key
+            info['targets'] = targets
+            info['enabled'] = str(task.get('enabled', True)).lower() in ['true', 'on', '1']
+            info['use_proxy'] = str(task.get('use_proxy', False)).lower() in ['true', 'on', '1']
+            info['proxy_url'] = task.get('proxy_url', '')
+            info['use_flaresolverr'] = str(task.get('use_flaresolverr', False)).lower() in ['true', 'on', '1']
+            info['use_selenium'] = str(task.get('use_selenium', False)).lower() in ['true', 'on', '1']
+            info['use_torrent_info'] = str(task.get('use_torrent_info', False)).lower() in ['true', 'on', '1']
+            info['use_rss_file'] = str(task.get('use_rss_file', False)).lower() in ['true', 'on', '1']
 
-            info['enabled'] = str(item.get('enabled', True)).lower() in ['true', 'on', '1']
-            info['use_proxy'] = str(item.get('use_proxy', False)).lower() in ['true', 'on', '1']
-            info['proxy_url'] = item.get('proxy_url', '')
-            info['use_flaresolverr'] = str(item.get('use_flaresolverr', False)).lower() in ['true', 'on', '1']
-            info['use_selenium'] = str(item.get('use_selenium', False)).lower() in ['true', 'on', '1']
-            info['use_torrent_info'] = str(item.get('use_torrent_info', False)).lower() in ['true', 'on', '1']
-            info['use_rss_file'] = str(item.get('use_rss_file', False)).lower() in ['true', 'on', '1']
-            info['rss_file'] = item.get('rss_file', '')
-            info['rss_file_path'] = item.get('rss_file_path', '')
-            info['rss_file_days'] = item.get('rss_file_days', '')
-            info['rss_file_items'] = item.get('rss_file_items', '')
-
-            info['api'] = f"{ddns}/{P.package_name}/api/board?site={site_name}&board={full_board_key}&apikey={apikey}"
-
-            if last_bbs:
-                info['one_day_more'] = (last_bbs.created_time < datetime.now() - timedelta(days=1))
-            else:
-                info['one_day_more'] = False
-
+            info['api'] = f"{ddns}/{P.package_name}/api/task?id={task_id}&apikey={apikey}"
             ret.append(info)
         return ret
 
-    def get_group_list(self) -> list[dict]:
-        groups = db.session.query(ModelFeedGroup).order_by(ModelFeedGroup.id.asc()).all()
-        ddns = get_ddns()
-        apikey = get_system_apikey()
-        ret = []
-
-        for g in groups:
-            item = g.as_dict()
-            item['rss'] = f"{ddns}/{P.package_name}/api/group?name={item['groupname']}&apikey={apikey}"
-            item['schedulers'] = [
-                {'id': idx, 'sitename': b.get('site_name'), 'board_id': b.get('board_id')}
-                for idx, b in enumerate(g.get_boards())
-            ]
-            ret.append(item)
-        return ret
-
     def get_search_form_info(self) -> dict:
-        ret = {'group': self.get_group_list(), 'site': [], 'board': {}}
+        ret = {'site': [], 'board': {}, 'tasks': []}
 
-        all_sites = ModelFeedSite.get_list()
-        for s in all_sites:
-            s_name = s.name if hasattr(s, 'name') else s.get('name')
-            if s_name and s_name not in ret['site']:
-                ret['site'].append(s_name)
-                ret['board'][s_name] = []
-
-        schedules = FeedConfigUtil.get_schedules()
-        from .task_feed import Task
-        for item in schedules:
-            site = item.get('site_name')
-            board = item.get('board_id')
-            subcat = item.get('subcat_id')
-            _, _, full_key = Task.parse_board_info(board, subcat)
-
-            if site and site not in ret['site']:
-                ret['site'].append(site)
-            if site and full_key:
-                if site not in ret['board']:
-                    ret['board'][site] = []
-                if full_key not in ret['board'][site]:
-                    ret['board'][site].append(full_key)
-
-        try:
-            db_boards = db.session.query(ModelFeedBbs.site, ModelFeedBbs.board).distinct().all()
-            for s, b in db_boards:
+        tasks = FeedConfigUtil.get_tasks()
+        for t in tasks:
+            ret['tasks'].append({
+                'id': t.get('id'),
+                'name': t.get('name', f"Task {t.get('id')}"),
+                'targets': t.get('targets', [])
+            })
+            for tgt in t.get('targets', []):
+                s = tgt.get('site')
+                b = tgt.get('full_board_key', tgt.get('board'))
                 if s and s not in ret['site']:
                     ret['site'].append(s)
                 if s and b:
@@ -905,7 +761,13 @@ class ModuleFeed(PluginModuleBase):
                         ret['board'][s] = []
                     if b not in ret['board'][s]:
                         ret['board'][s].append(b)
-        except Exception:
-            pass
+
+        all_sites = ModelFeedSite.get_list()
+        for s in all_sites:
+            s_name = s.name if hasattr(s, 'name') else s.get('name')
+            if s_name and s_name not in ret['site']:
+                ret['site'].append(s_name)
+            if s_name and s_name not in ret['board']:
+                ret['board'][s_name] = []
 
         return ret

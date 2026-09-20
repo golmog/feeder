@@ -104,9 +104,9 @@ class Task:
                 mode_str = "수동 1회 실행" if manual else "스케쥴러 자동 실행"
                 logger.info(f"[Feeder] [Celery Task] 전체 크롤링 수집 작업 시작 ({mode_str})")
 
-                schedules = FeedConfigUtil.get_schedules()
-                if not schedules:
-                    logger.info("[Feeder] [Celery Task] 등록된 수집 대상 게시판이 없습니다.")
+                tasks = FeedConfigUtil.get_tasks()
+                if not tasks:
+                    logger.info("[Feeder] [Celery Task] 등록된 수집 작업(TASKS)이 없습니다.")
                     return
 
                 current_count = P.ModelSetting.get_int('feed_scheduler_count') + 1
@@ -118,63 +118,62 @@ class Task:
                     max_page = 5
 
                 total_crawled_count = 0
-                for item in schedules:
-                    if not item.get('enabled', True):
-                        logger.debug(f"[Feeder] 수집 비활성화된 게시판 건너뜀: {item.get('site_name')} - {item.get('board_id')}")
+                for task in tasks:
+                    if not task.get('enabled', True):
+                        logger.debug(f"[Feeder] 수집 비활성화된 태스크 건너뜀: {task.get('name')}")
                         continue
 
-                    site_name = item.get('site_name')
-                    board_id = item.get('board_id')
-                    site_entity = ModelFeedSite.get(name=site_name)
-
-                    if not site_entity:
-                        logger.warning(f"[Feeder] [Celery Task] 등록되지 않은 사이트명: {site_name}")
-                        continue
-
-                    target_interval = int(item.get('interval', 1))
+                    target_interval = int(task.get('interval', 1))
                     if not manual and target_interval > 1:
                         if (current_count % target_interval) != 0:
-                            logger.info(f"[Feeder] 스케쥴 빈도({target_interval}회당 1회) 미도래로 건너뜀: {site_name} - {board_id}")
+                            logger.info(f"[Feeder] 스케쥴 빈도({target_interval}회당 1회) 미도래로 건너뜀: {task.get('name')}")
                             continue
 
-                    subcat_id = item.get('subcat_id', '').strip()
-                    _, _, full_board_key = Task.parse_board_info(board_id, subcat_id)
-
-                    last_bbs = ModelFeedBbs.get_last_bbs(site_name, full_board_key)
-                    max_id = 0
-                    extra = site_entity.info.get('EXTRA', []) if site_entity.info else []
-                    if 'USING_BOARD_CHAR_ID' not in extra and last_bbs and last_bbs.board_id:
-                        max_id = last_bbs.board_id
-
-                    logger.info(f"[Feeder] [Celery Task] 게시판 크롤링 진행: {site_name} - {full_board_key} (빈도={target_interval}, 최근 ID: {max_id})")
+                    task_name = task.get('name', f"task_{task.get('id')}")
+                    targets = task.get('targets', [])
+                    logger.info(f"[Feeder] [Celery Task] 태스크 수집 시작: [{task_name}] (포함 게시판={len(targets)}개)")
 
                     target_cfg = SimpleNamespace(
-                        subcat_id=subcat_id,
-                        use_proxy=item.get('use_proxy', False),
-                        proxy_url=item.get('proxy_url', '').strip(),
-                        use_flaresolverr=item.get('use_flaresolverr', False),
-                        use_selenium=item.get('use_selenium', False),
-                        use_torrent_info=item.get('use_torrent_info', False)
+                        use_proxy=task.get('use_proxy', False),
+                        proxy_url=task.get('proxy_url', '').strip(),
+                        use_flaresolverr=task.get('use_flaresolverr', False),
+                        use_selenium=task.get('use_selenium', False),
+                        use_torrent_info=task.get('use_torrent_info', False)
                     )
 
-                    crawled_items = Task.execute_board_crawl(
-                        site_entity.info,
-                        board_id,
-                        max_page=max_page,
-                        max_id=max_id,
-                        is_test=False,
-                        target_cfg=target_cfg
-                    )
+                    for tgt in targets:
+                        site_name = tgt.get('site')
+                        board_id = tgt.get('board')
+                        subcat_id = tgt.get('subcat', '').strip()
+                        full_board_key = tgt.get('full_board_key') or board_id
 
-                    if crawled_items:
-                        total_crawled_count += len(crawled_items)
-                        logger.info(f"[Feeder] [Celery Task] {site_name} - {full_board_key}: {len(crawled_items)}개 항목 수집 처리 완료")
-                    else:
-                        logger.info(f"[Feeder] [Celery Task] {site_name} - {full_board_key}: 새로운 게시물이 없거나 수집된 항목이 없습니다.")
+                        site_entity = ModelFeedSite.get(name=site_name)
+                        if not site_entity:
+                            logger.warning(f"[Feeder] 등록되지 않은 사이트명: {site_name}")
+                            continue
 
-                    # 공유용 RSS 파일 자동 생성 및 보존기간/항목수 갱신
+                        last_bbs = ModelFeedBbs.get_last_bbs(site_name, full_board_key)
+                        max_id = 0
+                        extra = site_entity.info.get('EXTRA', []) if site_entity.info else []
+                        if 'USING_BOARD_CHAR_ID' not in extra and last_bbs and last_bbs.board_id:
+                            max_id = last_bbs.board_id
+
+                        target_cfg.subcat_id = subcat_id
+                        crawled = Task.execute_board_crawl(
+                            site_entity.info,
+                            board_id,
+                            max_page=max_page,
+                            max_id=max_id,
+                            is_test=False,
+                            target_cfg=target_cfg
+                        )
+                        if crawled:
+                            total_crawled_count += len(crawled)
+                            logger.info(f"[Feeder] [{task_name}] {site_name} - {full_board_key}: {len(crawled)}개 항목 수집")
+
+                    # 태스크 소속 게시판 수집 완료 즉시 해당 태스크의 RSS XML 파일 생성
                     from .util_feed import FeedRssFileWriter
-                    FeedRssFileWriter.save_rss_file(site_name, full_board_key, item)
+                    FeedRssFileWriter.save_rss_file(task)
 
                 logger.info(f"[Feeder] [Celery Task] 전체 수집 작업 완료: 총 {total_crawled_count}개 게시물 처리됨")
 

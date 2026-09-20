@@ -8,16 +8,17 @@
 
 ### 1. 주요 특징
 
-* **표준 RSS 2.0 피드 생성:** 게시판별 개별 피드 및 다중 사이트 중복 제거 통합 그룹 피드 지원.
+* **표준 RSS 2.0 피드 생성:** 태스크별 개별 피드 및 다중 사이트/게시판 타겟 통합 피드(동일 마그넷 중복 자동 단일화) 지원.
 * **4단계 지능형 스크래핑 엔진:**
   * **1단계:** TLS/JA3 브라우저 지문 에뮬레이션(`curl_cffi`) 기반 초고속 수집 (HTTP Keep-Alive 세션 풀링 지원).
   * **2단계:** 표준 `requests` 세션 자동 폴백.
   * **3단계:** Cloudflare Turnstile / 5초 챌린지 대응을 위한 `FlareSolverr` 스마트 우회 (도메인별 세션 재사용).
   * **4단계:** 자바스크립트 완전 렌더링 및 봇 탐지 우회 스텔스 `Remote Selenium` 연동 (단일 세션 재사용).
+* **Flexget 규격 실시간 필터링 및 화질 판별:** 제목·파일명 기반 해상도 판별(`quality: 2160p+`, `>=1080p`, `720p-1080p` 등) 및 정규식(`regexp: reject/accept`) 엔진 내장.
+* **외부 배포용 공유 RSS XML 파일 생성:** API Key 노출 없는 정적 XML 자동 생성, 보관기간(기본 14일) 및 최대 항목 수 자동 정리(Retention).
 * **커스텀 사이트 훅 (`data/db/feeder_custom`):** 정규식/XPath만으로 수집이 불가능한 복잡한 사이트(성인 인증 게이트, 암호화 마그넷, 다중 분할 압축 zip/rar 첨부파일 분석 등)를 순수 파이썬 코드로 유연하게 확장.
 * **토렌트 메타데이터 분석:** `torrent_info` 플러그인(m2i API) 또는 `qBittorrent Web API`와 연동하여 마그넷 해시로부터 원본 파일명 및 용량을 획득해 피드 제목으로 변환.
-* **강력한 내장 웹 에디터:** Monokai 다크 테마, JSON Prettier 자동 정렬, 실시간 창 크기 조절(드래그 및 최대화), 자동 줄바꿈(Word Wrap) 토글을 지원하는 Ace Editor 내장.
-* **임시 파일 자동 관리:** 다운로드 임시 파일 및 디버그 스크린샷을 플랫폼 임시 경로(`{path_data}/tmp/feeder`)에서 격리 처리하여 FlaskFarm 재시작 시 자동 청소.
+* **내장 웹 에디터:** Monokai 다크 테마, JSON Prettier 자동 정렬, 실시간 창 크기 조절(드래그 및 최대화), 자동 줄바꿈(Word Wrap) 토글을 지원하는 Ace Editor 내장.
 
 ---
 
@@ -25,11 +26,10 @@
 
 | 메뉴 탭 | 설명 |
 | :--- | :--- |
-| **토렌트 리스트** | 수집된 게시글 목록, 마그넷 주소 복사, 첨부파일 직접 다운로드, PikPak 전송, 토렌트 메타데이터 모달 조회 지원. |
-| **기본 설정** | 수집 주기, 최대 탐색 페이지, HTTP 프록시, FlareSolverr, Remote Selenium(타임아웃 설정 포함), 토렌트 메타데이터 취득 방식 설정. |
+| **토렌트 리스트** | 수집된 게시글 목록, 마그넷/ed2k 복사, 첨부파일 직접 다운로드, 토렌트 메타데이터 조회, 사이트별 및 태스크별 필터 검색. |
+| **기본 설정** | 수집 주기, 최대 탐색 페이지, HTTP 프록시, FlareSolverr, Remote Selenium, 토렌트 메타데이터 취득 방식, 공유용 RSS XML 파일 경로/기간 설정. |
 | **사이트 관리** | 사이트 규칙(JSON) 등록/수정/삭제, 게시판 단위 수집 테스트, 커스텀 Python 스크립트 관리. |
-| **그룹화** | 여러 사이트의 서로 다른 게시판들을 하나의 그룹으로 묶고, 동일 마그넷 중복을 자동 제거한 통합 RSS 피드 발급. |
-| **스케줄링 (YAML)** | 수집 대상 사이트 및 게시판 등록, 개별 주기(Interval), 프록시/FlareSolverr/Selenium 활성 여부 제어. |
+| **작업 관리 (TASKS)** | 수집 태스크 등록/수정/삭제, 복수 타겟 게시판(Targets) 지정, 개별 주기(Interval), 화질(quality), 정규식 필터, 공유용 XML 파일 생성 제어. |
 | **자동 & DB정리** | Celery 스케줄러 자동 등록, 주기적 DB 자동 정리(Retention) 및 SQLite VACUUM 공간 회수. |
 
 ---
@@ -144,30 +144,30 @@
 
 ---
 
-### 4. 스케줄링 및 전역 설정 (YAML: `feeder_settings.yaml`) 가이드
+### 4. 작업 관리 및 전역 설정 (YAML: `feeder_settings.yaml`) 가이드
 
-상단 메뉴의 **YAML 편집** 버튼을 누르거나 `{path_data}/db/feeder_settings.yaml` 파일을 직접 수정하여 Flexget 스타일의 강력한 정규식 필터링과 게시판별 수집 스케줄, 공유용 RSS 파일 생성을 통합 제어할 수 있습니다.
+상단 메뉴의 **YAML 편집** 버튼을 누르거나 `{path_data}/db/feeder_settings.yaml` 파일을 직접 수정하여 Flexget 스타일의 강력한 정규식/화질 필터링과 다중 타겟 게시판을 포함하는 수집 작업(`TASKS`), 공유용 RSS 파일 생성을 통합 제어할 수 있습니다.
 
 <br>
 #### 전체 YAML 구조 예시
 
 ```yaml
-# 전역 공통 필터 및 화질 설정 (모든 수집 대상에 선행 적용)
+# 전역 공통 필터 및 화질 설정 (모든 수집 작업에 선행 적용)
 GLOBAL:
-  # 전역 최소 화질 조건 지정 (1080p 이상만 수집)
-  quality: 1080p+
+  quality: 1080p+                         # 1080p 이상만 수집 허용
   regexp:
     reject:
       - \btrailer\b: {from: title}        # 예고편(트레일러) 제외
       - \bWEBSCR\b: {from: title}         # WEBSCR 릴 제외
       - \bTS\b: {from: title}             # TS 극장캠 버전 제외
       - \bCam\b: {from: title}            # CAM 버전 제외
+      - spam_domain\.com: {from: link}    # 스팸 링크 포함 게시물 차단
 
-# 게시판별 수집 스케줄 설정
+# 수집 작업(Tasks) 설정
 TASKS:
+  # 단일 게시판 타겟 수집 작업 예시
   - id: 1
-    site_name: sukebei
-    board_id: '2_2'
+    name: "sukebei_board"
     interval: 1
     enabled: true
     use_proxy: true
@@ -175,92 +175,80 @@ TASKS:
     use_flaresolverr: false
     use_selenium: false
     use_torrent_info: true
+    targets:
+      - site: sukebei
+        board: '2_2'
+    quality: 2160p+                       # 해당 작업은 4K 전용 수집
     use_rss_file: true
-    rss_file: sukebei_2_2.xml
-    rss_file_path: ''
-    rss_file_days: ''
-    rss_file_items: ''
-    quality: 2160p+
-    regexp:
-      accept:
-        - 2160p: {from: [title, link]}
-    accept_all: false
+    rss_file: sukebei_4k.xml
 
+  # 다중 게시판 통합 수집 작업 예시 (여러 사이트의 게시판을 묶어 동일 마그넷 자동 통합)
   - id: 2
-    site_name: sehuatang
-    board_id: '166'
-    subcat_id: '875'
+    name: "asian_movies"
     interval: 2
     enabled: true
     use_proxy: true
     use_flaresolverr: true
     use_selenium: true
     use_torrent_info: false
-    use_rss_file: false
-    accept_all: true
+    targets:
+      - site: sukebei
+        board: '2_2'
+      - site: sehuatang
+        board: '103'
+      - site: sehuatang
+        board: '166'
+        subcat: '875'
+    quality: 1080p+
+    regexp:
+      accept:
+        - 1080p: {from: title}
+    accept_all: false
+    use_rss_file: true
+    rss_file: asian_movies.xml
 ```
 
 <br>
-#### 설정 필드 상세 설명
-
-* `GLOBAL` 설정은 모든 스케줄에 공통 적용됩니다. 동일 항목을 개별 설정시에는 개별 설정이 우선합니다.
-* 필터링은 RSS 생성시에 적용되며, 수집시에는 적용되지 않습니다(모든 게시물 수집).
-
-##### 필터링 패턴 설정
+#### `GLOBAL` 설정 필드 상세 설명
 
 | 필드명 | 타입 | 설명 |
 | :--- | :---: | :--- |
-| `regexp` | 딕셔너리 | Flexget 스타일 정규식 필터 블록입니다. |
-| `accept_all` | 불리언 | 필터에서 거부되지 않은 모든 항목을 기본 허용할지 여부 (`true`/`false`). |
+| `quality` | 문자열/배열 | 전역 최소 화질 기준식 (예: `1080p+`, `2160p+`, `720p-1080p`, `[1080p, 2160p]`). |
+| `regexp` | 딕셔너리 | 모든 수집 작업에 공통으로 우선 적용할 Flexget 규격 정규식 필터 블록입니다. |
+| `accept_all` | 불리언 | 필터에서 거부되지 않은 모든 항목을 전역에서 기본 허용할지 여부 (`true`/`false`). |
 
 <br>
-##### `regexp` 하위 필터 규칙 규격
+#### `TASKS` 항목 필드 상세 설명
 
-* `reject`: 패턴이 매칭되면 해당 게시글을 **즉시 수집 제외(거부)**합니다.
-* `reject_excluding`: 선언된 패턴 목록 중 **어느 하나도 매칭되지 않으면 거부**합니다. (반드시 포함되어야 할 필수 조건)
-* `accept`: 패턴이 매칭되면 해당 게시글을 **수집 허용**합니다.
-* `from`: 정규식을 검사할 대상 속성. 생략 시 기본값은 `title`입니다.
-  - 단일 대상: `{from: title}` 또는 `{from: link}`
-  - 다중 대상: `{from: [title, link]}` (제목, 상세URL, 마그넷, 첨부파일 다운로드 주소를 모두 검사)
-* **단순 패턴 선언 지원:** 대상이 `title`인 경우 `- \bCam\b` 처럼 단일 문자열로 간결하게 작성할 수 있습니다.
+각 수집 태스크의 구성 항목입니다. 단일/복수 타겟 게시판을 자유롭게 포함할 수 있습니다.
 
-<br>
-##### 화질 필터(`quality`) 상세 문법
-
-게시글 제목(`title`)과 첨부파일명에서 해상도 키워드를 정밀 판별하여 필터링합니다.
-
-* `2160p+` 또는 `1080p+`: 해당 해상도 **이상**인 항목만 허용
-* `>=1080p`, `>720p`, `<=1080p`, `<2160p`: 부등호 비교식을 통한 허용
-* `720p-1080p`: 지정된 해상도 **범위** 내 항목만 허용
-* `[1080p, 2160p]`: 지정된 특정 해상도 목록에 해당하는 항목만 허용
-
-<br>
-##### `TASKS` 항목 필드 상세 설명
-
-각 수집 대상 게시판의 스케줄러 구성 항목입니다.
-
-<br>
 | 필드명 | 타입 | 기본값 | 설명 |
 | :--- | :---: | :---: | :--- |
-| `id` | 정수 | 자동 채번 | 스케줄 고유 식별 번호 (1부터 시작). |
-| `site_name` | 문자열 | **필수** | 대상 사이트 식별명 (사이트 JSON의 `NAME`과 일치). |
-| `board_id` | 문자열 | **필수** | 수집할 게시판 ID (예: `2_2`, `movie_kor`, `166`). |
-| `subcat_id` | 문자열 | `""` | 서브 카테고리(분류 필터) 번호 (예: `875`). 지정 시 독립된 스케줄 및 별도 DB 키(`166:875`)로 격리 운용됩니다. |
+| `id` | 정수 | 자동 채번 | 작업 고유 식별 번호 (1부터 시작). |
+| `name` | 문자열 | **필수** | 작업 고유 이름 (예: `asian_movies`). 통합 RSS 피드명 및 기본 XML 파일명으로 사용됩니다. |
+| `targets` | 배열 | `[]` | **수집 대상 사이트 및 게시판 목록.** (하단 상세 설명 참조) |
 | `interval` | 정수 | `1` | 스케줄러 실행 빈도. N회 스케줄 주기마다 1회 크롤링을 수행합니다. |
 | `enabled` | 불리언 | `true` | 해당 작업의 활성화/중지 여부. |
-| `use_proxy` | 불리언 | `false` | 해당 게시판 크롤링 시 HTTP/SOCKS5 프록시 서버 경유 여부. |
+| `use_proxy` | 불리언 | `false` | 해당 작업 크롤링 시 HTTP/SOCKS5 프록시 서버 경유 여부. |
 | `proxy_url` | 문자열 | `""` | 개별 프록시 서버 주소. 비워둘 경우 기본 설정의 Proxy URL이 적용됩니다. |
 | `use_flaresolverr` | 불리언 | `false` | Cloudflare 챌린지 우회 엔진 경유 여부. |
 | `use_selenium` | 불리언 | `false` | 원격 Selenium 브라우저 완전 렌더링 사용 여부. |
 | `use_torrent_info` | 불리언 | `false` | 마그넷 메타데이터 분석을 통한 원본 파일명 치환 사용 여부. |
-| `use_rss_file` | 불리언 | `false` | **공유용 RSS XML 파일 자동 생성 활성화 여부.** |
-| `rss_file` | 문자열 | 자동 지정 | 생성할 XML 파일명. 비워두면 `{site}_{board}(_{subcat}).xml`로 자동 지정됩니다. |
+| `use_rss_file` | 불리언 | `false` | 공유용 RSS XML 파일 자동 생성 활성화 여부. |
+| `rss_file` | 문자열 | 자동 지정 | 생성할 XML 파일명. 비워두면 `{name}.xml`로 자동 지정됩니다. |
 | `rss_file_path` | 문자열 | `""` | 개별 XML 저장 절대 경로. 비워둘 경우 기본 설정의 저장 경로가 적용됩니다. |
-| `rss_file_days` | 정수 | `""` | 개별 XML 내 게시글 보관 기간(일). 비워둘 경우 기본 설정(기본 14일)이 적용되며 초과된 글은 XML에서 자동 제외됩니다. |
-| `rss_file_items` | 정수 | `""` | 개별 XML 내 최대 피드 수. 비워둘 경우 기본 설정(기본 100개)이 적용되며 초과된 오래된 항목부터 자동 제외됩니다. |
-| `regexp` | 딕셔너리 | - | 해당 게시판에만 적용할 개별 `reject`, `reject_excluding`, `accept` 정규식 필터 블록. |
+| `rss_file_days` | 정수 | `""` | 개별 XML 내 게시글 보관 기간(일). 비워둘 경우 기본 설정(기본 14일)이 적용됩니다. |
+| `rss_file_items` | 정수 | `""` | 개별 XML 내 최대 피드 수. 비워둘 경우 기본 설정(기본 100개)이 적용됩니다. |
+| `quality` | 문자열/배열 | - | 해당 작업에만 적용할 개별 화질 조건식 (예: `2160p+`). |
+| `regexp` | 딕셔너리 | - | 해당 작업에만 적용할 개별 `reject`, `reject_excluding`, `accept` 정규식 필터 블록. |
 | `accept_all` | 불리언 | `false` | 개별 필터에서 거부되지 않은 나머지 모든 항목을 허용할지 여부. |
-| `quality` | 딕셔너리 | - | 허용할 해상도를 지정. |
+
+<br>
+##### `targets` 항목 내부 필드
+
+* `site`: 대상 사이트 식별명 (사이트 JSON의 `NAME`과 일치).
+* `board`: 수집할 게시판 ID (예: `2_2`, `movie_kor`, `166`).
+* `subcat`: 서브 카테고리(분류 필터) 번호 (선택 사항, 예: `875`).
 
 ---
 
@@ -440,29 +428,23 @@ Feeder는 사이트 보안 수준과 필요 여부에 따라 리소스를 최소
 <br>
 #### 피드 URL 형식
 
-* **단일 게시판 피드:**
+* **태스크 ID 기반 통합 피드 (단일/복수 타겟 및 마그넷 중복 자동 단일화):**
+  ```text
+  http://{YOUR_HOST}:{PORT}/feeder/api/task?id={TASK_ID}&apikey={APIKEY}
+  ```
+  *(예: `http://192.168.1.100:9999/feeder/api/task?id=1&apikey=abcdef123456`)*
+
+* **태스크 이름 기반 통합 피드:**
+  ```text
+  http://{YOUR_HOST}:{PORT}/feeder/api/task?name={TASK_NAME}&apikey={APIKEY}
+  ```
+  *(예: `http://192.168.1.100:9999/feeder/api/task?name=asian_movies&apikey=abcdef123456`)*
+
+* **단일 게시판 직접 쿼리 피드 (특정 게시판 데이터만 즉시 조회할 때):**
   ```text
   http://{YOUR_HOST}:{PORT}/feeder/api/board?site={SITENAME}&board={BOARD_ID}&apikey={APIKEY}
   ```
-  *(예: `http://192.168.1.100:9999/feeder/api/board?site=sehuatang&board=103&apikey=abcdef123456`)*
-
-* **서브 카테고리 전용 피드:**
-  ```text
-  http://{YOUR_HOST}:{PORT}/feeder/api/board?site={SITENAME}&board={BOARD_ID}_{SUBCAT_ID}&apikey={APIKEY}
-  ```
-  *(예: `http://192.168.1.100:9999/feeder/api/board?site=sehuatang&board=166_875&apikey=abcdef123456`)*
-
-* **스케줄러 ID 기반 피드:**
-  ```text
-  http://{YOUR_HOST}:{PORT}/feeder/api/board?id={SCHEDULER_ID}&apikey={APIKEY}
-  ```
-  *(예: `http://192.168.1.100:9999/feeder/api/board?id=1&apikey=abcdef123456`)*
-
-* **다중 게시판 그룹 피드 (동일 마그넷 자동 중복 제거):**
-  ```text
-  http://{YOUR_HOST}:{PORT}/feeder/api/group?name={GROUP_NAME}&apikey={APIKEY}
-  ```
-  *(예: `http://192.168.1.100:9999/feeder/api/group?name=korean_drama&apikey=abcdef123456`)*
+  *(예: `http://192.168.1.100:9999/feeder/api/board?site=sukebei&board=2_2&apikey=abcdef123456`)*
 
 * **첨부파일 직접 다운로드 프록시 스트림:**
   ```text

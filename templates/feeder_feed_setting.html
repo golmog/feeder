@@ -21,8 +21,7 @@
   {{ macros.m_tab_head_start() }}
     {{ macros.m_tab_head('basic', '기본 설정', true) }}
     {{ macros.m_tab_head('site', '사이트 관리', false) }}
-    {{ macros.m_tab_head('group', '그룹화', false) }}
-    {{ macros.m_tab_head('schedule', '스케줄링(YAML)', false) }}
+    {{ macros.m_tab_head('tasks', '작업 관리 (TASKS)', false) }}
     {{ macros.m_tab_head('auto', '자동 & DB정리', false) }}
   {{ macros.m_tab_head_end() }}
 </nav>
@@ -39,7 +38,6 @@
       {{ macros.setting_checkbox('feed_allow_duplicate_magnet', '마그넷 중복 허용', value=arg['feed_allow_duplicate_magnet'], desc=['On: 마그넷 중복 검사 없이 수집 (단, 동일 게시판 내 중복 불가)', 'Off: 게시판에 관계없이 이미 DB에 등록된 마그넷은 수집 제외']) }}
       {{ macros.m_hr() }}
       {{ macros.setting_checkbox('feed_use_proxy', 'HTTP Proxy 사용', value=arg['feed_use_proxy'], desc=['On: 수집 및 요청 시 지정된 프록시 서버를 경유합니다.']) }}
-
       <div id="feed_use_proxy_div" class="collapse">
         {{ macros.setting_input_text('feed_proxy_url', 'Proxy URL', value=arg['feed_proxy_url'], placeholder='예: http://127.0.0.1:8118 또는 socks5://127.0.0.1:1080') }}
       </div>
@@ -102,44 +100,23 @@
       </div>
     {{ macros.m_tab_content_end() }}
 
-    <!-- 탭: 그룹화 -->
-    {{ macros.m_tab_content_start('group', false) }}
-      <div class="mb-2">
-        <button type="button" id="group_add_btn" class="btn btn-sm btn-primary">그룹 추가</button>
-      </div>
-      <div class="table-responsive">
-        <table class="table table-sm table-striped table-hover text-center align-middle">
-          <thead class="thead-dark">
-            <tr>
-              <th style="width: 8%;">ID</th>
-              <th style="width: 25%;">그룹명 / 작업</th>
-              <th style="width: 67%;">포함된 게시판 및 RSS 피드</th>
-            </tr>
-          </thead>
-          <tbody id="group_list_tbody">
-            <tr><td colspan="3" class="py-4 text-muted">등록된 그룹을 불러오는 중입니다...</td></tr>
-          </tbody>
-        </table>
-      </div>
-    {{ macros.m_tab_content_end() }}
-
-    <!-- 탭: 스케줄링(YAML) -->
-    {{ macros.m_tab_content_start('schedule', false) }}
+    <!-- 탭: 작업 관리 (TASKS) -->
+    {{ macros.m_tab_content_start('tasks', false) }}
       <div class="mb-2 d-flex justify-content-between align-items-center">
-        <button type="button" id="scheduler_add_btn" class="btn btn-sm btn-primary">게시판 추가</button>
-        <button type="button" id="scheduler_reload_btn" class="btn btn-sm btn-secondary">스케쥴 새로고침</button>
+        <button type="button" id="task_add_btn" class="btn btn-sm btn-primary">작업 추가</button>
+        <button type="button" id="scheduler_reload_btn" class="btn btn-sm btn-secondary">작업 새로고침</button>
       </div>
       <div class="table-responsive">
         <table class="table table-sm table-striped table-hover text-center align-middle">
           <thead class="thead-dark">
             <tr>
-              <th style="width: 8%;">ID</th>
-              <th style="width: 20%;">사이트 / 게시판</th>
-              <th style="width: 22%;">수집 옵션</th>
-              <th style="width: 50%;">최근 수집 내역 및 관리</th>
+              <th style="width: 6%;">ID</th>
+              <th style="width: 26%;">태스크명 / 포함 게시판 (Targets)</th>
+              <th style="width: 23%;">수집 옵션 / 화질</th>
+              <th style="width: 45%;">최근 수집 내역 및 관리</th>
             </tr>
           </thead>
-          <tbody id="scheduler_list_tbody">
+          <tbody id="task_list_tbody">
             <tr><td colspan="4" class="py-4 text-muted">등록된 수집 작업을 불러오는 중입니다...</td></tr>
           </tbody>
         </table>
@@ -159,44 +136,99 @@
   </div>
 </form>
 
-<!-- 모달: 게시판 추가/수정 -->
+<!-- 모달: 수집 작업(Task) 추가/수정 -->
 <div class="modal fade" id="add_job_modal" tabindex="-1" role="dialog" aria-hidden="true">
   <div class="modal-dialog modal-lg">
     <div class="modal-content">
       <div class="modal-header d-flex align-items-center justify-content-between">
-        <div class="d-flex align-items-center">
-          <h4 class="modal-title mr-2" id="modal_title">수집 대상 게시판 설정</h4>
-          <button type="button" id="apply_site_defaults_btn" class="btn btn-xs btn-outline-info" title="선택된 사이트의 기본 옵션값으로 체크박스를 리셋합니다.">사이트 기본값 적용</button>
-        </div>
+        <h4 class="modal-title" id="modal_title">수집 작업(Task) 설정</h4>
         <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
       </div>
       <div class="modal-body">
         <form id="job_form" name="job_form">
           <input type="hidden" name="modal_scheduler_id" id="modal_scheduler_id" value="-1">
-          {{ macros.setting_top('사이트') }}
-          <div id="site_list_option" class="input-group col-sm-8"></div>
-          {{ macros.setting_bottom() }}
-          {{ macros.setting_input_text('board_id', '게시판 ID', col='8', placeholder='예: 166 (또는 166_875)') }}
-          {{ macros.setting_input_text('subcat_id', '서브 카테고리 ID', col='8', placeholder='선택 사항 (예: 875)', desc=['게시판 내 서브 카테고리(typeid 등)가 있는 경우 입력']) }}
-          {{ macros.setting_input_int('interval', '스케쥴 빈도', value='1', min='1', desc=['몇 회 주기마다 1회 실행할지 설정']) }}
-          {{ macros.setting_checkbox('enabled', '수집 활성화', value='On') }}
+          <input type="hidden" name="targets_json" id="targets_json" value="[]">
+
+          {{ macros.setting_input_text('task_name', '작업(피드) 이름', col='8', placeholder='예: asian_movies, sukebei_all') }}
+
+          <!-- 다중 타겟 게시판 빌더 영역 -->
+          <div class="form-group row mb-2">
+            <label class="col-sm-2 col-form-label text-right font-weight-bold">타겟 게시판 추가</label>
+            <div class="col-sm-10">
+              <div class="input-group input-group-sm mb-2">
+                <div id="target_site_select_div" style="min-width: 140px;" class="mr-1"></div>
+                <input type="text" id="target_board_input" class="form-control mr-1" placeholder="게시판 ID (예: 2_2, 166)">
+                <input type="text" id="target_subcat_input" class="form-control mr-1" placeholder="서브카테고리 (선택, 예: 875)">
+                <div class="input-group-append">
+                  <button type="button" id="add_target_item_btn" class="btn btn-outline-primary">타겟 목록에 추가</button>
+                </div>
+              </div>
+              <div class="table-responsive rounded border" style="max-height: 180px; overflow-y: auto;">
+                <table class="table table-sm table-hover mb-0 text-center">
+                  <thead class="thead-light">
+                    <tr>
+                      <th style="width: 30%;">사이트</th>
+                      <th style="width: 30%;">게시판 ID</th>
+                      <th style="width: 25%;">서브 카테고리</th>
+                      <th style="width: 15%;">제외</th>
+                    </tr>
+                  </thead>
+                  <tbody id="modal_targets_tbody">
+                    <tr><td colspan="4" class="text-muted py-2">등록된 타겟 게시판이 없습니다.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+
+          {{ macros.setting_input_int('interval', '스케쥴 빈도', value='1', min='1', desc=['스케쥴러 몇 회 주기마다 1회 실행할지 설정']) }}
+          {{ macros.setting_input_text('quality', '최소 화질 (Flexget 규격)', col='8', placeholder='예: 1080p+, 2160p+, 720p-1080p', desc=['비워두면 전역(GLOBAL) 화질 설정이 적용됩니다.']) }}
+
+          {{ macros.m_hr() }}
+          {{ macros.setting_checkbox('use_task_filter', '정규식 필터 설정 (Flexget regexp)', value='', desc=['On: 해당 작업에만 개별 적용할 Flexget 규격 정규식 필터를 설정합니다.']) }}
+          <div id="modal_use_task_filter_div" class="collapse">
+            {{ macros.setting_checkbox('accept_all', '미거부 항목 일괄 허용 (accept_all)', value='', desc=['On: reject 되지 않은 나머지 모든 게시글을 수집 허용합니다.']) }}
+            <div class="form-group row mb-2">
+              <label class="col-sm-2 col-form-label text-right small font-weight-bold">거부 패턴<br>(reject)</label>
+              <div class="col-sm-10">
+                <textarea id="filter_reject" name="filter_reject" class="form-control form-control-sm" rows="3" placeholder="매칭 시 제외할 정규식 (줄바꿈 구분)&#10;예시:&#10;\bCam\b&#10;\btrailer\b: {from: title}&#10;spam_domain\.com: {from: link}"></textarea>
+                <small class="form-text text-muted">매칭 시 제외됩니다. 기본 대상은 title이며, {from: link} 또는 {from: [title, link]} 지원</small>
+              </div>
+            </div>
+            <div class="form-group row mb-2">
+              <label class="col-sm-2 col-form-label text-right small font-weight-bold">허용 패턴<br>(accept)</label>
+              <div class="col-sm-10">
+                <textarea id="filter_accept" name="filter_accept" class="form-control form-control-sm" rows="3" placeholder="매칭 시 수집 허용할 정규식 (줄바꿈 구분)&#10;예시:&#10;1080p&#10;\bKOR\b: {from: [title, link]}"></textarea>
+                <small class="form-text text-muted">선언 시 여기에 매칭되는 항목만 수집됩니다 (화이트리스트).</small>
+              </div>
+            </div>
+            <div class="form-group row mb-2">
+              <label class="col-sm-2 col-form-label text-right small font-weight-bold">필수 포함<br>(reject_excluding)</label>
+              <div class="col-sm-10">
+                <textarea id="filter_reject_excluding" name="filter_reject_excluding" class="form-control form-control-sm" rows="2" placeholder="반드시 포함되어야 할 필수 정규식 (줄바꿈 구분)&#10;예시:&#10;\b(KOR|한국어)\b"></textarea>
+                <small class="form-text text-muted">선언된 패턴이 하나도 매칭되지 않으면 수집에서 제외됩니다.</small>
+              </div>
+            </div>
+          </div>
+          {{ macros.m_hr() }}
+
+          {{ macros.setting_checkbox('enabled', '작업 활성화', value='On') }}
           {{ macros.setting_checkbox('use_torrent_info', 'Torrent Info 사용', value='') }}
           {{ macros.setting_checkbox('use_proxy', 'Proxy 사용', value='') }}
           <div id="modal_use_proxy_div" class="collapse">
-            {{ macros.setting_input_text('proxy_url', '개별 Proxy URL', value='', placeholder='미입력 시 기본 설정의 Proxy 사용', desc=['비워둘 경우 기본 설정의 Proxy URL이 적용됩니다.']) }}
+            {{ macros.setting_input_text('proxy_url', '개별 Proxy URL', value='', placeholder='미입력 시 기본 설정의 Proxy 사용') }}
           </div>
           {{ macros.setting_checkbox('use_flaresolverr', 'FlareSolverr 사용', value='') }}
           {{ macros.setting_checkbox('use_selenium', 'Selenium 사용', value='') }}
           {{ macros.setting_checkbox('use_rss_file', '공유용 RSS 파일 생성', value='') }}
           <div id="modal_use_rss_file_div" class="collapse">
-            {{ macros.setting_input_text('rss_file', 'RSS 파일명', col='8', placeholder='예: sukebei_2_2.xml', desc=['외부 공유용 XML 파일명 (.xml 자동 부여). 비워둘 경우 [사이트_게시판ID(_서브카테고리).xml]로 자동 지정됩니다.']) }}
-            {{ macros.setting_input_text('rss_file_path', '개별 저장 경로', col='8', value='', placeholder='미입력 시 기본 설정 경로 사용', desc=['비워둘 경우 기본 설정의 저장 경로가 적용됩니다.']) }}
-            {{ macros.setting_input_text('rss_file_days', '개별 유지 기간 (일)', col='8', value='', placeholder='미입력 시 기본 설정 (14일) 사용', desc=['비워둘 경우 기본 설정의 유지 기간이 적용됩니다.']) }}
-            {{ macros.setting_input_text('rss_file_items', '개별 최대 피드 수', col='8', value='', placeholder='미입력 시 기본 설정값 사용', desc=['비워둘 경우 기본 설정의 피드 수가 적용됩니다.']) }}
+            {{ macros.setting_input_text('rss_file', 'RSS 파일명', col='8', placeholder='예: asian_movies.xml', desc=['외부 배포용 XML 파일명. 비워두면 [태스크명.xml]로 자동 지정됩니다.']) }}
+            {{ macros.setting_input_text('rss_file_path', '개별 저장 경로', col='8', value='', placeholder='미입력 시 기본 설정 경로 사용') }}
+            {{ macros.setting_input_text('rss_file_days', '개별 유지 기간 (일)', col='8', value='', placeholder='미입력 시 기본 설정 (14일) 사용') }}
+            {{ macros.setting_input_text('rss_file_items', '개별 최대 피드 수', col='8', value='', placeholder='미입력 시 기본 설정값 사용') }}
           </div>
         </form>
       </div>
-
       <div class="modal-footer">
         <button id="add_job_save_btn" type="button" class="btn btn-primary">저장</button>
         <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
@@ -301,51 +333,6 @@
           <label class="custom-control-label small text-muted" for="custom_script_wrap_chk">자동 줄바꿈</label>
         </div>
         <button id="custom_script_save_btn" type="button" class="btn btn-primary">저장 및 훅 즉시 적용</button>
-        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- 모달: 그룹 생성 -->
-<div class="modal fade" id="add_group_modal" tabindex="-1" role="dialog" aria-hidden="true">
-  <div class="modal-dialog">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h4 class="modal-title">그룹 추가</h4>
-        <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
-      </div>
-      <div class="modal-body">
-        <input type="text" id="add_group_text" class="form-control" placeholder="그룹명을 입력하세요">
-      </div>
-      <div class="modal-footer">
-        <button id="add_group_save_btn" type="button" class="btn btn-primary">생성</button>
-        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- 모달: 그룹 내 게시판 추가 -->
-<div class="modal fade" id="add_group_child_modal" tabindex="-1" role="dialog" aria-hidden="true">
-  <div class="modal-dialog">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h4 class="modal-title">그룹에 게시판 추가</h4>
-        <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
-      </div>
-      <div class="modal-body">
-        <div class="form-group">
-          <label>사이트 선택</label>
-          <div id="site_list_on_group_option"></div>
-        </div>
-        <div class="form-group">
-          <label>게시판 선택</label>
-          <div id="board_select_on_group_div"></div>
-        </div>
-      </div>
-      <div class="modal-footer">
-        <button id="add_group_child_save_btn" type="button" class="btn btn-primary">추가</button>
         <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
       </div>
     </div>

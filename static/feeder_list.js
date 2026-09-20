@@ -37,7 +37,7 @@ $("body").on('change', '#board_select', function(e){
   globalRequestSearch('1');
 });
 
-$("body").on('change', '#group_select', function(e){
+$("body").on('change', '#task_select', function(e){
   e.preventDefault();
   globalRequestSearch('1');
 });
@@ -54,16 +54,16 @@ $("body").on('change', '#page_size', function(e){
 
 $("body").on('change', '#site_radio', function(e){
   if ($(this).is(':checked')) {
-    $('#group_select').attr('disabled', 'disabled');
+    $('#task_select').attr('disabled', 'disabled');
     $('#site_select').removeAttr('disabled');
     $('#board_select').removeAttr('disabled');
     globalRequestSearch('1');
   }
 });
 
-$("body").on('change', '#group_radio', function(e){
+$("body").on('change', '#task_radio', function(e){
   if ($(this).is(':checked')) {
-    $('#group_select').removeAttr('disabled');
+    $('#task_select').removeAttr('disabled');
     $('#site_select').attr('disabled', 'disabled');
     $('#board_select').attr('disabled', 'disabled');
     globalRequestSearch('1');
@@ -83,14 +83,14 @@ function build_search_form(data) {
   site_str += '</select>';
   $('#site_select_div').html(site_str);
 
-  var group_str = '<select id="group_select" name="group_select" class="form-control form-control-sm" disabled><option value="all">전체 그룹</option>';
-  if (data.group) {
-    for (var j = 0; j < data.group.length; j++) {
-      group_str += '<option value="' + data.group[j].groupname + '">' + data.group[j].groupname + '</option>';
+  var task_str = '<select id="task_select" name="task_select" class="form-control form-control-sm" disabled><option value="all">전체 작업(Task)</option>';
+  if (data.tasks) {
+    for (var j = 0; j < data.tasks.length; j++) {
+      task_str += '<option value="' + data.tasks[j].id + '">' + data.tasks[j].name + '</option>';
     }
   }
-  group_str += '</select>';
-  $('#group_select_div').html(group_str);
+  task_str += '</select>';
+  $('#task_select_div').html(task_str);
 
   update_board_select('all');
 }

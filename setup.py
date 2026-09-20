@@ -36,7 +36,7 @@ logger = P.logger
 PLUGIN_ROOT = os.path.dirname(__file__)
 
 try:
-    from .model_feed import ModelFeedSite, ModelFeedBbs, ModelFeedGroup
+    from .model_feed import ModelFeedSite, ModelFeedBbs
     from .mod_feed import ModuleFeed
 
     P.set_module_list([ModuleFeed])
