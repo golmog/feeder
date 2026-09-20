@@ -206,9 +206,19 @@ class FeedConfigUtil:
                     return 'success_update'
             return 'not_found'
 
+        new_site = item.get('site_name', '')
+        new_board = str(item.get('board_id', '')).strip()
+        new_subcat = str(item.get('subcat_id', '')).strip()
+
+        # 사이트명, 게시판ID, 서브카테고리ID가 모두 동일할 때만 중복으로 판정
         for s in schedules:
-            if s.get('site_name') == item.get('site_name') and str(s.get('board_id')) == str(item.get('board_id')):
-                logger.warning(f"[Feeder] 동일 게시판 스케쥴 중복: {item.get('site_name')} - {item.get('board_id')}")
+            s_site = s.get('site_name', '')
+            s_board = str(s.get('board_id', '')).strip()
+            s_subcat = str(s.get('subcat_id', '')).strip()
+
+            if s_site == new_site and s_board == new_board and s_subcat == new_subcat:
+                subcat_log = f" (서브카테고리: {new_subcat})" if new_subcat else ""
+                logger.warning(f"[Feeder] 동일 게시판 스케쥴 중복: {new_site} - {new_board}{subcat_log}")
                 return 'already_exist'
 
         max_id = max([int(s.get('id', 0)) for s in schedules], default=0)
@@ -216,7 +226,9 @@ class FeedConfigUtil:
         schedules.append(item)
         data['SCHEDULE'] = schedules
         cls.save_yaml(data)
-        logger.info(f"[Feeder] YAML 신규 스케쥴 추가 완료: ID={item['id']}, Site={item.get('site_name')}, Board={item.get('board_id')}")
+
+        subcat_info = f" (서브카테고리: {new_subcat})" if new_subcat else ""
+        logger.info(f"[Feeder] YAML 신규 스케쥴 추가 완료: ID={item['id']}, Site={new_site}, Board={new_board}{subcat_info}")
         return 'success'
 
     @classmethod

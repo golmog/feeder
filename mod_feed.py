@@ -821,16 +821,20 @@ class ModuleFeed(PluginModuleBase):
                 ret['board'][s_name] = []
 
         schedules = FeedConfigUtil.get_schedules()
+        from .task_feed import Task
         for item in schedules:
             site = item.get('site_name')
             board = item.get('board_id')
+            subcat = item.get('subcat_id')
+            _, _, full_key = Task.parse_board_info(board, subcat)
+
             if site and site not in ret['site']:
                 ret['site'].append(site)
-            if site and board:
+            if site and full_key:
                 if site not in ret['board']:
                     ret['board'][site] = []
-                if board not in ret['board'][site]:
-                    ret['board'][site].append(board)
+                if full_key not in ret['board'][site]:
+                    ret['board'][site].append(full_key)
 
         try:
             db_boards = db.session.query(ModelFeedBbs.site, ModelFeedBbs.board).distinct().all()
