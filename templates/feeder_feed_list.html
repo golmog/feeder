@@ -8,21 +8,12 @@
     <div class="container-fluid pl-0 pr-0">
       <div class="row show-grid align-items-center">
         <span class="col-md-6 form-inline">
-          <div class="custom-control custom-radio mr-2">
-            <input id="site_radio" type="radio" name="radio" value="site" class="custom-control-input" checked>
-            <label class="custom-control-label" for="site_radio">게시판별</label>
-          </div>
-          <div id="site_select_div" class="mr-1"></div>
+          <div id="site_select_div" class="mr-2"></div>
           <div id="board_select_div" class="mr-3">
-            <select id="board_select" name="board_select" class="form-control form-control-sm">
+            <select id="board_select" name="board_select" class="form-control form-control-sm" disabled>
               <option value="all">전체 게시판</option>
             </select>
           </div>
-          <div class="custom-control custom-radio mr-2">
-            <input id="task_radio" type="radio" name="radio" value="task" class="custom-control-input">
-            <label class="custom-control-label" for="task_radio">작업(Task)별</label>
-          </div>
-          <div id="task_select_div"></div>
         </span>
 
         <span class="col-md-6 text-right form-inline justify-content-end">

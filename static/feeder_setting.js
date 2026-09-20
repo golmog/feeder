@@ -1,7 +1,7 @@
 var current_sites = [];
-var current_tasks = [];
-var current_info = {};
-var modal_targets = [];
+var current_crawlers = [];
+var current_feeds = [];
+var modal_feed_sources = [];
 
 var json_editor = null;
 var python_editor = null;
@@ -153,78 +153,24 @@ function load_all_data() {
   });
 
   $.ajax({
-    url: '/' + package_name + '/ajax/' + sub + '/load_tasks',
+    url: '/' + package_name + '/ajax/' + sub + '/load_crawlers',
     type: "POST",
     dataType: "json",
     success: function(data) {
-      current_tasks = data.tasks || [];
-      render_tasks(current_tasks);
+      current_crawlers = data.crawlers || [];
+      render_crawlers(current_crawlers);
     }
   });
-}
 
-function render_tasks(data) {
-  var tbody = $('#task_list_tbody');
-  if (!data || data.length === 0) {
-    tbody.html('<tr><td colspan="4" class="py-4 text-muted">등록된 수집 작업(TASKS)이 없습니다. 상단의 "작업 추가"를 누르세요.</td></tr>');
-    return;
-  }
-  var str = '';
-  for (var i = 0; i < data.length; i++) {
-    var item = data[i];
-    var isEnabled = (item.enabled === true || item.enabled === 'True' || item.enabled === 'true' || item.enabled === 'on');
-    var isProxy = (item.use_proxy === true || item.use_proxy === 'True' || item.use_proxy === 'true' || item.use_proxy === 'on');
-    var isFlare = (item.use_flaresolverr === true || item.use_flaresolverr === 'True' || item.use_flaresolverr === 'true' || item.use_flaresolverr === 'on');
-    var isSelenium = (item.use_selenium === true || item.use_selenium === 'True' || item.use_selenium === 'true' || item.use_selenium === 'on');
-    var isRssFile = (item.use_rss_file === true || item.use_rss_file === 'True' || item.use_rss_file === 'true' || item.use_rss_file === 'on');
-
-    var proxyDisplay = '<span class="text-muted">미사용</span>';
-    if (isProxy) {
-      proxyDisplay = item.proxy_url ? '<span class="text-warning font-weight-bold" title="' + item.proxy_url + '">개별</span>' : '<span class="text-warning font-weight-bold">기본</span>';
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/load_feeds',
+    type: "POST",
+    dataType: "json",
+    success: function(data) {
+      current_feeds = data.feeds || [];
+      render_feeds(current_feeds);
     }
-
-    var targetsHtml = '';
-    var targets = item.targets || [];
-    if (targets.length > 0) {
-      targetsHtml += '<div class="mt-1">';
-      for (var t = 0; t < targets.length; t++) {
-        var subTag = targets[t].subcat ? ':' + targets[t].subcat : '';
-        targetsHtml += '<span class="badge badge-info mr-1 mb-1 font-weight-normal">' + targets[t].site + ' [' + targets[t].board + subTag + ']</span>';
-      }
-      targetsHtml += '</div>';
-    } else {
-      targetsHtml += '<div class="text-muted small">타겟 없음</div>';
-    }
-
-    str += '<tr>';
-    str += '  <td class="font-weight-bold">' + item.id + '</td>';
-    str += '  <td class="text-left"><strong>' + (item.name || ('Task ' + item.id)) + '</strong><br>' + targetsHtml + '</td>';
-    str += '  <td class="text-left small" style="line-height: 1.6;">';
-    str += '    상태: ' + (isEnabled ? '<span class="text-success font-weight-bold">활성</span>' : '<span class="text-muted">중지</span>') + ' / ' + (item.interval || 1) + '회당 1회<br>';
-    str += '    화질: ' + (item.quality ? '<span class="badge badge-primary">' + item.quality + '</span>' : '<span class="text-muted">전역 설정</span>') + '<br>';
-    str += '    Proxy: ' + proxyDisplay + ' | Flare: ' + (isFlare ? '<span class="text-danger">ON</span>' : '<span class="text-muted">OFF</span>') + ' | Selenium: ' + (isSelenium ? '<span class="text-info">ON</span>' : '<span class="text-muted">OFF</span>') + '<br>';
-    str += '    공유 XML: ' + (isRssFile ? '<span class="text-success font-weight-bold">' + (item.rss_file || '자동') + '</span>' : '<span class="text-muted">미생성</span>');
-    str += '  </td>';
-    str += '  <td class="text-left">';
-    if (item.last) {
-      str += '    <div class="text-truncate mb-1" style="max-width: 440px;"><strong>최근:</strong> ' + item.last.title + '</div>';
-      str += '    <small class="text-muted">수집: ' + item.last.created_time + '</small>';
-    } else {
-      str += '    <div class="text-muted small mb-1">수집된 데이터 없음</div>';
-    }
-    str += '    <div class="mt-2 d-flex justify-content-between align-items-center">';
-    str += '      <div class="btn-group btn-group-sm">';
-    str += '        <button type="button" class="btn btn-primary text-white task_edit_btn" data-id="' + item.id + '" data-index="' + i + '">수정</button>';
-    str += '        <button type="button" class="btn btn-danger text-white remove_task_btn" data-id="' + item.id + '">삭제</button>';
-    str += '        <button type="button" class="btn btn-secondary text-white remove_task_db_btn" data-id="' + item.id + '">DB 비우기</button>';
-    str += '      </div>';
-    str += '      <a href="' + item.api + '" target="_blank" class="btn btn-sm text-white" style="background-color: #f26522; font-weight: 500;"><i class="fa fa-rss"></i> 통합 RSS</a>';
-    str += '    </div>';
-    str += '    <div class="mt-1"><small class="text-muted" style="word-break: break-all;">' + item.api + '</small></div>';
-    str += '  </td>';
-    str += '</tr>';
-  }
-  tbody.html(str);
+  });
 }
 
 function render_sites(data) {
@@ -300,48 +246,132 @@ $(document).on('click', '.site_opt_toggle', function(e){
   });
 });
 
-function render_modal_targets() {
-  var tbody = $('#modal_targets_tbody');
-  if (!modal_targets || modal_targets.length === 0) {
-    tbody.html('<tr><td colspan="4" class="text-muted py-2">등록된 타겟 게시판이 없습니다.</td></tr>');
-    $('#targets_json').val('[]');
+function render_crawlers(data) {
+  var tbody = $('#crawler_list_tbody');
+  if (!data || data.length === 0) {
+    tbody.html('<tr><td colspan="4" class="py-4 text-muted">등록된 수집기(CRAWLERS)가 없습니다. 상단의 "수집기 추가"를 누르세요.</td></tr>');
     return;
   }
   var str = '';
-  for (var i = 0; i < modal_targets.length; i++) {
-    var t = modal_targets[i];
+  for (var i = 0; i < data.length; i++) {
+    var item = data[i];
+    var isEnabled = (item.enabled === true || item.enabled === 'True' || item.enabled === 'true' || item.enabled === 'on');
+    var isTorrentInfo = (item.use_torrent_info === true || item.use_torrent_info === 'True' || item.use_torrent_info === 'true' || item.use_torrent_info === 'on');
+    var isProxy = (item.use_proxy === true || item.use_proxy === 'True' || item.use_proxy === 'true' || item.use_proxy === 'on');
+    var isFlare = (item.use_flaresolverr === true || item.use_flaresolverr === 'True' || item.use_flaresolverr === 'true' || item.use_flaresolverr === 'on');
+    var isSelenium = (item.use_selenium === true || item.use_selenium === 'True' || item.use_selenium === 'true' || item.use_selenium === 'on');
+
+    var proxyDisplay = '<span class="text-muted">미사용</span>';
+    if (isProxy) {
+      proxyDisplay = item.proxy_url ? '<span class="text-warning font-weight-bold" title="' + item.proxy_url + '">개별</span>' : '<span class="text-warning font-weight-bold">기본</span>';
+    }
+
+    var subTag = item.subcat ? ':' + item.subcat : '';
+
     str += '<tr>';
-    str += '  <td><span class="badge badge-secondary">' + t.site + '</span></td>';
-    str += '  <td><strong>' + t.board + '</strong></td>';
-    str += '  <td>' + (t.subcat ? '<span class="badge badge-light">' + t.subcat + '</span>' : '<span class="text-muted">-</span>') + '</td>';
-    str += '  <td><button type="button" class="btn btn-xs btn-outline-danger remove_target_item_btn" data-index="' + i + '">삭제</button></td>';
+    str += '  <td class="font-weight-bold">' + item.id + '</td>';
+    str += '  <td class="text-left">';
+    str += '    <strong>' + item.site + '</strong><br>';
+    str += '    <span class="badge badge-info">' + item.board + subTag + '</span>';
+    str += '  </td>';
+    str += '  <td class="text-left small" style="line-height: 1.6;">';
+    str += '    상태: ' + (isEnabled ? '<span class="text-success font-weight-bold">활성</span>' : '<span class="text-muted">중지</span>') + ' / ' + (item.interval || 1) + '회당 1회<br>';
+    str += '    Proxy: ' + proxyDisplay + ' | Flare: ' + (isFlare ? '<span class="text-danger">ON</span>' : '<span class="text-muted">OFF</span>') + '<br>';
+    str += '    Selenium: ' + (isSelenium ? '<span class="text-info">ON</span>' : '<span class="text-muted">OFF</span>') + ' | TorInfo: ' + (isTorrentInfo ? '<span class="text-primary">ON</span>' : '<span class="text-muted">OFF</span>');
+    str += '  </td>';
+    str += '  <td class="text-left">';
+    if (item.last) {
+      str += '    <div class="text-truncate mb-1" style="max-width: 440px;"><strong>최근:</strong> ' + item.last.title + '</div>';
+      str += '    <small class="text-muted">수집: ' + item.last.created_time + '</small>';
+    } else {
+      str += '    <div class="text-muted small mb-1">수집된 데이터 없음</div>';
+    }
+    str += '    <div class="mt-2 btn-group btn-group-sm">';
+    str += '      <button type="button" class="btn btn-primary text-white crawler_edit_btn" data-id="' + item.id + '" data-index="' + i + '">수정</button>';
+    str += '      <button type="button" class="btn btn-danger text-white remove_crawler_btn" data-id="' + item.id + '">삭제</button>';
+    str += '      <button type="button" class="btn btn-secondary text-white remove_crawler_db_btn" data-id="' + item.id + '">DB 비우기</button>';
+    str += '    </div>';
+    str += '  </td>';
     str += '</tr>';
   }
   tbody.html(str);
-  $('#targets_json').val(JSON.stringify(modal_targets));
 }
 
-$(document).on('click', '#add_target_item_btn', function(e){
-  e.preventDefault();
-  var site = $('#target_site_select').val();
-  var board = $('#target_board_input').val().trim();
-  var subcat = $('#target_subcat_input').val().trim();
-  if (!site || !board) {
-    notify('사이트와 게시판 ID를 입력하세요.', 'warning');
+function render_feeds(data) {
+  var tbody = $('#feed_list_tbody');
+  if (!data || data.length === 0) {
+    tbody.html('<tr><td colspan="4" class="py-4 text-muted">등록된 피드(FEEDS)가 없습니다. 상단의 "피드 추가"를 누르세요.</td></tr>');
     return;
   }
-  modal_targets.push({site: site, board: board, subcat: subcat});
-  render_modal_targets();
-  $('#target_board_input').val('');
-  $('#target_subcat_input').val('');
-});
+  var str = '';
+  for (var i = 0; i < data.length; i++) {
+    var item = data[i];
+    var isRssFile = (item.use_rss_file === true || item.use_rss_file === 'True' || item.use_rss_file === 'true' || item.use_rss_file === 'on');
 
-$(document).on('click', '.remove_target_item_btn', function(e){
-  e.preventDefault();
-  var idx = $(this).data('index');
-  modal_targets.splice(idx, 1);
-  render_modal_targets();
-});
+    var sourcesHtml = '';
+    var sources = item.sources || [];
+    if (sources.length > 0) {
+      sourcesHtml += '<div class="mt-1">';
+      for (var s = 0; s < sources.length; s++) {
+        var subTag = sources[s].subcat ? ':' + sources[s].subcat : '';
+        sourcesHtml += '<span class="badge badge-info mr-1 mb-1 font-weight-normal">' + sources[s].site + ' [' + sources[s].board + subTag + ']</span>';
+      }
+      sourcesHtml += '</div>';
+    } else {
+      sourcesHtml += '<div class="text-muted small">소스 없음</div>';
+    }
+
+    var filterSummary = [];
+    if (item.quality) filterSummary.push('화질: ' + item.quality);
+    if (item.regexp && item.regexp.reject && item.regexp.reject.length > 0) filterSummary.push('거부(' + item.regexp.reject.length + '개)');
+    if (item.regexp && item.regexp.accept && item.regexp.accept.length > 0) filterSummary.push('허용(' + item.regexp.accept.length + '개)');
+    if (item.regexp && item.regexp.reject_excluding && item.regexp.reject_excluding.length > 0) filterSummary.push('필수(' + item.regexp.reject_excluding.length + '개)');
+    if (item.accept_all) filterSummary.push('accept_all');
+    var filterText = filterSummary.length > 0 ? filterSummary.join(' / ') : '<span class="text-muted">전역 설정 적용</span>';
+
+    str += '<tr>';
+    str += '  <td class="font-weight-bold">' + item.id + '</td>';
+    str += '  <td class="text-left">';
+    str += '    <strong>' + item.name + '</strong><br>' + sourcesHtml;
+    str += '  </td>';
+    str += '  <td class="text-left small" style="line-height: 1.6;">';
+    str += '    ' + filterText + '<br>';
+    str += '    공유 XML: ' + (isRssFile ? '<span class="text-success font-weight-bold">' + (item.rss_file || (item.name + '.xml')) + '</span>' : '<span class="text-muted">미생성</span>');
+    str += '  </td>';
+    str += '  <td class="text-left">';
+    str += '    <div class="d-flex justify-content-between align-items-center">';
+    str += '      <div class="btn-group btn-group-sm">';
+    str += '        <button type="button" class="btn btn-primary text-white feed_edit_btn" data-id="' + item.id + '" data-index="' + i + '">수정</button>';
+    str += '        <button type="button" class="btn btn-danger text-white remove_feed_btn" data-id="' + item.id + '">삭제</button>';
+    if (isRssFile) {
+      str += '      <button type="button" class="btn btn-outline-success generate_feed_file_btn" data-id="' + item.id + '" title="XML 파일 즉시 생성">XML 갱신</button>';
+    }
+    str += '      </div>';
+    str += '      <a href="' + item.api + '" target="_blank" class="btn btn-sm text-white" style="background-color: #f26522; font-weight: 500;"><i class="fa fa-rss"></i> RSS 피드</a>';
+    str += '    </div>';
+    str += '    <div class="mt-1"><small class="text-muted" style="word-break: break-all;">' + item.api + '</small></div>';
+    str += '  </td>';
+    str += '</tr>';
+  }
+  tbody.html(str);
+}
+
+function set_modal_checkbox(id, is_checked) {
+  var bool_val = (is_checked === true || is_checked === 'True' || is_checked === 'true' || is_checked === 'on');
+  var elem = $('#' + id);
+  elem.prop('checked', bool_val);
+  try {
+    if (elem.data('bs.toggle')) {
+      elem.bootstrapToggle(bool_val ? 'on' : 'off');
+    } else if (elem.parent().hasClass('toggle')) {
+      elem.bootstrapToggle(bool_val ? 'on' : 'off');
+    } else {
+      elem.trigger('change');
+    }
+  } catch (err) {
+    elem.trigger('change');
+  }
+}
 
 function rules_to_string(rules) {
   if (!rules || !Array.isArray(rules)) return '';
@@ -369,123 +399,291 @@ function rules_to_string(rules) {
   return lines.join('\n');
 }
 
-function set_modal_checkbox(id, is_checked) {
-  var bool_val = (is_checked === true || is_checked === 'True' || is_checked === 'true' || is_checked === 'on');
-  var elem = $('#' + id);
-  elem.prop('checked', bool_val);
-  try {
-    if (elem.data('bs.toggle')) {
-      elem.bootstrapToggle(bool_val ? 'on' : 'off');
-    } else if (elem.parent().hasClass('toggle')) {
-      elem.bootstrapToggle(bool_val ? 'on' : 'off');
-    } else {
-      elem.trigger('change');
-    }
-  } catch (err) {
-    elem.trigger('change');
+$('#crawler_use_proxy').change(function(){
+  if ($(this).is(':checked')) {
+    $('#modal_crawler_proxy_div').collapse('show');
+  } else {
+    $('#modal_crawler_proxy_div').collapse('hide');
+  }
+});
+
+function apply_site_defaults_to_crawler_modal(site_name) {
+  var site = current_sites.find(function(s){ return s.name === site_name; });
+  if (!site) return;
+  var opts = site.options || {};
+  set_modal_checkbox('crawler_use_proxy', opts.use_proxy);
+  set_modal_checkbox('crawler_use_flaresolverr', opts.use_flaresolverr);
+  set_modal_checkbox('crawler_use_selenium', opts.use_selenium);
+  set_modal_checkbox('crawler_use_torrent_info', opts.use_torrent_info);
+  $('#crawler_proxy_url').val('');
+  if (opts.use_proxy) {
+    $('#modal_crawler_proxy_div').collapse('show');
+  } else {
+    $('#modal_crawler_proxy_div').collapse('hide');
   }
 }
 
-$('#use_proxy').change(function(){
+$(document).on('change', '#crawler_site', function(){
+  if ($('#modal_crawler_id').val() === '-1') {
+    apply_site_defaults_to_crawler_modal($(this).val());
+  }
+});
+
+$(document).on('click', '#crawler_add_btn', function(e){
+  e.preventDefault();
+  if (!current_sites || current_sites.length === 0) {
+    notify('등록된 사이트가 없습니다. 먼저 "사이트 관리"에서 사이트를 추가하세요.', 'warning');
+    return;
+  }
+  var siteSelectHtml = '<select id="crawler_site" name="site" class="form-control form-control-sm">';
+  for (var i in current_sites) siteSelectHtml += '<option value="' + current_sites[i].name + '">' + current_sites[i].name + '</option>';
+  siteSelectHtml += '</select>';
+  $('#crawler_site_select_div').html(siteSelectHtml);
+
+  $('#crawler_modal_title').text('수집기(Crawler) 추가');
+  $('#modal_crawler_id').val('-1');
+  $('#crawler_board').removeAttr('readonly').val('');
+  $('#crawler_subcat').val('');
+  $('#crawler_interval').val('1');
+  $('#crawler_proxy_url').val('');
+  $('#modal_crawler_proxy_div').collapse('hide');
+
+  set_modal_checkbox('crawler_enabled', true);
+  apply_site_defaults_to_crawler_modal(current_sites[0].name);
+
+  $('#crawler_modal').modal('show');
+});
+
+$(document).on('click', '.crawler_edit_btn', function(e){
+  e.preventDefault();
+  var index = $(this).data('index');
+  var item = current_crawlers[index];
+
+  var siteSelectHtml = '<select id="crawler_site" name="site" class="form-control form-control-sm">';
+  for (var i in current_sites) {
+    var isSel = (current_sites[i].name === item.site) ? 'selected' : '';
+    siteSelectHtml += '<option value="' + current_sites[i].name + '" ' + isSel + '>' + current_sites[i].name + '</option>';
+  }
+  siteSelectHtml += '</select>';
+  $('#crawler_site_select_div').html(siteSelectHtml);
+
+  $('#crawler_modal_title').text('수집기(Crawler) 수정: ' + item.site + ' [' + item.board + ']');
+  $('#modal_crawler_id').val(item.id);
+  $('#crawler_board').val(item.board).attr('readonly', 'readonly');
+  $('#crawler_subcat').val(item.subcat || '');
+  $('#crawler_interval').val(item.interval || 1);
+  $('#crawler_proxy_url').val(item.proxy_url || '');
+
+  set_modal_checkbox('crawler_enabled', item.enabled);
+  set_modal_checkbox('crawler_use_torrent_info', item.use_torrent_info);
+  set_modal_checkbox('crawler_use_proxy', item.use_proxy);
+  set_modal_checkbox('crawler_use_flaresolverr', item.use_flaresolverr);
+  set_modal_checkbox('crawler_use_selenium', item.use_selenium);
+
+  if (item.use_proxy) $('#modal_crawler_proxy_div').collapse('show');
+  else $('#modal_crawler_proxy_div').collapse('hide');
+
+  $('#crawler_modal').modal('show');
+});
+
+$(document).on('click', '#crawler_save_btn', function(e){
+  e.preventDefault();
+  var formData = $('#crawler_form').serialize();
+  if ($('#crawler_board').is(':disabled')) {
+    formData += '&crawler_board=' + encodeURIComponent($('#crawler_board').val());
+  }
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/add_crawler',
+    type: "POST",
+    data: formData,
+    dataType: "json",
+    success: function(data) {
+      if (data.ret === 'success' || data.ret === 'success_update') {
+        notify('수집기(Crawler) 설정이 저장되었습니다.', 'success');
+        $('#crawler_modal').modal('hide');
+        current_crawlers = data.crawlers || [];
+        render_crawlers(current_crawlers);
+      } else {
+        notify('저장 실패: ' + (data.log || data.ret), 'danger');
+      }
+    }
+  });
+});
+
+$(document).on('click', '.remove_crawler_btn', function(e){
+  e.preventDefault();
+  var target_id = $(this).data('id');
+  if (!confirm('해당 수집기 설정과 수집된 DB 데이터를 모두 삭제하시겠습니까?')) return;
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/remove_crawler',
+    type: "POST",
+    data: {target_id: target_id},
+    dataType: "json",
+    success: function(data) {
+      notify('삭제되었습니다.', 'success');
+      current_crawlers = data.crawlers || [];
+      render_crawlers(current_crawlers);
+    }
+  });
+});
+
+$(document).on('click', '.remove_crawler_db_btn', function(e){
+  e.preventDefault();
+  var target_id = $(this).data('id');
+  if (!confirm('해당 수집기의 수집 데이터(DB)만 초기화하시겠습니까?')) return;
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/remove_crawler_db',
+    type: "POST",
+    data: {target_id: target_id},
+    dataType: "json",
+    success: function(data) {
+      notify('초기화되었습니다.', 'success');
+      current_crawlers = data.crawlers || [];
+      render_crawlers(current_crawlers);
+    }
+  });
+});
+
+$(document).on('click', '#crawler_reload_btn', function(e){
+  e.preventDefault();
+  load_all_data();
+  notify('새로고침 완료', 'info');
+});
+
+function render_modal_feed_sources() {
+  var tbody = $('#modal_feed_sources_tbody');
+  if (!modal_feed_sources || modal_feed_sources.length === 0) {
+    tbody.html('<tr><td colspan="4" class="text-muted py-2">지정된 소스 게시판이 없습니다.</td></tr>');
+    $('#sources_json').val('[]');
+    return;
+  }
+  var str = '';
+  for (var i = 0; i < modal_feed_sources.length; i++) {
+    var s = modal_feed_sources[i];
+    str += '<tr>';
+    str += '  <td><span class="badge badge-secondary">' + s.site + '</span></td>';
+    str += '  <td><strong>' + s.board + '</strong></td>';
+    str += '  <td>' + (s.subcat ? '<span class="badge badge-light">' + s.subcat + '</span>' : '<span class="text-muted">-</span>') + '</td>';
+    str += '  <td><button type="button" class="btn btn-xs btn-outline-danger remove_feed_source_btn" data-index="' + i + '">제외</button></td>';
+    str += '</tr>';
+  }
+  tbody.html(str);
+  $('#sources_json').val(JSON.stringify(modal_feed_sources));
+}
+
+function update_crawler_source_select_options() {
+  var select = $('#feed_source_crawler_select');
+  select.empty();
+  if (!current_crawlers || current_crawlers.length === 0) {
+    select.append('<option value="">-- 등록된 수집기 없음 --</option>');
+    return;
+  }
+  for (var i = 0; i < current_crawlers.length; i++) {
+    var c = current_crawlers[i];
+    var subTag = c.subcat ? ':' + c.subcat : '';
+    select.append('<option value="' + i + '">[' + c.site + '] ' + c.board + subTag + '</option>');
+  }
+}
+
+$(document).on('click', '#add_feed_source_btn', function(e){
+  e.preventDefault();
+  var selIdx = $('#feed_source_crawler_select').val();
+  if (selIdx === '' || selIdx === null) {
+    notify('추가할 수집기를 선택하세요.', 'warning');
+    return;
+  }
+  var c = current_crawlers[parseInt(selIdx)];
+  if (!c) return;
+
+  var exists = modal_feed_sources.some(function(s){
+    return s.site === c.site && s.board === c.board && (s.subcat || '') === (c.subcat || '');
+  });
+  if (exists) {
+    notify('이미 소스 목록에 포함되어 있습니다.', 'info');
+    return;
+  }
+
+  modal_feed_sources.push({
+    site: c.site,
+    board: c.board,
+    subcat: c.subcat || '',
+    full_board_key: c.full_board_key || c.board
+  });
+  render_modal_feed_sources();
+});
+
+$(document).on('click', '.remove_feed_source_btn', function(e){
+  e.preventDefault();
+  var idx = $(this).data('index');
+  modal_feed_sources.splice(idx, 1);
+  render_modal_feed_sources();
+});
+
+$('#use_feed_filter').change(function(){
   if ($(this).is(':checked')) {
-    $('#modal_use_proxy_div').collapse('show');
+    $('#modal_use_feed_filter_div').collapse('show');
   } else {
-    $('#modal_use_proxy_div').collapse('hide');
+    $('#modal_use_feed_filter_div').collapse('hide');
   }
 });
 
 $('#use_rss_file').change(function(){
   if ($(this).is(':checked')) {
-    $('#modal_use_rss_file_div').collapse('show');
+    $('#modal_use_feed_rss_file_div').collapse('show');
     if (!$('#rss_file').val()) {
-      var task_name = $('#task_name').val().trim() || 'feed';
-      $('#rss_file').val(task_name + '.xml');
+      var fname = $('#feed_name').val().trim() || 'feed';
+      $('#rss_file').val(fname + '.xml');
     }
   } else {
-    $('#modal_use_rss_file_div').collapse('hide');
+    $('#modal_use_feed_rss_file_div').collapse('hide');
   }
 });
 
-$('#use_task_filter').change(function(){
-  if ($(this).is(':checked')) {
-    $('#modal_use_task_filter_div').collapse('show');
-  } else {
-    $('#modal_use_task_filter_div').collapse('hide');
-  }
-});
-
-$(document).on('input change', '#task_name', function(){
+$(document).on('input change', '#feed_name', function(){
   if ($('#use_rss_file').is(':checked')) {
     var val = $(this).val().trim();
     if (val) $('#rss_file').attr('placeholder', val + '.xml');
   }
 });
 
-$(document).on('click', '#task_add_btn', function(e){
+$(document).on('click', '#feed_add_btn', function(e){
   e.preventDefault();
-  if (!current_sites || current_sites.length === 0) {
-    notify('등록된 사이트가 없습니다.', 'warning');
-    return;
-  }
-  var siteSelectHtml = '<select id="target_site_select" class="form-control form-control-sm">';
-  for (var i in current_sites) siteSelectHtml += '<option value="' + current_sites[i].name + '">' + current_sites[i].name + '</option>';
-  siteSelectHtml += '</select>';
-  $('#target_site_select_div').html(siteSelectHtml);
-
-  $('#modal_title').text('수집 작업(Task) 추가');
-  $('#modal_scheduler_id').val('-1');
-  $('#task_name').val('');
-  $('#target_board_input').val('');
-  $('#target_subcat_input').val('');
-  $('#interval').val('1');
+  $('#feed_modal_title').text('피드(Feed) 추가');
+  $('#modal_feed_id').val('-1');
+  $('#feed_name').val('');
   $('#quality').val('');
-  $('#proxy_url').val('');
+  $('#filter_reject').val('');
+  $('#filter_accept').val('');
+  $('#filter_reject_excluding').val('');
   $('#rss_file').val('');
   $('#rss_file_path').val('');
   $('#rss_file_days').val('');
   $('#rss_file_items').val('');
-  $('#filter_reject').val('');
-  $('#filter_accept').val('');
-  $('#filter_reject_excluding').val('');
-  $('#modal_use_proxy_div').collapse('hide');
-  $('#modal_use_rss_file_div').collapse('hide');
-  $('#modal_use_task_filter_div').collapse('hide');
-  set_modal_checkbox('enabled', true);
-  set_modal_checkbox('use_proxy', false);
-  set_modal_checkbox('use_flaresolverr', false);
-  set_modal_checkbox('use_selenium', false);
-  set_modal_checkbox('use_torrent_info', false);
-  set_modal_checkbox('use_rss_file', false);
-  set_modal_checkbox('use_task_filter', false);
-  set_modal_checkbox('accept_all', false);
 
-  modal_targets = [];
-  render_modal_targets();
-  $('#add_job_modal').modal('show');
+  $('#modal_use_feed_filter_div').collapse('hide');
+  $('#modal_use_feed_rss_file_div').collapse('hide');
+
+  set_modal_checkbox('use_feed_filter', false);
+  set_modal_checkbox('accept_all', false);
+  set_modal_checkbox('use_rss_file', false);
+
+  modal_feed_sources = [];
+  render_modal_feed_sources();
+  update_crawler_source_select_options();
+
+  $('#feed_modal').modal('show');
 });
 
-$(document).on('click', '.task_edit_btn', function(e){
+$(document).on('click', '.feed_edit_btn', function(e){
   e.preventDefault();
   var index = $(this).data('index');
-  var item = current_tasks[index];
+  var item = current_feeds[index];
 
-  var siteSelectHtml = '<select id="target_site_select" class="form-control form-control-sm">';
-  for (var i in current_sites) siteSelectHtml += '<option value="' + current_sites[i].name + '">' + current_sites[i].name + '</option>';
-  siteSelectHtml += '</select>';
-  $('#target_site_select_div').html(siteSelectHtml);
-
-  $('#modal_title').text('수집 작업(Task) 수정: ' + (item.name || item.id));
-  $('#modal_scheduler_id').val(item.id);
-  $('#task_name').val(item.name || '');
-  $('#interval').val(item.interval || 1);
+  $('#feed_modal_title').text('피드(Feed) 수정: ' + item.name);
+  $('#modal_feed_id').val(item.id);
+  $('#feed_name').val(item.name || '');
   $('#quality').val(item.quality || '');
-  $('#proxy_url').val(item.proxy_url || '');
-  $('#rss_file').val(item.rss_file || '');
-  $('#rss_file_path').val(item.rss_file_path || '');
-  $('#rss_file_days').val(item.rss_file_days || '');
-  $('#rss_file_items').val(item.rss_file_items || '');
 
-  // 정규식 필터 데이터 복원
   var regexp = item.regexp || {};
   var reject_str = rules_to_string(regexp.reject);
   var accept_str = rules_to_string(regexp.accept);
@@ -497,43 +695,42 @@ $(document).on('click', '.task_edit_btn', function(e){
   $('#filter_accept').val(accept_str);
   $('#filter_reject_excluding').val(reject_ex_str);
 
-  set_modal_checkbox('enabled', item.enabled);
-  set_modal_checkbox('use_torrent_info', item.use_torrent_info);
-  set_modal_checkbox('use_proxy', item.use_proxy);
-  set_modal_checkbox('use_flaresolverr', item.use_flaresolverr);
-  set_modal_checkbox('use_selenium', item.use_selenium);
-  set_modal_checkbox('use_rss_file', item.use_rss_file);
-  set_modal_checkbox('use_task_filter', has_filter);
+  $('#rss_file').val(item.rss_file || '');
+  $('#rss_file_path').val(item.rss_file_path || '');
+  $('#rss_file_days').val(item.rss_file_days || '');
+  $('#rss_file_items').val(item.rss_file_items || '');
+
+  set_modal_checkbox('use_feed_filter', has_filter);
   set_modal_checkbox('accept_all', is_accept_all);
+  set_modal_checkbox('use_rss_file', item.use_rss_file);
 
-  if (item.use_proxy) $('#modal_use_proxy_div').collapse('show');
-  else $('#modal_use_proxy_div').collapse('hide');
+  if (has_filter) $('#modal_use_feed_filter_div').collapse('show');
+  else $('#modal_use_feed_filter_div').collapse('hide');
 
-  if (item.use_rss_file) $('#modal_use_rss_file_div').collapse('show');
-  else $('#modal_use_rss_file_div').collapse('hide');
+  if (item.use_rss_file) $('#modal_use_feed_rss_file_div').collapse('show');
+  else $('#modal_use_feed_rss_file_div').collapse('hide');
 
-  if (has_filter) $('#modal_use_task_filter_div').collapse('show');
-  else $('#modal_use_task_filter_div').collapse('hide');
+  modal_feed_sources = item.sources ? JSON.parse(JSON.stringify(item.sources)) : [];
+  render_modal_feed_sources();
+  update_crawler_source_select_options();
 
-  modal_targets = item.targets ? JSON.parse(JSON.stringify(item.targets)) : [];
-  render_modal_targets();
-  $('#add_job_modal').modal('show');
+  $('#feed_modal').modal('show');
 });
 
-$(document).on('click', '#add_job_save_btn', function(e){
+$(document).on('click', '#feed_save_btn', function(e){
   e.preventDefault();
-  var formData = $('#job_form').serialize();
+  var formData = $('#feed_form').serialize();
   $.ajax({
-    url: '/' + package_name + '/ajax/' + sub + '/add_task',
+    url: '/' + package_name + '/ajax/' + sub + '/add_feed',
     type: "POST",
     data: formData,
     dataType: "json",
     success: function(data) {
       if (data.ret === 'success' || data.ret === 'success_update') {
-        notify('수집 작업(Task)이 저장되었습니다.', 'success');
-        $('#add_job_modal').modal('hide');
-        current_tasks = data.tasks || [];
-        render_tasks(current_tasks);
+        notify('피드(Feed) 설정이 저장되었습니다.', 'success');
+        $('#feed_modal').modal('hide');
+        current_feeds = data.feeds || [];
+        render_feeds(current_feeds);
       } else {
         notify('저장 실패: ' + (data.log || data.ret), 'danger');
       }
@@ -541,44 +738,46 @@ $(document).on('click', '#add_job_save_btn', function(e){
   });
 });
 
-$(document).on('click', '.remove_task_btn', function(e){
+$(document).on('click', '.remove_feed_btn', function(e){
   e.preventDefault();
   var target_id = $(this).data('id');
-  if (!confirm('해당 태스크와 수집된 DB 데이터를 모두 삭제하시겠습니까?')) return;
+  if (!confirm('해당 피드 설정을 삭제하시겠습니까? (수집된 DB 원본 데이터는 보존됩니다)')) return;
   $.ajax({
-    url: '/' + package_name + '/ajax/' + sub + '/remove_task',
+    url: '/' + package_name + '/ajax/' + sub + '/remove_feed',
     type: "POST",
     data: {target_id: target_id},
     dataType: "json",
     success: function(data) {
-      notify('삭제되었습니다.', 'success');
-      current_tasks = data.tasks || [];
-      render_tasks(current_tasks);
+      notify('피드가 삭제되었습니다.', 'success');
+      current_feeds = data.feeds || [];
+      render_feeds(current_feeds);
     }
   });
 });
 
-$(document).on('click', '.remove_task_db_btn', function(e){
+$(document).on('click', '.generate_feed_file_btn', function(e){
   e.preventDefault();
   var target_id = $(this).data('id');
-  if (!confirm('해당 태스크에 속한 게시판들의 수집 데이터(DB)를 초기화하시겠습니까?')) return;
+  notify('공유용 XML 파일 생성을 요청했습니다...', 'info');
   $.ajax({
-    url: '/' + package_name + '/ajax/' + sub + '/remove_task_db',
+    url: '/' + package_name + '/ajax/' + sub + '/generate_feed_file',
     type: "POST",
     data: {target_id: target_id},
     dataType: "json",
     success: function(data) {
-      notify('초기화되었습니다.', 'success');
-      current_tasks = data.tasks || [];
-      render_tasks(current_tasks);
+      if (data.ret === 'success') {
+        notify('XML 파일이 성공적으로 생성 및 갱신되었습니다.', 'success');
+      } else {
+        notify('파일 생성 실패: ' + (data.log || data.ret), 'warning');
+      }
     }
   });
 });
 
-$(document).on('click', '#scheduler_reload_btn', function(e){
+$(document).on('click', '#feed_reload_btn', function(e){
   e.preventDefault();
   load_all_data();
-  notify('작업 목록 새로고침 완료', 'info');
+  notify('새로고침 완료', 'info');
 });
 
 $(document).on('click', '#my_site_add_btn', function(e){

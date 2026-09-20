@@ -164,7 +164,8 @@ class FeedConfigUtil:
                         ]
                     }
                 },
-                'TASKS': []
+                'CRAWLERS': [],
+                'FEEDS': []
             }
             cls.save_yaml(default_data)
             return default_data
@@ -173,43 +174,31 @@ class FeedConfigUtil:
             with open(CONFIG_FILEPATH, 'r', encoding='utf-8') as f:
                 data = yaml.safe_load(f) or {}
 
-            # 기존 레거시 SCHEDULE 키 마이그레이션
-            if 'TASKS' not in data and 'SCHEDULE' in data:
-                data['TASKS'] = data.pop('SCHEDULE')
-
-            if 'TASKS' not in data or not isinstance(data['TASKS'], list):
-                data['TASKS'] = []
+            if 'CRAWLERS' not in data or not isinstance(data['CRAWLERS'], list):
+                data['CRAWLERS'] = []
+            if 'FEEDS' not in data or not isinstance(data['FEEDS'], list):
+                data['FEEDS'] = []
             if 'GLOBAL' not in data or not isinstance(data['GLOBAL'], dict):
                 data['GLOBAL'] = {}
 
-            # 단일 게시판 형태의 레거시 태스크를 targets 배열 형태로 자동 정규화
             from .task_feed import Task
-            for t in data['TASKS']:
-                if 'targets' not in t or not isinstance(t['targets'], list):
-                    site = t.get('site_name') or t.get('site', '')
-                    board = t.get('board_id') or t.get('board', '')
-                    subcat = t.get('subcat_id') or t.get('subcat', '')
-                    if site and board:
-                        _, _, full_key = Task.parse_board_info(board, subcat)
-                        t['targets'] = [{
-                            'site': site,
-                            'board': str(board),
-                            'subcat': str(subcat) if subcat else '',
-                            'full_board_key': full_key
-                        }]
-                    else:
-                        t['targets'] = []
-                else:
-                    for tgt in t['targets']:
-                        b_val = tgt.get('board', '')
-                        s_val = tgt.get('subcat', '')
-                        _, _, f_key = Task.parse_board_info(b_val, s_val)
-                        tgt['full_board_key'] = f_key
+            for c in data['CRAWLERS']:
+                b_val = c.get('board', '')
+                s_val = c.get('subcat', '')
+                _, _, f_key = Task.parse_board_info(b_val, s_val)
+                c['full_board_key'] = f_key
+
+            for f in data['FEEDS']:
+                for src in f.get('sources', []):
+                    b_val = src.get('board', '')
+                    s_val = src.get('subcat', '')
+                    _, _, f_key = Task.parse_board_info(b_val, s_val)
+                    src['full_board_key'] = f_key
 
             return data
         except Exception as e:
             logger.error(f"[Feeder] YAML 로드 실패: {e}")
-            return {'GLOBAL': {}, 'TASKS': []}
+            return {'GLOBAL': {}, 'CRAWLERS': [], 'FEEDS': []}
 
     @classmethod
     def get_global(cls) -> dict:
@@ -227,113 +216,154 @@ class FeedConfigUtil:
             logger.error(f"[Feeder] YAML 저장 실패: {e}")
             return False
 
+    # 수집기 (CRAWLERS) 관리 메서드
     @classmethod
-    def get_tasks(cls) -> list[dict]:
+    def get_crawlers(cls) -> list[dict]:
         data = cls.load_yaml()
-        return data.get('TASKS', [])
+        return data.get('CRAWLERS', [])
 
     @classmethod
-    def get_task(cls, target_id):
-        tasks = cls.get_tasks()
-        for t in tasks:
-            if str(t.get('id')) == str(target_id):
-                return t
+    def get_crawler(cls, crawler_id):
+        crawlers = cls.get_crawlers()
+        for c in crawlers:
+            if str(c.get('id')) == str(crawler_id):
+                return c
         return None
 
     @classmethod
-    def get_task_by_name(cls, task_name: str):
-        tasks = cls.get_tasks()
-        target_name = str(task_name).strip().lower()
-        for t in tasks:
-            if str(t.get('name', '')).strip().lower() == target_name:
-                return t
-        return None
-
-    @classmethod
-    def get_task_by_board(cls, site_name: str, board_id: str, subcat_id: str = None):
-        """사이트명과 게시판/서브카테고리 정보로 해당 타겟이 포함된 태스크 검색"""
+    def get_crawler_by_board(cls, site_name: str, board_id: str, subcat_id: str = None):
         from .task_feed import Task
         _, _, full_key = Task.parse_board_info(board_id, subcat_id)
-        tasks = cls.get_tasks()
-        for t in tasks:
-            for tgt in t.get('targets', []):
-                if tgt.get('site') == site_name:
-                    t_key = tgt.get('full_board_key') or tgt.get('board')
-                    if t_key == full_key:
-                        return t
+        crawlers = cls.get_crawlers()
+        for c in crawlers:
+            if c.get('site') == site_name and c.get('full_board_key') == full_key:
+                return c
         return None
 
     @classmethod
-    def get_task_by_board_key(cls, site_name: str, full_board_key: str):
-        """사이트명과 full_board_key(예: '166:875' 또는 '2_2')로 해당 타겟이 포함된 태스크 검색"""
-        tasks = cls.get_tasks()
-        for t in tasks:
-            for tgt in t.get('targets', []):
-                if tgt.get('site') == site_name:
-                    t_key = tgt.get('full_board_key') or tgt.get('board')
-                    if t_key == full_board_key:
-                        return t
-        return None
-
-    @classmethod
-    def save_task(cls, item: dict) -> str:
+    def save_crawler(cls, item: dict) -> str:
         data = cls.load_yaml()
-        tasks = data.get('TASKS', [])
+        crawlers = data.get('CRAWLERS', [])
         target_id = item.get('id')
 
-        # 타겟 목록 정규화
         from .task_feed import Task
-        targets = item.get('targets', [])
-        normalized_targets = []
-        for tgt in targets:
-            b_val = tgt.get('board', '')
-            s_val = tgt.get('subcat', '')
+        b_val = item.get('board', '')
+        s_val = item.get('subcat', '')
+        _, _, f_key = Task.parse_board_info(b_val, s_val)
+        item['full_board_key'] = f_key
+
+        if target_id is not None and int(target_id) > 0:
+            for idx, c in enumerate(crawlers):
+                if str(c.get('id')) == str(target_id):
+                    crawlers[idx].update(item)
+                    data['CRAWLERS'] = crawlers
+                    cls.save_yaml(data)
+                    logger.info(f"[Feeder] 수집기 수정 완료: ID={target_id}, Board={f_key}")
+                    return 'success_update'
+            return 'not_found'
+
+        # 동일 사이트/게시판 중복 등록 차단
+        for c in crawlers:
+            if c.get('site') == item.get('site') and c.get('full_board_key') == f_key:
+                logger.warning(f"[Feeder] 동일 게시판 수집기 중복: {item.get('site')} - {f_key}")
+                return 'already_exist'
+
+        max_id = max([int(c.get('id', 0)) for c in crawlers], default=0)
+        item['id'] = max_id + 1
+        crawlers.append(item)
+        data['CRAWLERS'] = crawlers
+        cls.save_yaml(data)
+        logger.info(f"[Feeder] 신규 수집기 추가 완료: ID={item['id']}, Site={item.get('site')}, Board={f_key}")
+        return 'success'
+
+    @classmethod
+    def delete_crawler(cls, target_id) -> bool:
+        data = cls.load_yaml()
+        crawlers = data.get('CRAWLERS', [])
+        new_crawlers = [c for c in crawlers if str(c.get('id')) != str(target_id)]
+        data['CRAWLERS'] = new_crawlers
+        cls.save_yaml(data)
+        logger.info(f"[Feeder] 수집기 삭제 완료: ID={target_id}")
+        return True
+
+    # 피드 발행기 (FEEDS) 관리 메서드
+    @classmethod
+    def get_feeds(cls) -> list[dict]:
+        data = cls.load_yaml()
+        return data.get('FEEDS', [])
+
+    @classmethod
+    def get_feed(cls, feed_id):
+        feeds = cls.get_feeds()
+        for f in feeds:
+            if str(f.get('id')) == str(feed_id):
+                return f
+        return None
+
+    @classmethod
+    def get_feed_by_name(cls, feed_name: str):
+        feeds = cls.get_feeds()
+        target_name = str(feed_name).strip().lower()
+        for f in feeds:
+            if str(f.get('name', '')).strip().lower() == target_name:
+                return f
+        return None
+
+    @classmethod
+    def save_feed(cls, item: dict) -> str:
+        data = cls.load_yaml()
+        feeds = data.get('FEEDS', [])
+        target_id = item.get('id')
+
+        from .task_feed import Task
+        sources = item.get('sources', [])
+        normalized_sources = []
+        for src in sources:
+            b_val = src.get('board', '')
+            s_val = src.get('subcat', '')
             _, _, f_key = Task.parse_board_info(b_val, s_val)
-            normalized_targets.append({
-                'site': tgt.get('site', ''),
+            normalized_sources.append({
+                'site': src.get('site', ''),
                 'board': str(b_val),
                 'subcat': str(s_val) if s_val else '',
                 'full_board_key': f_key
             })
-        item['targets'] = normalized_targets
+        item['sources'] = normalized_sources
 
         if target_id is not None and int(target_id) > 0:
-            for idx, t in enumerate(tasks):
-                if str(t.get('id')) == str(target_id):
-                    tasks[idx].update(item)
-                    data['TASKS'] = tasks
-                    data.pop('SCHEDULE', None)
+            for idx, f in enumerate(feeds):
+                if str(f.get('id')) == str(target_id):
+                    feeds[idx].update(item)
+                    data['FEEDS'] = feeds
                     cls.save_yaml(data)
-                    logger.info(f"[Feeder] YAML 태스크 수정 완료: ID={target_id}, Name={item.get('name')}")
+                    logger.info(f"[Feeder] 피드 수정 완료: ID={target_id}, Name={item.get('name')}")
                     return 'success_update'
             return 'not_found'
 
-        # 신규 태스크 ID 채번 및 추가
-        max_id = max([int(t.get('id', 0)) for t in tasks], default=0)
+        # 동일 피드명 중복 등록 차단
+        target_name = str(item.get('name', '')).strip().lower()
+        for f in feeds:
+            if str(f.get('name', '')).strip().lower() == target_name:
+                logger.warning(f"[Feeder] 동일 이름의 피드 중복: {item.get('name')}")
+                return 'already_exist'
+
+        max_id = max([int(f.get('id', 0)) for f in feeds], default=0)
         item['id'] = max_id + 1
-        tasks.append(item)
-        data['TASKS'] = tasks
-        data.pop('SCHEDULE', None)
+        feeds.append(item)
+        data['FEEDS'] = feeds
         cls.save_yaml(data)
-        logger.info(f"[Feeder] YAML 신규 태스크 추가 완료: ID={item['id']}, Name={item.get('name')}, Targets={len(normalized_targets)}개")
+        logger.info(f"[Feeder] 신규 피드 추가 완료: ID={item['id']}, Name={item.get('name')}, Sources={len(normalized_sources)}개")
         return 'success'
 
     @classmethod
-    def delete_task(cls, target_id) -> bool:
+    def delete_feed(cls, target_id) -> bool:
         data = cls.load_yaml()
-        tasks = data.get('TASKS', [])
-        new_tasks = [t for t in tasks if str(t.get('id')) != str(target_id)]
-        data['TASKS'] = new_tasks
-        data.pop('SCHEDULE', None)
+        feeds = data.get('FEEDS', [])
+        new_feeds = [f for f in feeds if str(f.get('id')) != str(target_id)]
+        data['FEEDS'] = new_feeds
         cls.save_yaml(data)
-        logger.info(f"[Feeder] YAML 태스크 삭제 완료: ID={target_id}")
+        logger.info(f"[Feeder] 피드 삭제 완료: ID={target_id}")
         return True
-
-    # 하위 호환용 별칭
-    get_schedules = get_tasks
-    get_schedule = get_task
-    save_schedule = save_task
-    delete_schedule = delete_task
 
 
 # --- 커스텀 스크립트 훅 관리 클래스 ---
@@ -1278,55 +1308,54 @@ class FeedFilter:
 class FeedRssFileWriter:
 
     @classmethod
-    def save_rss_file(cls, task_item: dict) -> bool:
-        """태스크에 등록된 복수 타겟 게시판의 수집 글을 통합 중복제거/필터링하여 XML 파일 생성"""
+    def save_rss_file(cls, feed_cfg: dict) -> bool:
+        """피드(FEEDS) 설정을 바탕으로 DB에서 소스 게시판들을 조회/필터링하여 공유용 XML 파일 생성"""
         try:
-            task = task_item if isinstance(task_item, dict) else (vars(task_item) if task_item else {})
+            feed = feed_cfg if isinstance(feed_cfg, dict) else (vars(feed_cfg) if feed_cfg else {})
 
             global_make = P.ModelSetting.get_bool('feed_make_rss_file') if P.ModelSetting else False
-            task_use = str(task.get('use_rss_file', False)).lower() in ['true', 'on', '1']
-            if not (global_make and task_use):
+            feed_use = str(feed.get('use_rss_file', False)).lower() in ['true', 'on', '1']
+            if not (global_make and feed_use):
                 return False
 
-            save_dir = task.get('rss_file_path') or (P.ModelSetting.get('feed_rss_file_path') if P.ModelSetting else '')
+            save_dir = feed.get('rss_file_path') or (P.ModelSetting.get('feed_rss_file_path') if P.ModelSetting else '')
             save_dir = save_dir.strip() if save_dir else ''
             if not save_dir:
-                logger.warning(f"[FeedRssFile] [{task.get('name')}] RSS 파일 저장 경로(path)가 설정되지 않아 건너뜁니다.")
+                logger.warning(f"[FeedRssFile] [{feed.get('name')}] RSS 파일 저장 경로가 설정되지 않아 건너뜁니다.")
                 return False
 
-            default_filename = f"{task.get('name', 'feed')}.xml"
-            filename = (task.get('rss_file') or default_filename).strip()
+            default_filename = f"{feed.get('name', 'feed')}.xml"
+            filename = (feed.get('rss_file') or default_filename).strip()
             if not filename.lower().endswith('.xml'):
                 filename += '.xml'
 
             try:
-                days_val = int(task.get('rss_file_days') or P.ModelSetting.get('feed_rss_file_days') or 14)
+                days_val = int(feed.get('rss_file_days') or P.ModelSetting.get('feed_rss_file_days') or 14)
             except Exception:
                 days_val = 14
 
             try:
-                items_val = int(task.get('rss_file_items') or P.ModelSetting.get('feed_rss_file_items') or P.ModelSetting.get('feed_feed_count') or 100)
+                items_val = int(feed.get('rss_file_items') or P.ModelSetting.get('feed_rss_file_items') or P.ModelSetting.get('feed_feed_count') or 100)
             except Exception:
                 items_val = 100
 
-            targets = task.get('targets', [])
-            if not targets:
+            sources = feed.get('sources', [])
+            if not sources:
                 return False
 
-            # 타겟 게시판 조건 생성
             from .model_feed import ModelFeedBbs
             from sqlalchemy import and_, or_
-            target_conditions = []
-            for t in targets:
-                s_name = t.get('site') or t.get('site_name')
-                b_name = t.get('full_board_key') or t.get('board') or t.get('board_id')
+            source_conditions = []
+            for src in sources:
+                s_name = src.get('site')
+                b_name = src.get('full_board_key') or src.get('board')
                 if s_name and b_name:
-                    target_conditions.append(and_(ModelFeedBbs.site == s_name, ModelFeedBbs.board == b_name))
+                    source_conditions.append(and_(ModelFeedBbs.site == s_name, ModelFeedBbs.board == b_name))
 
-            if not target_conditions:
+            if not source_conditions:
                 return False
 
-            query = db.session.query(ModelFeedBbs).filter(or_(*target_conditions))
+            query = db.session.query(ModelFeedBbs).filter(or_(*source_conditions))
             if days_val > 0:
                 limit_date = datetime.now() - timedelta(days=days_val)
                 query = query.filter(ModelFeedBbs.created_time >= limit_date)
@@ -1334,21 +1363,27 @@ class FeedRssFileWriter:
             query_limit = max(items_val * 4, 400)
             candidates = query.order_by(ModelFeedBbs.id.desc()).limit(query_limit).all()
 
-            # 마그넷 중복 제거 및 필터링
+            # 마그넷 중복 제거 및 피드 조건 필터링
             global_cfg = FeedConfigUtil.get_global()
             seen_magnets = set()
             filtered_records = []
             for bbs in candidates:
-                mag = bbs.magnet
-                if mag:
-                    info_hash = extract_info_hash(mag) or mag
-                    if info_hash in seen_magnets:
-                        continue
-                    seen_magnets.add(info_hash)
-
                 bbs_dict = bbs.as_dict()
-                is_pass, _ = FeedFilter.evaluate(bbs_dict, task, global_cfg)
+
+                # 복수 마그넷 해시 중복 검사 (XML 파일 생성 시 완벽 단일화)
+                item_hashes = []
+                for m in bbs_dict.get('magnet', []):
+                    h = extract_info_hash(m) or m
+                    if h:
+                        item_hashes.append(h)
+
+                if item_hashes and any(h in seen_magnets for h in item_hashes):
+                    continue
+
+                is_pass, _ = FeedFilter.evaluate(bbs_dict, feed, global_cfg)
                 if is_pass:
+                    for h in item_hashes:
+                        seen_magnets.add(h)
                     filtered_records.append(bbs)
                     if len(filtered_records) >= items_val:
                         break
@@ -1357,16 +1392,26 @@ class FeedRssFileWriter:
             if not feed_mod:
                 return False
 
-            task_title = f"{task.get('name', 'Feeder')} (Shared Feed)"
-            xml_content = feed_mod.generate_rss_feed(task_title, filtered_records, include_apikey=False)
+            feed_title = f"{feed.get('name', 'Feeder')} (Shared Feed)"
+            xml_content = feed_mod.generate_rss_feed(feed_title, filtered_records, include_apikey=False)
 
             os.makedirs(save_dir, exist_ok=True)
             target_filepath = os.path.join(save_dir, filename)
             with open(target_filepath, 'w', encoding='utf-8') as f:
                 f.write(xml_content)
 
-            logger.info(f"[FeedRssFile] 태스크 통합 RSS 파일 생성 완료: {target_filepath} (유효 항목: {len(filtered_records)}/{items_val}개)")
+            logger.info(f"[FeedRssFile] 피드 공유용 RSS 파일 생성 완료: {target_filepath} (필터 통과: {len(filtered_records)}/{items_val}개)")
             return True
         except Exception as e:
-            logger.error(f"[FeedRssFile] 태스크 RSS 파일 생성 실패 ({task_item.get('name')}): {e}")
+            logger.error(f"[FeedRssFile] 피드 RSS 파일 생성 실패 ({feed_cfg.get('name')}): {e}")
             return False
+
+    @classmethod
+    def save_all_rss_files(cls) -> int:
+        """등록된 모든 FEEDS 중 파일 생성이 활성화된 피드들의 XML 파일을 일괄 갱신"""
+        count = 0
+        for f in FeedConfigUtil.get_feeds():
+            if str(f.get('use_rss_file', False)).lower() in ['true', 'on', '1']:
+                if cls.save_rss_file(f):
+                    count += 1
+        return count

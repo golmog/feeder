@@ -17,7 +17,6 @@ $("body").on('click', '#page', function(e){
 
 $("#reset_btn").click(function(e){
   e.preventDefault();
-  $("#site_radio").prop('checked', true).trigger('change');
   $("#site_select").val('all').trigger('change');
   $("#order").val('desc');
   $("#page_size").val('25');
@@ -37,11 +36,6 @@ $("body").on('change', '#board_select', function(e){
   globalRequestSearch('1');
 });
 
-$("body").on('change', '#task_select', function(e){
-  e.preventDefault();
-  globalRequestSearch('1');
-});
-
 $("body").on('change', '#order', function(e){
   e.preventDefault();
   globalRequestSearch('1');
@@ -50,24 +44,6 @@ $("body").on('change', '#order', function(e){
 $("body").on('change', '#page_size', function(e){
   e.preventDefault();
   globalRequestSearch('1');
-});
-
-$("body").on('change', '#site_radio', function(e){
-  if ($(this).is(':checked')) {
-    $('#task_select').attr('disabled', 'disabled');
-    $('#site_select').removeAttr('disabled');
-    $('#board_select').removeAttr('disabled');
-    globalRequestSearch('1');
-  }
-});
-
-$("body").on('change', '#task_radio', function(e){
-  if ($(this).is(':checked')) {
-    $('#task_select').removeAttr('disabled');
-    $('#site_select').attr('disabled', 'disabled');
-    $('#board_select').attr('disabled', 'disabled');
-    globalRequestSearch('1');
-  }
 });
 
 function build_search_form(data) {
@@ -83,36 +59,28 @@ function build_search_form(data) {
   site_str += '</select>';
   $('#site_select_div').html(site_str);
 
-  var task_str = '<select id="task_select" name="task_select" class="form-control form-control-sm" disabled><option value="all">전체 작업(Task)</option>';
-  if (data.tasks) {
-    for (var j = 0; j < data.tasks.length; j++) {
-      task_str += '<option value="' + data.tasks[j].id + '">' + data.tasks[j].name + '</option>';
-    }
-  }
-  task_str += '</select>';
-  $('#task_select_div').html(task_str);
-
   update_board_select('all');
 }
 
 function update_board_select(selected_site) {
-  var str = '<select id="board_select" name="board_select" class="form-control form-control-sm"><option value="all">전체 게시판</option>';
-  if (site_info && site_info.board) {
-    if (selected_site === 'all') {
-      var all_boards = [];
-      for (var s in site_info.board) {
-        var b_list = site_info.board[s] || [];
-        for (var k = 0; k < b_list.length; k++) {
-          if (all_boards.indexOf(b_list[k]) === -1) {
-            all_boards.push(b_list[k]);
-            str += '<option value="' + b_list[k] + '">' + b_list[k] + '</option>';
-          }
-        }
-      }
-    } else if (site_info.board[selected_site]) {
-      var b_list = site_info.board[selected_site];
-      for (var i = 0; i < b_list.length; i++) {
-        str += '<option value="' + b_list[i] + '">' + b_list[i] + '</option>';
+  var str = '<select id="board_select" name="board_select" class="form-control form-control-sm"';
+  
+  // 전체 사이트일 때는 게시판 선택을 비활성화하여 혼란 방지
+  if (selected_site === 'all') {
+    str += ' disabled><option value="all">전체 게시판</option></select>';
+    $('#board_select_div').html(str);
+    return;
+  }
+
+  str += '><option value="all">전체 게시판</option>';
+  if (site_info && site_info.board && site_info.board[selected_site]) {
+    var b_list = site_info.board[selected_site];
+    for (var i = 0; i < b_list.length; i++) {
+      var item = b_list[i];
+      if (typeof item === 'object' && item !== null) {
+        str += '<option value="' + item.key + '">' + item.name + '</option>';
+      } else {
+        str += '<option value="' + item + '">' + item + '</option>';
       }
     }
   }
@@ -137,9 +105,18 @@ function make_list(data) {
       str += j_row_start();
       str += j_col(1, item.id);
 
+      // 사이트, 게시판, 서브카테고리 뱃지 세분화
       var site_col = '<small class="text-muted">' + (item.created_time || '') + '</small><br>';
       site_col += '<span class="badge badge-info">' + item.site + '</span> ';
-      site_col += '<span class="badge badge-secondary">' + item.board + '</span>';
+
+      var bStr = String(item.board || '');
+      if (bStr.indexOf(':') !== -1) {
+        var parts = bStr.split(':');
+        site_col += '<span class="badge badge-secondary">' + parts[0] + '</span> ';
+        site_col += '<span class="badge badge-light border text-muted" title="서브카테고리">서브: ' + parts[1] + '</span>';
+      } else {
+        site_col += '<span class="badge badge-secondary">' + bStr + '</span>';
+      }
       str += j_col(2, site_col);
 
       var detail_col = '<div class="mb-2"><strong><a href="' + item.url + '" target="_blank">' + item.title + '</a></strong></div>';

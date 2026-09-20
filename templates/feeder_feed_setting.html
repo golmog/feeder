@@ -21,7 +21,8 @@
   {{ macros.m_tab_head_start() }}
     {{ macros.m_tab_head('basic', '기본 설정', true) }}
     {{ macros.m_tab_head('site', '사이트 관리', false) }}
-    {{ macros.m_tab_head('tasks', '작업 관리 (TASKS)', false) }}
+    {{ macros.m_tab_head('crawlers', '수집 관리 (CRAWLERS)', false) }}
+    {{ macros.m_tab_head('feeds', '피드 관리 (FEEDS)', false) }}
     {{ macros.m_tab_head('auto', '자동 & DB정리', false) }}
   {{ macros.m_tab_head_end() }}
 </nav>
@@ -100,24 +101,47 @@
       </div>
     {{ macros.m_tab_content_end() }}
 
-    <!-- 탭: 작업 관리 (TASKS) -->
-    {{ macros.m_tab_content_start('tasks', false) }}
+    <!-- 탭: 수집 관리 (CRAWLERS) -->
+    {{ macros.m_tab_content_start('crawlers', false) }}
       <div class="mb-2 d-flex justify-content-between align-items-center">
-        <button type="button" id="task_add_btn" class="btn btn-sm btn-primary">작업 추가</button>
-        <button type="button" id="scheduler_reload_btn" class="btn btn-sm btn-secondary">작업 새로고침</button>
+        <button type="button" id="crawler_add_btn" class="btn btn-sm btn-primary">수집기 추가</button>
+        <button type="button" id="crawler_reload_btn" class="btn btn-sm btn-secondary">수집기 새로고침</button>
       </div>
       <div class="table-responsive">
         <table class="table table-sm table-striped table-hover text-center align-middle">
           <thead class="thead-dark">
             <tr>
               <th style="width: 6%;">ID</th>
-              <th style="width: 26%;">태스크명 / 포함 게시판 (Targets)</th>
-              <th style="width: 23%;">수집 옵션 / 화질</th>
+              <th style="width: 22%;">사이트 / 대상 게시판</th>
+              <th style="width: 27%;">수집 네트워크 옵션</th>
               <th style="width: 45%;">최근 수집 내역 및 관리</th>
             </tr>
           </thead>
-          <tbody id="task_list_tbody">
-            <tr><td colspan="4" class="py-4 text-muted">등록된 수집 작업을 불러오는 중입니다...</td></tr>
+          <tbody id="crawler_list_tbody">
+            <tr><td colspan="4" class="py-4 text-muted">등록된 수집기가 없습니다.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    {{ macros.m_tab_content_end() }}
+
+    <!-- 탭: 피드 관리 (FEEDS) -->
+    {{ macros.m_tab_content_start('feeds', false) }}
+      <div class="mb-2 d-flex justify-content-between align-items-center">
+        <button type="button" id="feed_add_btn" class="btn btn-sm btn-primary">피드 추가</button>
+        <button type="button" id="feed_reload_btn" class="btn btn-sm btn-secondary">피드 새로고침</button>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm table-striped table-hover text-center align-middle">
+          <thead class="thead-dark">
+            <tr>
+              <th style="width: 6%;">ID</th>
+              <th style="width: 28%;">피드명 / 소스 게시판 (Sources)</th>
+              <th style="width: 26%;">화질 및 필터 조건</th>
+              <th style="width: 40%;">RSS 구독 링크 및 관리</th>
+            </tr>
+          </thead>
+          <tbody id="feed_list_tbody">
+            <tr><td colspan="4" class="py-4 text-muted">등록된 피드가 없습니다.</td></tr>
           </tbody>
         </table>
       </div>
@@ -136,93 +160,117 @@
   </div>
 </form>
 
-<!-- 모달: 수집 작업(Task) 추가/수정 -->
-<div class="modal fade" id="add_job_modal" tabindex="-1" role="dialog" aria-hidden="true">
+<!-- 모달: 수집기(Crawler) 추가/수정 -->
+<div class="modal fade" id="crawler_modal" tabindex="-1" role="dialog" aria-hidden="true">
   <div class="modal-dialog modal-lg">
     <div class="modal-content">
       <div class="modal-header d-flex align-items-center justify-content-between">
-        <h4 class="modal-title" id="modal_title">수집 작업(Task) 설정</h4>
+        <h4 class="modal-title" id="crawler_modal_title">수집기(Crawler) 설정</h4>
         <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
       </div>
       <div class="modal-body">
-        <form id="job_form" name="job_form">
-          <input type="hidden" name="modal_scheduler_id" id="modal_scheduler_id" value="-1">
-          <input type="hidden" name="targets_json" id="targets_json" value="[]">
+        <form id="crawler_form" name="crawler_form">
+          <input type="hidden" name="modal_crawler_id" id="modal_crawler_id" value="-1">
 
-          {{ macros.setting_input_text('task_name', '작업(피드) 이름', col='8', placeholder='예: asian_movies, sukebei_all') }}
+          {{ macros.setting_top('수집 사이트') }}
+          <div id="crawler_site_select_div" class="input-group col-sm-8"></div>
+          {{ macros.setting_bottom() }}
 
-          <!-- 다중 타겟 게시판 빌더 영역 -->
+          {{ macros.setting_input_text('crawler_board', '게시판 ID', col='8', placeholder='예: 2_2, offkab, 166', desc=['수집 대상 게시판의 식별자를 입력하세요.']) }}
+          {{ macros.setting_input_text('crawler_subcat', '서브 카테고리 ID', col='8', placeholder='선택 사항 (예: 875)', desc=['게시판 내 서브 카테고리(분류 필터)가 있는 경우 입력']) }}
+          {{ macros.setting_input_int('crawler_interval', '스케쥴 빈도', value='1', min='1', desc=['스케쥴러 몇 회 주기마다 1회 실행할지 설정 (기본: 1)']) }}
+          {{ macros.setting_checkbox('crawler_enabled', '수집 활성화', value='On') }}
+          {{ macros.setting_checkbox('crawler_use_torrent_info', 'Torrent Info 사용', value='', desc=['On: 마그넷 메타데이터를 사전 분석하여 원본 파일명을 취득합니다.']) }}
+          {{ macros.setting_checkbox('crawler_use_proxy', 'Proxy 사용', value='') }}
+          <div id="modal_crawler_proxy_div" class="collapse">
+            {{ macros.setting_input_text('crawler_proxy_url', '개별 Proxy URL', value='', placeholder='미입력 시 기본 설정의 Proxy 사용') }}
+          </div>
+          {{ macros.setting_checkbox('crawler_use_flaresolverr', 'FlareSolverr 사용', value='') }}
+          {{ macros.setting_checkbox('crawler_use_selenium', 'Selenium 사용', value='') }}
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button id="crawler_save_btn" type="button" class="btn btn-primary">저장</button>
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 모달: 피드(Feed) 추가/수정 -->
+<div class="modal fade" id="feed_modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header d-flex align-items-center justify-content-between">
+        <h4 class="modal-title" id="feed_modal_title">피드(Feed) 설정</h4>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+      </div>
+      <div class="modal-body">
+        <form id="feed_form" name="feed_form">
+          <input type="hidden" name="modal_feed_id" id="modal_feed_id" value="-1">
+          <input type="hidden" name="sources_json" id="sources_json" value="[]">
+
+          {{ macros.setting_input_text('feed_name', '피드 이름', col='8', placeholder='예: offkab_cen, asian_movies', desc=['발행할 RSS 피드의 고유 이름 (URL 및 XML 파일명에 사용)']) }}
+
+          <!-- 소스 게시판 선택 및 빌더 영역 -->
           <div class="form-group row mb-2">
-            <label class="col-sm-2 col-form-label text-right font-weight-bold">타겟 게시판 추가</label>
+            <label class="col-sm-2 col-form-label text-right font-weight-bold">소스 게시판 지정</label>
             <div class="col-sm-10">
               <div class="input-group input-group-sm mb-2">
-                <div id="target_site_select_div" style="min-width: 140px;" class="mr-1"></div>
-                <input type="text" id="target_board_input" class="form-control mr-1" placeholder="게시판 ID (예: 2_2, 166)">
-                <input type="text" id="target_subcat_input" class="form-control mr-1" placeholder="서브카테고리 (선택, 예: 875)">
+                <select id="feed_source_crawler_select" class="form-control mr-1"></select>
                 <div class="input-group-append">
-                  <button type="button" id="add_target_item_btn" class="btn btn-outline-primary">타겟 목록에 추가</button>
+                  <button type="button" id="add_feed_source_btn" class="btn btn-outline-primary">소스 추가</button>
                 </div>
               </div>
-              <div class="table-responsive rounded border" style="max-height: 180px; overflow-y: auto;">
+              <div class="table-responsive rounded border" style="max-height: 160px; overflow-y: auto;">
                 <table class="table table-sm table-hover mb-0 text-center">
                   <thead class="thead-light">
                     <tr>
-                      <th style="width: 30%;">사이트</th>
-                      <th style="width: 30%;">게시판 ID</th>
-                      <th style="width: 25%;">서브 카테고리</th>
-                      <th style="width: 15%;">제외</th>
+                      <th style="width: 35%;">사이트</th>
+                      <th style="width: 35%;">게시판 ID</th>
+                      <th style="width: 20%;">서브 카테고리</th>
+                      <th style="width: 10%;">제외</th>
                     </tr>
                   </thead>
-                  <tbody id="modal_targets_tbody">
-                    <tr><td colspan="4" class="text-muted py-2">등록된 타겟 게시판이 없습니다.</td></tr>
+                  <tbody id="modal_feed_sources_tbody">
+                    <tr><td colspan="4" class="text-muted py-2">지정된 소스 게시판이 없습니다.</td></tr>
                   </tbody>
                 </table>
               </div>
+              <small class="form-text text-muted">등록된 수집기 중 이 피드에 포함할 게시판들을 선택하여 추가하세요 (복수 지정 시 통합 피드로 발행).</small>
             </div>
           </div>
 
-          {{ macros.setting_input_int('interval', '스케쥴 빈도', value='1', min='1', desc=['스케쥴러 몇 회 주기마다 1회 실행할지 설정']) }}
-          {{ macros.setting_input_text('quality', '최소 화질 (Flexget 규격)', col='8', placeholder='예: 1080p+, 2160p+, 720p-1080p', desc=['비워두면 전역(GLOBAL) 화질 설정이 적용됩니다.']) }}
+          {{ macros.setting_input_text('quality', '화질 필터 (Flexget 규격)', col='8', placeholder='예: 1080p+, 2160p+, 720p-1080p', desc=['비워두면 전역(GLOBAL) 화질 설정이 적용됩니다.']) }}
 
           {{ macros.m_hr() }}
-          {{ macros.setting_checkbox('use_task_filter', '정규식 필터 설정 (Flexget regexp)', value='', desc=['On: 해당 작업에만 개별 적용할 Flexget 규격 정규식 필터를 설정합니다.']) }}
-          <div id="modal_use_task_filter_div" class="collapse">
-            {{ macros.setting_checkbox('accept_all', '미거부 항목 일괄 허용 (accept_all)', value='', desc=['On: reject 되지 않은 나머지 모든 게시글을 수집 허용합니다.']) }}
+          {{ macros.setting_checkbox('use_feed_filter', '정규식 필터 설정 (Flexget regexp)', value='', desc=['On: 해당 피드에만 개별 적용할 정규식 필터를 설정합니다.']) }}
+          <div id="modal_use_feed_filter_div" class="collapse">
+            {{ macros.setting_checkbox('accept_all', '미거부 항목 일괄 허용 (accept_all)', value='', desc=['On: reject 되지 않은 모든 게시글을 수집 허용합니다.']) }}
             <div class="form-group row mb-2">
               <label class="col-sm-2 col-form-label text-right small font-weight-bold">거부 패턴<br>(reject)</label>
               <div class="col-sm-10">
-                <textarea id="filter_reject" name="filter_reject" class="form-control form-control-sm" rows="3" placeholder="매칭 시 제외할 정규식 (줄바꿈 구분)&#10;예시:&#10;\bCam\b&#10;\btrailer\b: {from: title}&#10;spam_domain\.com: {from: link}"></textarea>
-                <small class="form-text text-muted">매칭 시 제외됩니다. 기본 대상은 title이며, {from: link} 또는 {from: [title, link]} 지원</small>
+                <textarea id="filter_reject" name="filter_reject" class="form-control form-control-sm" rows="3" placeholder="매칭 시 제외할 정규식 (줄바꿈 구분)&#10;예시:&#10;FC2-PPV&#10;\btrailer\b: {from: title}"></textarea>
               </div>
             </div>
             <div class="form-group row mb-2">
               <label class="col-sm-2 col-form-label text-right small font-weight-bold">허용 패턴<br>(accept)</label>
               <div class="col-sm-10">
                 <textarea id="filter_accept" name="filter_accept" class="form-control form-control-sm" rows="3" placeholder="매칭 시 수집 허용할 정규식 (줄바꿈 구분)&#10;예시:&#10;1080p&#10;\bKOR\b: {from: [title, link]}"></textarea>
-                <small class="form-text text-muted">선언 시 여기에 매칭되는 항목만 수집됩니다 (화이트리스트).</small>
               </div>
             </div>
             <div class="form-group row mb-2">
               <label class="col-sm-2 col-form-label text-right small font-weight-bold">필수 포함<br>(reject_excluding)</label>
               <div class="col-sm-10">
-                <textarea id="filter_reject_excluding" name="filter_reject_excluding" class="form-control form-control-sm" rows="2" placeholder="반드시 포함되어야 할 필수 정규식 (줄바꿈 구분)&#10;예시:&#10;\b(KOR|한국어)\b"></textarea>
-                <small class="form-text text-muted">선언된 패턴이 하나도 매칭되지 않으면 수집에서 제외됩니다.</small>
+                <textarea id="filter_reject_excluding" name="filter_reject_excluding" class="form-control form-control-sm" rows="2" placeholder="반드시 포함되어야 할 필수 정규식 (줄바꿈 구분)&#10;예시:&#10;\[FHD\]"></textarea>
               </div>
             </div>
           </div>
           {{ macros.m_hr() }}
 
-          {{ macros.setting_checkbox('enabled', '작업 활성화', value='On') }}
-          {{ macros.setting_checkbox('use_torrent_info', 'Torrent Info 사용', value='') }}
-          {{ macros.setting_checkbox('use_proxy', 'Proxy 사용', value='') }}
-          <div id="modal_use_proxy_div" class="collapse">
-            {{ macros.setting_input_text('proxy_url', '개별 Proxy URL', value='', placeholder='미입력 시 기본 설정의 Proxy 사용') }}
-          </div>
-          {{ macros.setting_checkbox('use_flaresolverr', 'FlareSolverr 사용', value='') }}
-          {{ macros.setting_checkbox('use_selenium', 'Selenium 사용', value='') }}
           {{ macros.setting_checkbox('use_rss_file', '공유용 RSS 파일 생성', value='') }}
-          <div id="modal_use_rss_file_div" class="collapse">
-            {{ macros.setting_input_text('rss_file', 'RSS 파일명', col='8', placeholder='예: asian_movies.xml', desc=['외부 배포용 XML 파일명. 비워두면 [태스크명.xml]로 자동 지정됩니다.']) }}
+          <div id="modal_use_feed_rss_file_div" class="collapse">
+            {{ macros.setting_input_text('rss_file', 'RSS 파일명', col='8', placeholder='예: offkab_cen.xml', desc=['외부 배포용 XML 파일명. 비워두면 [피드명.xml]로 자동 지정됩니다.']) }}
             {{ macros.setting_input_text('rss_file_path', '개별 저장 경로', col='8', value='', placeholder='미입력 시 기본 설정 경로 사용') }}
             {{ macros.setting_input_text('rss_file_days', '개별 유지 기간 (일)', col='8', value='', placeholder='미입력 시 기본 설정 (14일) 사용') }}
             {{ macros.setting_input_text('rss_file_items', '개별 최대 피드 수', col='8', value='', placeholder='미입력 시 기본 설정값 사용') }}
@@ -230,7 +278,7 @@
         </form>
       </div>
       <div class="modal-footer">
-        <button id="add_job_save_btn" type="button" class="btn btn-primary">저장</button>
+        <button id="feed_save_btn" type="button" class="btn btn-primary">저장</button>
         <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
       </div>
     </div>
