@@ -50,6 +50,11 @@ class ModuleFeed(PluginModuleBase):
             f"{self.name}_qb_username": "",
             f"{self.name}_qb_password": "",
             f"{self.name}_qb_temp_category": "feeder_temp",
+            # 공유용 RSS 파일 별도 생성 설정
+            f"{self.name}_make_rss_file": "False",
+            f"{self.name}_rss_file_path": "",
+            f"{self.name}_rss_file_days": "14",
+            f"{self.name}_rss_file_items": "100",
         }
 
     def process_menu(self, page_name, req):
@@ -334,6 +339,12 @@ class ModuleFeed(PluginModuleBase):
             use_flaresolverr = req.form.get('use_flaresolverr') in ['True', 'on', 'true', True]
             use_selenium = req.form.get('use_selenium') in ['True', 'on', 'true', True]
             use_torrent_info = req.form.get('use_torrent_info') in ['True', 'on', 'true', True]
+            use_rss_file = req.form.get('use_rss_file') in ['True', 'on', 'true', True]
+
+            rss_file = req.form.get('rss_file', '').strip()
+            rss_file_path = req.form.get('rss_file_path', '').strip()
+            rss_file_days = req.form.get('rss_file_days', '').strip()
+            rss_file_items = req.form.get('rss_file_items', '').strip()
 
             try:
                 interval_val = int(req.form.get('interval', 1))
@@ -369,6 +380,11 @@ class ModuleFeed(PluginModuleBase):
                 'use_flaresolverr': use_flaresolverr,
                 'use_selenium': use_selenium,
                 'use_torrent_info': use_torrent_info,
+                'use_rss_file': use_rss_file,
+                'rss_file': rss_file,
+                'rss_file_path': rss_file_path,
+                'rss_file_days': rss_file_days,
+                'rss_file_items': rss_file_items,
             }
 
             ret = FeedConfigUtil.save_schedule(item_data)
@@ -652,9 +668,9 @@ class ModuleFeed(PluginModuleBase):
             logger.error(f"[Feeder] _handle_site_update 에러: {e}")
             return jsonify({'ret': 'error', 'log': str(e)}), 500
 
-    def generate_rss_feed(self, title: str, items: list) -> str:
-        ddns = get_ddns()
-        apikey = get_system_apikey()
+    def generate_rss_feed(self, title: str, items: list, include_apikey: bool = True) -> str:
+        ddns = get_ddns().rstrip('/')
+        apikey = get_system_apikey() if include_apikey else ''
 
         xml = '<?xml version="1.0" encoding="utf-8"?>\n'
         xml += '<rss version="2.0" xmlns:showrss="http://showrss.info/">\n'
@@ -695,7 +711,8 @@ class ModuleFeed(PluginModuleBase):
                     if has_magnet and filename.lower().endswith('.torrent'):
                         continue
 
-                    download_proxy_url = f"{ddns}/{P.package_name}/api/download?id={bbs.id}_{f_idx}&apikey={apikey}"
+                    apikey_param = f"&apikey={apikey}" if include_apikey and apikey else ""
+                    download_proxy_url = f"{ddns}/{P.package_name}/api/download?id={bbs.id}_{f_idx}{apikey_param}"
 
                     xml += '    <item>\n'
                     xml += f'      <title>{clean_xml_string(filename)}</title>\n'
@@ -783,6 +800,11 @@ class ModuleFeed(PluginModuleBase):
             info['use_flaresolverr'] = str(item.get('use_flaresolverr', False)).lower() in ['true', 'on', '1']
             info['use_selenium'] = str(item.get('use_selenium', False)).lower() in ['true', 'on', '1']
             info['use_torrent_info'] = str(item.get('use_torrent_info', False)).lower() in ['true', 'on', '1']
+            info['use_rss_file'] = str(item.get('use_rss_file', False)).lower() in ['true', 'on', '1']
+            info['rss_file'] = item.get('rss_file', '')
+            info['rss_file_path'] = item.get('rss_file_path', '')
+            info['rss_file_days'] = item.get('rss_file_days', '')
+            info['rss_file_items'] = item.get('rss_file_items', '')
 
             info['api'] = f"{ddns}/{P.package_name}/api/board?site={site_name}&board={full_board_key}&apikey={apikey}"
 

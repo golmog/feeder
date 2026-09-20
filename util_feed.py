@@ -153,7 +153,19 @@ class FeedConfigUtil:
     @classmethod
     def load_yaml(cls) -> dict:
         if not os.path.exists(CONFIG_FILEPATH):
-            default_data = {'SCHEDULE': []}
+            default_data = {
+                'GLOBAL': {
+                    'regexp': {
+                        'reject': [
+                            {'\\btrailer\\b': {'from': 'title'}},
+                            {'\\bWEBSCR\\b': {'from': 'title'}},
+                            {'\\bTS\\b': {'from': 'title'}},
+                            {'\\bCam\\b': {'from': 'title'}}
+                        ]
+                    }
+                },
+                'SCHEDULE': []
+            }
             cls.save_yaml(default_data)
             return default_data
         try:
@@ -161,10 +173,17 @@ class FeedConfigUtil:
                 data = yaml.safe_load(f) or {}
             if 'SCHEDULE' not in data or not isinstance(data['SCHEDULE'], list):
                 data['SCHEDULE'] = []
+            if 'GLOBAL' not in data or not isinstance(data['GLOBAL'], dict):
+                data['GLOBAL'] = {}
             return data
         except Exception as e:
             logger.error(f"[Feeder] YAML 로드 실패: {e}")
-            return {'SCHEDULE': []}
+            return {'GLOBAL': {}, 'SCHEDULE': []}
+
+    @classmethod
+    def get_global(cls) -> dict:
+        data = cls.load_yaml()
+        return data.get('GLOBAL', {})
 
     @classmethod
     def save_yaml(cls, data: dict) -> bool:
@@ -187,6 +206,19 @@ class FeedConfigUtil:
         schedules = cls.get_schedules()
         for s in schedules:
             if str(s.get('id')) == str(target_id):
+                return s
+        return None
+
+    @classmethod
+    def get_schedule_by_board(cls, site_name: str, board_id: str, subcat_id: str = None):
+        schedules = cls.get_schedules()
+        target_board = str(board_id).strip()
+        target_subcat = str(subcat_id).strip() if subcat_id else ''
+        for s in schedules:
+            s_site = s.get('site_name', '')
+            s_board = str(s.get('board_id', '')).strip()
+            s_subcat = str(s.get('subcat_id', '')).strip()
+            if s_site == site_name and s_board == target_board and s_subcat == target_subcat:
                 return s
         return None
 
@@ -934,3 +966,208 @@ class FeedTorrentInfo:
             except Exception:
                 pass
             return None
+
+
+# --- Flexget 스타일 정규식 필터링 엔진 ---
+
+class FeedFilter:
+
+    @classmethod
+    def parse_rule(cls, rule_item) -> tuple[re.Pattern | None, list[str]]:
+        """단순 문자열, 단일 키 딕셔너리, {from: [title, link]} 형태 파싱"""
+        pattern = None
+        raw_from = 'title'
+
+        if isinstance(rule_item, str):
+            pattern = rule_item.strip()
+        elif isinstance(rule_item, dict):
+            if 'pattern' in rule_item or 'regexp' in rule_item:
+                pattern = rule_item.get('pattern') or rule_item.get('regexp')
+                raw_from = rule_item.get('from', 'title')
+            else:
+                pattern = list(rule_item.keys())[0]
+                val = rule_item[pattern]
+                raw_from = val.get('from', 'title') if isinstance(val, dict) else 'title'
+        else:
+            return None, []
+
+        if not pattern:
+            return None, []
+
+        fields = [str(f).strip().lower() for f in raw_from] if isinstance(raw_from, list) else [str(raw_from).strip().lower()]
+
+        try:
+            compiled = re.compile(str(pattern), re.IGNORECASE)
+            return compiled, fields
+        except re.error as e:
+            logger.warning(f"[FeedFilter] 올바르지 않은 정규식 패턴 '{pattern}': {e}")
+            return None, []
+
+    @classmethod
+    def get_field_values(cls, item: dict, field_name: str) -> list[str]:
+        values = []
+        target = field_name.lower()
+
+        if target == 'title':
+            if item.get('title'):
+                values.append(str(item['title']))
+        elif target in ['link', 'url']:
+            if item.get('url'):
+                values.append(str(item['url']))
+            if item.get('magnet'):
+                mags = item['magnet'] if isinstance(item['magnet'], list) else [item['magnet']]
+                values.extend([str(m) for m in mags if m])
+            if item.get('download'):
+                downs = item['download'] if isinstance(item['download'], list) else [item['download']]
+                for d in downs:
+                    if isinstance(d, dict) and d.get('link'):
+                        values.append(str(d['link']))
+                    elif isinstance(d, (list, tuple)) and len(d) > 0:
+                        values.append(str(d[0]))
+        return values
+
+    @classmethod
+    def check_match(cls, item: dict, regex: re.Pattern, fields: list[str]) -> bool:
+        for f in fields:
+            vals = cls.get_field_values(item, f)
+            for v in vals:
+                if regex.search(v):
+                    return True
+        return False
+
+    @classmethod
+    def evaluate(cls, item: dict, scheduler_cfg: dict = None, global_cfg: dict = None) -> tuple[bool, str]:
+        """
+        Flexget 필터 체인 평가
+        반환: (is_accepted: bool, reason: str)
+        """
+        sched_dict = scheduler_cfg if isinstance(scheduler_cfg, dict) else (vars(scheduler_cfg) if scheduler_cfg else {})
+        glob_dict = global_cfg if global_cfg is not None else FeedConfigUtil.get_global()
+
+        # GLOBAL reject
+        glob_regexp = glob_dict.get('regexp', {}) if isinstance(glob_dict, dict) else {}
+        for r in (glob_regexp.get('reject') or []):
+            comp, fields = cls.parse_rule(r)
+            if comp and cls.check_match(item, comp, fields):
+                return False, f"GLOBAL reject: '{comp.pattern}'"
+
+        # GLOBAL reject_excluding
+        glob_re_ex = glob_regexp.get('reject_excluding') or []
+        if glob_re_ex:
+            matched_any = False
+            for r in glob_re_ex:
+                comp, fields = cls.parse_rule(r)
+                if comp and cls.check_match(item, comp, fields):
+                    matched_any = True
+                    break
+            if not matched_any:
+                return False, "GLOBAL reject_excluding 조건 불일치"
+
+        # GLOBAL accept
+        for r in (glob_regexp.get('accept') or []):
+            comp, fields = cls.parse_rule(r)
+            if comp and cls.check_match(item, comp, fields):
+                return True, f"GLOBAL accept: '{comp.pattern}'"
+
+        # SCHEDULE reject
+        sched_regexp = sched_dict.get('regexp', {}) if isinstance(sched_dict.get('regexp'), dict) else {}
+        for r in (sched_regexp.get('reject') or []):
+            comp, fields = cls.parse_rule(r)
+            if comp and cls.check_match(item, comp, fields):
+                return False, f"SCHEDULE reject: '{comp.pattern}'"
+
+        # SCHEDULE reject_excluding
+        sched_re_ex = sched_regexp.get('reject_excluding') or []
+        if sched_re_ex:
+            matched_any = False
+            for r in sched_re_ex:
+                comp, fields = cls.parse_rule(r)
+                if comp and cls.check_match(item, comp, fields):
+                    matched_any = True
+                    break
+            if not matched_any:
+                return False, "SCHEDULE reject_excluding 조건 불일치"
+
+        # SCHEDULE accept
+        for r in (sched_regexp.get('accept') or []):
+            comp, fields = cls.parse_rule(r)
+            if comp and cls.check_match(item, comp, fields):
+                return True, f"SCHEDULE accept: '{comp.pattern}'"
+
+        # accept_all 검사
+        accept_all_flag = sched_dict.get('accept_all')
+        if accept_all_flag is None and isinstance(glob_dict, dict):
+            accept_all_flag = glob_dict.get('accept_all')
+        if str(accept_all_flag).lower() in ['true', 'yes', '1', 'on']:
+            return True, "accept_all 허용"
+
+        # 화이트리스트(accept/reject_excluding) 미충족 시 탈락
+        has_whitelist = bool(glob_regexp.get('accept') or sched_regexp.get('accept') or glob_re_ex or sched_re_ex)
+        if has_whitelist:
+            return False, "accept 또는 reject_excluding 조건 미충족"
+
+        return True, "기본 허용 (미거부 항목)"
+
+
+# --- 외부 공유용 RSS XML 파일 관리 클래스 ---
+
+class FeedRssFileWriter:
+
+    @classmethod
+    def save_rss_file(cls, site_name: str, full_board_key: str, scheduler_cfg: dict = None) -> bool:
+        """API Key를 포함하지 않는 순수 RSS XML 파일을 지정된 경로에 생성 및 보관기간 정리"""
+        try:
+            sched = scheduler_cfg if isinstance(scheduler_cfg, dict) else (vars(scheduler_cfg) if scheduler_cfg else {})
+
+            global_make = P.ModelSetting.get_bool('feed_make_rss_file') if P.ModelSetting else False
+            sched_use = str(sched.get('use_rss_file', False)).lower() in ['true', 'on', '1']
+            if not (global_make and sched_use):
+                return False
+
+            save_dir = sched.get('rss_file_path') or (P.ModelSetting.get('feed_rss_file_path') if P.ModelSetting else '')
+            save_dir = save_dir.strip() if save_dir else ''
+            if not save_dir:
+                logger.warning(f"[FeedRssFile] [{site_name} - {full_board_key}] RSS 파일 저장 경로(path)가 설정되지 않아 생성을 건너뜁니다.")
+                return False
+
+            board_clean = full_board_key.replace(':', '_')
+            default_filename = f"{site_name}_{board_clean}.xml"
+            filename = (sched.get('rss_file') or default_filename).strip()
+            if not filename.lower().endswith('.xml'):
+                filename += '.xml'
+
+            try:
+                days_val = int(sched.get('rss_file_days') or P.ModelSetting.get('feed_rss_file_days', '14'))
+            except Exception:
+                days_val = 14
+
+            try:
+                items_val = int(sched.get('rss_file_items') or P.ModelSetting.get('feed_rss_file_items', '100'))
+            except Exception:
+                items_val = 100
+
+            from .model_feed import ModelFeedBbs
+            query = db.session.query(ModelFeedBbs).filter_by(site=site_name, board=full_board_key)
+            if days_val > 0:
+                limit_date = datetime.now() - timedelta(days=days_val)
+                query = query.filter(ModelFeedBbs.created_time >= limit_date)
+
+            records = query.order_by(ModelFeedBbs.id.desc()).limit(items_val).all()
+
+            feed_mod = P.get_module('feed')
+            if not feed_mod:
+                return False
+
+            title = f"{site_name} - {full_board_key} (Shared Feed)"
+            xml_content = feed_mod.generate_rss_feed(title, records, include_apikey=False)
+
+            os.makedirs(save_dir, exist_ok=True)
+            target_filepath = os.path.join(save_dir, filename)
+            with open(target_filepath, 'w', encoding='utf-8') as f:
+                f.write(xml_content)
+
+            logger.info(f"[FeedRssFile] 공유용 RSS 파일 생성 완료: {target_filepath} (보존: {days_val}일, 수록: {len(records)}/{items_val}개)")
+            return True
+        except Exception as e:
+            logger.error(f"[FeedRssFile] RSS 파일 생성 실패 ({site_name} - {full_board_key}): {e}")
+            return False

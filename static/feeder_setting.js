@@ -123,6 +123,7 @@ $(document).ready(function(){
   use_collapse("feed_use_flaresolverr");
   use_collapse("feed_use_selenium");
   use_collapse("feed_use_torrent_info");
+  use_collapse("feed_make_rss_file");
   toggle_qb_setting();
   load_all_data();
   init_ace_editors();
@@ -139,6 +140,34 @@ $('#feed_use_proxy').change(function() { use_collapse('feed_use_proxy'); });
 $('#feed_use_flaresolverr').change(function() { use_collapse('feed_use_flaresolverr'); });
 $('#feed_use_selenium').change(function() { use_collapse('feed_use_selenium'); });
 $('#feed_use_torrent_info').change(function() { use_collapse('feed_use_torrent_info'); });
+$('#feed_make_rss_file').change(function() { use_collapse('feed_make_rss_file'); });
+
+$('#use_rss_file').change(function(){
+  if ($(this).is(':checked')) {
+    $('#modal_use_rss_file_div').collapse('show');
+    update_default_rss_filename();
+  } else {
+    $('#modal_use_rss_file_div').collapse('hide');
+  }
+});
+
+function update_default_rss_filename() {
+  var site = $('#site_name').val() || '';
+  var board = $('#board_id').val() || '';
+  var subcat = $('#subcat_id').val() || '';
+  if (site && board) {
+    var clean_board = board.split(':')[0];
+    var clean_subcat = subcat || (board.indexOf(':') !== -1 ? board.split(':')[1] : '');
+    var name = site + '_' + clean_board + (clean_subcat ? '_' + clean_subcat : '') + '.xml';
+    if ($('#modal_scheduler_id').val() === '-1' || !$('#rss_file').val()) {
+      $('#rss_file').val(name);
+    }
+  }
+}
+
+$(document).on('change', '#site_name', update_default_rss_filename);
+$(document).on('input change', '#board_id', update_default_rss_filename);
+$(document).on('input change', '#subcat_id', update_default_rss_filename);
 
 function load_all_data() {
   $.ajax({
@@ -188,6 +217,7 @@ function render_schedulers(data) {
     var isProxy = (item.use_proxy === true || item.use_proxy === 'True' || item.use_proxy === 'true' || item.use_proxy === 'on');
     var isFlare = (item.use_flaresolverr === true || item.use_flaresolverr === 'True' || item.use_flaresolverr === 'true' || item.use_flaresolverr === 'on');
     var isSelenium = (item.use_selenium === true || item.use_selenium === 'True' || item.use_selenium === 'true' || item.use_selenium === 'on');
+    var isRssFile = (item.use_rss_file === true || item.use_rss_file === 'True' || item.use_rss_file === 'true' || item.use_rss_file === 'on');
 
     var proxyDisplay = '<span class="text-muted">미사용</span>';
     if (isProxy) {
@@ -209,7 +239,8 @@ function render_schedulers(data) {
     str += '    토렌트정보: ' + (isTorrentInfo ? '<span class="text-primary font-weight-bold">사용</span>' : '<span class="text-muted">미사용</span>') + '<br>';
     str += '    Proxy: ' + proxyDisplay + '<br>';
     str += '    FlareSolverr: ' + (isFlare ? '<span class="text-danger font-weight-bold">사용</span>' : '<span class="text-muted">미사용</span>') + '<br>';
-    str += '    Selenium: ' + (isSelenium ? '<span class="text-info font-weight-bold">사용</span>' : '<span class="text-muted">미사용</span>');
+    str += '    Selenium: ' + (isSelenium ? '<span class="text-info font-weight-bold">사용</span>' : '<span class="text-muted">미사용</span>') + '<br>';
+    str += '    공유 RSS 파일: ' + (isRssFile ? '<span class="text-success font-weight-bold" title="' + (item.rss_file || '') + '">사용 (' + (item.rss_file || '자동') + ')</span>' : '<span class="text-muted">미사용</span>');
     str += '  </td>';
     str += '  <td class="text-left">';
     if (item.last) {
@@ -347,9 +378,16 @@ $(document).on('click', '#scheduler_add_btn', function(e){
   $('#interval').val('1');
   $('#proxy_url').val('');
   $('#modal_use_proxy_div').collapse('hide');
+  $('#modal_use_rss_file_div').collapse('hide');
+  $('#rss_file').val('');
+  $('#rss_file_path').val('');
+  $('#rss_file_days').val('');
+  $('#rss_file_items').val('');
   set_modal_checkbox('enabled', true);
+  set_modal_checkbox('use_rss_file', false);
 
   apply_site_defaults_to_modal(current_sites[0].name);
+  update_default_rss_filename();
 
   $('#add_job_modal').modal('show');
 });
@@ -443,6 +481,19 @@ $(document).on('click', '.scheduler_edit_btn', function(e){
   } else {
     $('#modal_use_proxy_div').collapse('hide');
   }
+
+  var isRssFile = (item.use_rss_file === true || item.use_rss_file === 'True' || item.use_rss_file === 'true' || item.use_rss_file === 'on');
+  set_modal_checkbox('use_rss_file', isRssFile);
+  if (isRssFile) {
+    $('#modal_use_rss_file_div').collapse('show');
+  } else {
+    $('#modal_use_rss_file_div').collapse('hide');
+  }
+
+  $('#rss_file').val(item.rss_file || '');
+  $('#rss_file_path').val(item.rss_file_path || '');
+  $('#rss_file_days').val(item.rss_file_days || '');
+  $('#rss_file_items').val(item.rss_file_items || '');
 
   set_modal_checkbox('enabled', item.enabled);
   set_modal_checkbox('use_torrent_info', item.use_torrent_info);

@@ -68,6 +68,13 @@
           {{ macros.setting_input_text('feed_qb_temp_category', '임시 카테고리', value=arg['feed_qb_temp_category']) }}
         </div>
       </div>
+      {{ macros.m_hr() }}
+      {{ macros.setting_checkbox('feed_make_rss_file', 'RSS 파일 별도 생성', value=arg['feed_make_rss_file'], desc=['On: API Key 노출 없이 외부 배포가 가능한 RSS 피드 XML 파일을 로컬 디스크에 자동 생성합니다.']) }}
+      <div id="feed_make_rss_file_div" class="collapse">
+        {{ macros.setting_input_text('feed_rss_file_path', '저장 경로 (절대 경로)', value=arg['feed_rss_file_path'], placeholder='예: /data/rss 또는 /var/www/html/rss', desc=['XML 파일이 저장될 절대 경로 (폴더가 없으면 자동 생성됩니다)']) }}
+        {{ macros.setting_input_int('feed_rss_file_days', '피드 유지 기간 (일)', value=arg['feed_rss_file_days'], min='1', placeholder='14', desc=['생성된 RSS 파일 내 게시글 유지 기간(일 단위). 기간이 지난 항목은 XML에서 자동 제외됩니다. 기본값: 14일']) }}
+        {{ macros.setting_input_int('feed_rss_file_items', '피드 항목 수', value=arg['feed_rss_file_items'], min='1', placeholder='100', desc=['XML 파일에 포함될 최대 피드 항목 수. 오래된 항목부터 자동 제외됩니다. 기본값: 100개']) }}
+      </div>
     {{ macros.m_tab_content_end() }}
 
     <!-- 탭: 사이트 관리 -->
@@ -180,8 +187,16 @@
           </div>
           {{ macros.setting_checkbox('use_flaresolverr', 'FlareSolverr 사용', value='') }}
           {{ macros.setting_checkbox('use_selenium', 'Selenium 사용', value='') }}
+          {{ macros.setting_checkbox('use_rss_file', '공유용 RSS 파일 생성', value='') }}
+          <div id="modal_use_rss_file_div" class="collapse">
+            {{ macros.setting_input_text('rss_file', 'RSS 파일명', col='8', placeholder='예: sukebei_2_2.xml', desc=['외부 공유용 XML 파일명 (.xml 자동 부여). 비워둘 경우 [사이트_게시판ID(_서브카테고리).xml]로 자동 지정됩니다.']) }}
+            {{ macros.setting_input_text('rss_file_path', '개별 저장 경로', col='8', value='', placeholder='미입력 시 기본 설정 경로 사용', desc=['비워둘 경우 기본 설정의 저장 경로가 적용됩니다.']) }}
+            {{ macros.setting_input_text('rss_file_days', '개별 유지 기간 (일)', col='8', value='', placeholder='미입력 시 기본 설정 (14일) 사용', desc=['비워둘 경우 기본 설정의 유지 기간이 적용됩니다.']) }}
+            {{ macros.setting_input_text('rss_file_items', '개별 최대 피드 수', col='8', value='', placeholder='미입력 시 기본 설정값 사용', desc=['비워둘 경우 기본 설정의 피드 수가 적용됩니다.']) }}
+          </div>
         </form>
       </div>
+
       <div class="modal-footer">
         <button id="add_job_save_btn" type="button" class="btn btn-primary">저장</button>
         <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>

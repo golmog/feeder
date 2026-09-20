@@ -36,7 +36,7 @@
 
 ### 3. 사이트 설정 규칙 (JSON) 작성 가이드
 
-사이트 관리 탭의 **사이트 직접 추가** 또는 **규칙 수정**에서 사용하는 사이트별 설정 스키마입니다.
+사이트 관리 탭의 **사이트 직접 추가** 또는 **규칙 수정**에서 사용하는 사이트별 크롤링 설정 스키마입니다. 단순한 구조의 사이트부터 다중 게시판 체계를 가진 포럼까지 모든 필드를 유연하게 커스터마이징할 수 있습니다.
 
 <br>
 #### 전체 JSON 구조 예시
@@ -46,79 +46,232 @@
   "NAME": "example_site",
   "TORRENT_SITE_URL": "https://example.com",
   "DELAY": 1.5,
+  "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+  "COOKIE": "member_key=abcdef123456; safe_mode=off",
   "BOARD_URL_RULE": "{URL}/bbs/board.php?bo_table={BOARD_NAME}&page={PAGE}",
   "SUBCAT_URL_RULE": "{URL}/forum.php?mod=forumdisplay&fid={BOARD_NAME}&filter=typeid&typeid={SUBCAT}&page={PAGE}",
   "XPATH_LIST_TAG": {
     "XPATH": "//tbody/tr[%s]//td[2]//a",
     "INDEX_START": 1,
     "INDEX_STEP": 1,
+    "TITLE_XPATH": "./text()",
     "TITLE_REGEX": "(?P<title>.*)"
+  },
+  "BOARD_LIST": {
+    "special_board": "SPECIAL_XPATH_TAG"
+  },
+  "SPECIAL_XPATH_TAG": {
+    "XPATH": "//ul[@class='post-list']/li[%s]/a",
+    "INDEX_START": 1,
+    "INDEX_STEP": 1
   },
   "ID_REGEX": "wr_id=(?P<id>\\d+)",
   "SELENIUM_WAIT_TAG": "//tbody/tr[1]",
   "SELENIUM_DETAIL_WAIT_TAG": "//div[@class='view-content']",
-  "MAGNET_REGAX": [
+  "SELENIUM_TIMEOUT": 25,
+  "MAGNET_REGEX": [
     "magnet:\\?xt=urn:btih:([a-zA-Z0-9]+)",
     "magnet:?xt=urn:btih:%s"
   ],
   "DOWNLOAD_REGEX": "href=\"(?P<url>[^\"]+download\\.php[^\"]+)\".*?>(?P<filename>[^<]+\\.torrent)<",
   "EXTRA": [
+    "USE_PROXY",
     "USE_FLARESOLVERR",
-    "USE_SELENIUM"
+    "USE_SELENIUM",
+    "USE_TORRENT_INFO",
+    "USING_BOARD_CHAR_ID",
+    "ONLY_FILE",
+    "MAGNET_ONLY_ONE_LAST"
   ],
   "DESCRIPTION": [
-    "게시판 ID 입력 안내:",
-    "- 한국 영화: movie_kor",
-    "- 예능 프로그램: ent",
-    "- 서브 카테고리(분류 필터) 수집 시: fid_typeid (예: 166_875)"
+    "사이트 안내 및 게시판 ID 입력 안내:",
+    "- 일반 게시판: movie_kor, ent, 103",
+    "- 서브 카테고리(분류 필터) 수집 시: fid:typeid (예: 166:875)"
   ]
 }
 ```
 
-#### 주요 설정 필드 상세 설명
+<br>
+#### JSON 최상위 설정 필드 상세 설명
 
-| 필드명 | 필수 여부 | 기본값 | 설명 |
+| 필드명 | 필수 여부 | 기본값 | 상세 설명 |
 | :--- | :---: | :---: | :--- |
-| `NAME` | **필수** | - | 사이트를 식별하는 고유 이름 (소문자 영문 권장). 커스텀 스크립트와 1:1 매핑 키로 사용됩니다. |
-| `TORRENT_SITE_URL` | **필수** | - | 사이트의 기본 도메인 주소 (끝에 `/` 제외). |
-| `DELAY` | 선택 | `기본 설정값` | 해당 사이트 크롤링 시 상세 페이지 요청 간 대기 시간(초). 사이트 부하 및 차단 방지에 필수적입니다. |
+| `NAME` | **필수** | - | 사이트를 고유하게 식별하는 영문 식별명. 커스텀 스크립트 훅(`site_{NAME}.py`)과의 매핑 키로 사용됩니다. |
+| `TORRENT_SITE_URL` | **필수** | - | 대상 사이트의 대표 도메인 주소 (끝에 `/` 제외). |
+| `DELAY` | 선택 | `2.0` | 목록 및 상세 페이지 요청 간 대기 시간(초, 소수점 가능). 미선언 시 기본 설정의 딜레이가 적용됩니다. |
+| `USER_AGENT` | 선택 | 기본 크롬 UA | 해당 사이트 크롤링 시 HTTP 요청 헤더 및 Selenium에 강제 적용할 User-Agent 문자열입니다. |
+| `COOKIE` | 선택 | - | 로그인 세션 유지나 성인 인증 통과에 필요한 고정 HTTP Cookie 헤더 문자열 (`name=val; name2=val2`). |
 | `BOARD_URL_RULE` | 선택 | 그누보드 기본 | 기본 게시판 목록 페이지 URL 템플릿. `{URL}`, `{BOARD_NAME}`, `{PAGE}` 치환자를 지원합니다. |
-| `SUBCAT_URL_RULE` | 선택 | - | 게시판 내에 서브 카테고리(분류 필터)가 존재하여 기본 주소와 체계가 달라지는 경우 사용되는 URL 템플릿. `{URL}`, `{BOARD_NAME}`(또는 `{FID}`), `{SUBCAT}`(또는 `{TYPEID}`), `{PAGE}` 치환자를 지원합니다. |
-| `XPATH_LIST_TAG` | **필수** | - | 목록 페이지에서 각 게시글의 링크(`<a>`)를 순회 추출하는 XPath 규칙 딕셔너리입니다. |
-| `ID_REGEX` | 선택 | 자동 정규식 | 상세 페이지 URL에서 고유 게시글 ID를 추출하는 정규식 (`(?P<id>...)` 명명 그룹 필수). |
-| `SELENIUM_WAIT_TAG` | 선택 | `body` | 셀레니움으로 **목록 페이지** 로드 시 렌더링 완료를 판정할 XPath 대기 태그. |
-| `SELENIUM_DETAIL_WAIT_TAG` | 선택 | `body` | 셀레니움으로 **본문 상세 페이지** 로드 시 렌더링 완료를 판정할 XPath 대기 태그. |
-| `SELENIUM_TIMEOUT` | 선택 | `기본 설정값` | 해당 사이트에만 별도로 적용할 셀레니움 타임아웃(초). 미지정 시 기본 설정의 타임아웃이 적용됩니다. |
-| `MAGNET_REGAX` | 선택 | 자동 탐색 | 본문에서 마그넷 해시를 정규식으로 추출할 때 사용 `[정규식, 조립템플릿]`. |
+| `SUBCAT_URL_RULE` | 선택 | - | 분류 필터(서브 카테고리) 선택 시 변동되는 URL 템플릿. `{URL}`, `{BOARD_NAME}`, `{FID}`, `{SUBCAT}`, `{TYPEID}`, `{PAGE}` 치환자를 지원합니다. |
+| `XPATH_LIST_TAG` | **필수** | - | 목록 페이지에서 각 게시글의 링크(`<a>`)를 순회 추출하기 위한 상세 XPath 규칙 딕셔너리입니다. (하단 상세 설명 참조) |
+| `BOARD_LIST` | 선택 | - | 사이트 내 특정 게시판만 목록 구조가 다를 때 사용하는 매핑 테이블. `{"게시판ID": "별도_XPATH_설정키"}` 형태로 선언하여 오버라이드합니다. |
+| `ID_REGEX` | 선택 | 다중 정규식 | 상세 페이지 URL에서 고유 게시글 ID를 추출하는 정규식 (`(?P<id>...)` 명명 그룹 필수). 미선언 시 그누보드, Discuz!, 제로보드 등 표준 정규식이 자동 적용됩니다. |
+| `SELENIUM_WAIT_TAG` | 선택 | `body` | Selenium으로 **목록 페이지**를 로드할 때 렌더링 완료를 판정할 대기 요소의 XPath. |
+| `SELENIUM_DETAIL_WAIT_TAG` | 선택 | `body` | Selenium으로 **본문 상세 페이지**를 로드할 때 렌더링 완료를 판정할 대기 요소의 XPath. |
+| `SELENIUM_TIMEOUT` | 선택 | 기본 설정값 | 해당 사이트에만 적용할 Selenium 페이지 로딩 대기 제한시간(초). 미선언 시 기본 설정의 타임아웃이 적용됩니다. |
+| `MAGNET_REGEX` | 선택 | 자동 정규식 | 본문에서 마그넷 주소를 추출하기 위한 정규식 규칙 `[매칭정규식, 치환포맷]`. (레거시 오타인 `MAGNET_REGAX`도 자동 호환 지원) |
 | `DOWNLOAD_REGEX` | 선택 | - | 첨부파일 다운로드 주소와 파일명을 추출하는 정규식 (`(?P<url>...)`, `(?P<filename>...)` 필수). |
-| `COOKIE` | 선택 | - | 로그인 또는 본인인증이 필요한 사이트에 고정 전달할 HTTP Cookie 문자열. |
-| `EXTRA` | 선택 | `[]` | 사이트별 특수 동작 플래그 배열 (아래 표 참조). |
-| `DESCRIPTION` | 선택 | - | UI 사이트 목록 테이블에 표시할 안내 문구 (문자열 또는 문자열 배열). |
+| `EXTRA` | 선택 | `[]` | 사이트별 특수 동작 플래그 배열. (하단 표 참조) |
+| `DESCRIPTION` | 선택 | - | 웹 UI 사이트 목록 테이블에 표시할 안내 문구 (문자열 또는 문자열 배열). |
 
 <br>
-##### 서브 카테고리(Subcategory) 지원 및 동작 규칙
+#### `XPATH_LIST_TAG` 상세 내부 속성
 
-Discuz! 포럼(색화당 등)이나 일부 토렌트 사이트는 동일 게시판 내에서 특정 서브 카테고리(`typeid` 등)를 선택할 경우 정적 URL 구조가 아닌 동적 쿼리스트링 구조로 변경됩니다. Feeder는 이를 플랫폼 차원에서 완벽히 지원합니다.
+목록 페이지 테이블이나 카드 그리드에서 각 행을 순회할 때 사용하는 세부 필드입니다.
 
-* **수집 테스트 창에서 입력:**
-  * 기본 게시판 테스트: `103`, `2_2`, `movie_kor` (언더스코어 `_`는 일반 게시판 ID의 고유 문자로 온전히 보존되어 오작동하지 않습니다.)
-  * 서브 카테고리 테스트: **`166:875`** (콜론 `:`을 구분자로 사용하여 게시판 ID `166`과 서브 카테고리 `875`를 자동 분리 후 `SUBCAT_URL_RULE`로 조합)
-* **스케줄링 등록 시:**
-  * `게시판 추가/수정` 모달에서 `게시판 ID`(`166`)와 `서브 카테고리 ID`(`875`)를 각각 입력하여 개별 등록 가능.
-* **DB 격리 및 독립 피드 발행:**
-  * 서브 카테고리가 지정된 게시판은 내부적으로 `166:875`라는 고유 복합 키로 관리되어, 전체 게시판 수집 데이터와 중복되지 않고 독립된 RSS 피드로 발행됩니다.
+| 내부 필드명 | 필수 여부 | 기본값 | 설명 |
+| :--- | :---: | :---: | :--- |
+| `XPATH` | **필수** | - | 각 게시글 링크를 가리키는 XPath 표현식. 행 단위 순회가 필요한 경우 `//tbody/tr[%s]//td[2]//a`처럼 `%s` 포맷 스트링을 삽입합니다. |
+| `INDEX_START` | 선택 | `1` | `%s` 치환자에 대입할 시작 인덱스 번호. (대부분의 HTML 테이블은 1부터 시작) |
+| `INDEX_STEP` | 선택 | `1` | `%s` 치환자에 더해질 증가폭. (예: 공지사항 건너뛰기나 2줄이 1개 게시글인 경우 조절) |
+| `TITLE_XPATH` | 선택 | `./text()` | 링크 태그 내부에서 제목 텍스트만을 별도로 추출할 때 사용하는 상대 XPath. |
+| `TITLE_REGEX` | 선택 | 전체 텍스트 | 태그의 텍스트에서 불필요한 말머리나 댓글 수를 제거하고 제목만 추출하는 정규식 (`(?P<title>...)` 그룹 필수). |
 
-##### `EXTRA` 플래그 종류
+<br>
+#### `EXTRA` 플래그 종류 및 동작
 
-* `"USE_FLARESOLVERR"`: Cloudflare 차단 사이트 수집 시 FlareSolverr 세션을 경유하여 챌린지를 우회합니다.
-* `"USE_SELENIUM"`: 목록 및 본문 페이지를 원격 Selenium 드라이버를 통해 동적 렌더링합니다. (사이트 관리 배지 클릭으로도 ON/OFF 가능)
-* `"USING_BOARD_CHAR_ID"`: 게시물 고유 ID가 숫자가 아닌 영문/해시 등 문자열 형태인 경우 적용합니다.
-* `"ONLY_FILE"`: 본문에 마그넷이 없고 `.torrent` 첨부파일만 존재하는 게시판도 수집 대상으로 허용합니다.
-* `"MAGNET_ONLY_ONE_LAST"`: 상세 페이지에 마그넷이 여러 개 존재할 때 가장 마지막 마그넷 1개만 수집합니다.
+사이트 관리 메뉴의 원클릭 토글 배지 및 상세 크롤러 엔진과 직결되는 옵션들입니다.
+
+| 플래그명 | 기본값 | 상세 동작 |
+| :--- | :---: | :--- |
+| `"USE_PROXY"` | OFF | 수집 시 전역 기본 설정의 HTTP/SOCKS5 프록시 서버를 우선 경유하도록 기본 지정합니다. |
+| `"USE_FLARESOLVERR"` | OFF | Cloudflare Turnstile 및 5초 챌린지 사이트 수집 시 FlareSolverr 인가를 사전에 획득합니다. |
+| `"USE_SELENIUM"` | OFF | 목록 및 본문 페이지를 원격 Selenium 드라이버를 통해 자바스크립트를 완전 렌더링하여 수집합니다. |
+| `"USE_TORRENT_INFO"` | OFF | 수집된 마그넷을 `torrent_info` 플러그인 또는 qBittorrent Web API로 분석하여 원본 파일명으로 변환합니다. |
+| `"USING_BOARD_CHAR_ID"` | OFF | 게시물 고유 ID가 숫자가 아닌 영문/해시 등 문자열 형태인 경우 중복 수집 체크에 문자열 컬럼(`board_char_id`)을 사용합니다. |
+| `"ONLY_FILE"` | OFF | 본문에 마그넷/ed2k 링크가 없고 `.torrent` 첨부파일만 존재하는 게시물도 수집 대상(DB 저장 및 RSS 발행)으로 허용합니다. |
+| `"MAGNET_ONLY_ONE_LAST"` | OFF | 한 게시글 본문에 여러 개의 마그넷이 존재할 경우 가장 마지막 마그넷 1개만 수집합니다. |
 
 ---
 
-### 4. 커스텀 사이트 훅 스크립트 개발 가이드
+### 4. 스케줄링 및 전역 설정 (YAML: `feeder_settings.yaml`) 가이드
+
+상단 메뉴의 **YAML 편집** 버튼을 누르거나 `{path_data}/db/feeder_settings.yaml` 파일을 직접 수정하여 Flexget 스타일의 강력한 정규식 필터링과 게시판별 수집 스케줄, 공유용 RSS 파일 생성을 통합 제어할 수 있습니다.
+
+<br>
+#### 전체 YAML 구조 예시
+
+```yaml
+# 전역 공통 필터 및 설정 (모든 수집 대상에 선행 적용)
+GLOBAL:
+  regexp:
+    reject:
+      - \btrailer\b: {from: title}        # 예고편(트레일러) 제외
+      - \bWEBSCR\b: {from: title}         # WEBSCR 릴 제외
+      - \bTS\b: {from: title}             # TS 극장캠 버전 제외
+      - \bCam\b: {from: title}            # CAM 버전 제외
+      - spam_domain\.com: {from: link}    # 스팸 링크 포함 게시물 차단
+
+# 게시판별 수집 스케줄 설정
+SCHEDULE:
+  - id: 1
+    site_name: sukebei
+    board_id: '2_2'
+    interval: 1
+    enabled: true
+    use_proxy: true
+    proxy_url: ''
+    use_flaresolverr: false
+    use_selenium: false
+    use_torrent_info: true
+    use_rss_file: true
+    rss_file: sukebei_2_2.xml
+    rss_file_path: ''
+    rss_file_days: ''
+    rss_file_items: ''
+    regexp:
+      accept:
+        - 1080p: {from: title}
+        - 2160p: {from: [title, link]}
+    accept_all: false
+
+  - id: 2
+    site_name: sehuatang
+    board_id: '166'
+    subcat_id: '875'
+    interval: 2
+    enabled: true
+    use_proxy: true
+    use_flaresolverr: true
+    use_selenium: true
+    use_torrent_info: false
+    use_rss_file: false
+    accept_all: true
+```
+
+<br>
+#### `GLOBAL` 설정 필드 상세 설명
+
+| 필드명 | 타입 | 설명 |
+| :--- | :---: | :--- |
+| `regexp` | 딕셔너리 | 모든 스케줄링 게시판에 공통으로 우선 적용할 Flexget 규격 정규식 필터 블록입니다. |
+| `accept_all` | 불리언 | 필터에서 거부되지 않은 모든 항목을 전역에서 기본 허용할지 여부 (`true`/`false`). |
+
+<br>
+##### `regexp` 하위 필터 규칙 규격
+
+* `reject`: 패턴이 매칭되면 해당 게시글을 **즉시 수집 제외(거부)**합니다.
+* `reject_excluding`: 선언된 패턴 목록 중 **어느 하나도 매칭되지 않으면 거부**합니다. (반드시 포함되어야 할 필수 조건)
+* `accept`: 패턴이 매칭되면 해당 게시글을 **수집 허용**합니다.
+* `from`: 정규식을 검사할 대상 속성. 생략 시 기본값은 `title`입니다.
+  - 단일 대상: `{from: title}` 또는 `{from: link}`
+  - 다중 대상: `{from: [title, link]}` (제목, 상세URL, 마그넷, 첨부파일 다운로드 주소를 모두 검사)
+* **단순 패턴 선언 지원:** 대상이 `title`인 경우 `- \bCam\b` 처럼 단일 문자열로 간결하게 작성할 수 있습니다.
+
+<br>
+#### `SCHEDULE` 항목 필드 상세 설명
+
+각 수집 대상 게시판의 스케줄러 구성 항목입니다.
+
+<br>
+| 필드명 | 타입 | 기본값 | 설명 |
+| :--- | :---: | :---: | :--- |
+| `id` | 정수 | 자동 채번 | 스케줄 고유 식별 번호 (1부터 시작). |
+| `site_name` | 문자열 | **필수** | 대상 사이트 식별명 (사이트 JSON의 `NAME`과 일치). |
+| `board_id` | 문자열 | **필수** | 수집할 게시판 ID (예: `2_2`, `movie_kor`, `166`). |
+| `subcat_id` | 문자열 | `""` | 서브 카테고리(분류 필터) 번호 (예: `875`). 지정 시 독립된 스케줄 및 별도 DB 키(`166:875`)로 격리 운용됩니다. |
+| `interval` | 정수 | `1` | 스케줄러 실행 빈도. N회 스케줄 주기마다 1회 크롤링을 수행합니다. |
+| `enabled` | 불리언 | `true` | 해당 작업의 활성화/중지 여부. |
+| `use_proxy` | 불리언 | `false` | 해당 게시판 크롤링 시 HTTP/SOCKS5 프록시 서버 경유 여부. |
+| `proxy_url` | 문자열 | `""` | 개별 프록시 서버 주소. 비워둘 경우 기본 설정의 Proxy URL이 적용됩니다. |
+| `use_flaresolverr` | 불리언 | `false` | Cloudflare 챌린지 우회 엔진 경유 여부. |
+| `use_selenium` | 불리언 | `false` | 원격 Selenium 브라우저 완전 렌더링 사용 여부. |
+| `use_torrent_info` | 불리언 | `false` | 마그넷 메타데이터 분석을 통한 원본 파일명 치환 사용 여부. |
+| `use_rss_file` | 불리언 | `false` | **공유용 RSS XML 파일 자동 생성 활성화 여부.** |
+| `rss_file` | 문자열 | 자동 지정 | 생성할 XML 파일명. 비워두면 `{site}_{board}(_{subcat}).xml`로 자동 지정됩니다. |
+| `rss_file_path` | 문자열 | `""` | 개별 XML 저장 절대 경로. 비워둘 경우 기본 설정의 저장 경로가 적용됩니다. |
+| `rss_file_days` | 정수 | `""` | 개별 XML 내 게시글 보관 기간(일). 비워둘 경우 기본 설정(기본 14일)이 적용되며 초과된 글은 XML에서 자동 제외됩니다. |
+| `rss_file_items` | 정수 | `""` | 개별 XML 내 최대 피드 수. 비워둘 경우 기본 설정(기본 100개)이 적용되며 초과된 오래된 항목부터 자동 제외됩니다. |
+| `regexp` | 딕셔너리 | - | 해당 게시판에만 적용할 개별 `reject`, `reject_excluding`, `accept` 정규식 필터 블록. |
+| `accept_all` | 불리언 | `false` | 개별 필터에서 거부되지 않은 나머지 모든 항목을 허용할지 여부. |
+
+---
+
+### 5. 외부 공유용 RSS XML 파일 생성 및 보안 가이드
+
+기존의 FlaskFarm RSS 피드 URL(`http://호스트:포트/feeder/api/board?...&apikey=...`)은 URL 내에 시스템 관리자 API Key가 포함되므로 지인이나 외부 다운로더에 공유 시 보안 위험이 발생할 수 있습니다.
+
+Feeder는 이를 근본적으로 해결하기 위해 **로컬 디스크에 API Key가 완전히 배제된 순수 RSS 2.0 XML 파일을 자동 생성하고 주기적으로 로테이션하는 기능**을 제공합니다.
+
+<br>
+#### 주요 동작 방식 및 특징
+
+* **API Key 노출 원천 차단:**
+  - 생성되는 XML 파일 내에는 사용자 인증 토큰(`apikey`)이 전혀 기록되지 않습니다.
+  - 마그넷 및 ed2k 링크는 순수 P2P 주소로 발행되며, 첨부파일 프록시 다운로드 링크 역시 API Key 없이 안전한 스트림 주소로 생성됩니다.
+* **유지 기간 및 수량 자동 정리 (Retention & Auto-Purge):**
+  - 설정된 보관 기간(`feed_rss_file_days`, 기본 14일)이 지난 항목은 크롤링이 돌 때마다 XML 파일에서 자동 삭제됩니다.
+  - 최대 항목 수(`feed_rss_file_items`, 기본 100개)를 초과하면 가장 오래된 항목부터 밀려나며 항상 최신 데이터만 유지됩니다.
+* **웹 서버(Nginx, Caddy, WebDAV 등)와의 완벽한 연동:**
+  - 저장 경로를 웹 서버의 정적 문서 루트(예: `/var/www/html/rss`)나 볼륨 마운트 폴더로 지정하면, 외부에서는 API Key 없이 간결한 URL로 피드를 구독할 수 있습니다:
+    ```text
+    https://my-domain.com/rss/sukebei_2_2.xml
+    https://my-domain.com/rss/sehuatang_166_875.xml
+    ```
+
+---
+
+### 6. 커스텀 사이트 훅 스크립트 개발 가이드
 
 정적 HTML 파싱만으로 해결되지 않는 복잡한 사이트는 파이썬 스크립트를 통해 크롤링 라이프사이클에 직접 개입할 수 있습니다.
 
@@ -196,6 +349,7 @@ class CustomSiteHook:
         return []
 ```
 
+<br>
 #### 실전 예제: 색화당(`site_sehuatang.py`) 동작 메커니즘
 
 1. **`on_init_session`:**
@@ -210,7 +364,7 @@ class CustomSiteHook:
 
 ---
 
-### 5. 네트워크 및 보안 우회 아키텍처
+### 7. 네트워크 및 보안 우회 아키텍처
 
 Feeder는 사이트 보안 수준과 필요 여부에 따라 리소스를 최소화하면서도, Cloudflare Turnstile 및 성인 확인 게이트를 완벽히 통과할 수 있도록 **"우선순위 기반 인가 및 하향 상속(Top-Down Clearance & Downward Inheritance)"** 아키텍처를 채택하고 있습니다.
 
@@ -239,6 +393,7 @@ Feeder는 사이트 보안 수준과 필요 여부에 따라 리소스를 최소
               └─ 4. 자가 치유 (Self-Healing) ──────> 토큰 만료(403) 감지 시 인가 파기 후 FlareSolverr 자동 재인가
 ```
 
+<br>
 #### 주요 기술적 특징
 
 * **인증 자격 증명의 1:1 완벽 일치 (Clearance Consistency):**
@@ -261,7 +416,7 @@ Feeder는 사이트 보안 수준과 필요 여부에 따라 리소스를 최소
 
 ---
 
-### 6. RSS 피드 사용 및 다운로더 연동
+### 8. RSS 피드 사용 및 다운로더 연동
 
 생성된 피드는 표준 RSS 2.0 및 showRSS 네임스페이스를 따르며, qBittorrent, Transmission, Sonarr, Radarr 등 모든 토렌트 클라이언트의 RSS 다운로더에 바로 등록할 수 있습니다.
 

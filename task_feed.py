@@ -168,9 +168,13 @@ class Task:
 
                     if crawled_items:
                         total_crawled_count += len(crawled_items)
-                        logger.info(f"[Feeder] [Celery Task] {site_name} - {board_id}: {len(crawled_items)}개 항목 수집 처리 완료")
+                        logger.info(f"[Feeder] [Celery Task] {site_name} - {full_board_key}: {len(crawled_items)}개 항목 수집 처리 완료")
                     else:
-                        logger.info(f"[Feeder] [Celery Task] {site_name} - {board_id}: 새로운 게시물이 없거나 수집된 항목이 없습니다.")
+                        logger.info(f"[Feeder] [Celery Task] {site_name} - {full_board_key}: 새로운 게시물이 없거나 수집된 항목이 없습니다.")
+
+                    # 공유용 RSS 파일 자동 생성 및 보존기간/항목수 갱신
+                    from .util_feed import FeedRssFileWriter
+                    FeedRssFileWriter.save_rss_file(site_name, full_board_key, item)
 
                 logger.info(f"[Feeder] [Celery Task] 전체 수집 작업 완료: 총 {total_crawled_count}개 게시물 처리됨")
 
@@ -319,9 +323,25 @@ class Task:
                 logger.info(f"[Feeder] [{site_name}] 상세 페이지 파싱 대상: {total_targets}개 (첫 페이지 전체: {len(raw_list)}개)")
 
                 detail_count = 0
+                from .util_feed import FeedFilter, FeedConfigUtil
+                global_cfg = FeedConfigUtil.get_global()
+                target_sched_dict = vars(target_cfg) if target_cfg else {}
+                target_db_sched = FeedConfigUtil.get_schedule_by_board(site_name, board_id, subcat_id)
+                if target_db_sched:
+                    target_sched_dict.update(target_db_sched)
+
                 for idx, item in enumerate(raw_list):
-                    # 테스트 모드: 지정된 max_count(3개) 초과 시 상세 페이지를 방문하지 않고 목록 정보만 bbs_list에 보존
                     if is_test and detail_count >= max_count:
+                        bbs_list.append(item)
+                        continue
+
+                    # Flexget 정규식 필터 사전 검사 (불필요한 상세 페이지 요청 차단)
+                    is_pass, filter_reason = FeedFilter.evaluate(item, target_sched_dict, global_cfg)
+                    if not is_pass:
+                        logger.info(f"[Feeder] [필터 제외] ID={item.get('id')} / '{item.get('title')[:35]}' -> {filter_reason}")
+                        item['filter_status'] = f"REJECTED: {filter_reason}"
+                        if not is_test:
+                            continue
                         bbs_list.append(item)
                         continue
 
