@@ -972,6 +972,93 @@ class FeedTorrentInfo:
 
 class FeedFilter:
 
+    RESOLUTION_MAP = {
+        '4320p': 4320, '8k': 4320,
+        '2160p': 2160, '4k': 2160, 'uhd': 2160,
+        '1080p': 1080, '1080i': 1080, 'fhd': 1080,
+        '720p': 720, 'hd': 720,
+        '576p': 576, '480p': 480, 'sd': 480,
+        '360p': 360,
+    }
+
+    @classmethod
+    def detect_resolution(cls, item: dict) -> int | None:
+        """게시글 제목, 파일명, 마그넷 명칭 등에서 해상도(숫자 높이) 추출"""
+        texts = [item.get('title', '')]
+        if item.get('download'):
+            for d in item['download']:
+                if isinstance(d, dict) and d.get('filename'):
+                    texts.append(d['filename'])
+
+        combined_text = " ".join([t for t in texts if t])
+        if not combined_text:
+            return None
+
+        # 표준 태그 검사 (해상도 높은 순서대로 검사하여 정확도 확보)
+        if re.search(r'\b(4320p|8k)\b', combined_text, re.IGNORECASE):
+            return 4320
+        if re.search(r'\b(2160p|4k|uhd)\b', combined_text, re.IGNORECASE):
+            return 2160
+        if re.search(r'\b(1080p|1080i|fhd)\b', combined_text, re.IGNORECASE):
+            return 1080
+        if re.search(r'\b(720p)\b', combined_text, re.IGNORECASE):
+            return 720
+        if re.search(r'\b(576p|480p|sd)\b', combined_text, re.IGNORECASE):
+            return 480
+        if re.search(r'\b(360p)\b', combined_text, re.IGNORECASE):
+            return 360
+
+        # WxH 형식의 해상도 표기 검사 (예: 3840x2160, 1920x1080, 1280x720)
+        m = re.search(r'\b\d{3,4}x(?P<res>\d{3,4})\b', combined_text, re.IGNORECASE)
+        if m:
+            res_val = int(m.group('res'))
+            if res_val >= 2100: return 2160
+            if res_val >= 1050: return 1080
+            if res_val >= 700: return 720
+            if res_val >= 450: return 480
+
+        return None
+
+    @classmethod
+    def matches_quality(cls, item_res: int | None, requirement: str) -> bool:
+        """단일 품질 표현식(2160p+, >=1080p, 720p-1080p 등) 일치 여부 평가"""
+        if item_res is None:
+            return False
+
+        req = str(requirement).strip().lower()
+
+        # Plus 연산자 처리 (예: 2160p+, 1080p+)
+        if req.endswith('+'):
+            base_res = cls.RESOLUTION_MAP.get(req[:-1].strip())
+            if base_res:
+                return item_res >= base_res
+
+        # 부등호 비교 연산자 처리 (예: >=1080p, <=720p, >1080p, <2160p)
+        m_op = re.match(r'^(>=|<=|>|<)(.+)$', req)
+        if m_op:
+            op, target = m_op.group(1), m_op.group(2).strip()
+            base_res = cls.RESOLUTION_MAP.get(target)
+            if base_res:
+                if op == '>=': return item_res >= base_res
+                if op == '<=': return item_res <= base_res
+                if op == '>': return item_res > base_res
+                if op == '<': return item_res < base_res
+
+        # 범위 연산자 처리 (예: 720p-1080p)
+        if '-' in req:
+            parts = req.split('-', 1)
+            r_min = cls.RESOLUTION_MAP.get(parts[0].strip())
+            r_max = cls.RESOLUTION_MAP.get(parts[1].strip())
+            if r_min and r_max:
+                return min(r_min, r_max) <= item_res <= max(r_min, r_max)
+
+        # 단일 고정 해상도 일치 처리 (예: 1080p, 2160p, 4k)
+        base_res = cls.RESOLUTION_MAP.get(req)
+        if base_res:
+            return item_res == base_res
+
+        return False
+
     @classmethod
     def parse_rule(cls, rule_item) -> tuple[re.Pattern | None, list[str]]:
         """단순 문자열, 단일 키 딕셔너리, {from: [title, link]} 형태 파싱"""
@@ -1038,7 +1125,7 @@ class FeedFilter:
     @classmethod
     def evaluate(cls, item: dict, scheduler_cfg: dict = None, global_cfg: dict = None) -> tuple[bool, str]:
         """
-        Flexget 필터 체인 평가
+        Flexget 필터 체인 평가 (정규식 필터 및 화질 필터 통합)
         반환: (is_accepted: bool, reason: str)
         """
         sched_dict = scheduler_cfg if isinstance(scheduler_cfg, dict) else (vars(scheduler_cfg) if scheduler_cfg else {})
@@ -1050,6 +1137,27 @@ class FeedFilter:
             comp, fields = cls.parse_rule(r)
             if comp and cls.check_match(item, comp, fields):
                 return False, f"GLOBAL reject: '{comp.pattern}'"
+
+        # SCHEDULE reject
+        sched_regexp = sched_dict.get('regexp', {}) if isinstance(sched_dict.get('regexp'), dict) else {}
+        for r in (sched_regexp.get('reject') or []):
+            comp, fields = cls.parse_rule(r)
+            if comp and cls.check_match(item, comp, fields):
+                return False, f"SCHEDULE reject: '{comp.pattern}'"
+
+        # 화질(Quality) 필터 평가 (스케줄 개별 설정 우선 적용 -> 전역 설정 적용)
+        target_quality = sched_dict.get('quality')
+        if target_quality is None and isinstance(glob_dict, dict):
+            target_quality = glob_dict.get('quality')
+
+        if target_quality:
+            req_list = target_quality if isinstance(target_quality, list) else [target_quality]
+            item_res = cls.detect_resolution(item)
+            if item_res is None:
+                return False, f"화질(해상도) 식별 불가 (요구조건: {target_quality})"
+            matched_quality = any(cls.matches_quality(item_res, req) for req in req_list)
+            if not matched_quality:
+                return False, f"화질 조건 불일치 ({item_res}p != {target_quality})"
 
         # GLOBAL reject_excluding
         glob_re_ex = glob_regexp.get('reject_excluding') or []
@@ -1063,19 +1171,6 @@ class FeedFilter:
             if not matched_any:
                 return False, "GLOBAL reject_excluding 조건 불일치"
 
-        # GLOBAL accept
-        for r in (glob_regexp.get('accept') or []):
-            comp, fields = cls.parse_rule(r)
-            if comp and cls.check_match(item, comp, fields):
-                return True, f"GLOBAL accept: '{comp.pattern}'"
-
-        # SCHEDULE reject
-        sched_regexp = sched_dict.get('regexp', {}) if isinstance(sched_dict.get('regexp'), dict) else {}
-        for r in (sched_regexp.get('reject') or []):
-            comp, fields = cls.parse_rule(r)
-            if comp and cls.check_match(item, comp, fields):
-                return False, f"SCHEDULE reject: '{comp.pattern}'"
-
         # SCHEDULE reject_excluding
         sched_re_ex = sched_regexp.get('reject_excluding') or []
         if sched_re_ex:
@@ -1087,6 +1182,12 @@ class FeedFilter:
                     break
             if not matched_any:
                 return False, "SCHEDULE reject_excluding 조건 불일치"
+
+        # GLOBAL accept
+        for r in (glob_regexp.get('accept') or []):
+            comp, fields = cls.parse_rule(r)
+            if comp and cls.check_match(item, comp, fields):
+                return True, f"GLOBAL accept: '{comp.pattern}'"
 
         # SCHEDULE accept
         for r in (sched_regexp.get('accept') or []):

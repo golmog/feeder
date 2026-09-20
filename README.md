@@ -152,15 +152,16 @@
 #### 전체 YAML 구조 예시
 
 ```yaml
-# 전역 공통 필터 및 설정 (모든 수집 대상에 선행 적용)
+# 전역 공통 필터 및 화질 설정 (모든 수집 대상에 선행 적용)
 GLOBAL:
+  # 전역 최소 화질 조건 지정 (1080p 이상만 수집)
+  quality: 1080p+
   regexp:
     reject:
       - \btrailer\b: {from: title}        # 예고편(트레일러) 제외
       - \bWEBSCR\b: {from: title}         # WEBSCR 릴 제외
       - \bTS\b: {from: title}             # TS 극장캠 버전 제외
       - \bCam\b: {from: title}            # CAM 버전 제외
-      - spam_domain\.com: {from: link}    # 스팸 링크 포함 게시물 차단
 
 # 게시판별 수집 스케줄 설정
 SCHEDULE:
@@ -169,43 +170,35 @@ SCHEDULE:
     board_id: '2_2'
     interval: 1
     enabled: true
-    use_proxy: true
-    proxy_url: ''
-    use_flaresolverr: false
-    use_selenium: false
-    use_torrent_info: true
+    # 해당 게시판은 4K(2160p) 이상만 전용 수집
+    quality: 2160p+
     use_rss_file: true
-    rss_file: sukebei_2_2.xml
-    rss_file_path: ''
-    rss_file_days: ''
-    rss_file_items: ''
-    regexp:
-      accept:
-        - 1080p: {from: title}
-        - 2160p: {from: [title, link]}
-    accept_all: false
+    rss_file: sukebei_4k.xml
+    accept_all: true
 
   - id: 2
-    site_name: sehuatang
-    board_id: '166'
-    subcat_id: '875'
+    site_name: torrent_site
+    board_id: 'movie'
     interval: 2
     enabled: true
-    use_proxy: true
-    use_flaresolverr: true
-    use_selenium: true
-    use_torrent_info: false
-    use_rss_file: false
+    # 복수 화질 또는 범위 지정 예시
+    quality:
+      - 1080p
+      - 2160p+
     accept_all: true
 ```
 
 <br>
-#### `GLOBAL` 설정 필드 상세 설명
+#### 설정 필드 상세 설명
+
+* `GLOBAL` 설정은 모든 스케줄에 공통 적용됩니다. 동일 항목을 개별 설정시에는 개별 설정이 우선합니다.
+
+##### 필터링 패턴 설정
 
 | 필드명 | 타입 | 설명 |
 | :--- | :---: | :--- |
-| `regexp` | 딕셔너리 | 모든 스케줄링 게시판에 공통으로 우선 적용할 Flexget 규격 정규식 필터 블록입니다. |
-| `accept_all` | 불리언 | 필터에서 거부되지 않은 모든 항목을 전역에서 기본 허용할지 여부 (`true`/`false`). |
+| `regexp` | 딕셔너리 | Flexget 스타일 정규식 필터 블록입니다. |
+| `accept_all` | 불리언 | 필터에서 거부되지 않은 모든 항목을 기본 허용할지 여부 (`true`/`false`). |
 
 <br>
 ##### `regexp` 하위 필터 규칙 규격
@@ -219,7 +212,17 @@ SCHEDULE:
 * **단순 패턴 선언 지원:** 대상이 `title`인 경우 `- \bCam\b` 처럼 단일 문자열로 간결하게 작성할 수 있습니다.
 
 <br>
-#### `SCHEDULE` 항목 필드 상세 설명
+##### 화질 필터(`quality`) 상세 문법
+
+게시글 제목(`title`)과 첨부파일명에서 해상도 키워드를 정밀 판별하여 필터링합니다.
+
+* `2160p+` 또는 `1080p+`: 해당 해상도 **이상**인 항목만 허용
+* `>=1080p`, `>720p`, `<=1080p`, `<2160p`: 부등호 비교식을 통한 허용
+* `720p-1080p`: 지정된 해상도 **범위** 내 항목만 허용
+* `[1080p, 2160p]`: 지정된 특정 해상도 목록에 해당하는 항목만 허용
+
+<br>
+##### `SCHEDULE` 항목 필드 상세 설명
 
 각 수집 대상 게시판의 스케줄러 구성 항목입니다.
 
@@ -244,6 +247,7 @@ SCHEDULE:
 | `rss_file_items` | 정수 | `""` | 개별 XML 내 최대 피드 수. 비워둘 경우 기본 설정(기본 100개)이 적용되며 초과된 오래된 항목부터 자동 제외됩니다. |
 | `regexp` | 딕셔너리 | - | 해당 게시판에만 적용할 개별 `reject`, `reject_excluding`, `accept` 정규식 필터 블록. |
 | `accept_all` | 불리언 | `false` | 개별 필터에서 거부되지 않은 나머지 모든 항목을 허용할지 여부. |
+| `quality` | 딕셔너리 | - | 허용할 해상도를 지정. |
 
 ---
 
