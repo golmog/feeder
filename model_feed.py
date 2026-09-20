@@ -1,9 +1,33 @@
 # -*- coding: utf-8 -*-
+import os
+import shutil
 from datetime import datetime
 from sqlalchemy import and_, or_, func, desc
 from .setup import *
 
 PACKAGE_NAME = P.package_name
+
+# 모듈 전용 DB 바인드 키 및 파일 경로 설정
+BIND_KEY = f'{PACKAGE_NAME}_feed'
+db_file = os.path.join(path_data, 'db', f'{BIND_KEY}.db')
+old_db_file = os.path.join(path_data, 'db', f'{PACKAGE_NAME}.db')
+
+# 기존 단일 DB(feeder.db)가 있을 경우 새 모듈 DB(feeder_feed.db)로 1회 복사 이전
+if not os.path.exists(db_file) and os.path.exists(old_db_file):
+    try:
+        shutil.copy2(old_db_file, db_file)
+        logger.info(f"[{PACKAGE_NAME}] 기존 DB({old_db_file})를 '{BIND_KEY}.db'로 자동 복사 마이그레이션 완료")
+    except Exception as e:
+        logger.error(f"[{PACKAGE_NAME}] DB 마이그레이션 실패: {e}")
+
+# FlaskFarm SQLAlchemy Binds에 feeder_feed 등록
+if BIND_KEY not in app.config['SQLALCHEMY_BINDS']:
+    app.config['SQLALCHEMY_BINDS'][BIND_KEY] = f'sqlite:///{db_file}'
+
+try:
+    db.create_all(bind=BIND_KEY)
+except Exception as e:
+    logger.error(f"[{PACKAGE_NAME}] {BIND_KEY} 테이블 생성 에러: {e}")
 
 
 class ModelFeedSite(db.Model):
@@ -87,7 +111,7 @@ class ModelFeedBbs(ModelBase):
     P = P
     __tablename__ = f'{PACKAGE_NAME}_bbs'
     __table_args__ = {'mysql_collate': 'utf8_general_ci'}
-    __bind_key__ = PACKAGE_NAME
+    __bind_key__ = BIND_KEY
 
     id = db.Column(db.Integer, primary_key=True)
     created_time = db.Column(db.DateTime, default=datetime.now)

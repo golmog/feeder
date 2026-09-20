@@ -543,26 +543,31 @@ class ModuleFeed(PluginModuleBase):
 
             target_conditions = []
             for t in targets:
-                target_conditions.append(and_(ModelFeedBbs.site == t.get('site'), ModelFeedBbs.board == t.get('full_board_key', t.get('board'))))
+                s_name = t.get('site') or t.get('site_name')
+                b_name = t.get('full_board_key') or t.get('board') or t.get('board_id')
+                if s_name and b_name:
+                    target_conditions.append(and_(ModelFeedBbs.site == s_name, ModelFeedBbs.board == b_name))
 
-            group_key = func.coalesce(
-                func.nullif(ModelFeedBbs.magnet, ''),
-                func.cast(ModelFeedBbs.id, db.String)
-            )
-            subq = (
-                db.session.query(func.max(ModelFeedBbs.id).label("max_id"))
-                .filter(or_(*target_conditions))
-                .group_by(group_key)
-                .subquery()
-            )
+            if not target_conditions:
+                xml_empty = self.generate_rss_feed(task.get('name', 'Task'), [])
+                return Response(xml_empty, mimetype='application/xml; charset=utf-8')
 
             feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
-            query_limit = max(feed_count * 3, 300)
-            candidates = db.session.query(ModelFeedBbs).join(subq, ModelFeedBbs.id == subq.c.max_id).order_by(ModelFeedBbs.id.desc()).limit(query_limit).all()
+            query_limit = max(feed_count * 4, 400)
+            candidates = db.session.query(ModelFeedBbs).filter(or_(*target_conditions)).order_by(ModelFeedBbs.id.desc()).limit(query_limit).all()
 
             global_cfg = FeedConfigUtil.get_global()
+            from .util_feed import extract_info_hash
+            seen_magnets = set()
             filtered_items = []
             for bbs in candidates:
+                mag = bbs.magnet
+                if mag:
+                    info_hash = extract_info_hash(mag) or mag
+                    if info_hash in seen_magnets:
+                        continue
+                    seen_magnets.add(info_hash)
+
                 is_pass, _ = FeedFilter.evaluate(bbs.as_dict(), task, global_cfg)
                 if is_pass:
                     filtered_items.append(bbs)
@@ -736,8 +741,9 @@ class ModuleFeed(PluginModuleBase):
 
     def db_vacuum(self):
         try:
+            bind_key = f'{P.package_name}_{self.name}'
             try:
-                engine = db.get_engine(bind=P.package_name)
+                engine = db.get_engine(bind=bind_key)
             except Exception:
                 engine = db.engine
 
@@ -748,7 +754,7 @@ class ModuleFeed(PluginModuleBase):
                     cursor = raw_conn.cursor()
                     cursor.execute("VACUUM")
                     cursor.close()
-                    logger.info(f"[{self.name}] SQLite DB VACUUM 정리 완료")
+                    logger.info(f"[{self.name}] SQLite DB VACUUM 정리 완료 ({bind_key}.db)")
                 finally:
                     raw_conn.close()
         except Exception as e:

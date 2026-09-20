@@ -220,6 +220,7 @@ function render_tasks(data) {
     str += '      </div>';
     str += '      <a href="' + item.api + '" target="_blank" class="btn btn-sm text-white" style="background-color: #f26522; font-weight: 500;"><i class="fa fa-rss"></i> 통합 RSS</a>';
     str += '    </div>';
+    str += '    <div class="mt-1"><small class="text-muted" style="word-break: break-all;">' + item.api + '</small></div>';
     str += '  </td>';
     str += '</tr>';
   }

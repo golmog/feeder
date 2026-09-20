@@ -191,7 +191,7 @@ class Task:
             return 2.0
 
     @staticmethod
-    def execute_board_crawl(site_info: dict, board: str, max_page: int = 1, max_id: int = 0, is_test: bool = False, max_count: int = 999, target_cfg=None) -> list[dict]:
+    def execute_board_crawl(site_info: dict, board: str, max_page: int = 1, max_id: int = 0, is_test: bool = False, max_count: int = 0, target_cfg=None) -> list[dict]:
         bbs_list = []
         site_name = site_info.get('NAME', '')
         subcat_param = getattr(target_cfg, 'subcat_id', None) if target_cfg else None
@@ -408,7 +408,11 @@ class Task:
                     bbs_list.append(item)
                     detail_count += 1
 
-                    if not is_test and len(bbs_list) >= max_count:
+                    if is_test and max_count > 0 and len(bbs_list) >= max_count:
+                        stop_crawl = True
+                        break
+
+                    if not is_test and max_count > 0 and len(bbs_list) >= max_count:
                         stop_crawl = True
                         break
 

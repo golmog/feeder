@@ -155,7 +155,6 @@ class FeedConfigUtil:
         if not os.path.exists(CONFIG_FILEPATH):
             default_data = {
                 'GLOBAL': {
-                    'quality': '1080p+',
                     'regexp': {
                         'reject': [
                             {'\\btrailer\\b': {'from': 'title'}},
@@ -169,6 +168,7 @@ class FeedConfigUtil:
             }
             cls.save_yaml(default_data)
             return default_data
+
         try:
             with open(CONFIG_FILEPATH, 'r', encoding='utf-8') as f:
                 data = yaml.safe_load(f) or {}
@@ -1299,12 +1299,12 @@ class FeedRssFileWriter:
                 filename += '.xml'
 
             try:
-                days_val = int(task.get('rss_file_days') or P.ModelSetting.get('feed_rss_file_days', '14'))
+                days_val = int(task.get('rss_file_days') or P.ModelSetting.get('feed_rss_file_days') or 14)
             except Exception:
                 days_val = 14
 
             try:
-                items_val = int(task.get('rss_file_items') or P.ModelSetting.get('feed_rss_file_items', '100'))
+                items_val = int(task.get('rss_file_items') or P.ModelSetting.get('feed_rss_file_items') or P.ModelSetting.get('feed_feed_count') or 100)
             except Exception:
                 items_val = 100
 
@@ -1314,34 +1314,37 @@ class FeedRssFileWriter:
 
             # 타겟 게시판 조건 생성
             from .model_feed import ModelFeedBbs
-            from sqlalchemy import and_, or_, func
+            from sqlalchemy import and_, or_
             target_conditions = []
             for t in targets:
-                target_conditions.append(and_(ModelFeedBbs.site == t.get('site'), ModelFeedBbs.board == t.get('full_board_key', t.get('board'))))
+                s_name = t.get('site') or t.get('site_name')
+                b_name = t.get('full_board_key') or t.get('board') or t.get('board_id')
+                if s_name and b_name:
+                    target_conditions.append(and_(ModelFeedBbs.site == s_name, ModelFeedBbs.board == b_name))
+
+            if not target_conditions:
+                return False
 
             query = db.session.query(ModelFeedBbs).filter(or_(*target_conditions))
             if days_val > 0:
                 limit_date = datetime.now() - timedelta(days=days_val)
                 query = query.filter(ModelFeedBbs.created_time >= limit_date)
 
-            # 동일 마그넷 중복 통합 서브쿼리
-            group_key = func.coalesce(
-                func.nullif(ModelFeedBbs.magnet, ''),
-                func.cast(ModelFeedBbs.id, db.String)
-            )
-            subq = (
-                db.session.query(func.max(ModelFeedBbs.id).label("max_id"))
-                .filter(or_(*target_conditions))
-                .group_by(group_key)
-                .subquery()
-            )
-            query_limit = max(items_val * 3, 300)
-            candidates = db.session.query(ModelFeedBbs).join(subq, ModelFeedBbs.id == subq.c.max_id).order_by(ModelFeedBbs.id.desc()).limit(query_limit).all()
+            query_limit = max(items_val * 4, 400)
+            candidates = query.order_by(ModelFeedBbs.id.desc()).limit(query_limit).all()
 
-            # 태스크 필터 및 전역 필터 실시간 적용
+            # 마그넷 중복 제거 및 필터링
             global_cfg = FeedConfigUtil.get_global()
+            seen_magnets = set()
             filtered_records = []
             for bbs in candidates:
+                mag = bbs.magnet
+                if mag:
+                    info_hash = extract_info_hash(mag) or mag
+                    if info_hash in seen_magnets:
+                        continue
+                    seen_magnets.add(info_hash)
+
                 bbs_dict = bbs.as_dict()
                 is_pass, _ = FeedFilter.evaluate(bbs_dict, task, global_cfg)
                 if is_pass:
