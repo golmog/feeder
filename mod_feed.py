@@ -6,7 +6,7 @@ import base64
 import traceback
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from flask import Response, send_file, abort, request, jsonify
+from flask import Response, send_file, abort, request, jsonify, has_request_context
 from sqlalchemy import and_, or_, func, desc
 
 from .setup import *
@@ -768,7 +768,11 @@ class ModuleFeed(PluginModuleBase):
                 logger.error(f"[Feeder] db auto delete 에러: {e}")
                 db.session.rollback()
 
-        self.start_celery(TaskBase.start, None, "default")
+        # 웹 UI에서 1회 실행을 누른 경우(HTTP 컨텍스트 존재) 'manual' 모드로 전달하여 조기 종료 방지
+        # 백그라운드 스케줄러 데몬이 호출한 경우 'default' 모드로 전달하여 max_id 도래 시 빠른 종료
+        job_type = "manual" if has_request_context() else "default"
+        logger.info(f"[{self.name}] 크롤링 워커 작업 전달 (모드: {job_type})")
+        self.start_celery(TaskBase.start, None, job_type)
 
     def delete_task_db(self, task: dict) -> str:
         try:
