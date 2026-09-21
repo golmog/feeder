@@ -641,10 +641,27 @@ class FeedScraper:
 
             # 3-3. 세션 실행 중 403 차단 또는 토큰 만료 감지 시 FlareSolverr로 토큰 재발급
             if use_fs:
-                logger.warning(f"[Scraper] [{host}] HTTP 세션 차단 감지 -> FlareSolverr 챌린지 재우회 요청: {url}")
+                logger.warning(f"[Scraper] [{host}] Cloudflare 차단 감지 -> 기존 소켓 세션 완전 파기 및 FlareSolverr 재인가 시작: {url}")
                 cls._cf_cookies.pop(host, None)
+
+                # 차단 플래그가 꽂힌 기존 HTTP 연결 풀 강제 종료 및 파기
+                if host in cls._cffi_sessions:
+                    try:
+                        cls._cffi_sessions[host].close()
+                    except Exception:
+                        pass
+                    cls._cffi_sessions.pop(host, None)
+
+                if host in cls._requests_sessions:
+                    try:
+                        cls._requests_sessions[host].close()
+                    except Exception:
+                        pass
+                    cls._requests_sessions.pop(host, None)
+
                 tree, source = cls.get_by_flaresolverr(url, proxies=proxies)
                 if source and 'Just a moment...' not in source and 'cf-turnstile' not in source:
+                    logger.info(f"[Scraper] [{host}] 전역 세션 자가 치유 완료 -> 페이지 수신 성공")
                     return source
                 if attempt < max_retries:
                     logger.debug(f"[Scraper] FlareSolverr 재시도 ({attempt}/{max_retries}): {url}")
