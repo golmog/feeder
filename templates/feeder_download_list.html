@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block content %}
+
+<link rel="stylesheet" href="{{ url_for('.static', filename='feeder.css') }}">
+
+<form id="form_search" class="form-inline mb-3 justify-content-between">
+  <div class="form-inline">
+    <select id="status_filter" name="status_filter" class="form-control form-control-sm mr-2">
+      <option value="all">전체 상태</option>
+      <option value="completed">최종 완료 (Completed)</option>
+      <option value="active">진행 중 (Active)</option>
+      <option value="move_failed">이동 실패 (Move Failed)</option>
+      <option value="failed">최종 실패 (Failed)</option>
+      <option value="pending">대기 (Pending)</option>
+    </select>
+  </div>
+  <div class="form-inline">
+    <select id="page_size" name="page_size" class="form-control form-control-sm mr-1">
+      <option value="15">15개씩</option>
+      <option value="25" selected>25개씩</option>
+      <option value="50">50개씩</option>
+      <option value="100">100개씩</option>
+    </select>
+    <input id="search_word" name="search_word" class="form-control form-control-sm mr-1" style="width: 220px;" type="text" placeholder="제목/파일명 검색">
+    <button id="search_btn" class="btn btn-sm btn-primary mr-1">검색</button>
+    <button id="reset_btn" class="btn btn-sm btn-outline-secondary">리셋</button>
+  </div>
+</form>
+
+<div id="page1"></div>
+<div class="table-responsive">
+  <table class="table table-sm table-striped table-hover text-center align-middle">
+    <thead class="thead-dark">
+      <tr>
+        <th style="width: 5%;">ID</th>
+        <th style="width: 14%;">상태 / 엔진</th>
+        <th style="width: 36%;">피드명 / 콘텐츠 정보</th>
+        <th style="width: 15%;">용량 / 저장 경로</th>
+        <th style="width: 14%;">완료/수정 시간</th>
+        <th style="width: 16%;">제어</th>
+      </tr>
+    </thead>
+    <tbody id="download_list_tbody">
+      <tr><td colspan="6" class="py-4 text-muted">다운로드 리스트를 불러오는 중입니다...</td></tr>
+    </tbody>
+  </table>
+</div>
+<div id="page2"></div>
+
+<script type="text/javascript">
+var package_name = "{{ arg['package_name'] }}";
+var sub = "{{ arg['sub'] }}";
+</script>
+<script src="{{ url_for('.static', filename='feeder_download_list.js') }}"></script>
+
+{% endblock %}

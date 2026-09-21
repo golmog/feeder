@@ -1,0 +1,305 @@
+{% extends "base.html" %}
+{% block content %}
+
+<link rel="stylesheet" href="{{ url_for('.static', filename='feeder.css') }}">
+
+{{ macros.m_button_group([
+  ['globalSettingSaveBtn', '설정 저장'],
+  ['globalOneExecuteBtn', '1회 실행'],
+  ['globalEditBtn', 'YAML 편집', [['file', arg['yaml_filepath']]]]
+]) }}
+{{ macros.m_row_start('5') }}
+{{ macros.m_row_end() }}
+
+<nav>
+  {{ macros.m_tab_head_start() }}
+    {{ macros.m_tab_head('basic', '기본 설정', true) }}
+    {{ macros.m_tab_head('downloaders', '다운로더 엔진 관리', false) }}
+    {{ macros.m_tab_head('profiles', '다운로드 라우팅 프로필', false) }}
+    {{ macros.m_tab_head('gdrive', 'Google Drive 계정 풀', false) }}
+    {{ macros.m_tab_head('auto', '자동 & DB정리', false) }}
+  {{ macros.m_tab_head_end() }}
+</nav>
+
+<form id="setting" name="setting">
+  <div class="tab-content mb-4" id="nav-tabContent">
+
+    <!-- 탭 1: 기본 설정 -->
+    {{ macros.m_tab_content_start('basic', true) }}
+      {{ macros.setting_input_text('download_local_staging_path', '로컬 스테이징(임시) 경로', value=arg['download_local_staging_path'], placeholder='예: /data/tmp/staging', desc=['원격 클라우드 다운로드 후 로컬 버퍼로 수신할 임시 디렉터리 (비워두면 기본 임시 폴더 사용)']) }}
+      {{ macros.setting_checkbox('download_enable_sse', '실시간 SSE 브로드캐스트', value=arg['download_enable_sse'], desc=['On: 큐 대시보드 화면에서 실시간 진행 현황을 자동 수신합니다.']) }}
+      {{ macros.m_hr() }}
+      <h6 class="font-weight-bold text-info"><i class="fa fa-hdd-o mr-1"></i>Rclone 공통 및 구글 드라이브 우회 수치 설정</h6>
+      {{ macros.setting_input_text('download_rclone_conf_path', 'Rclone 설정 파일 경로', value=arg['download_rclone_conf_path'], placeholder='예: /root/.config/rclone/rclone.conf') }}
+      {{ macros.setting_input_text('download_rclone_remote_name', '내 드라이브 SA 기본 리모트', value=arg['download_rclone_remote_name'], placeholder='net', desc=['개인/SA 계정의 15GB MyDrive 바이패스용 rclone 리모트 이름']) }}
+      {{ macros.setting_input_text('download_rclone_shared_remote_name', '공유 드라이브 직행 리모트', value=arg['download_rclone_shared_remote_name'], placeholder='gf', desc=['임계값 초과 대용량 파일 또는 라이트 유저 공유 드라이브 직행용 rclone 리모트 이름']) }}
+      {{ macros.setting_input_text('download_shared_drive_id', '기본 목적지 공유 드라이브 ID', value=arg['download_shared_drive_id'], placeholder='예: 0ABCDE12345678') }}
+      {{ macros.setting_input_text('download_rclone_bind_ip', 'Rclone 바인드 IP', value=arg['download_rclone_bind_ip'], placeholder='예: 192.168.1.100 (특정 네트워크 인터페이스 고정 시 입력)') }}
+      {{ macros.setting_input_text('download_rclone_chunk_size', 'Rclone 청크 사이즈', value=arg['download_rclone_chunk_size'], placeholder='256M', desc=['구글 드라이브 업로드 청크 크기 (기본값: 256M)']) }}
+      {{ macros.m_hr() }}
+      {{ macros.setting_input_text('download_mydrive_upload_threshold', '내 드라이브 바이패스 임계 용량', value=arg['download_mydrive_upload_threshold'], placeholder='14GB', desc=['이 용량 이하의 파일만 15GB MyDrive로 1차 업로드 후 공유 드라이브로 서버사이드 이동합니다. (기본값: 14GB)']) }}
+      {{ macros.setting_input_text('download_gdrive_upload_limit', '개인 계정 일일 업로드 한도', value=arg['download_gdrive_upload_limit'], placeholder='700GB', desc=['개인 SA 계정당 24시간 안전 업로드 제한량 (기본값: 700GB)']) }}
+      {{ macros.setting_input_text('download_shared_drive_upload_limit', '공유 드라이브 일일 업로드 한도', value=arg['download_shared_drive_upload_limit'], placeholder='3TB', desc=['공유 드라이브 전체 24시간 안전 업로드 제한량 (기본값: 3TB)']) }}
+      {{ macros.setting_input_text('download_shared_drive_quota_reset_time', '공유 드라이브 쿼터 리셋 시간', value=arg['download_shared_drive_quota_reset_time'], placeholder='16:00', desc=['구글 드라이브 일일 쿼터가 초기화되는 시각 (기본값: 16:00 KST)']) }}
+    {{ macros.m_tab_content_end() }}
+
+    <!-- 탭 2: 다운로더 엔진 관리 -->
+    {{ macros.m_tab_content_start('downloaders', false) }}
+      <div class="mb-2 d-flex justify-content-between align-items-center">
+        <button type="button" id="downloader_add_btn" class="btn btn-sm btn-primary">다운로더 추가</button>
+        <button type="button" id="downloader_reload_btn" class="btn btn-sm btn-secondary">새로고침</button>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm table-striped table-hover text-center align-middle">
+          <thead class="thead-dark">
+            <tr>
+              <th style="width: 15%;">식별명</th>
+              <th style="width: 15%;">엔진 타입</th>
+              <th style="width: 15%;">상태 및 지연한도</th>
+              <th style="width: 35%;">주요 연결 정보</th>
+              <th style="width: 20%;">관리</th>
+            </tr>
+          </thead>
+          <tbody id="downloader_list_tbody">
+            <tr><td colspan="5" class="py-4 text-muted">등록된 다운로더 엔진이 없습니다.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    {{ macros.m_tab_content_end() }}
+
+    <!-- 탭 3: 다운로드 라우팅 프로필 -->
+    {{ macros.m_tab_content_start('profiles', false) }}
+      <div class="mb-2 d-flex justify-content-between align-items-center">
+        <button type="button" id="profile_add_btn" class="btn btn-sm btn-primary">프로필 추가</button>
+        <button type="button" id="profile_reload_btn" class="btn btn-sm btn-secondary">새로고침</button>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm table-striped table-hover text-center align-middle">
+          <thead class="thead-dark">
+            <tr>
+              <th style="width: 18%;">프로필명</th>
+              <th style="width: 20%;">대상 피드 (Feeds)</th>
+              <th style="width: 28%;">우선순위 체인 (Priority Chain)</th>
+              <th style="width: 22%;">목적지 설정</th>
+              <th style="width: 12%;">관리</th>
+            </tr>
+          </thead>
+          <tbody id="profile_list_tbody">
+            <tr><td colspan="5" class="py-4 text-muted">등록된 다운로드 프로필이 없습니다.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    {{ macros.m_tab_content_end() }}
+
+    <!-- 탭 4: Google Drive 계정 풀 -->
+    {{ macros.m_tab_content_start('gdrive', false) }}
+      <div class="mb-2 d-flex justify-content-between align-items-center">
+        <div>
+          <button type="button" id="gdrive_batch_modal_btn" class="btn btn-sm btn-primary">계정 일괄 등록 (텍스트)</button>
+          <button type="button" id="gdrive_reset_blocks_btn" class="btn btn-sm btn-outline-warning ml-1">차단 일괄 해제</button>
+        </div>
+        <button type="button" id="gdrive_reload_btn" class="btn btn-sm btn-secondary">새로고침</button>
+      </div>
+      <div class="table-responsive">
+        <table class="table table-sm table-striped table-hover text-center align-middle">
+          <thead class="thead-dark">
+            <tr>
+              <th style="width: 35%;">계정 이메일 (User / Impersonate)</th>
+              <th style="width: 25%;">내 드라이브 Rclone ID</th>
+              <th style="width: 25%;">24시간 누적 사용량 / 차단 상태</th>
+              <th style="width: 15%;">관리</th>
+            </tr>
+          </thead>
+          <tbody id="gdrive_account_list_tbody">
+            <tr><td colspan="4" class="py-4 text-muted">등록된 구글 드라이브 계정이 없습니다.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    {{ macros.m_tab_content_end() }}
+
+    <!-- 탭 5: 자동 & DB정리 -->
+    {{ macros.m_tab_content_start('auto', false) }}
+      {{ macros.global_setting_scheduler_button(arg['is_include'], arg['is_running']) }}
+      {{ macros.setting_input_text('download_interval', '스케쥴링 실행 정보', value=arg['download_interval'], col='3', desc=['Interval(분 단위) 또는 Cron 설정']) }}
+      {{ macros.setting_checkbox('download_auto_start', '시작 시 자동 실행', value=arg['download_auto_start'], desc=['On: 서버 시작 시 다운로드 스케쥴러 자동 등록']) }}
+      {{ macros.m_hr() }}
+      {{ macros.setting_input_text_and_buttons('download_db_delete_day', '완료 DB 삭제 기간', [['globalDbDeleteDayBtn', '기간 적용 삭제', [['tag_id','download_db_delete_day']]], ['globalDbDeleteBtn', '전체 삭제']], value=arg['download_db_delete_day'], col='6') }}
+      {{ macros.setting_checkbox('download_db_auto_delete', '완료 DB 자동 삭제', value=arg['download_db_auto_delete'], desc=['On: 보관 기간이 지난 완료 레코드를 주기적으로 자동 삭제합니다.']) }}
+    {{ macros.m_tab_content_end() }}
+
+  </div>
+</form>
+
+<!-- 모달: 다운로더 추가/수정 -->
+<div class="modal fade" id="downloader_modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header d-flex align-items-center justify-content-between">
+        <h4 class="modal-title" id="downloader_modal_title">다운로더 엔진 설정</h4>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+      </div>
+      <div class="modal-body">
+        <form id="downloader_form">
+          <input type="hidden" id="downloader_mode" value="add">
+          {{ macros.setting_input_text('dl_name', '식별명', placeholder='예: ad_main, 115_vip, qbit_local', desc=['프로필 체인에서 참조할 고유 식별 영문명']) }}
+          {{ macros.setting_select('dl_engine_type', '엔진 타입', [
+              ['alldebrid', 'AllDebrid (오프라인 고속 캐시)'],
+              ['115', '115 Cloud (CD2 gRPC 연동)'],
+              ['qbittorrent', 'qBittorrent (로컬 다운로더)']
+            ]) }}
+          {{ macros.setting_checkbox('dl_enabled', '활성화', value='On') }}
+          {{ macros.setting_input_int('dl_stalled_timeout_hours', '지연 타임아웃 (시간)', value='24', min='1', desc=['해당 시간 동안 미완료/지연 시 다음 엔진으로 자동 폴백']) }}
+
+          <div id="dl_fields_alldebrid" class="dl-engine-fields">
+            {{ macros.m_hr() }}
+            {{ macros.setting_input_text('dl_ad_apikey', 'AllDebrid API Key', placeholder='AllDebrid 개인 API 키 입력') }}
+            {{ macros.setting_input_text('dl_ad_remote', 'Rclone 리모트명', value='ad', placeholder='ad') }}
+            {{ macros.setting_input_text('dl_ad_base_path', 'Rclone 마그넷 경로', value='magnets', placeholder='magnets') }}
+          </div>
+
+          <div id="dl_fields_115" class="dl-engine-fields" style="display: none;">
+            {{ macros.m_hr() }}
+            {{ macros.setting_input_text('dl_115_addr', 'CD2 gRPC 주소', value='127.0.0.1', placeholder='127.0.0.1') }}
+            {{ macros.setting_input_int('dl_115_port', 'CD2 gRPC 포트', value='19798') }}
+            {{ macros.setting_input_text('dl_115_token', 'CD2 인증 토큰', placeholder='CloudDrive2 API Token') }}
+            {{ macros.setting_input_text('dl_115_vpath', 'CD2 가상 다운로드 경로', value='115open/云下载') }}
+            {{ macros.setting_input_text('dl_115_mpath', 'CD2 로컬 마운트 경로', placeholder='예: /mnt/cd2/115open/云下载') }}
+            {{ macros.setting_input_text('dl_115_cpath', '115 내부 완료 경로', placeholder='예: /mnt/cd2/115open/uploads') }}
+          </div>
+
+          <div id="dl_fields_qbittorrent" class="dl-engine-fields" style="display: none;">
+            {{ macros.m_hr() }}
+            {{ macros.setting_input_text('dl_qb_url', 'Web UI 주소', value='http://127.0.0.1:8080') }}
+            {{ macros.setting_input_text('dl_qb_user', '사용자명', value='admin') }}
+            {{ macros.setting_input_text('dl_qb_pass', '비밀번호', type='password') }}
+            {{ macros.setting_input_text('dl_qb_save_path', '다운로드 완료 경로', placeholder='예: /data/downloads') }}
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button id="downloader_save_btn" type="button" class="btn btn-primary">저장</button>
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 모달: 프로필 추가/수정 (일반 Rclone 리모트 설정 포함) -->
+<div class="modal fade" id="profile_modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header d-flex align-items-center justify-content-between">
+        <h4 class="modal-title" id="profile_modal_title">다운로드 프로필 설정</h4>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+      </div>
+      <div class="modal-body">
+        <form id="profile_form">
+          <input type="hidden" id="profile_mode" value="add">
+          {{ macros.setting_input_text('profile_name', '프로필명', placeholder='예: default_profile, movies_direct_115') }}
+          <!-- 적용 피드 선택 영역 -->
+          <div class="form-group row mb-2">
+            <label class="col-sm-2 col-form-label text-right font-weight-bold">적용 피드</label>
+            <div class="col-sm-10">
+              <div class="input-group input-group-sm mb-2">
+                <select id="profile_feed_select" class="form-control mr-1"></select>
+                <div class="input-group-append">
+                  <button type="button" id="btn_add_profile_feed" class="btn btn-outline-primary">피드 추가</button>
+                  <button type="button" id="btn_add_all_feed" class="btn btn-outline-secondary ml-1">전체 피드(*)</button>
+                </div>
+              </div>
+              <div id="profile_selected_feeds_container" class="p-2 border rounded d-flex flex-wrap align-items-center" style="min-height: 38px; background: rgba(128,128,128,0.05);">
+                <span class="text-muted small">선택된 피드가 없습니다.</span>
+              </div>
+              <small class="form-text text-muted">다운로드를 적용할 피드를 선택하세요 (*는 개별 지정되지 않은 모든 피드에 일괄 적용됩니다).</small>
+            </div>
+          </div>
+
+          <!-- 우선순위 체인 설정 영역 -->
+          <div class="form-group row mb-2">
+            <label class="col-sm-2 col-form-label text-right font-weight-bold">우선순위 체인</label>
+            <div class="col-sm-10">
+              <div class="input-group input-group-sm mb-2">
+                <select id="profile_engine_select" class="form-control mr-1"></select>
+                <div class="input-group-append">
+                  <button type="button" id="btn_add_profile_engine" class="btn btn-outline-primary">엔진 추가</button>
+                </div>
+              </div>
+              <div class="table-responsive rounded border" style="max-height: 180px; overflow-y: auto;">
+                <table class="table table-sm table-hover mb-0 text-center">
+                  <thead class="thead-light">
+                    <tr>
+                      <th style="width: 15%;">우선순위</th>
+                      <th style="width: 45%;">다운로더 식별명</th>
+                      <th style="width: 40%;">순서 조정 및 제외</th>
+                    </tr>
+                  </thead>
+                  <tbody id="profile_chain_table_tbody">
+                    <tr><td colspan="3" class="text-muted py-2">등록된 다운로더 엔진이 없습니다.</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <small class="form-text text-muted">상단 엔진부터 다운로드를 시도하며, 오류 또는 지연 발생 시 다음 순위 엔진으로 자동 폴백됩니다.</small>
+            </div>
+          </div>
+          {{ macros.setting_checkbox('profile_append_hash_on_conflict', '중복 시에만 폴더명 해시 추가', value='On', desc=['On: DB에 동일한 폴더명이 이미 존재할 때만 해시(_[hash])를 붙여 분리합니다. Off: 원본 폴더명을 항상 그대로 유지합니다.']) }}
+          {{ macros.m_hr() }}
+          {{ macros.setting_select('profile_dest_type', '목적지 유형', [
+              ['gdrive_rotation', 'Google Drive 계정 풀 로테이션 (MyDrive 경유용)'],
+              ['rclone_simple', '일반 Rclone 리모트 단순 업로드 (전용 단일 리모트)'],
+              ['115_internal', '115 Cloud 내부 완료 폴더 이동 (115 전용)'],
+              ['local', '로컬 디스크 보존 (단순 완료)']
+            ]) }}
+
+          <!-- 구글 드라이브 로테이션 목적지 필드 -->
+          <div id="profile_fields_gdrive_rotation" class="dest-type-fields">
+            {{ macros.setting_input_text('profile_gdrive_upload_path', '임시 수신 경로 (Incoming)', value='incoming/default') }}
+            {{ macros.setting_input_text('profile_gdrive_complete_path', '최종 라이브러리 경로 (Complete)', value='uploads/default') }}
+            {{ macros.setting_input_text('profile_gdrive_remote_id', '공유 드라이브 ID (Shared Drive ID)', placeholder='미입력 시 기본 설정값 사용') }}
+          </div>
+
+          <!-- 일반 Rclone 리모트 단순 업로드 필드 -->
+          <div id="profile_fields_rclone_simple" class="dest-type-fields" style="display: none;">
+            {{ macros.setting_input_text('profile_simple_remote_path', 'Rclone 목적지 경로', placeholder='예: my_gdrive:media/movies 또는 onedrive:incoming') }}
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button id="profile_save_btn" type="button" class="btn btn-primary">저장</button>
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 모달: 구글 드라이브 계정 일괄 등록 (텍스트) -->
+<div class="modal fade" id="gdrive_batch_modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header d-flex align-items-center justify-content-between">
+        <h4 class="modal-title">Google Drive 계정 일괄 등록 (텍스트)</h4>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+      </div>
+      <div class="modal-body">
+        <p class="small text-muted mb-2">
+          줄바꿈으로 구분하여 <code>이메일:내드라이브폴더ID</code> 형식으로 붙여넣으세요.<br>
+          예시:<br>
+          <code>user01@example.com:0AIoBxxxxxx_MyDriveFolderID</code><br>
+          <code>user02@example.com:0AIoByyyyyy_MyDriveFolderID</code>
+        </p>
+        <textarea id="gdrive_batch_textarea" class="form-control" rows="12" style="font-family: monospace; font-size: 0.85rem;" placeholder="이메일:내드라이브ID"></textarea>
+      </div>
+      <div class="modal-footer">
+        <button id="gdrive_batch_save_btn" type="button" class="btn btn-primary">일괄 추가하기</button>
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="text/javascript">
+var package_name = "{{ arg['package_name'] }}";
+var sub = "{{ arg['sub'] }}";
+</script>
+<script src="{{ url_for('.static', filename='feeder_download_setting.js') }}"></script>
+
+{% endblock %}

@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+{% block content %}
+
+<link rel="stylesheet" href="{{ url_for('.static', filename='feeder.css') }}">
+
+<div class="row mb-3">
+  <div class="col-md-2 col-sm-4 mb-2">
+    <div class="card text-center border-warning">
+      <div class="card-body py-2 px-1">
+        <h6 class="text-muted small mb-1 font-weight-bold">대기 (Pending)</h6>
+        <h3 id="stat_pending" class="mb-0 text-warning font-weight-bold">0</h3>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-2 col-sm-4 mb-2">
+    <div class="card text-center border-primary">
+      <div class="card-body py-2 px-1">
+        <h6 class="text-muted small mb-1 font-weight-bold">다운로드 중</h6>
+        <h3 id="stat_downloading" class="mb-0 text-primary font-weight-bold">0</h3>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-2 col-sm-4 mb-2">
+    <div class="card text-center border-info">
+      <div class="card-body py-2 px-1">
+        <h6 class="text-muted small mb-1 font-weight-bold">로컬 스테이징</h6>
+        <h3 id="stat_staging" class="mb-0 text-info font-weight-bold">0</h3>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-2 col-sm-4 mb-2">
+    <div class="card text-center border-primary">
+      <div class="card-body py-2 px-1">
+        <h6 class="text-muted small mb-1 font-weight-bold">업로드 중</h6>
+        <h3 id="stat_uploading" class="mb-0 text-primary font-weight-bold">0</h3>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-2 col-sm-4 mb-2">
+    <div class="card text-center border-success">
+      <div class="card-body py-2 px-1">
+        <h6 class="text-muted small mb-1 font-weight-bold">최종 완료</h6>
+        <h3 id="stat_completed" class="mb-0 text-success font-weight-bold">0</h3>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-2 col-sm-4 mb-2">
+    <div class="card text-center border-danger">
+      <div class="card-body py-2 px-1">
+        <h6 class="text-muted small mb-1 font-weight-bold">실패/이동오류</h6>
+        <h3 id="stat_failed" class="mb-0 text-danger font-weight-bold">0</h3>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h5 class="mb-0 font-weight-bold"><i class="fa fa-tasks mr-1"></i>실시간 활성 작업 큐 (Active Queue)</h5>
+  <button id="queue_refresh_btn" class="btn btn-sm btn-outline-secondary"><i class="fa fa-refresh mr-1"></i>새로고침</button>
+</div>
+
+<div class="table-responsive">
+  <table class="table table-sm table-striped table-hover text-center align-middle">
+    <thead class="thead-dark">
+      <tr>
+        <th style="width: 5%;">ID</th>
+        <th style="width: 14%;">상태 / 엔진</th>
+        <th style="width: 36%;">피드명 / 콘텐츠 정보</th>
+        <th style="width: 15%;">용량 / 저장 경로</th>
+        <th style="width: 14%;">시간</th>
+        <th style="width: 16%;">제어</th>
+      </tr>
+    </thead>
+    <tbody id="active_queue_tbody">
+      <tr><td colspan="6" class="py-4 text-muted">활성 작업 큐를 불러오는 중입니다...</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<script type="text/javascript">
+var package_name = "{{ arg['package_name'] }}";
+var sub = "{{ arg['sub'] }}";
+var enable_sse = ("{{ arg.get('download_enable_sse', 'True') }}" === 'True');
+</script>
+<script src="{{ url_for('.static', filename='feeder_download_queue.js') }}"></script>
+
+{% endblock %}

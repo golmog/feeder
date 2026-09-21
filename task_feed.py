@@ -420,10 +420,6 @@ class Task:
                     bbs_list.append(item)
                     detail_count += 1
 
-                    if is_test and max_count > 0 and len(bbs_list) >= max_count:
-                        stop_crawl = True
-                        break
-
                     if not is_test and max_count > 0 and len(bbs_list) >= max_count:
                         stop_crawl = True
                         break

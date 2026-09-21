@@ -19,6 +19,15 @@ setting = {
                 ]
             },
             {
+                'uri': 'download',
+                'name': 'DOWNLOAD',
+                'list': [
+                    {'uri': 'setting', 'name': '설정 및 관리'},
+                    {'uri': 'queue', 'name': '다운로드 큐 및 대시보드'},
+                    {'uri': 'list', 'name': '다운로드 리스트'}
+                ]
+            },
+            {
                 'uri': 'manual',
                 'name': '매뉴얼',
                 'list': [
@@ -37,9 +46,11 @@ PLUGIN_ROOT = os.path.dirname(__file__)
 
 try:
     from .model_feed import ModelFeedSite, ModelFeedBbs
+    from .model_download import ModelDownload, ModelDownloadStat
     from .mod_feed import ModuleFeed
+    from .mod_download import ModuleDownload
 
-    P.set_module_list([ModuleFeed])
+    P.set_module_list([ModuleFeed, ModuleDownload])
 except Exception as e:
     P.logger.error(f'Exception: {str(e)}')
     P.logger.error(traceback.format_exc())

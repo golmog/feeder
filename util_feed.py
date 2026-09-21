@@ -168,6 +168,10 @@ class FeedConfigUtil:
                 'CRAWLERS': [],
                 'FEEDS': []
             }
+
+            default_data['DOWNLOADERS'] = []
+            default_data['DOWNLOAD_PROFILES'] = []
+            default_data['GDRIVE_ACCOUNTS'] = []
             cls.save_yaml(default_data)
             return default_data
 
@@ -181,6 +185,12 @@ class FeedConfigUtil:
                 data['FEEDS'] = []
             if 'GLOBAL' not in data or not isinstance(data['GLOBAL'], dict):
                 data['GLOBAL'] = {}
+            if 'DOWNLOADERS' not in data or not isinstance(data['DOWNLOADERS'], list):
+                data['DOWNLOADERS'] = []
+            if 'DOWNLOAD_PROFILES' not in data or not isinstance(data['DOWNLOAD_PROFILES'], list):
+                data['DOWNLOAD_PROFILES'] = []
+            if 'GDRIVE_ACCOUNTS' not in data or not isinstance(data['GDRIVE_ACCOUNTS'], list):
+                data['GDRIVE_ACCOUNTS'] = []
 
             from .task_feed import Task
             for c in data['CRAWLERS']:
@@ -204,7 +214,102 @@ class FeedConfigUtil:
             return data
         except Exception as e:
             logger.error(f"[Feeder] YAML 로드 실패: {e}")
-            return {'GLOBAL': {}, 'CRAWLERS': [], 'FEEDS': []}
+            return {'GLOBAL': {}, 'CRAWLERS': [], 'FEEDS': [], 'DOWNLOADERS': [], 'DOWNLOAD_PROFILES': [], 'GDRIVE_ACCOUNTS': []}
+
+    # 다운로더 인스턴스 (DOWNLOADERS) 관리
+    @classmethod
+    def get_downloaders(cls) -> list[dict]:
+        data = cls.load_yaml()
+        return data.get('DOWNLOADERS', [])
+
+    @classmethod
+    def get_downloader_by_name(cls, name: str) -> dict | None:
+        target = str(name).strip().lower()
+        for d in cls.get_downloaders():
+            if str(d.get('name', '')).strip().lower() == target:
+                return d
+        return None
+
+    @classmethod
+    def save_downloader(cls, item: dict) -> str:
+        data = cls.load_yaml()
+        items = data.get('DOWNLOADERS', [])
+        target_name = item.get('name', '').strip()
+        if not target_name:
+            return 'empty_name'
+
+        for idx, d in enumerate(items):
+            if str(d.get('name', '')).strip().lower() == target_name.lower():
+                items[idx].update(item)
+                data['DOWNLOADERS'] = items
+                cls.save_yaml(data)
+                logger.info(f"[FeederConfig] 다운로더 설정 갱신: {target_name}")
+                return 'success_update'
+
+        items.append(item)
+        data['DOWNLOADERS'] = items
+        cls.save_yaml(data)
+        logger.info(f"[FeederConfig] 신규 다운로더 추가: {target_name}")
+        return 'success'
+
+    @classmethod
+    def delete_downloader(cls, name: str) -> bool:
+        data = cls.load_yaml()
+        items = data.get('DOWNLOADERS', [])
+        target = str(name).strip().lower()
+        data['DOWNLOADERS'] = [d for d in items if str(d.get('name', '')).strip().lower() != target]
+        cls.save_yaml(data)
+        logger.info(f"[FeederConfig] 다운로더 삭제: {name}")
+        return True
+
+    # 다운로드 라우팅 프로필 (DOWNLOAD_PROFILES) 관리
+    @classmethod
+    def get_download_profiles(cls) -> list[dict]:
+        data = cls.load_yaml()
+        return data.get('DOWNLOAD_PROFILES', [])
+
+    @classmethod
+    def get_download_profile_by_feed(cls, feed_name: str) -> dict | None:
+        target = str(feed_name).strip().lower()
+        for p in cls.get_download_profiles():
+            feeds = [str(f).strip().lower() for f in p.get('feeds', [])]
+            if target in feeds or '*' in feeds:
+                return p
+        return None
+
+    @classmethod
+    def save_download_profile(cls, item: dict) -> str:
+        data = cls.load_yaml()
+        profiles = data.get('DOWNLOAD_PROFILES', [])
+        name = item.get('name', '').strip()
+        if not name:
+            return 'empty_name'
+
+        for idx, p in enumerate(profiles):
+            if str(p.get('name', '')).strip().lower() == name.lower():
+                profiles[idx].update(item)
+                data['DOWNLOAD_PROFILES'] = profiles
+                cls.save_yaml(data)
+                logger.info(f"[FeederConfig] 다운로드 프로필 갱신: {name}")
+                return 'success_update'
+
+        profiles.append(item)
+        data['DOWNLOAD_PROFILES'] = profiles
+        cls.save_yaml(data)
+        logger.info(f"[FeederConfig] 신규 다운로드 프로필 추가: {name}")
+        return 'success'
+
+    # 구글 드라이브 계정 풀 (GDRIVE_ACCOUNTS) 관리
+    @classmethod
+    def get_gdrive_accounts(cls) -> list[dict]:
+        data = cls.load_yaml()
+        return data.get('GDRIVE_ACCOUNTS', [])
+
+    @classmethod
+    def save_gdrive_accounts(cls, accounts: list[dict]) -> bool:
+        data = cls.load_yaml()
+        data['GDRIVE_ACCOUNTS'] = accounts
+        return cls.save_yaml(data)
 
     @classmethod
     def get_global(cls) -> dict:
@@ -215,8 +320,11 @@ class FeedConfigUtil:
     def save_yaml(cls, data: dict) -> bool:
         try:
             os.makedirs(os.path.dirname(CONFIG_FILEPATH), exist_ok=True)
+            raw_yaml = yaml.dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)
+            formatted_yaml = re.sub(r'\n([A-Z0-9_]+:)', r'\n\n\1', raw_yaml).lstrip('\n')
+
             with open(CONFIG_FILEPATH, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+                f.write(formatted_yaml)
             return True
         except Exception as e:
             logger.error(f"[Feeder] YAML 저장 실패: {e}")
