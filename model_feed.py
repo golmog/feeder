@@ -99,7 +99,7 @@ class ModelFeedBbs(ModelBase):
     url = db.Column(db.String)
     magnet_count = db.Column(db.Integer, default=0)
     file_count = db.Column(db.Integer, default=0)
-    magnet = db.Column(db.String)
+    magnet = db.Column(db.String, index=True)
     files = db.Column(db.String)
     torrent_info = db.Column(db.JSON, nullable=True)
     broadcast_status = db.Column(db.String, default='')
