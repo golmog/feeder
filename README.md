@@ -29,7 +29,8 @@
 | **토렌트 리스트** | 수집된 게시글 목록, 마그넷/ed2k 복사, 첨부파일 직접 다운로드, 토렌트 메타데이터 조회, 사이트별 및 태스크별 필터 검색. |
 | **기본 설정** | 수집 주기, 최대 탐색 페이지, HTTP 프록시, FlareSolverr, Remote Selenium, 토렌트 메타데이터 취득 방식, 공유용 RSS XML 파일 경로/기간 설정. |
 | **사이트 관리** | 사이트 규칙(JSON) 등록/수정/삭제, 게시판 단위 수집 테스트, 커스텀 Python 스크립트 관리. |
-| **작업 관리 (TASKS)** | 수집 태스크 등록/수정/삭제, 복수 타겟 게시판(Targets) 지정, 개별 주기(Interval), 화질(quality), 정규식 필터, 공유용 XML 파일 생성 제어. |
+| **수집 관리 (CRAWLERS)** | 사이트별 수집기 등록/수정/삭제, 복수 수집 대상 게시판 지정, 개별 실행 빈도(Interval), 프록시/보안 우회 옵션 제어. |
+| **피드 관리 (FEEDS)** | RSS 피드 발행기 등록/수정/삭제, 수집된 소스 게시판 조합(통합 피드), 화질(quality) 및 Flexget 정규식 필터, 공유용 XML 파일 생성 제어. |
 | **자동 & DB정리** | Celery 스케줄러 자동 등록, 주기적 DB 자동 정리(Retention) 및 SQLite VACUUM 공간 회수. |
 
 ---
@@ -79,7 +80,7 @@
     "USE_FLARESOLVERR",
     "USE_SELENIUM",
     "USE_TORRENT_INFO",
-    "USING_BOARD_CHAR_ID",
+    "USING_POST_CHAR_ID",
     "ONLY_FILE",
     "MAGNET_ONLY_ONE_LAST"
   ],
@@ -138,21 +139,21 @@
 | `"USE_FLARESOLVERR"` | OFF | Cloudflare Turnstile 및 5초 챌린지 사이트 수집 시 FlareSolverr 인가를 사전에 획득합니다. |
 | `"USE_SELENIUM"` | OFF | 목록 및 본문 페이지를 원격 Selenium 드라이버를 통해 자바스크립트를 완전 렌더링하여 수집합니다. |
 | `"USE_TORRENT_INFO"` | OFF | 수집된 마그넷을 `torrent_info` 플러그인 또는 qBittorrent Web API로 분석하여 원본 파일명으로 변환합니다. |
-| `"USING_BOARD_CHAR_ID"` | OFF | 게시물 고유 ID가 숫자가 아닌 영문/해시 등 문자열 형태인 경우 중복 수집 체크에 문자열 컬럼(`board_char_id`)을 사용합니다. |
+| `"USING_POST_CHAR_ID"` | OFF | 게시글(포스트) 고유 ID가 숫자가 아닌 영문/해시 등 문자열 형태인 경우 중복 수집 체크에 문자열 컬럼(`post_char_id`)을 사용합니다. |
 | `"ONLY_FILE"` | OFF | 본문에 마그넷/ed2k 링크가 없고 `.torrent` 첨부파일만 존재하는 게시물도 수집 대상(DB 저장 및 RSS 발행)으로 허용합니다. |
 | `"MAGNET_ONLY_ONE_LAST"` | OFF | 한 게시글 본문에 여러 개의 마그넷이 존재할 경우 가장 마지막 마그넷 1개만 수집합니다. |
 
 ---
 
-### 4. 작업 관리 및 전역 설정 (YAML: `feeder_settings.yaml`) 가이드
+### 4. 수집기, 피드 및 전역 설정 (YAML: `feeder_settings.yaml`) 가이드
 
-상단 메뉴의 **YAML 편집** 버튼을 누르거나 `{path_data}/db/feeder_settings.yaml` 파일을 직접 수정하여 Flexget 스타일의 강력한 정규식/화질 필터링과 다중 타겟 게시판을 포함하는 수집 작업(`TASKS`), 공유용 RSS 파일 생성을 통합 제어할 수 있습니다.
+상단 메뉴의 **YAML 편집** 버튼을 누르거나 `{path_data}/db/feeder_settings.yaml` 파일을 직접 수정하여 사이트별 수집 설정(`CRAWLERS`)과 맞춤형 RSS 발행 설정(`FEEDS`), 전역 공통 필터(`GLOBAL`)를 통합 제어할 수 있습니다.
 
 <br>
 #### 전체 YAML 구조 예시
 
 ```yaml
-# 전역 공통 필터 및 화질 설정 (모든 수집 작업에 선행 적용)
+# 전역 공통 필터 및 화질 설정 (모든 피드 발행에 선행 적용)
 GLOBAL:
   quality: 1080p+                         # 1080p 이상만 수집 허용
   regexp:
@@ -163,11 +164,12 @@ GLOBAL:
       - \bCam\b: {from: title}            # CAM 버전 제외
       - spam_domain\.com: {from: link}    # 스팸 링크 포함 게시물 차단
 
-# 수집 작업(Tasks) 설정
-TASKS:
-  # 단일 게시판 타겟 수집 작업 예시
+# 수집기(CRAWLERS) 설정: 사이트별 탐색 대상 게시판 및 네트워크/우회 옵션
+CRAWLERS:
   - id: 1
-    name: "sukebei_board"
+    site: sukebei
+    boards:
+      - board: '2_2'
     interval: 1
     enabled: true
     use_proxy: true
@@ -175,23 +177,35 @@ TASKS:
     use_flaresolverr: false
     use_selenium: false
     use_torrent_info: true
-    targets:
-      - site: sukebei
-        board: '2_2'
-    quality: 2160p+                       # 해당 작업은 4K 전용 수집
-    use_rss_file: true
-    rss_file: sukebei_4k.xml
 
-  # 다중 게시판 통합 수집 작업 예시 (여러 사이트의 게시판을 묶어 동일 마그넷 자동 통합)
   - id: 2
-    name: "asian_movies"
+    site: sehuatang
+    boards:
+      - board: '103'
+      - board: '166'
+        subcat: '875'
     interval: 2
     enabled: true
     use_proxy: true
+    proxy_url: ''
     use_flaresolverr: true
     use_selenium: true
     use_torrent_info: false
-    targets:
+
+# 피드(FEEDS) 설정: 수집된 DB 기반 RSS 발행, 필터링 및 XML 파일 생성
+FEEDS:
+  - id: 1
+    name: "sukebei_4k"
+    sources:
+      - site: sukebei
+        board: '2_2'
+    quality: 2160p+
+    use_rss_file: true
+    rss_file: sukebei_4k.xml
+
+  - id: 2
+    name: "asian_movies"
+    sources:
       - site: sukebei
         board: '2_2'
       - site: sehuatang
@@ -209,36 +223,37 @@ TASKS:
 ```
 
 <br>
-#### `GLOBAL` 설정 필드 상세 설명
-
-| 필드명 | 타입 | 설명 |
-| :--- | :---: | :--- |
-| `quality` | 문자열/배열 | 전역 최소 화질 기준식 (예: `1080p+`, `2160p+`, `720p-1080p`, `[1080p, 2160p]`). |
-| `regexp` | 딕셔너리 | 모든 수집 작업에 공통으로 우선 적용할 Flexget 규격 정규식 필터 블록입니다. |
-| `accept_all` | 불리언 | 필터에서 거부되지 않은 모든 항목을 전역에서 기본 허용할지 여부 (`true`/`false`). |
-
-<br>
-#### `TASKS` 항목 필드 상세 설명
-
-각 수집 태스크의 구성 항목입니다. 단일/복수 타겟 게시판을 자유롭게 포함할 수 있습니다.
+#### `CRAWLERS` 항목 필드 상세 설명
 
 | 필드명 | 타입 | 기본값 | 설명 |
 | :--- | :---: | :---: | :--- |
-| `id` | 정수 | 자동 채번 | 작업 고유 식별 번호 (1부터 시작). |
-| `name` | 문자열 | **필수** | 작업 고유 이름 (예: `asian_movies`). 통합 RSS 피드명 및 기본 XML 파일명으로 사용됩니다. |
-| `targets` | 배열 | `[]` | **수집 대상 사이트 및 게시판 목록.** (하단 상세 설명 참조) |
-| `interval` | 정수 | `1` | 스케줄러 실행 빈도. N회 스케줄 주기마다 1회 크롤링을 수행합니다. |
-| `enabled` | 불리언 | `true` | 해당 작업의 활성화/중지 여부. |
-| `use_proxy` | 불리언 | `false` | 해당 작업 크롤링 시 HTTP/SOCKS5 프록시 서버 경유 여부. |
-| `proxy_url` | 문자열 | `""` | 개별 프록시 서버 주소. 비워둘 경우 기본 설정의 Proxy URL이 적용됩니다. |
+| `id` | 정수 | 자동 채번 | 수집기 고유 식별 번호 (1부터 시작). |
+| `site` | 문자열 | **필수** | 수집 대상 사이트 식별명 (사이트 JSON의 `NAME`과 일치). |
+| `boards` | 배열 | `[]` | 해당 사이트에서 수집할 대상 게시판 목록 (`board`, 선택사항 `subcat`). |
+| `interval` | 정수 | `1` | 스케줄러 실행 빈도. N회 스케줄 주기마다 1회 크롤링 수행. |
+| `enabled` | 불리언 | `true` | 수집기 활성화/중지 여부. |
+| `use_proxy` | 불리언 | `false` | 수집 시 HTTP/SOCKS5 프록시 서버 경유 여부. |
+| `proxy_url` | 문자열 | `""` | 개별 프록시 서버 주소. 비워둘 경우 기본 설정의 Proxy URL 사용. |
 | `use_flaresolverr` | 불리언 | `false` | Cloudflare 챌린지 우회 엔진 경유 여부. |
 | `use_selenium` | 불리언 | `false` | 원격 Selenium 브라우저 완전 렌더링 사용 여부. |
 | `use_torrent_info` | 불리언 | `false` | 마그넷 메타데이터 분석을 통한 원본 파일명 치환 사용 여부. |
+
+<br>
+#### `FEEDS` 항목 필드 상세 설명
+
+| 필드명 | 타입 | 기본값 | 설명 |
+| :--- | :---: | :---: | :--- |
+| `id` | 정수 | 자동 채번 | 피드 고유 식별 번호 (1부터 시작). |
+| `name` | 문자열 | **필수** | 피드 고유 식별명 (RSS 피드 URL의 `name` 파라미터 및 기본 XML 파일명으로 사용). |
+| `sources` | 배열 | `[]` | 이 피드에 포함할 수집 소스 게시판 목록 (`site`, `board`, `subcat`). |
+| `quality` | 문자열/배열 | - | 해당 피드에만 적용할 개별 화질 조건식 (예: `1080p+`, `2160p+`). |
+| `regexp` | 딕셔너리 | - | 해당 피드에 적용할 개별 `reject`, `reject_excluding`, `accept` 정규식 필터 블록. |
+| `accept_all` | 불리언 | `false` | 필터에서 거부되지 않은 나머지 모든 항목을 허용할지 여부. |
 | `use_rss_file` | 불리언 | `false` | 공유용 RSS XML 파일 자동 생성 활성화 여부. |
-| `rss_file` | 문자열 | 자동 지정 | 생성할 XML 파일명. 비워두면 `{name}.xml`로 자동 지정됩니다. |
-| `rss_file_path` | 문자열 | `""` | 개별 XML 저장 절대 경로. 비워둘 경우 기본 설정의 저장 경로가 적용됩니다. |
-| `rss_file_days` | 정수 | `""` | 개별 XML 내 게시글 보관 기간(일). 비워둘 경우 기본 설정(기본 14일)이 적용됩니다. |
-| `rss_file_items` | 정수 | `""` | 개별 XML 내 최대 피드 수. 비워둘 경우 기본 설정(기본 100개)이 적용됩니다. |
+| `rss_file` | 문자열 | 자동 지정 | 생성할 XML 파일명. 비워두면 `{name}.xml`로 지정. |
+| `rss_file_path` | 문자열 | `""` | 개별 XML 저장 절대 경로. 비워둘 경우 기본 설정의 저장 경로 적용. |
+| `rss_file_days` | 정수 | `""` | 개별 XML 내 게시글 보관 기간(일). 비워둘 경우 기본 설정(기본 14일) 적용. |
+| `rss_file_items` | 정수 | `""` | 개별 XML 내 최대 피드 수. 비워둘 경우 기본 설정(기본 100개) 적용. |
 | `quality` | 문자열/배열 | - | 해당 작업에만 적용할 개별 화질 조건식 (예: `2160p+`). |
 | `regexp` | 딕셔너리 | - | 해당 작업에만 적용할 개별 `reject`, `reject_excluding`, `accept` 정규식 필터 블록. |
 | `accept_all` | 불리언 | `false` | 개별 필터에서 거부되지 않은 나머지 모든 항목을 허용할지 여부. |
@@ -428,17 +443,17 @@ Feeder는 사이트 보안 수준과 필요 여부에 따라 리소스를 최소
 <br>
 #### 피드 URL 형식
 
-* **태스크 ID 기반 통합 피드 (단일/복수 타겟 및 마그넷 중복 자동 단일화):**
+* **피드 이름 기반 통합 피드 (단일/복수 소스 및 마그넷 중복 자동 단일화):**
   ```text
-  http://{YOUR_HOST}:{PORT}/feeder/api/task?id={TASK_ID}&apikey={APIKEY}
+  http://{YOUR_HOST}:{PORT}/feeder/api/feed?name={FEED_NAME}&apikey={APIKEY}
   ```
-  *(예: `http://192.168.1.100:9999/feeder/api/task?id=1&apikey=abcdef123456`)*
+  *(예: `http://192.168.1.100:9999/feeder/api/feed?name=sukebei_offkab&apikey=abcdef123456`)*
 
-* **태스크 이름 기반 통합 피드:**
+* **피드 ID 기반 통합 피드:**
   ```text
-  http://{YOUR_HOST}:{PORT}/feeder/api/task?name={TASK_NAME}&apikey={APIKEY}
+  http://{YOUR_HOST}:{PORT}/feeder/api/feed?id={FEED_ID}&apikey={APIKEY}
   ```
-  *(예: `http://192.168.1.100:9999/feeder/api/task?name=asian_movies&apikey=abcdef123456`)*
+  *(예: `http://192.168.1.100:9999/feeder/api/feed?id=1&apikey=abcdef123456`)*
 
 * **단일 게시판 직접 쿼리 피드 (특정 게시판 데이터만 즉시 조회할 때):**
   ```text

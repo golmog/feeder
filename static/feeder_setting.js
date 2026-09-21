@@ -556,9 +556,6 @@ $(document).on('click', '.crawler_edit_btn', function(e){
 $(document).on('click', '#crawler_save_btn', function(e){
   e.preventDefault();
   var formData = $('#crawler_form').serialize();
-  if ($('#crawler_board').is(':disabled')) {
-    formData += '&crawler_board=' + encodeURIComponent($('#crawler_board').val());
-  }
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/add_crawler',
     type: "POST",

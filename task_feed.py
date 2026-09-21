@@ -164,8 +164,8 @@ class Task:
 
                             # 스케줄러 자동 실행 시에만 기존 수집 지점(max_id)을 적용하여 조기 종료
                             # 수동 1회 실행 시에는 max_id를 0으로 두어 지정된 max_page까지 전체 탐색
-                            if not manual and 'USING_BOARD_CHAR_ID' not in extra and last_bbs and last_bbs.board_id:
-                                max_id = last_bbs.board_id
+                            if not manual and 'USING_POST_CHAR_ID' not in extra and last_bbs and last_bbs.post_id:
+                                max_id = last_bbs.post_id
 
                             target_cfg.subcat_id = subcat_id
 
@@ -360,7 +360,7 @@ class Task:
                             pass
 
                     if not is_test and post_id:
-                        existing = ModelFeedBbs.get(site=site_name, board=full_board_key, board_id=int(post_id)) if str(post_id).isdigit() else ModelFeedBbs.get(site=site_name, board=full_board_key, board_char_id=str(post_id))
+                        existing = ModelFeedBbs.get(site=site_name, board=full_board_key, post_id=int(post_id)) if str(post_id).isdigit() else ModelFeedBbs.get(site=site_name, board=full_board_key, post_char_id=str(post_id))
                         if existing:
                             logger.debug(f"[Feeder] 이미 수집 완료된 게시물 건너뜀: [{site_name}] {item['title'][:30]} (ID: {post_id})")
                             continue
@@ -448,7 +448,7 @@ class Task:
 
         from .util_feed import extract_info_hash
 
-        magnet_rule = site_info.get('MAGNET_REGEX') or site_info.get('MAGNET_REGAX')
+        magnet_rule = site_info.get('MAGNET_REGEX')
 
         if not magnet_rule:
             # <a> 태그 href 속성 탐색
@@ -540,21 +540,21 @@ class Task:
         return downloads
 
     @staticmethod
-    def save_single_bbs(site_name: str, board_id: str, item: dict):
+    def save_single_bbs(site_name: str, board_name: str, item: dict):
         try:
             post_id = item.get('id', '')
             if not post_id:
                 return None
 
-            existing = ModelFeedBbs.get(site=site_name, board=board_id, board_id=int(post_id)) if str(post_id).isdigit() else ModelFeedBbs.get(site=site_name, board=board_id, board_char_id=str(post_id))
+            existing = ModelFeedBbs.get(site=site_name, board=board_name, post_id=int(post_id)) if str(post_id).isdigit() else ModelFeedBbs.get(site=site_name, board=board_name, post_char_id=str(post_id))
             if existing:
                 return existing
 
-            bbs = ModelFeedBbs(site_name, board_id)
+            bbs = ModelFeedBbs(site_name, board_name)
             if str(post_id).isdigit():
-                bbs.board_id = int(post_id)
+                bbs.post_id = int(post_id)
             else:
-                bbs.board_char_id = str(post_id)
+                bbs.post_char_id = str(post_id)
 
             bbs.title = item.get('title', '')
             bbs.url = item.get('url', '')

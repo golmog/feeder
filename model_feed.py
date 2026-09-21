@@ -93,8 +93,8 @@ class ModelFeedBbs(ModelBase):
     created_time = db.Column(db.DateTime, default=datetime.now)
     site = db.Column(db.String, index=True)
     board = db.Column(db.String, index=True)
-    board_id = db.Column(db.Integer, index=True, nullable=True)
-    board_char_id = db.Column(db.String, index=True, nullable=True)
+    post_id = db.Column(db.Integer, index=True, nullable=True)
+    post_char_id = db.Column(db.String, index=True, nullable=True)
     title = db.Column(db.String, index=True)
     url = db.Column(db.String)
     magnet_count = db.Column(db.Integer, default=0)
@@ -104,10 +104,10 @@ class ModelFeedBbs(ModelBase):
     torrent_info = db.Column(db.JSON, nullable=True)
     broadcast_status = db.Column(db.String, default='')
 
-    def __init__(self, site_name, board_id):
+    def __init__(self, site_name, board_name):
         self.created_time = datetime.now()
         self.site = site_name
-        self.board = board_id
+        self.board = board_name
         self.broadcast_status = ''
 
     def as_dict(self):
@@ -121,7 +121,7 @@ class ModelFeedBbs(ModelBase):
         return ret
 
     @classmethod
-    def get(cls, id=None, site=None, board=None, board_id=None, board_char_id=None):
+    def get(cls, id=None, site=None, board=None, post_id=None, post_char_id=None):
         try:
             query = db.session.query(cls)
             if id is not None:
@@ -130,10 +130,10 @@ class ModelFeedBbs(ModelBase):
                 query = query.filter_by(site=site)
             if board is not None:
                 query = query.filter_by(board=board)
-            if board_id is not None:
-                query = query.filter_by(board_id=int(board_id))
-            if board_char_id is not None:
-                query = query.filter_by(board_char_id=str(board_char_id))
+            if post_id is not None:
+                query = query.filter_by(post_id=int(post_id))
+            if post_char_id is not None:
+                query = query.filter_by(post_char_id=str(post_char_id))
             return query.first()
         except Exception as e:
             logger.error(f"ModelFeedBbs.get error: {e}")

@@ -12,6 +12,7 @@ import base64
 import requests
 import subprocess
 import importlib.util
+from datetime import datetime, timedelta
 from urllib.parse import urlparse, unquote
 from html import unescape
 from lxml import html
@@ -1248,12 +1249,12 @@ class FeedFilter:
         return False
 
     @classmethod
-    def evaluate(cls, item: dict, scheduler_cfg: dict = None, global_cfg: dict = None) -> tuple[bool, str]:
+    def evaluate(cls, item: dict, feed_cfg: dict = None, global_cfg: dict = None) -> tuple[bool, str]:
         """
         Flexget 필터 체인 평가 (정규식 필터 및 화질 필터 통합)
         반환: (is_accepted: bool, reason: str)
         """
-        sched_dict = scheduler_cfg if isinstance(scheduler_cfg, dict) else (vars(scheduler_cfg) if scheduler_cfg else {})
+        feed_dict = feed_cfg if isinstance(feed_cfg, dict) else (vars(feed_cfg) if feed_cfg else {})
         glob_dict = global_cfg if global_cfg is not None else FeedConfigUtil.get_global()
 
         # GLOBAL reject
@@ -1263,15 +1264,15 @@ class FeedFilter:
             if comp and cls.check_match(item, comp, fields):
                 return False, f"GLOBAL reject: '{comp.pattern}'"
 
-        # SCHEDULE reject
-        sched_regexp = sched_dict.get('regexp', {}) if isinstance(sched_dict.get('regexp'), dict) else {}
-        for r in (sched_regexp.get('reject') or []):
+        # FEED reject
+        feed_regexp = feed_dict.get('regexp', {}) if isinstance(feed_dict.get('regexp'), dict) else {}
+        for r in (feed_regexp.get('reject') or []):
             comp, fields = cls.parse_rule(r)
             if comp and cls.check_match(item, comp, fields):
-                return False, f"SCHEDULE reject: '{comp.pattern}'"
+                return False, f"FEED reject: '{comp.pattern}'"
 
-        # 화질(Quality) 필터 평가 (스케줄 개별 설정 우선 적용 -> 전역 설정 적용)
-        target_quality = sched_dict.get('quality')
+        # 화질(Quality) 필터 평가 (피드 개별 설정 우선 적용 -> 전역 설정 적용)
+        target_quality = feed_dict.get('quality')
         if target_quality is None and isinstance(glob_dict, dict):
             target_quality = glob_dict.get('quality')
 
@@ -1296,17 +1297,17 @@ class FeedFilter:
             if not matched_any:
                 return False, "GLOBAL reject_excluding 조건 불일치"
 
-        # SCHEDULE reject_excluding
-        sched_re_ex = sched_regexp.get('reject_excluding') or []
-        if sched_re_ex:
+        # FEED reject_excluding
+        feed_re_ex = feed_regexp.get('reject_excluding') or []
+        if feed_re_ex:
             matched_any = False
-            for r in sched_re_ex:
+            for r in feed_re_ex:
                 comp, fields = cls.parse_rule(r)
                 if comp and cls.check_match(item, comp, fields):
                     matched_any = True
                     break
             if not matched_any:
-                return False, "SCHEDULE reject_excluding 조건 불일치"
+                return False, "FEED reject_excluding 조건 불일치"
 
         # GLOBAL accept
         for r in (glob_regexp.get('accept') or []):
@@ -1314,21 +1315,21 @@ class FeedFilter:
             if comp and cls.check_match(item, comp, fields):
                 return True, f"GLOBAL accept: '{comp.pattern}'"
 
-        # SCHEDULE accept
-        for r in (sched_regexp.get('accept') or []):
+        # FEED accept
+        for r in (feed_regexp.get('accept') or []):
             comp, fields = cls.parse_rule(r)
             if comp and cls.check_match(item, comp, fields):
-                return True, f"TASK accept: '{comp.pattern}'"
+                return True, f"FEED accept: '{comp.pattern}'"
 
         # accept_all 검사
-        accept_all_flag = sched_dict.get('accept_all')
+        accept_all_flag = feed_dict.get('accept_all')
         if accept_all_flag is None and isinstance(glob_dict, dict):
             accept_all_flag = glob_dict.get('accept_all')
         if str(accept_all_flag).lower() in ['true', 'yes', '1', 'on']:
             return True, "accept_all 허용"
 
         # 명시적인 accept(화이트리스트) 규칙이 선언되어 있는 경우에만 미일치 항목 탈락
-        has_accept_rules = bool(glob_regexp.get('accept') or sched_regexp.get('accept'))
+        has_accept_rules = bool(glob_regexp.get('accept') or feed_regexp.get('accept'))
         if has_accept_rules:
             return False, "accept 조건 미충족"
 

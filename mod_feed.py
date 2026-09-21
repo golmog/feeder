@@ -648,12 +648,8 @@ class ModuleFeed(PluginModuleBase):
             download_url = target_file[0]
             filename = target_file[1]
 
-            target_crawler = None
-            for c in FeedConfigUtil.get_crawlers():
-                c_board = c.get('full_board_key') or c.get('board')
-                if c.get('site') == post.site and str(c_board) == str(post.board):
-                    target_crawler = c
-                    break
+            # 게시판이 소속된 수집기(CRAWLER) 설정 조회 (개별 프록시 및 FlareSolverr 옵션 상속)
+            target_crawler = FeedConfigUtil.get_crawler_by_board(post.site, post.board)
 
             target_cfg = SimpleNamespace(
                 use_proxy=target_crawler.get('use_proxy', False) if target_crawler else P.ModelSetting.get_bool(f"{self.name}_use_proxy"),
@@ -807,37 +803,6 @@ class ModuleFeed(PluginModuleBase):
                     raw_conn.close()
         except Exception as e:
             logger.error(f"[{self.name}] db_vacuum 실행 오류: {e}")
-
-    def get_task_list(self) -> list[dict]:
-        ret = []
-        raw_tasks = FeedConfigUtil.get_tasks()
-        ddns = get_ddns().rstrip('/')
-        apikey = get_system_apikey()
-
-        for task in raw_tasks:
-            info = dict(task)
-            task_id = task.get('id')
-            targets = task.get('targets', [])
-
-            last_bbs = None
-            if targets:
-                target_conds = [and_(ModelFeedBbs.site == t.get('site'), ModelFeedBbs.board == t.get('full_board_key', t.get('board'))) for t in targets]
-                last_bbs = db.session.query(ModelFeedBbs).filter(or_(*target_conds)).order_by(ModelFeedBbs.id.desc()).first()
-
-            info['last'] = last_bbs.as_dict() if last_bbs else None
-            info['targets'] = targets
-            info['enabled'] = str(task.get('enabled', True)).lower() in ['true', 'on', '1']
-            info['use_proxy'] = str(task.get('use_proxy', False)).lower() in ['true', 'on', '1']
-            info['proxy_url'] = task.get('proxy_url', '')
-            info['use_flaresolverr'] = str(task.get('use_flaresolverr', False)).lower() in ['true', 'on', '1']
-            info['use_selenium'] = str(task.get('use_selenium', False)).lower() in ['true', 'on', '1']
-            info['use_torrent_info'] = str(task.get('use_torrent_info', False)).lower() in ['true', 'on', '1']
-            info['use_rss_file'] = str(task.get('use_rss_file', False)).lower() in ['true', 'on', '1']
-
-            info['api'] = f"{ddns}/{P.package_name}/api/task?id={task_id}&apikey={apikey}"
-            ret.append(info)
-        return ret
-
 
     def delete_crawler_db(self, crawler: dict) -> str:
         try:
