@@ -18,7 +18,13 @@ class TaskBase:
 
     @F.celery.task(bind=True, acks_late=False)
     def start(self, *args):
-        logger.debug(f"[Feeder] Celery Task 수신 인자: {args}")
+        logger.info(f"[Feeder] Celery Task 수신 인자: {args}")
+        target_crawler_id = None
+        for arg in args:
+            if isinstance(arg, (int, str)) and str(arg).isdigit():
+                target_crawler_id = int(arg)
+                break
+
         delivery_info = getattr(self.request, 'delivery_info', {}) or {}
         is_redelivered = delivery_info.get('redelivered') or getattr(self.request, 'redelivered', False)
 
@@ -26,14 +32,25 @@ class TaskBase:
             logger.warning("[Feeder] 이전 세션 비정상 종료로 재전송된 고아 태스크 실행 취소")
             return
 
-        Task.start()
+        feed_mod = P.get_module('feed')
+        task_id = getattr(self.request, 'id', '')
+        task_desc = f"수집기 [ID: {target_crawler_id}]" if target_crawler_id else "전체 크롤링 수집"
+
+        if feed_mod and hasattr(feed_mod, 'set_crawler_running'):
+            feed_mod.set_crawler_running(True, desc=task_desc, task_id=task_id)
+
+        try:
+            Task.start(target_crawler_id=target_crawler_id)
+        finally:
+            if feed_mod and hasattr(feed_mod, 'set_crawler_running'):
+                feed_mod.set_crawler_running(False)
 
 
 class Task:
 
     @staticmethod
-    def start():
-        Task.run_crawl()
+    def start(target_crawler_id: int = None):
+        Task.run_crawl(target_crawler_id=target_crawler_id)
 
     @staticmethod
     def parse_board_info(board: str, subcat: str = None) -> tuple[str, str, str]:
@@ -92,19 +109,31 @@ class Task:
             return rule.format(URL=site_url, BOARD_NAME=board_id, PAGE=page)
 
     @staticmethod
-    def run_crawl():
+    def run_crawl(target_crawler_id: int = None):
         with F.app.app_context():
             try:
                 always_max_page = P.ModelSetting.get_bool('feed_always_max_page')
-                logger.info(f"[Feeder] [Celery Task] 전체 크롤링 수집 작업 시작 (항상 최대 페이지 탐색: {'ON' if always_max_page else 'OFF'})")
+                is_single_run = (target_crawler_id is not None)
+
+                if is_single_run:
+                    logger.info(f"[Feeder] [Celery Task] 개별 크롤러 수동 실행 시작 (수집기 ID: {target_crawler_id})")
+                else:
+                    logger.info(f"[Feeder] [Celery Task] 전체 크롤링 수집 작업 시작 (항상 최대 페이지 탐색: {'ON' if always_max_page else 'OFF'})")
 
                 crawlers = FeedConfigUtil.get_crawlers()
                 if not crawlers:
                     logger.info("[Feeder] [Celery Task] 등록된 수집기(CRAWLERS)가 없습니다.")
                     return
 
-                current_count = P.ModelSetting.get_int('feed_scheduler_count') + 1
-                P.ModelSetting.set('feed_scheduler_count', str(current_count))
+                # 개별 수집기 수동 실행 시 대상 필터링
+                if is_single_run:
+                    crawlers = [c for c in crawlers if int(c.get('id', -1)) == int(target_crawler_id)]
+                    if not crawlers:
+                        logger.warning(f"[Feeder] 대상 수집기(ID: {target_crawler_id})를 찾을 수 없습니다.")
+                        return
+                else:
+                    current_count = P.ModelSetting.get_int('feed_scheduler_count') + 1
+                    P.ModelSetting.set('feed_scheduler_count', str(current_count))
 
                 try:
                     max_page = P.ModelSetting.get_int('feed_max_page')
@@ -113,15 +142,17 @@ class Task:
 
                 total_crawled_count = 0
                 for crawler in crawlers:
-                    if not crawler.get('enabled', True):
-                        logger.debug(f"[Feeder] 비활성화된 수집기 건너뜀: {crawler.get('site')}")
-                        continue
-
-                    target_interval = int(crawler.get('interval', 1))
-                    if target_interval > 1:
-                        if (current_count % target_interval) != 0:
-                            logger.info(f"[Feeder] 스케쥴 빈도({target_interval}회당 1회) 미도래로 건너뜀: {crawler.get('site')}")
+                    # 개별 수동 실행 시에는 interval 빈도나 비활성 여부에 관계없이 즉시 실행
+                    if not is_single_run:
+                        if not crawler.get('enabled', True):
+                            logger.debug(f"[Feeder] 비활성화된 수집기 건너뜀: {crawler.get('site')}")
                             continue
+
+                        target_interval = int(crawler.get('interval', 1))
+                        if target_interval > 1:
+                            if (current_count % target_interval) != 0:
+                                logger.info(f"[Feeder] 스케쥴 빈도({target_interval}회당 1회) 미도래로 건너뜀: {crawler.get('site')}")
+                                continue
 
                     site_name = crawler.get('site')
                     site_entity = ModelFeedSite.get(name=site_name)
