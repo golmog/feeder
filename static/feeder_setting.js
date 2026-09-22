@@ -296,7 +296,7 @@ function render_crawlers(data) {
       str += '    <div class="text-muted small mb-1">수집된 데이터 없음</div>';
     }
     str += '    <div class="mt-2 btn-group btn-group-sm">';
-    str += '      <button type="button" class="btn btn-outline-success crawler_manual_btn" data-id="' + item.id + '" data-site="' + item.site + '">수동 수집</button>';
+    str += '      <button type="button" class="btn btn-outline-success crawler_manual_btn" data-id="' + item.id + '" data-site="' + item.site + '">즉시 실행</button>';
     str += '      <button type="button" class="btn btn-primary text-white crawler_edit_btn" data-id="' + item.id + '" data-index="' + i + '">수정</button>';
     str += '      <button type="button" class="btn btn-danger text-white remove_crawler_btn" data-id="' + item.id + '">삭제</button>';
     str += '      <button type="button" class="btn btn-secondary text-white remove_crawler_db_btn" data-id="' + item.id + '">DB 비우기</button>';
@@ -946,7 +946,7 @@ $(document).on('keydown', 'input[id^="board_id_"]', function(e){
   }
 });
 
-// 수동 수집 요청 함수
+// 즉시 실행 요청 함수 (비동기 쏘기 전용, 스피너 즉시 강제 해제)
 function request_manual_crawl(crawler_id) {
   var postData = {
     command: 'manual_crawl'
@@ -955,7 +955,7 @@ function request_manual_crawl(crawler_id) {
     postData.crawler_id = crawler_id;
   }
   var targetName = crawler_id ? '개별 수집기(ID: ' + crawler_id + ')' : '전체 수집기';
-  notify(targetName + ' 수동 수집 요청 중...', 'info');
+  notify(targetName + ' 즉시 실행 요청 중...', 'info');
 
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/manual_crawl',
@@ -964,11 +964,11 @@ function request_manual_crawl(crawler_id) {
     dataType: "json",
     success: function(data) {
       if (data && data.ret === 'success') {
-        notify(data.msg || targetName + ' 수동 수집을 시작했습니다.', 'success');
+        notify(data.msg || targetName + ' 즉시 실행을 시작했습니다.', 'success');
       } else if (data && data.ret === 'running') {
         notify(data.msg || '현재 다른 수집 작업이 이미 실행 중입니다.', 'warning');
       } else {
-        notify((data && data.msg) || '수동 수집 요청 실패', 'warning');
+        notify((data && data.msg) || '즉시 실행 요청 실패', 'warning');
       }
     },
     error: function() {
@@ -983,11 +983,10 @@ function request_manual_crawl(crawler_id) {
   });
 }
 
-// 상단 [전체 수동 수집] 버튼 핸들러
+// 상단 [즉시 실행] 버튼 핸들러
 $(document).on('click', '#btn_manual_crawl', function(e){
   e.preventDefault();
   request_manual_crawl(null);
-  // 클릭 즉시 잔여 스피너 해제
   setTimeout(function(){
     try { if (typeof m_loading_hide === 'function') m_loading_hide(); } catch(e){}
     try { if (typeof m_modal_loading_hide === 'function') m_modal_loading_hide(); } catch(e){}
@@ -995,7 +994,7 @@ $(document).on('click', '#btn_manual_crawl', function(e){
   }, 100);
 });
 
-// 개별 크롤러 [수동 수집] 버튼 핸들러
+// 개별 크롤러 [즉시 실행] 버튼 핸들러
 $(document).on('click', '.crawler_manual_btn', function(e){
   e.preventDefault();
   var cId = $(this).data('id');

@@ -106,7 +106,7 @@ class Task:
             P.ModelSetting.set('feed_running_start_time', str(int(time.time())))
             try:
                 is_manual = (trigger_type == "manual")
-                mode_label = "수동 수집" if is_manual else "스케줄러 정기 실행"
+                mode_label = "즉시 실행" if is_manual else "스케줄러 정기 실행"
 
                 always_max_page = P.ModelSetting.get_bool('feed_always_max_page')
                 target_desc = f"개별 수집기(ID: {target_crawler_id})" if target_crawler_id else "전체 수집기"
@@ -139,7 +139,7 @@ class Task:
                 total_crawled_count = 0
                 for crawler in crawlers:
                     # 정기 스케줄 실행일 때만 활성화 여부 및 주기 빈도(interval) 검사 적용
-                    # 수동 수집 시에는 유저의 명시적 요청이므로 빈도 제한 없이 즉시 실행
+                    # 즉시 실행 시에는 유저의 명시적 요청이므로 빈도 제한 없이 즉시 실행
                     if not is_manual:
                         if not crawler.get('enabled', True):
                             logger.debug(f"[Feeder] 비활성화된 수집기 건너뜀: {crawler.get('site')}")
@@ -151,7 +151,7 @@ class Task:
                                 logger.info(f"[Feeder] 스케쥴 빈도({target_interval}회당 1회) 미도래로 건너뜀: {crawler.get('site')}")
                                 continue
                     else:
-                        # 전체 수동 수집 시에는 비활성 수집기만 스킵 (개별 수동 수집은 지정 수집기 무조건 실행)
+                        # 전체 즉시 실행 시에는 비활성 수집기만 스킵 (개별 즉시 실행은 지정 수집기 무조건 실행)
                         if target_crawler_id is None and not crawler.get('enabled', True):
                             logger.debug(f"[Feeder] 비활성화된 수집기 건너뜀: {crawler.get('site')}")
                             continue

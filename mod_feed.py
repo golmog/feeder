@@ -178,13 +178,13 @@ class ModuleFeed(PluginModuleBase):
         P.ModelSetting.set(f"{self.name}_task_stop_flag", "False")
 
     def process_command(self, command, arg1, arg2, arg3, req):
-        # 수동 수집 전용 명령 (비동기 백그라운드 디스패치 & 즉시 결과 반환)
+        # 즉시 실행 전용 명령 (비동기 백그라운드 디스패치 & 즉시 결과 반환)
         if command == 'manual_crawl':
             is_running = P.ModelSetting.get_bool(f"{self.name}_is_running")
             if is_running:
                 start_time = P.ModelSetting.get(f"{self.name}_running_start_time")
                 if start_time and str(start_time).isdigit() and (time.time() - int(start_time) > 3600):
-                    logger.warning(f"[{self.name}] 1시간 경과 고아 락 감지 -> 락 강제 해제 후 수동 수집 허용")
+                    logger.warning(f"[{self.name}] 1시간 경과 고아 락 감지 -> 락 강제 해제 후 즉시 실행 허용")
                     P.ModelSetting.set(f"{self.name}_is_running", "False")
                 else:
                     return jsonify({'ret': 'running', 'msg': '현재 다른 수집 작업이 이미 실행 중입니다. 완료 후 다시 실행해 주세요.'})
@@ -197,13 +197,13 @@ class ModuleFeed(PluginModuleBase):
             import threading
             def dispatch_celery_task():
                 try:
-                    logger.info(f"[{self.name}] [수동 수집] {target_desc} 작업 Celery 워커 비동기 전달")
+                    logger.info(f"[{self.name}] [즉시 실행] {target_desc} 작업 Celery 워커 비동기 전달")
                     self.start_celery(TaskBase.start, None, "manual", target_c_id)
                 except Exception as ex:
-                    logger.error(f"[{self.name}] [수동 수집] Celery 비동기 전달 실패: {ex}")
+                    logger.error(f"[{self.name}] [즉시 실행] Celery 비동기 전달 실패: {ex}")
 
             threading.Thread(target=dispatch_celery_task, daemon=True).start()
-            return jsonify({'ret': 'success', 'msg': f'{target_desc} 수동 수집 작업을 시작했습니다.'})
+            return jsonify({'ret': 'success', 'msg': f'{target_desc} 즉시 실행 작업을 시작했습니다.'})
 
         # 사이트 관리 명령
         elif command == 'load_site':
