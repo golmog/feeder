@@ -337,10 +337,10 @@ class Task:
 
                 detail_count = 0
                 for idx, item in enumerate(raw_list):
-                    # 테스트 모드 시 지정된 테스트 개수에 도달하면 즉시 순회를 중단하고 결과 반환
-                    if is_test and max_count > 0 and len(bbs_list) >= max_count:
-                        stop_crawl = True
-                        break
+                    # 테스트 모드: 설정된 개수(예: 3개) 초과 시 상세 페이지를 방문하지 않고 목록 정보만 결과 리스트에 보존
+                    if is_test and max_count > 0 and detail_count >= max_count:
+                        bbs_list.append(item)
+                        continue
 
                     post_id = item.get('id', '')
 
@@ -414,8 +414,8 @@ class Task:
                     bbs_list.append(item)
                     detail_count += 1
 
-                    # 최대 지정 개수가 설정된 경우(테스트 모드 포함) 목표 개수 도달 시 루프 종료
-                    if max_count > 0 and len(bbs_list) >= max_count:
+                    # 실제 수집 모드일 때만 지정 수량에 도달하면 루프 종료 (테스트 모드는 1페이지 전체 목록 보존)
+                    if not is_test and max_count > 0 and len(bbs_list) >= max_count:
                         stop_crawl = True
                         break
 
