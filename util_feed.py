@@ -640,7 +640,7 @@ class FeedScraper:
         try:
             if max_retries is None:
                 inst_retries = getattr(scheduler_instance, 'max_retries', None) if scheduler_instance else None
-                max_retries = int(inst_retries) if inst_retries not in [None, ''] else int(P.ModelSetting.get('feed_crawler_max_retries', '3'))
+                max_retries = int(inst_retries) if inst_retries not in [None, ''] else int(P.ModelSetting.get('feed_crawler_max_retries') or 3)
             if max_retries < 1:
                 max_retries = 1
         except Exception:
@@ -649,7 +649,7 @@ class FeedScraper:
         try:
             if retry_interval is None:
                 inst_interval = getattr(scheduler_instance, 'retry_interval', None) if scheduler_instance else None
-                retry_interval = float(inst_interval) if inst_interval not in [None, ''] else float(P.ModelSetting.get('feed_crawler_retry_interval', '1.5'))
+                retry_interval = float(inst_interval) if inst_interval not in [None, ''] else float(P.ModelSetting.get('feed_crawler_retry_interval') or 1.5)
             if retry_interval < 0:
                 retry_interval = 1.5
         except Exception:
@@ -668,7 +668,7 @@ class FeedScraper:
         if 'USE_FLARESOLVERR' in extra or (site_info and site_info.get('USE_FLARESOLVERR')):
             use_fs = True
 
-        # 1. 원격 Selenium 브라우저 모드
+        # 원격 Selenium 브라우저 모드
         if use_selenium:
             target_wait_tag = wait_tag or (site_info.get('SELENIUM_WAIT_TAG') if site_info else None) or 'body'
             for attempt in range(1, max_retries + 1):
@@ -680,7 +680,7 @@ class FeedScraper:
                     time.sleep(retry_interval)
             return None
 
-        # 2. HTTP 모드: FlareSolverr 우선순위 체계 (FlareSolverr > curl_cffi > requests)
+        # HTTP 모드: FlareSolverr 우선순위 체계 (FlareSolverr > curl_cffi > requests)
         # FlareSolverr가 켜져 있고 유효한 clearance가 아직 없다면, 403을 유발하지 않고 FlareSolverr를 최우선 호출하여 인가 획득
         if use_fs and not cls._has_valid_clearance(host):
             logger.info(f"[Scraper] [{host}] Cloudflare 사이트 감지 -> FlareSolverr 최우선 인가 요청: {url}")
@@ -714,11 +714,9 @@ class FeedScraper:
                 current_cookie_str = headers.get('Cookie', '')
                 headers['Cookie'] = f"{current_cookie_str}; {injected}".strip('; ')
 
-        # 3. 고속 세션(curl_cffi -> requests) 순차 실행
+        # 고속 세션(curl_cffi -> requests) 순차 실행
         for attempt in range(1, max_retries + 1):
-            source_text = None
-
-            # 3-1. curl_cffi 고속 요청 (동기화된 UA/쿠키 탑재)
+            # curl_cffi 고속 요청 (동기화된 UA/쿠키 탑재)
             if _CURL_CFFI_AVAILABLE:
                 try:
                     cffi_session = cls._cffi_sessions.get(host)
@@ -736,26 +734,25 @@ class FeedScraper:
                 except Exception as e:
                     logger.debug(f"[Scraper] curl_cffi 요청 실패 ({url}): {e}")
 
-            # 3-2. requests 폴백 요청
-            if not source_text:
-                try:
-                    req_session = cls._requests_sessions.get(host)
-                    if not req_session:
-                        req_session = requests.Session()
-                        cls._requests_sessions[host] = req_session
-                        logger.debug(f"[Scraper] requests 세션 생성: {host}")
+            # requests 폴백 요청
+            try:
+                req_session = cls._requests_sessions.get(host)
+                if not req_session:
+                    req_session = requests.Session()
+                    cls._requests_sessions[host] = req_session
+                    logger.debug(f"[Scraper] requests 세션 생성: {host}")
 
-                    cls._sync_clearance_to_sessions(host)
-                    res = req_session.get(url, headers=headers, proxies=proxies, timeout=25, verify=False)
-                    if res.status_code == 200:
-                        res.encoding = res.apparent_encoding or 'utf-8'
-                        if 'Just a moment...' not in res.text and 'cf-turnstile' not in res.text:
-                            return res.text
-                    logger.debug(f"[Scraper] requests 응답 코드: {res.status_code} ({url})")
-                except Exception as e:
-                    logger.debug(f"[Scraper] requests 요청 실패 ({url}): {e}")
+                cls._sync_clearance_to_sessions(host)
+                res = req_session.get(url, headers=headers, proxies=proxies, timeout=25, verify=False)
+                if res.status_code == 200:
+                    res.encoding = res.apparent_encoding or 'utf-8'
+                    if 'Just a moment...' not in res.text and 'cf-turnstile' not in res.text:
+                        return res.text
+                logger.debug(f"[Scraper] requests 응답 코드: {res.status_code} ({url})")
+            except Exception as e:
+                logger.debug(f"[Scraper] requests 요청 실패 ({url}): {e}")
 
-            # 3-3. 세션 실행 중 403 차단 또는 토큰 만료 감지 시 FlareSolverr로 토큰 재발급
+            # 세션 실행 중 403 차단 또는 토큰 만료 감지 시 FlareSolverr로 토큰 재발급
             if use_fs:
                 logger.warning(f"[Scraper] [{host}] Cloudflare 차단 감지 -> 기존 소켓 세션 완전 파기 및 FlareSolverr 재인가 시작: {url}")
                 cls._cf_cookies.pop(host, None)
@@ -881,7 +878,7 @@ class FeedScraper:
         try:
             if max_retries is None:
                 inst_retries = getattr(scheduler_instance, 'max_retries', None) if scheduler_instance else None
-                max_retries = int(inst_retries) if inst_retries not in [None, ''] else int(P.ModelSetting.get('feed_crawler_max_retries', '3'))
+                max_retries = int(inst_retries) if inst_retries not in [None, ''] else int(P.ModelSetting.get('feed_crawler_max_retries') or 3)
             if max_retries < 1:
                 max_retries = 1
         except Exception:
@@ -890,7 +887,7 @@ class FeedScraper:
         try:
             if retry_interval is None:
                 inst_interval = getattr(scheduler_instance, 'retry_interval', None) if scheduler_instance else None
-                retry_interval = float(inst_interval) if inst_interval not in [None, ''] else float(P.ModelSetting.get('feed_crawler_retry_interval', '1.5'))
+                retry_interval = float(inst_interval) if inst_interval not in [None, ''] else float(P.ModelSetting.get('feed_crawler_retry_interval') or 1.5)
             if retry_interval < 0:
                 retry_interval = 1.5
         except Exception:

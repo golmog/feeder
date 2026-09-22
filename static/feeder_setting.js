@@ -296,7 +296,7 @@ function render_crawlers(data) {
       str += '    <div class="text-muted small mb-1">수집된 데이터 없음</div>';
     }
     str += '    <div class="mt-2 btn-group btn-group-sm">';
-    str += '      <button type="button" class="btn btn-outline-info crawler_run_btn" data-id="' + item.id + '" data-site="' + item.site + '">1회 실행</button>';
+    str += '      <button type="button" class="btn btn-outline-success crawler_manual_btn" data-id="' + item.id + '" data-site="' + item.site + '">수동 수집</button>';
     str += '      <button type="button" class="btn btn-primary text-white crawler_edit_btn" data-id="' + item.id + '" data-index="' + i + '">수정</button>';
     str += '      <button type="button" class="btn btn-danger text-white remove_crawler_btn" data-id="' + item.id + '">삭제</button>';
     str += '      <button type="button" class="btn btn-secondary text-white remove_crawler_db_btn" data-id="' + item.id + '">DB 비우기</button>';
@@ -617,35 +617,6 @@ $(document).on('click', '#crawler_reload_btn', function(e){
   e.preventDefault();
   load_all_data();
   notify('새로고침 완료', 'info');
-});
-
-// 개별 수집기 수동 1회 실행 이벤트
-function request_crawler_run(cId, site, isForce) {
-  notify('[' + site + '] 수집기 1회 실행을 워커에 요청했습니다...', 'info');
-  $.ajax({
-    url: '/' + package_name + '/ajax/' + sub + '/crawler_run',
-    type: "POST",
-    data: {crawler_id: cId, force: isForce ? 'true' : 'false'},
-    dataType: "json",
-    success: function(data) {
-      if (data.ret === 'running') {
-        if (confirm(data.msg)) {
-          request_crawler_run(cId, site, true);
-        }
-      } else if (data.ret === 'success') {
-        notify(data.msg || '수집 작업이 시작되었습니다.', 'success');
-      } else {
-        notify(data.msg || '실행 실패', 'warning');
-      }
-    }
-  });
-}
-
-$(document).on('click', '.crawler_run_btn', function(e){
-  e.preventDefault();
-  var cId = $(this).data('id');
-  var site = $(this).data('site');
-  request_crawler_run(cId, site, false);
 });
 
 function render_modal_feed_sources() {
@@ -975,25 +946,78 @@ $(document).on('keydown', 'input[id^="board_id_"]', function(e){
   }
 });
 
-function request_site_test(site_id, board_id, isForce) {
+// 수동 수집 요청 함수
+function request_manual_crawl(crawler_id) {
+  var postData = {
+    command: 'manual_crawl'
+  };
+  if (crawler_id) {
+    postData.crawler_id = crawler_id;
+  }
+  var targetName = crawler_id ? '개별 수집기(ID: ' + crawler_id + ')' : '전체 수집기';
+  notify(targetName + ' 수동 수집 요청 중...', 'info');
+
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/manual_crawl',
+    type: "POST",
+    data: postData,
+    dataType: "json",
+    success: function(data) {
+      if (data && data.ret === 'success') {
+        notify(data.msg || targetName + ' 수동 수집을 시작했습니다.', 'success');
+      } else if (data && data.ret === 'running') {
+        notify(data.msg || '현재 다른 수집 작업이 이미 실행 중입니다.', 'warning');
+      } else {
+        notify((data && data.msg) || '수동 수집 요청 실패', 'warning');
+      }
+    },
+    error: function() {
+      notify('서버 통신 실패', 'danger');
+    },
+    complete: function() {
+      // FF 프레임워크 전역 스피너 즉시 강제 종료
+      try { if (typeof m_loading_hide === 'function') m_loading_hide(); } catch(e){}
+      try { if (typeof m_modal_loading_hide === 'function') m_modal_loading_hide(); } catch(e){}
+      try { $('#loading').hide(); } catch(e){}
+    }
+  });
+}
+
+// 상단 [전체 수동 수집] 버튼 핸들러
+$(document).on('click', '#btn_manual_crawl', function(e){
+  e.preventDefault();
+  request_manual_crawl(null);
+  // 클릭 즉시 잔여 스피너 해제
+  setTimeout(function(){
+    try { if (typeof m_loading_hide === 'function') m_loading_hide(); } catch(e){}
+    try { if (typeof m_modal_loading_hide === 'function') m_modal_loading_hide(); } catch(e){}
+    try { $('#loading').hide(); } catch(e){}
+  }, 100);
+});
+
+// 개별 크롤러 [수동 수집] 버튼 핸들러
+$(document).on('click', '.crawler_manual_btn', function(e){
+  e.preventDefault();
+  var cId = $(this).data('id');
+  request_manual_crawl(cId);
+});
+
+// 수집 테스트 요청 함수
+function request_board_test(site_id, board_id) {
   notify('게시판 [' + board_id + '] 수집 테스트 시작...', 'info');
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/test',
     type: "POST",
-    data: {site_id: site_id, board_id: board_id, force: isForce ? 'true' : 'false'},
+    data: {site_id: site_id, board_id: board_id},
     dataType: "json",
     success: function(data) {
-      if (data && data.ret === 'running') {
-        if (confirm(data.msg)) {
-          request_site_test(site_id, board_id, true);
-        }
-      } else if (Array.isArray(data)) {
-        $('#test_modal_title').text('수집 테스트 결과 (전체 ' + data.length + '개)');
-        $('#test_modal_body').val(JSON.stringify(data, null, 2));
-        $('#test_result_modal').modal('show');
-      } else {
-        notify('테스트 실패: ' + (data.log || data.ret || '오류'), 'warning');
+      if (data && data.ret === 'fail') {
+        notify(data.log || '테스트 실패', 'warning');
+        return;
       }
+      $('#test_modal_title').text('수집 테스트 결과 (전체 ' + data.length + '개)');
+      $('#test_modal_body').val(JSON.stringify(data, null, 2));
+      $('#test_result_modal').modal('show');
     }
   });
 }
@@ -1003,7 +1027,7 @@ $(document).on('click', '.test_btn', function(e){
   var site_id = $(this).data('site_id');
   var board_id = $('#board_id_' + site_id).val().trim();
   if (!board_id) { notify('게시판 ID를 입력하세요.', 'warning'); return; }
-  request_site_test(site_id, board_id, false);
+  request_board_test(site_id, board_id);
 });
 
 $(document).on('click', '.remove_site_btn', function(e){
@@ -1168,31 +1192,3 @@ $(document).on('change', '#custom_script_file_input', function(){
     }
   });
 });
-
-function request_global_one_execute(isForce) {
-  notify('전체 수집 1회 실행을 요청했습니다...', 'info');
-  $.ajax({
-    url: '/' + package_name + '/ajax/' + sub + '/one_execute',
-    type: "POST",
-    data: {force: isForce ? 'true' : 'false'},
-    dataType: "json",
-    success: function(data) {
-      if (data.ret === 'running') {
-        if (confirm(data.msg)) {
-          request_global_one_execute(true);
-        }
-      } else if (data.ret === 'success') {
-        notify(data.msg || '작업이 시작되었습니다.', 'success');
-      } else {
-        notify(data.msg || '실행 실패', 'warning');
-      }
-    }
-  });
-}
-
-$(document).off('click', '#globalOneExecuteBtn').on('click', '#globalOneExecuteBtn', function(e){
-  e.preventDefault();
-  e.stopImmediatePropagation();
-  request_global_one_execute(false);
-});
-

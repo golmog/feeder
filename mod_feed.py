@@ -42,11 +42,10 @@ class ModuleFeed(PluginModuleBase):
             f"{self.name}_crawler_retry_interval": "1.5",
             f"{self.name}_allow_duplicate_magnet": "False",
             f"{self.name}_scheduler_count": "0",
-            # 실행 상태 동시성 제어 플래그
+            # 태스크 런타임 상태 플래그
             f"{self.name}_is_running": "False",
-            f"{self.name}_running_time": "0",
-            f"{self.name}_running_desc": "",
-            f"{self.name}_running_task_id": "",
+            f"{self.name}_test_running": "False",
+            f"{self.name}_running_start_time": "0",
             # 프록시 및 보안 우회 설정
             f"{self.name}_use_proxy": "False",
             f"{self.name}_proxy_url": "",
@@ -68,6 +67,21 @@ class ModuleFeed(PluginModuleBase):
             f"{self.name}_rss_file_days": "14",
             f"{self.name}_rss_file_items": "100",
         }
+
+    def plugin_load(self):
+        """플러그인 부팅 및 재시작 시 잔여 런타임 락 플래그 강제 초기화"""
+        try:
+            P.ModelSetting.set(f"{self.name}_is_running", "False")
+            P.ModelSetting.set(f"{self.name}_test_running", "False")
+            P.ModelSetting.set(f"{self.name}_running_start_time", "0")
+            logger.info(f"[{self.name}] 플러그인 로드: 수집 런타임 락 플래그 초기화 완료")
+        except Exception as e:
+            logger.debug(f"[{self.name}] plugin_load 초기화 예외: {e}")
+        try:
+            super(ModuleFeed, self).plugin_load()
+        except Exception:
+            pass
+
 
     def process_menu(self, page_name, req):
         try:
@@ -111,108 +125,85 @@ class ModuleFeed(PluginModuleBase):
             logger.error(traceback.format_exc())
             return jsonify({'ret': 'error', 'msg': str(e)})
 
+    def check_running_task(self) -> tuple[bool, str, str]:
+        """현재 Celery 크롤링 또는 수집 테스트가 진행 중인지 확인 (상태, 작업타입, task_id)"""
+        # 수집 테스트 진행 중 여부 확인
+        if P.ModelSetting.get_bool(f"{self.name}_test_running"):
+            return True, "test", ""
+
+        # Celery 크롤링 진행 중 여부 확인
+        running_task_id = (P.ModelSetting.get(f"{self.name}_running_task_id") or "").strip()
+        if running_task_id:
+            try:
+                inspector = F.celery.control.inspect(timeout=1.0)
+                active = inspector.active() if inspector else None
+                if active:
+                    for worker, tasks in active.items():
+                        for t in tasks:
+                            if t.get('id') == running_task_id:
+                                return True, "crawl", running_task_id
+            except Exception as e:
+                logger.debug(f"[{self.name}] Celery 활성 검사 예외: {e}")
+
+            # Celery 워커에서 이미 종료되었으나 플래그가 남아있는 경우 클린업
+            P.ModelSetting.set(f"{self.name}_running_task_id", "")
+
+        return False, "", ""
+
+    def stop_running_task(self):
+        """실행 중인 크롤링/테스트 작업을 안전하게 종료 및 세션 리셋"""
+        is_running, task_type, task_id = self.check_running_task()
+        if not is_running:
+            return
+
+        logger.warning(f"[{self.name}] 실행 중인 작업({task_type}, ID: {task_id}) 강제 종료 절차 진행")
+        P.ModelSetting.set(f"{self.name}_task_stop_flag", "True")
+
+        if task_id:
+            try:
+                F.celery.control.revoke(task_id, terminate=True, signal='SIGTERM')
+                logger.info(f"[{self.name}] Celery 태스크 revoke 명령 전달 (ID: {task_id})")
+            except Exception as ex:
+                logger.error(f"[{self.name}] Celery revoke 실패: {ex}")
+
+        # 공유 브라우저 및 HTTP 연결 클린 정리
+        try:
+            FeedScraper.close_sessions()
+        except Exception:
+            pass
+
+        time.sleep(0.6)
+        P.ModelSetting.set(f"{self.name}_running_task_id", "")
+        P.ModelSetting.set(f"{self.name}_test_running", "False")
+        P.ModelSetting.set(f"{self.name}_task_stop_flag", "False")
+
     def process_command(self, command, arg1, arg2, arg3, req):
-        force = (req.form.get('force') == 'true')
+        # 수동 수집 전용 명령 (비동기 백그라운드 디스패치 & 즉시 결과 반환)
+        if command == 'manual_crawl':
+            is_running = P.ModelSetting.get_bool(f"{self.name}_is_running")
+            if is_running:
+                start_time = P.ModelSetting.get(f"{self.name}_running_start_time")
+                if start_time and str(start_time).isdigit() and (time.time() - int(start_time) > 3600):
+                    logger.warning(f"[{self.name}] 1시간 경과 고아 락 감지 -> 락 강제 해제 후 수동 수집 허용")
+                    P.ModelSetting.set(f"{self.name}_is_running", "False")
+                else:
+                    return jsonify({'ret': 'running', 'msg': '현재 다른 수집 작업이 이미 실행 중입니다. 완료 후 다시 실행해 주세요.'})
 
-        # 수동 전체 1회 실행 명령
-        if command == 'one_execute':
-            running, desc, elapsed = self.is_crawler_running()
-            if running and not force:
-                return jsonify({
-                    'ret': 'running',
-                    'msg': f"현재 작업('{desc}', 경과: {elapsed}초)이 실행 중입니다.\n기존 작업을 강제 중단하고 새로 실행하시겠습니까?"
-                })
-
-            if running and force:
-                self.abort_running_crawler()
-
-            logger.info(f"[{self.name}] 전체 1회 실행 명령 수신 -> Celery 워커 전달")
-            self.start_celery(TaskBase.start, None)
-            return jsonify({'ret': 'success', 'msg': '전체 수집 작업을 Celery 워커에서 시작했습니다.'})
-
-        # 개별 수집기 수동 1회 실행 명령
-        elif command == 'crawler_run':
             crawler_id = req.form.get('crawler_id')
-            c_id = int(crawler_id) if crawler_id and str(crawler_id).isdigit() else None
-            crawler = FeedConfigUtil.get_crawler(c_id) if c_id else None
-            site_name = crawler.get('site') if crawler else f"ID: {c_id}"
+            target_c_id = int(crawler_id) if crawler_id and str(crawler_id).isdigit() else None
+            target_desc = f"개별 수집기(ID: {target_c_id})" if target_c_id else "전체 수집기"
 
-            running, desc, elapsed = self.is_crawler_running()
-            if running and not force:
-                return jsonify({
-                    'ret': 'running',
-                    'msg': f"현재 작업('{desc}', 경과: {elapsed}초)이 실행 중입니다.\n기존 작업을 강제 중단하고 [{site_name}] 수집을 시작하시겠습니까?"
-                })
+            # 웹 요청 스레드 블로킹 방지를 위해 백그라운드 스레드에서 Celery에 던지고 즉시 응답
+            import threading
+            def dispatch_celery_task():
+                try:
+                    logger.info(f"[{self.name}] [수동 수집] {target_desc} 작업 Celery 워커 비동기 전달")
+                    self.start_celery(TaskBase.start, None, "manual", target_c_id)
+                except Exception as ex:
+                    logger.error(f"[{self.name}] [수동 수집] Celery 비동기 전달 실패: {ex}")
 
-            if running and force:
-                self.abort_running_crawler()
-
-            logger.info(f"[{self.name}] 개별 수집기 1회 실행 명령 수신 -> Celery 워커 전달 (사이트: {site_name}, ID: {c_id})")
-            self.start_celery(TaskBase.start, None, c_id)
-            return jsonify({'ret': 'success', 'msg': f'[{site_name}] 수집기 1회 실행을 시작했습니다.'})
-
-        # 사이트 관리: 수집 테스트 명령
-        elif command == 'test':
-            site_id = req.form.get('site_id')
-            board_input = req.form.get('board_id', '').strip()
-            site = ModelFeedSite.get(site_id=site_id)
-            if not site or not board_input:
-                logger.warning(f"[{self.name}] 수집 테스트 실패: 사이트 또는 게시판 ID가 올바르지 않음 (site_id={site_id}, board_id={board_input})")
-                return jsonify({'ret': 'fail', 'log': '사이트 또는 게시판 ID가 올바르지 않습니다.'})
-
-            board_id, subcat_id, full_board_key = Task.parse_board_info(board_input)
-
-            running, desc, elapsed = self.is_crawler_running()
-            if running and not force:
-                return jsonify({
-                    'ret': 'running',
-                    'msg': f"현재 백그라운드에서 작업('{desc}', 경과: {elapsed}초)이 진행 중입니다.\n기존 작업을 강제 중단하고 수집 테스트를 실행하시겠습니까?"
-                })
-
-            if running and force:
-                self.abort_running_crawler()
-
-            try:
-                test_count = P.ModelSetting.get_int(f"{self.name}_test_count")
-            except Exception:
-                test_count = 3
-
-            site_opts = site.get_options()
-            global_proxy = P.ModelSetting.get_bool(f"{self.name}_use_proxy")
-            global_fs = P.ModelSetting.get_bool(f"{self.name}_use_flaresolverr")
-            global_selenium = P.ModelSetting.get_bool(f"{self.name}_use_selenium")
-            global_torrent_info = P.ModelSetting.get_bool(f"{self.name}_use_torrent_info")
-
-            test_target_cfg = SimpleNamespace(
-                subcat_id=subcat_id,
-                use_proxy=global_proxy and site_opts.get('use_proxy', False),
-                proxy_url=P.ModelSetting.get(f"{self.name}_proxy_url") or '',
-                use_flaresolverr=global_fs and site_opts.get('use_flaresolverr', False),
-                use_selenium=global_selenium and site_opts.get('use_selenium', False),
-                use_torrent_info=global_torrent_info and site_opts.get('use_torrent_info', False),
-                max_retries='',
-                retry_interval=''
-            )
-
-            subcat_log = f", 서브카테고리='{subcat_id}'" if subcat_id else ""
-            logger.info(f"[{self.name}] ========================================================")
-            logger.info(f"[{self.name}] [수집 테스트 시작] 사이트='{site.name}', 게시판='{board_id}'{subcat_log}, 개수={test_count}")
-            logger.info(f"[{self.name}] ========================================================")
-
-            test_desc = f"[{site.name}] 게시판 [{full_board_key}] 수집 테스트"
-            self.set_crawler_running(True, desc=test_desc)
-            try:
-                test_results = Task.execute_board_crawl(site.info, board_id, is_test=True, max_count=test_count, target_cfg=test_target_cfg)
-                if test_results is None:
-                    test_results = []
-            finally:
-                self.set_crawler_running(False)
-
-            detailed_count = sum(1 for x in test_results if x.get('magnet') or x.get('download'))
-            logger.info(f"[{self.name}] ========================================================")
-            logger.info(f"[{self.name}] [수집 테스트 완료] 사이트='{site.name}', 게시판='{full_board_key}', 전체 항목={len(test_results)}개 (상세 파싱={detailed_count}개)")
-            logger.info(f"[{self.name}] ========================================================")
-            return jsonify(test_results)
+            threading.Thread(target=dispatch_celery_task, daemon=True).start()
+            return jsonify({'ret': 'success', 'msg': f'{target_desc} 수동 수집 작업을 시작했습니다.'})
 
         # 사이트 관리 명령
         elif command == 'load_site':
@@ -257,6 +248,59 @@ class ModuleFeed(PluginModuleBase):
                 return jsonify({'ret': 'success', 'site': ModelFeedSite.get_list(by_dict=True)})
 
             return jsonify({'ret': 'fail', 'log': '알 수 없는 옵션 항목입니다.'})
+
+        elif command == 'test':
+            site_id = req.form.get('site_id')
+            board_input = req.form.get('board_id', '').strip()
+            site = ModelFeedSite.get(site_id=site_id)
+            if not site or not board_input:
+                logger.warning(f"[{self.name}] 수집 테스트 실패: 사이트 또는 게시판 ID가 올바르지 않음 (site_id={site_id}, board_id={board_input})")
+                return jsonify({'ret': 'fail', 'log': '사이트 또는 게시판 ID가 올바르지 않습니다.'})
+
+            # 크롤링 백그라운드 작업 실행 중 충돌 방지
+            if P.ModelSetting.get_bool(f"{self.name}_is_running"):
+                return jsonify({'ret': 'fail', 'log': '현재 백그라운드 크롤링이 실행 중입니다. 크롤링이 완료된 후 테스트를 진행해 주세요.'})
+
+            board_id, subcat_id, full_board_key = Task.parse_board_info(board_input)
+
+            try:
+                test_count = P.ModelSetting.get_int(f"{self.name}_test_count")
+            except Exception:
+                test_count = 3
+
+            site_opts = site.get_options()
+            global_proxy = P.ModelSetting.get_bool(f"{self.name}_use_proxy")
+            global_fs = P.ModelSetting.get_bool(f"{self.name}_use_flaresolverr")
+            global_selenium = P.ModelSetting.get_bool(f"{self.name}_use_selenium")
+            global_torrent_info = P.ModelSetting.get_bool(f"{self.name}_use_torrent_info")
+
+            test_target_cfg = SimpleNamespace(
+                subcat_id=subcat_id,
+                use_proxy=global_proxy and site_opts.get('use_proxy', False),
+                proxy_url=P.ModelSetting.get(f"{self.name}_proxy_url") or '',
+                use_flaresolverr=global_fs and site_opts.get('use_flaresolverr', False),
+                use_selenium=global_selenium and site_opts.get('use_selenium', False),
+                use_torrent_info=global_torrent_info and site_opts.get('use_torrent_info', False)
+            )
+
+            subcat_log = f", 서브카테고리='{subcat_id}'" if subcat_id else ""
+            logger.info(f"[{self.name}] ========================================================")
+            logger.info(f"[{self.name}] [수집 테스트 시작] 사이트='{site.name}', 게시판='{board_id}'{subcat_log}, 개수={test_count}")
+            logger.info(f"[{self.name}] ========================================================")
+
+            P.ModelSetting.set(f"{self.name}_test_running", "True")
+            try:
+                test_results = Task.execute_board_crawl(site.info, board_id, is_test=True, max_count=test_count, target_cfg=test_target_cfg)
+                if test_results is None:
+                    test_results = []
+            finally:
+                P.ModelSetting.set(f"{self.name}_test_running", "False")
+
+            detailed_count = sum(1 for x in test_results if x.get('magnet') or x.get('download'))
+            logger.info(f"[{self.name}] ========================================================")
+            logger.info(f"[{self.name}] [수집 테스트 완료] 사이트='{site.name}', 게시판='{full_board_key}', 전체 항목={len(test_results)}개 (상세 파싱={detailed_count}개)")
+            logger.info(f"[{self.name}] ========================================================")
+            return jsonify(test_results)
 
         elif command == 'site_delete':
             site_id = req.form.get('site_id')
@@ -812,51 +856,17 @@ class ModuleFeed(PluginModuleBase):
         xml += '</rss>'
         return xml
 
-    def is_crawler_running(self) -> tuple[bool, str, int]:
-        """크롤러 백그라운드 실행 여부 및 경과 시간 확인 (30분 초과 시 좀비 프로세스 자동 해제)"""
-        is_running = P.ModelSetting.get_bool(f"{self.name}_is_running")
-        start_time = P.ModelSetting.get_int(f"{self.name}_running_time", 0)
-        desc = P.ModelSetting.get(f"{self.name}_running_desc", "")
-        now = int(time.time())
-
-        if is_running and (now - start_time < 1800):
-            return True, desc, now - start_time
-        elif is_running:
-            self.set_crawler_running(False)
-        return False, "", 0
-
-    def set_crawler_running(self, is_running: bool, desc: str = "", task_id: str = ""):
-        """크롤러 실행 상태 갱신"""
-        P.ModelSetting.set(f"{self.name}_is_running", "True" if is_running else "False")
-        P.ModelSetting.set(f"{self.name}_running_time", str(int(time.time())) if is_running else "0")
-        P.ModelSetting.set(f"{self.name}_running_desc", desc if is_running else "")
-        P.ModelSetting.set(f"{self.name}_running_task_id", task_id if is_running else "")
-
-    def abort_running_crawler(self):
-        """실행 중인 크롤러 태스크 강제 취소 및 브라우저 세션 정리"""
-        task_id = P.ModelSetting.get(f"{self.name}_running_task_id")
-        if task_id:
-            try:
-                F.celery.control.revoke(task_id, terminate=True, signal='SIGTERM')
-                logger.warning(f"[{self.name}] 실행 중인 Celery 태스크 강제 종료: {task_id}")
-            except Exception as ex:
-                logger.warning(f"[{self.name}] Celery 태스크 강제 종료 실패 (무시): {ex}")
-
-        try:
-            from .util_feed import FeedScraper
-            FeedScraper.close_sessions()
-        except Exception:
-            pass
-
-        self.set_crawler_running(False)
-
     def scheduler_function(self):
-        """스케줄러 주기 타이머 및 프레임워크 1회 실행 표준 호출"""
-        # 이전 크롤링 작업이 진행 중인 경우 이번 스케줄 주기는 안전하게 건너뜀
-        running, desc, elapsed = self.is_crawler_running()
-        if running:
-            logger.info(f"[{self.name}] 이전 작업('{desc}', 경과: {elapsed}초)이 아직 진행 중이므로 이번 스케줄 주기는 건너뜁니다 (Skip).")
-            return
+        """스케줄러 주기 타이머 호출 (스케줄러 전용 모드로 Celery 전달)"""
+        is_running = P.ModelSetting.get_bool(f"{self.name}_is_running")
+        if is_running:
+            start_time = P.ModelSetting.get(f"{self.name}_running_start_time")
+            if start_time and str(start_time).isdigit() and (time.time() - int(start_time) > 3600):
+                logger.warning(f"[{self.name}] 1시간 경과 고아 락 감지 -> 스케줄 주기를 위해 락 강제 해제")
+                P.ModelSetting.set(f"{self.name}_is_running", "False")
+            else:
+                logger.info(f"[{self.name}] 이전 수집 작업이 아직 진행 중이므로 이번 스케줄 주기는 자동으로 건너뜁니다 (Skip).")
+                return
 
         if P.ModelSetting.get_bool(f"{self.name}_db_auto_delete"):
             try:
@@ -872,8 +882,8 @@ class ModuleFeed(PluginModuleBase):
                 logger.error(f"[Feeder] db auto delete 에러: {e}")
                 db.session.rollback()
 
-        logger.info(f"[{self.name}] 크롤링 워커 작업 전달")
-        self.start_celery(TaskBase.start, None)
+        logger.info(f"[{self.name}] [스케줄러 자동 실행] 정기 크롤링 워커 작업 전달")
+        self.start_celery(TaskBase.start, None, "scheduler", None)
 
     def delete_task_db(self, task: dict) -> str:
         try:

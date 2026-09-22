@@ -18,13 +18,7 @@ class TaskBase:
 
     @F.celery.task(bind=True, acks_late=False)
     def start(self, *args):
-        logger.info(f"[Feeder] Celery Task 수신 인자: {args}")
-        target_crawler_id = None
-        for arg in args:
-            if isinstance(arg, (int, str)) and str(arg).isdigit():
-                target_crawler_id = int(arg)
-                break
-
+        logger.info(f"[Feeder] Celery Task 수신 인자: {args} (Task ID: {self.request.id})")
         delivery_info = getattr(self.request, 'delivery_info', {}) or {}
         is_redelivered = delivery_info.get('redelivered') or getattr(self.request, 'redelivered', False)
 
@@ -32,25 +26,22 @@ class TaskBase:
             logger.warning("[Feeder] 이전 세션 비정상 종료로 재전송된 고아 태스크 실행 취소")
             return
 
-        feed_mod = P.get_module('feed')
-        task_id = getattr(self.request, 'id', '')
-        task_desc = f"수집기 [ID: {target_crawler_id}]" if target_crawler_id else "전체 크롤링 수집"
+        trigger_type = "scheduler"
+        target_crawler_id = None
+        for arg in args:
+            if isinstance(arg, str) and arg in ["scheduler", "manual"]:
+                trigger_type = arg
+            elif isinstance(arg, (int, str)) and str(arg).isdigit():
+                target_crawler_id = int(arg)
 
-        if feed_mod and hasattr(feed_mod, 'set_crawler_running'):
-            feed_mod.set_crawler_running(True, desc=task_desc, task_id=task_id)
-
-        try:
-            Task.start(target_crawler_id=target_crawler_id)
-        finally:
-            if feed_mod and hasattr(feed_mod, 'set_crawler_running'):
-                feed_mod.set_crawler_running(False)
+        Task.start(trigger_type=trigger_type, target_crawler_id=target_crawler_id)
 
 
 class Task:
 
     @staticmethod
-    def start(target_crawler_id: int = None):
-        Task.run_crawl(target_crawler_id=target_crawler_id)
+    def start(trigger_type: str = "scheduler", target_crawler_id: int = None):
+        Task.run_crawl(trigger_type=trigger_type, target_crawler_id=target_crawler_id)
 
     @staticmethod
     def parse_board_info(board: str, subcat: str = None) -> tuple[str, str, str]:
@@ -109,31 +100,36 @@ class Task:
             return rule.format(URL=site_url, BOARD_NAME=board_id, PAGE=page)
 
     @staticmethod
-    def run_crawl(target_crawler_id: int = None):
+    def run_crawl(trigger_type: str = "scheduler", target_crawler_id: int = None):
         with F.app.app_context():
+            P.ModelSetting.set('feed_is_running', 'True')
+            P.ModelSetting.set('feed_running_start_time', str(int(time.time())))
             try:
-                always_max_page = P.ModelSetting.get_bool('feed_always_max_page')
-                is_single_run = (target_crawler_id is not None)
+                is_manual = (trigger_type == "manual")
+                mode_label = "수동 수집" if is_manual else "스케줄러 정기 실행"
 
-                if is_single_run:
-                    logger.info(f"[Feeder] [Celery Task] 개별 크롤러 수동 실행 시작 (수집기 ID: {target_crawler_id})")
-                else:
-                    logger.info(f"[Feeder] [Celery Task] 전체 크롤링 수집 작업 시작 (항상 최대 페이지 탐색: {'ON' if always_max_page else 'OFF'})")
+                always_max_page = P.ModelSetting.get_bool('feed_always_max_page')
+                target_desc = f"개별 수집기(ID: {target_crawler_id})" if target_crawler_id else "전체 수집기"
+                logger.info(f"[Feeder] [{mode_label}] 크롤링 수집 작업 시작 ({target_desc}, 항상 최대 페이지 탐색: {'ON' if always_max_page else 'OFF'})")
 
                 crawlers = FeedConfigUtil.get_crawlers()
                 if not crawlers:
                     logger.info("[Feeder] [Celery Task] 등록된 수집기(CRAWLERS)가 없습니다.")
                     return
 
-                # 개별 수집기 수동 실행 시 대상 필터링
-                if is_single_run:
+                # 특정 수집기만 지정된 경우 1개만 필터링
+                if target_crawler_id is not None:
                     crawlers = [c for c in crawlers if int(c.get('id', -1)) == int(target_crawler_id)]
                     if not crawlers:
                         logger.warning(f"[Feeder] 대상 수집기(ID: {target_crawler_id})를 찾을 수 없습니다.")
                         return
-                else:
+
+                # 스케줄 회차 카운터는 정기 스케줄 실행 시에만 증가
+                if not is_manual:
                     current_count = P.ModelSetting.get_int('feed_scheduler_count') + 1
                     P.ModelSetting.set('feed_scheduler_count', str(current_count))
+                else:
+                    current_count = P.ModelSetting.get_int('feed_scheduler_count')
 
                 try:
                     max_page = P.ModelSetting.get_int('feed_max_page')
@@ -142,8 +138,9 @@ class Task:
 
                 total_crawled_count = 0
                 for crawler in crawlers:
-                    # 개별 수동 실행 시에는 interval 빈도나 비활성 여부에 관계없이 즉시 실행
-                    if not is_single_run:
+                    # 정기 스케줄 실행일 때만 활성화 여부 및 주기 빈도(interval) 검사 적용
+                    # 수동 수집 시에는 유저의 명시적 요청이므로 빈도 제한 없이 즉시 실행
+                    if not is_manual:
                         if not crawler.get('enabled', True):
                             logger.debug(f"[Feeder] 비활성화된 수집기 건너뜀: {crawler.get('site')}")
                             continue
@@ -153,6 +150,11 @@ class Task:
                             if (current_count % target_interval) != 0:
                                 logger.info(f"[Feeder] 스케쥴 빈도({target_interval}회당 1회) 미도래로 건너뜀: {crawler.get('site')}")
                                 continue
+                    else:
+                        # 전체 수동 수집 시에는 비활성 수집기만 스킵 (개별 수동 수집은 지정 수집기 무조건 실행)
+                        if target_crawler_id is None and not crawler.get('enabled', True):
+                            logger.debug(f"[Feeder] 비활성화된 수집기 건너뜀: {crawler.get('site')}")
+                            continue
 
                     site_name = crawler.get('site')
                     site_entity = ModelFeedSite.get(name=site_name)
@@ -175,7 +177,7 @@ class Task:
                         retry_interval=crawler.get('retry_interval', '')
                     )
 
-                    logger.info(f"[Feeder] [Celery Task] 사이트 크롤러 시작: [{site_name}] (대상 게시판={len(boards)}개, 최대 탐색={max_page}p)")
+                    logger.info(f"[Feeder] [{mode_label}] 사이트 크롤러 시작: [{site_name}] (대상 게시판={len(boards)}개, 최대 탐색={max_page}p)")
 
                     try:
                         for b in boards:
@@ -194,9 +196,9 @@ class Task:
                             target_cfg.subcat_id = subcat_id
 
                             if always_max_page:
-                                logger.info(f"[Feeder] [{site_name}] 항상 최대 페이지 탐색: {full_board_key} (최대 {max_page}p 전체 탐색, 기수집건 스킵)")
+                                logger.info(f"[Feeder] [{site_name}] {full_board_key} [{mode_label}]: 항상 최대 페이지 탐색 (최대 {max_page}p 전체 탐색, 기수집건 스킵)")
                             else:
-                                logger.info(f"[Feeder] [{site_name}] 스케쥴 증분 모드: {full_board_key} (최근 수집 ID: {max_id})")
+                                logger.info(f"[Feeder] [{site_name}] {full_board_key} [{mode_label}]: 증분 탐색 (최근 수집 ID: {max_id})")
 
                             crawled = Task.execute_board_crawl(
                                 site_entity.info,
@@ -224,6 +226,9 @@ class Task:
             except Exception as e:
                 logger.error(f"[Feeder] [Celery Task] 크롤링 수집 중 오류: {e}")
                 logger.error(traceback.format_exc())
+            finally:
+                P.ModelSetting.set('feed_is_running', 'False')
+                FeedScraper.close_sessions()
 
 
     @staticmethod
@@ -368,6 +373,12 @@ class Task:
 
                 detail_count = 0
                 for idx, item in enumerate(raw_list):
+                    # 외부 중단 요청 감지 시 루프 즉시 종료
+                    if P.ModelSetting.get_bool('feed_task_stop_flag'):
+                        logger.warning(f"[Feeder] [{site_name}] 외부 중단 요청 감지 -> 게시판 상세 수집 조기 종료")
+                        stop_crawl = True
+                        break
+
                     # 테스트 모드: 설정된 개수(예: 3개) 초과 시 상세 페이지를 방문하지 않고 목록 정보만 결과 리스트에 보존
                     if is_test and max_count > 0 and detail_count >= max_count:
                         bbs_list.append(item)
