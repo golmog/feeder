@@ -866,15 +866,168 @@ class FeedScraper:
         return None, None
 
     @classmethod
-    def get_by_remote_selenium(cls, url: str, wait_tag: str = 'body', scheduler_instance=None, site_info: dict = None) -> str | None:
-        remote_url = (P.ModelSetting.get('feed_selenium_remote_url') or '').strip()
-        if not remote_url:
-            logger.error("[Scraper] Selenium remote URL이 설정되지 않았습니다.")
-            return None
+    def get_flaresolverr_clearance(cls, url: str, scheduler_instance=None, max_retries: int = None, retry_interval: float = None) -> tuple[list[dict], str]:
+        """FlareSolverr를 통한 Cloudflare clearance 쿠키 및 User-Agent 공통 획득 (검증 및 재시도 포함)"""
+        fs_url = (P.ModelSetting.get('feed_flaresolverr_url') or '').rstrip('/')
+        if not fs_url:
+            return [], ""
 
-        parsed_url = urlparse(url)
-        host = parsed_url.hostname or ''
+        parsed = urlparse(url)
+        host = parsed.hostname or ''
         proxies = cls.get_proxies(scheduler_instance)
+        session_name = f"feeder_{host.replace('.', '_')}"
+        fs_endpoint = f"{fs_url}/v1"
+
+        try:
+            if max_retries is None:
+                inst_retries = getattr(scheduler_instance, 'max_retries', None) if scheduler_instance else None
+                max_retries = int(inst_retries) if inst_retries not in [None, ''] else int(P.ModelSetting.get('feed_crawler_max_retries', '3'))
+            if max_retries < 1:
+                max_retries = 1
+        except Exception:
+            max_retries = 3
+
+        try:
+            if retry_interval is None:
+                inst_interval = getattr(scheduler_instance, 'retry_interval', None) if scheduler_instance else None
+                retry_interval = float(inst_interval) if inst_interval not in [None, ''] else float(P.ModelSetting.get('feed_crawler_retry_interval', '1.5'))
+            if retry_interval < 0:
+                retry_interval = 1.5
+        except Exception:
+            retry_interval = 1.5
+
+        req_payload = {
+            "cmd": "request.get",
+            "url": url,
+            "maxTimeout": 45000,
+        }
+        if proxies and 'http' in proxies:
+            req_payload["proxy"] = {"url": proxies['http']}
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                res = requests.post(fs_endpoint, json=req_payload, headers={'Content-Type': 'application/json'}, timeout=55)
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get('status') == 'ok':
+                        solution = data.get('solution', {})
+                        sol_cookies = solution.get('cookies') or []
+                        user_agent = solution.get('userAgent') or ''
+                        cookie_names = [c.get('name') for c in sol_cookies]
+
+                        # cf_clearance 쿠키 포함 여부 필수 검증 (조기 반환 차단)
+                        has_clearance = any(c.get('name') == 'cf_clearance' and c.get('value') for c in sol_cookies)
+                        if not has_clearance:
+                            logger.warning(f"[Scraper] [{host}] FlareSolverr cf_clearance 누락 조기 반환 감지 (쿠키: {cookie_names}) -> 재시도 ({attempt}/{max_retries})")
+                            if attempt < max_retries:
+                                time.sleep(retry_interval)
+                            continue
+
+                        # 플랫폼 세션 캐시 동기화
+                        if host not in cls._cf_cookies:
+                            cls._cf_cookies[host] = {}
+                        for c in sol_cookies:
+                            cls._cf_cookies[host][c['name']] = c['value']
+                        cls._cf_cookies[host]['_timestamp'] = time.time()
+                        if user_agent:
+                            cls._cf_user_agents[host] = user_agent
+
+                        cls._sync_clearance_to_sessions(host)
+                        logger.info(f"[Scraper] [{host}] FlareSolverr 인가 성공 (쿠키 {len(sol_cookies)}개: {cookie_names})")
+                        return sol_cookies, user_agent
+                    else:
+                        logger.warning(f"[Scraper] [{host}] FlareSolverr 응답 오류 ({attempt}/{max_retries}): {data.get('message')}")
+            except Exception as e:
+                logger.warning(f"[Scraper] [{host}] FlareSolverr 통신 실패 ({attempt}/{max_retries}): {e}")
+
+            if attempt < max_retries:
+                time.sleep(retry_interval)
+
+        logger.error(f"[Scraper] [{host}] FlareSolverr {max_retries}회 재시도 모두 실패")
+        return [], ""
+
+    @classmethod
+    def solve_turnstile_checkbox(cls, driver, max_wait: int = 6) -> bool:
+        """브라우저 내 Turnstile iframe 감지 시 체크박스 클릭 시도"""
+        from selenium.webdriver.common.by import By
+        start_time = time.time()
+        while time.time() - start_time < max_wait:
+            title = driver.title or ""
+            if not any(k in title for k in ["Just a moment", "Cloudflare", "Attention Required"]):
+                return True
+            try:
+                iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                for frame in iframes:
+                    src = frame.get_attribute("src") or ""
+                    if any(k in src for k in ["cloudflare", "turnstile", "challenge"]):
+                        driver.switch_to.frame(frame)
+                        try:
+                            targets = driver.find_elements(By.XPATH, "//input[@type='checkbox'] | //span[contains(@class, 'checkbox')] | //div[@id='challenge-stage']//label | //body")
+                            if targets:
+                                driver.execute_script("arguments[0].click();", targets[0])
+                                logger.debug("[Scraper] Cloudflare Turnstile 체크박스 클릭 시도")
+                        finally:
+                            driver.switch_to.default_content()
+                        break
+            except Exception:
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
+            time.sleep(1.2)
+        return False
+
+    @classmethod
+    def handle_turnstile_challenge(cls, driver, url: str, site_info: dict = None, scheduler_instance=None) -> bool:
+        """Cloudflare 챌린지 화면 감지 시 자동 클릭 및 토큰 재주입 복구 수행"""
+        page_title = driver.title or ""
+        if not any(k in page_title for k in ["Just a moment", "Cloudflare", "Attention Required"]):
+            return True
+
+        logger.info(f"[Scraper] Cloudflare 챌린지 화면 감지 ('{page_title}') -> 플랫폼 자동 해결 시도: {url}")
+        if cls.solve_turnstile_checkbox(driver, max_wait=5):
+            return True
+
+        # 클릭으로 해결되지 않으면 FlareSolverr를 통해 새 토큰을 취득하여 현재 브라우저에 즉시 주입
+        logger.warning(f"[Scraper] Turnstile 자동 클릭 미통과 -> FlareSolverr 새 토큰 재인가 시작: {url}")
+        fresh_cookies, _ = cls.get_flaresolverr_clearance(url, scheduler_instance=scheduler_instance)
+        if fresh_cookies and any(c.get('name') == 'cf_clearance' and c.get('value') for c in fresh_cookies):
+            for c in fresh_cookies:
+                cookie_dict = {'name': c['name'], 'value': c['value'], 'path': c.get('path', '/')}
+                dom = c.get('domain', '')
+                if dom:
+                    cookie_dict['domain'] = dom.lstrip('.')
+                try:
+                    driver.add_cookie(cookie_dict)
+                except Exception:
+                    try:
+                        driver.add_cookie({'name': c['name'], 'value': c['value'], 'path': '/'})
+                    except Exception:
+                        pass
+            logger.info(f"[Scraper] 새 clearance 쿠키 {len(fresh_cookies)}개 브라우저 재주입 완료 -> 페이지 재접속")
+            driver.get(url)
+            time.sleep(2)
+            cls.solve_turnstile_checkbox(driver, max_wait=4)
+
+        current_title = driver.title or ""
+        return not any(k in current_title for k in ["Just a moment", "Cloudflare", "Attention Required"])
+
+    @classmethod
+    def init_stealth_selenium(cls, site_info: dict, scheduler_instance=None):
+        """플랫폼 표준 스텔스 Remote Selenium 드라이버 기동 및 쿠키 완전체 주입 (단일 영속 세션)"""
+        site_url = site_info.get('TORRENT_SITE_URL', '').rstrip('/')
+        remote_url = site_info.get('SELENIUM_REMOTE_URL') or P.ModelSetting.get('feed_selenium_remote_url') or 'http://selenium:4444/wd/hub'
+        proxies = cls.get_proxies(scheduler_instance)
+        parsed_url = urlparse(site_url)
+        host = parsed_url.hostname or ''
+
+        # 기존 활성 드라이버가 살아있다면 재사용
+        if cls._selenium_driver:
+            try:
+                _ = cls._selenium_driver.current_url
+                return cls._selenium_driver
+            except Exception:
+                cls._selenium_driver = None
 
         try:
             selenium_timeout = int((site_info.get('SELENIUM_TIMEOUT') if site_info else None) or P.ModelSetting.get('feed_selenium_timeout', '20'))
@@ -883,83 +1036,106 @@ class FeedScraper:
         except Exception:
             selenium_timeout = 20
 
-        driver = cls._selenium_driver
-        if driver:
-            try:
-                _ = driver.current_url
-            except Exception:
-                driver = None
-                cls._selenium_driver = None
+        # FlareSolverr가 설정된 경우 clearance 토큰 사전 확보
+        use_fs = getattr(scheduler_instance, 'use_flaresolverr', False) if scheduler_instance else P.ModelSetting.get_bool('feed_use_flaresolverr')
+        if site_info and ('USE_FLARESOLVERR' in site_info.get('EXTRA', []) or site_info.get('USE_FLARESOLVERR')):
+            use_fs = True
 
-        if not driver:
-            try:
-                from selenium import webdriver
+        raw_cf_cookies, cf_user_agent = [], ""
+        if use_fs:
+            raw_cf_cookies, cf_user_agent = cls.get_flaresolverr_clearance(site_url, scheduler_instance=scheduler_instance)
 
-                use_fs = getattr(scheduler_instance, 'use_flaresolverr', False) if scheduler_instance else P.ModelSetting.get_bool('feed_use_flaresolverr')
-                if site_info and ('USE_FLARESOLVERR' in site_info.get('EXTRA', []) or site_info.get('USE_FLARESOLVERR')):
-                    use_fs = True
+        from selenium import webdriver
+        options = webdriver.ChromeOptions()
+        options.add_argument('--headless=new')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--start-maximized')
 
-                # Selenium 기동 전 FlareSolverr clearance 토큰 사전 취득
-                if use_fs and not cls._has_valid_clearance(host):
-                    logger.info(f"[Scraper] Selenium 기동 전 FlareSolverr 토큰 사전 인가: {url}")
-                    cls.get_by_flaresolverr(url, proxies=proxies)
+        target_ua = cf_user_agent or site_info.get('USER_AGENT') or cls._cf_user_agents.get(host) or \
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+        options.add_argument(f"user-agent={target_ua}")
+        options.add_argument('--disable-blink-features=AutomationControlled')
+        options.add_experimental_option('excludeSwitches', ['enable-automation'])
+        options.add_experimental_option('useAutomationExtension', False)
 
-                options = webdriver.ChromeOptions()
-                options.add_argument('--headless=new')
-                options.add_argument('--no-sandbox')
-                options.add_argument('--disable-dev-shm-usage')
-                options.add_argument('--disable-gpu')
-                options.add_argument('--window-size=1920,1080')
-                options.add_argument('--start-maximized')
+        if proxies and 'http' in proxies:
+            options.add_argument(f'--proxy-server={proxies["http"]}')
+            logger.info(f"[Scraper] Selenium 프록시 적용: {proxies['http']}")
 
-                target_ua = (site_info.get('USER_AGENT') if site_info else None) or \
-                            cls._cf_user_agents.get(host) or \
-                            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
-                options.add_argument(f"user-agent={target_ua}")
-                options.add_argument('--disable-blink-features=AutomationControlled')
-                options.add_experimental_option('excludeSwitches', ['enable-automation'])
-                options.add_experimental_option('useAutomationExtension', False)
+        try:
+            driver = webdriver.Remote(command_executor=remote_url, options=options)
+            driver.set_page_load_timeout(selenium_timeout)
+        except Exception as e:
+            logger.error(f"[Scraper] Remote Selenium 기동 실패 ({remote_url}): {e}")
+            return None
 
-                if proxies and 'http' in proxies:
-                    options.add_argument(f'--proxy-server={proxies["http"]}')
-                    logger.debug(f"[Scraper] Selenium 프록시: {proxies['http']}")
+        # CDP 스텔스 마스킹 주입
+        try:
+            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': '''
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    window.chrome = { runtime: {} };
+                    Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'ko-KR', 'ko', 'en-US', 'en']});
+                '''
+            })
+        except Exception:
+            pass
 
-                driver = webdriver.Remote(command_executor=remote_url, options=options)
-                driver.set_page_load_timeout(selenium_timeout)
+        # 쿠키 주입을 위한 도메인 컨텍스트 확정
+        base_domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        try:
+            driver.get(f"{base_domain}/robots.txt")
+        except Exception:
+            driver.get(site_url)
 
+        # FlareSolverr 쿠키 주입
+        injected_count = 0
+        if raw_cf_cookies:
+            for c in raw_cf_cookies:
+                cookie_dict = {'name': c['name'], 'value': c['value'], 'path': c.get('path', '/')}
+                dom = c.get('domain', '')
+                if dom:
+                    cookie_dict['domain'] = dom.lstrip('.')
                 try:
-                    driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                        'source': 'Object.defineProperty(navigator, "webdriver", {get: () => undefined})'
-                    })
+                    driver.add_cookie(cookie_dict)
+                    injected_count += 1
                 except Exception:
-                    pass
-
-                # site_info 쿠키 및 FlareSolverr cf_cookies 통합 주입
-                all_cookies = {}
-                if host in cls._cf_cookies:
-                    for k, v in cls._cf_cookies[host].items():
-                        if not k.startswith('_'):
-                            all_cookies[k] = v
-                if site_info and site_info.get('COOKIE'):
-                    for part in site_info['COOKIE'].split(';'):
-                        if '=' in part:
-                            k, v = part.strip().split('=', 1)
-                            all_cookies[k.strip()] = v.strip()
-
-                if all_cookies:
-                    base_domain = f"{parsed_url.scheme}://{parsed_url.netloc}"
                     try:
-                        driver.get(f"{base_domain}/404notfound")
-                        for c_name, c_val in all_cookies.items():
-                            driver.add_cookie({'name': c_name, 'value': c_val, 'path': '/'})
-                        logger.debug(f"[Scraper] Selenium에 세션 쿠키 {len(all_cookies)}개 주입 완료")
-                    except Exception as cookie_err:
-                        logger.debug(f"[Scraper] Selenium 쿠키 주입 예외: {cookie_err}")
+                        driver.add_cookie({'name': c['name'], 'value': c['value'], 'path': '/'})
+                        injected_count += 1
+                    except Exception:
+                        pass
+            logger.info(f"[Scraper] [{host}] Selenium에 clearance 쿠키 {injected_count}개 정밀 주입 완료")
 
-                cls._selenium_driver = driver
-            except Exception as e:
-                logger.error(f"[Scraper] Remote Selenium 생성 실패 ({url}): {e}")
-                return None
+        # 사이트 기본 고정 쿠키가 있다면 추가 주입
+        if site_info and site_info.get('COOKIE'):
+            for part in site_info['COOKIE'].split(';'):
+                if '=' in part:
+                    k, v = part.strip().split('=', 1)
+                    try:
+                        driver.add_cookie({'name': k.strip(), 'value': v.strip(), 'path': '/'})
+                    except Exception:
+                        pass
+
+        cls._selenium_driver = driver
+        return driver
+
+    @classmethod
+    def get_by_remote_selenium(cls, url: str, wait_tag: str = 'body', scheduler_instance=None, site_info: dict = None) -> str | None:
+        """단일 스텔스 브라우저 세션을 재사용하여 페이지를 로드하고 챌린지 자동 해결 후 HTML 반환"""
+        driver = cls.init_stealth_selenium(site_info or {}, scheduler_instance=scheduler_instance)
+        if not driver:
+            return None
+
+        try:
+            selenium_timeout = int((site_info.get('SELENIUM_TIMEOUT') if site_info else None) or P.ModelSetting.get('feed_selenium_timeout', '20'))
+            if selenium_timeout <= 0:
+                selenium_timeout = 20
+        except Exception:
+            selenium_timeout = 20
 
         try:
             from selenium.webdriver.common.by import By
@@ -969,6 +1145,10 @@ class FeedScraper:
             logger.debug(f"[Scraper] Selenium 페이지 로드: {url}")
             driver.get(url)
 
+            # 1. 플랫폼 차원의 Cloudflare Turnstile 챌린지 자동 검사 및 해결
+            cls.handle_turnstile_challenge(driver, url, site_info=site_info, scheduler_instance=scheduler_instance)
+
+            # 2. 커스텀 훅의 페이지 로드 직후 이벤트 호출 (사이트별 성인 확인 버튼 등)
             if site_info:
                 try:
                     hook = FeedCustomManager.get_hook(site_info.get('NAME'))
@@ -977,6 +1157,7 @@ class FeedScraper:
                 except Exception:
                     pass
 
+            # 3. 지정 태그 렌더링 완료 대기
             effective_wait_tag = wait_tag or 'body'
             if effective_wait_tag != 'body':
                 try:
