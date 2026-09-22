@@ -93,6 +93,9 @@ class ModuleFeed(PluginModuleBase):
             if sub == 'web_list' or command == 'web_list':
                 return jsonify(self.web_list_model.web_list(req))
 
+            if sub in ['one_execute', 'scheduler_once'] or command in ['one_execute', 'scheduler_once']:
+                return self.one_execute()
+
             if command:
                 res = self.process_command(command, req.form.get('arg1', ''), req.form.get('arg2', ''), req.form.get('arg3', ''), req)
                 if res is not None:
@@ -749,7 +752,20 @@ class ModuleFeed(PluginModuleBase):
         xml += '</rss>'
         return xml
 
+    def one_execute(self):
+        """상단 '1회 실행' 버튼 클릭 시 즉시 수동 모드로 Celery 전달"""
+        logger.info(f"[{self.name}] 수동 1회 실행(one_execute) 요청 -> 크롤링 워커 전달 (모드: manual)")
+        self.start_celery(TaskBase.start, None, "manual")
+        return jsonify({'ret': 'success', 'msg': '수집 작업을 Celery 워커에서 시작했습니다 (수동 모드).'})
+
+    def scheduler_once(self):
+        """스케줄러 탭 '1회 실행' 버튼 클릭 시 즉시 수동 모드로 Celery 전달"""
+        logger.info(f"[{self.name}] 스케줄러 1회 실행(scheduler_once) 요청 -> 크롤링 워커 전달 (모드: manual)")
+        self.start_celery(TaskBase.start, None, "manual")
+        return jsonify({'ret': 'success', 'msg': '수집 작업을 Celery 워커에서 시작했습니다 (수동 모드).'})
+
     def scheduler_function(self):
+        """스케줄러 주기 타이머 도래 시 자동 실행 (모드: default)"""
         if P.ModelSetting.get_bool(f"{self.name}_db_auto_delete"):
             try:
                 day = P.ModelSetting.get_int(f"{self.name}_db_delete_day")
@@ -759,16 +775,13 @@ class ModuleFeed(PluginModuleBase):
                     db.session.commit()
                     if deleted_count > 0:
                         self.db_vacuum()
-                    logger.debug(f"[Feeder] {day}일 경과된 이전 수집 DB 자동 정리 완료 (삭제: {deleted_count}건)")
+                    logger.debug(f"[Feeder] {day}일 경과 이전 수집 DB 자동 정리 완료 (삭제: {deleted_count}건)")
             except Exception as e:
                 logger.error(f"[Feeder] db auto delete 에러: {e}")
                 db.session.rollback()
 
-        # 웹 UI에서 1회 실행을 누른 경우(HTTP 컨텍스트 존재) 'manual' 모드로 전달하여 조기 종료 방지
-        # 백그라운드 스케줄러 데몬이 호출한 경우 'default' 모드로 전달하여 max_id 도래 시 빠른 종료
-        job_type = "manual" if has_request_context() else "default"
-        logger.info(f"[{self.name}] 크롤링 워커 작업 전달 (모드: {job_type})")
-        self.start_celery(TaskBase.start, None, job_type)
+        logger.info(f"[{self.name}] 스케줄러 주기 실행 -> 크롤링 워커 작업 전달 (모드: default)")
+        self.start_celery(TaskBase.start, None, "default")
 
     def delete_task_db(self, task: dict) -> str:
         try:

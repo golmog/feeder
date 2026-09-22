@@ -28,7 +28,8 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_interval": "5",
             f"{self.name}_db_delete_day": "30",
             f"{self.name}_db_auto_delete": "False",
-            # 스토리지 및 업로드 수치 설정 (하드코딩 제거)
+            f"{self.name}_feed_sync_days": "3",
+            f"{self.name}_batch_limit": "50",
             f"{self.name}_local_staging_path": "",
             f"{self.name}_rclone_conf_path": "",
             f"{self.name}_rclone_remote_name": "net",
@@ -72,10 +73,8 @@ class ModuleDownload(PluginModuleBase):
         try:
             command = req.form.get('command') or sub
 
-            if command == 'one_execute':
-                logger.info(f"[{self.name}] 1회 실행 명령 수신 -> Celery 워커 전달")
-                self.start_celery(TaskDownloadBase.start, None, "manual")
-                return jsonify({'ret': 'success', 'msg': '다운로드 파이프라인 작업을 Celery 워커에서 시작했습니다.'})
+            if sub in ['one_execute', 'scheduler_once'] or command in ['one_execute', 'scheduler_once']:
+                return self.one_execute()
 
             # 큐 및 이력 웹 리스트
             elif sub == 'web_list' or command == 'web_list':
@@ -158,6 +157,111 @@ class ModuleDownload(PluginModuleBase):
                 db.session.commit()
                 logger.info(f"[{self.name}] 구글 드라이브 계정 차단 목록 수동 초기화 완료")
                 return jsonify({'ret': 'success', 'stats': self.get_account_stats_summary()})
+
+            # 과거 이력 가져오기: 마그넷 텍스트 목록 일괄 임포트
+            elif command == 'import_history_text':
+                raw_text = req.form.get('import_text', '').strip()
+                lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+                now = datetime.now()
+                added_count, skipped_count = 0, 0
+
+                from .util_feed import extract_info_hash
+                for line in lines:
+                    infohash = extract_info_hash(line)
+                    target_mag = f"magnet:?xt=urn:btih:{infohash}" if infohash else line
+
+                    existing = ModelDownload.get_by_infohash(infohash) if infohash else ModelDownload.get_by_magnet(target_mag)
+                    if existing:
+                        skipped_count += 1
+                        continue
+
+                    item = ModelDownload(
+                        feed_name='MIGRATED',
+                        title=f"[기존완료이력] {infohash or target_mag[:30]}",
+                        magnet=target_mag,
+                        infohash=infohash
+                    )
+                    item.status = 'completed'
+                    item.completed_time = now
+                    db.session.add(item)
+                    added_count += 1
+
+                db.session.commit()
+                logger.info(f"[{self.name}] 마그넷 텍스트 이력 임포트: {added_count}건 추가, {skipped_count}건 중복 스킵")
+                return jsonify({'ret': 'success', 'added': added_count, 'skipped': skipped_count})
+
+            # 과거 이력 가져오기: 외부 SQLite DB 파일 (.db) 범용 임포트
+            elif command == 'import_history_db':
+                db_path = req.form.get('db_path', '').strip()
+                table_name = req.form.get('table_name', '').strip() or 'magnets'
+                magnet_col = req.form.get('magnet_col', '').strip() or 'magnet'
+                title_col = req.form.get('title_col', '').strip() or 'title'
+                file_name_col = req.form.get('file_name_col', '').strip()
+                where_clause = req.form.get('where_clause', '').strip()
+
+                if not os.path.exists(db_path):
+                    return jsonify({'ret': 'fail', 'msg': '지정한 DB 파일을 찾을 수 없습니다.'})
+
+                import sqlite3
+                from .util_feed import extract_info_hash
+
+                added_count, skipped_count = 0, 0
+                now = datetime.now()
+
+                try:
+                    conn = sqlite3.connect(db_path)
+                    conn.row_factory = sqlite3.Row
+                    cur = conn.cursor()
+
+                    # 범용 쿼리 조립: 사용자가 WHERE 조건을 입력했을 때만 필터링, 비워두면 테이블 전체 임포트
+                    query = f"SELECT * FROM {table_name}"
+                    if where_clause:
+                        clean_where = re.sub(r'^\s*where\s+', '', where_clause, flags=re.IGNORECASE).strip()
+                        if clean_where:
+                            query += f" WHERE {clean_where}"
+
+                    cur.execute(query)
+                    rows = cur.fetchall()
+
+                    for r in rows:
+                        r_dict = dict(r)
+                        raw_mag = str(r_dict.get(magnet_col, '')).strip()
+                        if not raw_mag:
+                            continue
+
+                        infohash = extract_info_hash(raw_mag)
+                        target_mag = f"magnet:?xt=urn:btih:{infohash}" if infohash else raw_mag
+
+                        existing = ModelDownload.get_by_infohash(infohash) if infohash else ModelDownload.get_by_magnet(target_mag)
+                        if existing:
+                            skipped_count += 1
+                            continue
+
+                        title_val = r_dict.get(title_col) or f"[기존완료이력] {infohash or target_mag[:30]}"
+                        fname_val = r_dict.get(file_name_col) if file_name_col else None
+                        fsize_val = r_dict.get('file_size') or 0
+
+                        item = ModelDownload(
+                            feed_name=r_dict.get('rss_feed_category') or 'MIGRATED',
+                            title=title_val,
+                            magnet=target_mag,
+                            infohash=infohash
+                        )
+                        item.file_name = fname_val
+                        item.file_size = fsize_val
+                        item.status = 'completed'
+                        item.completed_time = now
+                        db.session.add(item)
+                        added_count += 1
+
+                    db.session.commit()
+                    conn.close()
+                    logger.info(f"[{self.name}] 외부 DB ({os.path.basename(db_path)}) 범용 이력 임포트: {added_count}건 완료, {skipped_count}건 중복 제외")
+                    return jsonify({'ret': 'success', 'added': added_count, 'skipped': skipped_count})
+                except Exception as ex:
+                    logger.error(f"[{self.name}] 외부 DB 범용 임포트 중 오류: {ex}")
+                    db.session.rollback()
+                    return jsonify({'ret': 'fail', 'msg': str(ex)})
 
             # 큐 개별 항목 제어
             elif command == 'item_action':
@@ -254,7 +358,20 @@ class ModuleDownload(PluginModuleBase):
 
         return {'usage_24h': usage_map, 'blocked_remains': blocked_map}
 
+    def one_execute(self):
+        """수동 1회 실행 요청 처리 (모드: manual)"""
+        logger.info(f"[{self.name}] 수동 1회 실행(one_execute) 요청 -> 다운로드 워커 전달 (모드: manual)")
+        self.start_celery(TaskDownloadBase.start, None, "manual")
+        return jsonify({'ret': 'success', 'msg': '다운로드 파이프라인 작업을 Celery 워커에서 시작했습니다 (수동 모드).'})
+
+    def scheduler_once(self):
+        """스케줄러 탭 1회 실행 요청 처리 (모드: manual)"""
+        logger.info(f"[{self.name}] 스케줄러 1회 실행(scheduler_once) 요청 -> 다운로드 워커 전달 (모드: manual)")
+        self.start_celery(TaskDownloadBase.start, None, "manual")
+        return jsonify({'ret': 'success', 'msg': '다운로드 파이프라인 작업을 Celery 워커에서 시작했습니다 (수동 모드).'})
+
     def scheduler_function(self):
+        """스케줄러 주기 타이머 도래 시 자동 실행 (모드: default)"""
         if P.ModelSetting.get_bool(f"{self.name}_db_auto_delete"):
             try:
                 day = P.ModelSetting.get_int(f"{self.name}_db_delete_day")
@@ -275,6 +392,5 @@ class ModuleDownload(PluginModuleBase):
                 logger.error(f"[{self.name}] DB 자동 삭제 에러: {e}")
                 db.session.rollback()
 
-        job_type = "manual" if has_request_context() else "default"
-        logger.info(f"[{self.name}] 다운로드 워커 작업 전달 (모드: {job_type})")
-        self.start_celery(TaskDownloadBase.start, None, job_type)
+        logger.info(f"[{self.name}] 스케줄러 주기 실행 -> 다운로드 워커 작업 전달 (모드: default)")
+        self.start_celery(TaskDownloadBase.start, None, "default")

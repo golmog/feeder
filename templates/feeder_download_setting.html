@@ -8,6 +8,12 @@
   ['globalOneExecuteBtn', '1회 실행'],
   ['globalEditBtn', 'YAML 편집', [['file', arg['yaml_filepath']]]]
 ]) }}
+<div class="mb-2 text-right">
+  <button type="button" id="history_import_modal_btn" class="btn btn-sm btn-outline-info">
+    <i class="fa fa-database mr-1"></i>과거 이력 가져오기 (마이그레이션)
+  </button>
+</div>
+
 {{ macros.m_row_start('5') }}
 {{ macros.m_row_end() }}
 
@@ -26,6 +32,8 @@
 
     <!-- 탭 1: 기본 설정 -->
     {{ macros.m_tab_content_start('basic', true) }}
+      {{ macros.setting_input_int('download_feed_sync_days', '다운로드 대상 피드 기간 (일)', value=arg['download_feed_sync_days'], min='1', placeholder='3', desc=['최근 N일 이내에 수집된 피드 게시물만 다운로드 대상으로 큐에 추가합니다 (과거 게시물 다운로드 폭탄 방지, 기본값: 3일)']) }}
+      {{ macros.setting_input_int('download_batch_limit', '주기당 최대 배치 작업 수', value=arg['download_batch_limit'], min='1', placeholder='50', desc=['스케줄 1주기마다 동시에 탐색 및 처리할 최대 작업 수 (하드코딩 제거, 기본값: 50개)']) }}
       {{ macros.setting_input_text('download_local_staging_path', '로컬 스테이징(임시) 경로', value=arg['download_local_staging_path'], placeholder='예: /data/tmp/staging', desc=['원격 클라우드 다운로드 후 로컬 버퍼로 수신할 임시 디렉터리 (비워두면 기본 임시 폴더 사용)']) }}
       {{ macros.setting_checkbox('download_enable_sse', '실시간 SSE 브로드캐스트', value=arg['download_enable_sse'], desc=['On: 큐 대시보드 화면에서 실시간 진행 현황을 자동 수신합니다.']) }}
       {{ macros.m_hr() }}
@@ -290,6 +298,80 @@
       </div>
       <div class="modal-footer">
         <button id="gdrive_batch_save_btn" type="button" class="btn btn-primary">일괄 추가하기</button>
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 모달: 과거 이력 가져오기 (마이그레이션) -->
+<div class="modal fade" id="history_import_modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content">
+      <div class="modal-header d-flex align-items-center justify-content-between">
+        <h4 class="modal-title font-weight-bold"><i class="fa fa-database mr-1"></i>과거 다운로드 이력 가져오기</h4>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+      </div>
+      <div class="modal-body">
+        <ul class="nav nav-tabs mb-3" role="tablist">
+          <li class="nav-item">
+            <a class="nav-link active font-weight-bold" data-toggle="tab" href="#tab_import_db">기존 SQLite DB 파일 (.db)</a>
+          </li>
+          <li class="nav-item">
+            <a class="nav-link font-weight-bold" data-toggle="tab" href="#tab_import_text">마그넷 목록 (텍스트)</a>
+          </li>
+        </ul>
+
+        <div class="tab-content">
+          <!-- 탭 A: 외부 SQLite DB 통째 임포트 (offline_downloader.db 완벽 지원) -->
+          <div class="tab-pane fade show active" id="tab_import_db">
+            <p class="small text-muted mb-2">
+              이전에 사용하시던 오프라인 다운로더의 <code>.db</code> 파일 경로를 지정하여 다운로드 완료 이력을 그대로 흡수합니다.<br>
+              이미 다운로드된 토렌트는 새 플랫폼에서 <strong>완료(completed)</strong> 상태로 등록되어 다시 내려받지 않습니다.
+            </p>
+            <div class="form-group mb-2">
+              <label class="small font-weight-bold">SQLite DB 절대 경로</label>
+              <input type="text" id="import_db_path" class="form-control form-control-sm" placeholder="예: /data/db/offline_downloader.db">
+            </div>
+            <div class="form-row mb-2">
+              <div class="col-md-4">
+                <label class="small text-muted">테이블명</label>
+                <input type="text" id="import_table_name" class="form-control form-control-sm" value="magnets">
+              </div>
+              <div class="col-md-4">
+                <label class="small text-muted">마그넷 컬럼명</label>
+                <input type="text" id="import_magnet_col" class="form-control form-control-sm" value="magnet">
+              </div>
+              <div class="col-md-4">
+                <label class="small text-muted">필터링 조건식 (WHERE절, 선택사항)</label>
+                <input type="text" id="import_where_clause" class="form-control form-control-sm" placeholder="예: status = 'completed' (비워두면 전체)">
+              </div>
+            </div>
+            <div class="form-row mb-3">
+              <div class="col-md-6">
+                <label class="small text-muted">제목 컬럼명 (선택)</label>
+                <input type="text" id="import_title_col" class="form-control form-control-sm" value="title">
+              </div>
+              <div class="col-md-6">
+                <label class="small text-muted">파일명 컬럼명 (선택)</label>
+                <input type="text" id="import_file_name_col" class="form-control form-control-sm" value="file_name">
+              </div>
+            </div>
+            <small class="form-text text-muted mb-3">조건식을 비워두면 지정된 테이블의 모든 레코드를 가져옵니다. 다른 컬럼명(예: state = 'FINISHED' 또는 is_done = 1)도 자유롭게 지정 가능합니다.</small>
+            <button type="button" id="btn_run_import_db" class="btn btn-sm btn-primary btn-block">DB 파일 이력 흡수하기</button>
+          </div>
+
+          <!-- 탭 B: 마그넷 텍스트 목록 일괄 임포트 -->
+          <div class="tab-pane fade" id="tab_import_text">
+            <p class="small text-muted mb-2">
+              줄바꿈으로 구분된 마그넷 URL 또는 40자리 해시 목록을 붙여넣으세요. 새 플랫폼 DB에 <strong>완료(completed)</strong> 상태로 일괄 등록됩니다.
+            </p>
+            <textarea id="import_text_content" class="form-control mb-3" rows="10" style="font-family: monospace; font-size: 0.82rem;" placeholder="magnet:?xt=urn:btih:..."></textarea>
+            <button type="button" id="btn_run_import_text" class="btn btn-sm btn-primary btn-block">텍스트 목록 일괄 등록하기</button>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
         <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
       </div>
     </div>

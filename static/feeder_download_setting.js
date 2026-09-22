@@ -577,3 +577,71 @@ $(document).on('click', '#gdrive_reset_blocks_btn', function(e){
   });
 });
 
+$(document).on('click', '#history_import_modal_btn', function(e){
+  e.preventDefault();
+  $('#import_text_content').val('');
+  $('#history_import_modal').modal('show');
+});
+
+// 텍스트 마그넷 목록 임포트
+$(document).on('click', '#btn_run_import_text', function(e){
+  e.preventDefault();
+  var text = $('#import_text_content').val().trim();
+  if (!text) {
+    notify('임포트할 마그넷 목록을 입력하세요.', 'warning');
+    return;
+  }
+  notify('마그넷 목록 임포트 중...', 'info');
+
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/import_history_text',
+    type: "POST",
+    data: {import_text: text},
+    dataType: "json",
+    success: function(data) {
+      if (data.ret === 'success') {
+        notify('이력 등록 완료: ' + data.added + '건 추가 (중복 ' + data.skipped + '건 스킵)', 'success');
+        $('#history_import_modal').modal('hide');
+      } else {
+        notify(data.msg || '임포트 실패', 'danger');
+      }
+    }
+  });
+});
+
+// SQLite DB 파일 통째 임포트
+$(document).on('click', '#btn_run_import_db', function(e){
+  e.preventDefault();
+  var dbPath = $('#import_db_path').val().trim();
+  if (!dbPath) {
+    notify('SQLite DB 파일 경로를 입력하세요.', 'warning');
+    return;
+  }
+
+  var formData = {
+    db_path: dbPath,
+    table_name: $('#import_table_name').val().trim(),
+    magnet_col: $('#import_magnet_col').val().trim(),
+    title_col: $('#import_title_col').val().trim(),
+    file_name_col: $('#import_file_name_col').val().trim(),
+    where_clause: $('#import_where_clause').val().trim()
+  };
+
+  notify('기존 DB 파일 이력 흡수 중 (잠시 기다려주세요)...', 'info');
+
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/import_history_db',
+    type: "POST",
+    data: formData,
+    dataType: "json",
+    success: function(data) {
+      if (data.ret === 'success') {
+        notify('DB 이력 흡수 완료: 총 ' + data.added + '건이 완료 상태로 등록되었습니다 (중복 ' + data.skipped + '건 스킵).', 'success');
+        $('#history_import_modal').modal('hide');
+      } else {
+        notify('DB 임포트 실패: ' + (data.msg || '알 수 없는 오류'), 'danger');
+      }
+    }
+  });
+});
+

@@ -112,14 +112,19 @@ class TaskDownload:
                     if not site_name or not board_key:
                         continue
 
-                    # 최근 수집된 게시글 조회 (최신 100건)
-                    candidates = (
-                        db.session.query(ModelFeedBbs)
-                        .filter_by(site=site_name, board=board_key)
-                        .order_by(ModelFeedBbs.id.desc())
-                        .limit(100)
-                        .all()
-                    )
+                    # 프로필 개별 설정 또는 전역 기본 다운로드 기간(일) 적용
+                    sync_days = profile.get('sync_days')
+                    if sync_days is None:
+                        sync_days = P.ModelSetting.get_int('download_feed_sync_days', 3)
+                    else:
+                        sync_days = int(sync_days)
+
+                    query = db.session.query(ModelFeedBbs).filter_by(site=site_name, board=board_key)
+                    if sync_days > 0:
+                        limit_date = datetime.now() - timedelta(days=sync_days)
+                        query = query.filter(ModelFeedBbs.created_time >= limit_date)
+
+                    candidates = query.order_by(ModelFeedBbs.id.desc()).all()
 
                     for bbs in candidates:
                         bbs_dict = bbs.as_dict()
@@ -167,7 +172,8 @@ class TaskDownload:
     @staticmethod
     def dispatch_pending_downloads():
         """pending 상태 작업을 현재 우선순위 체인 엔진에 할당"""
-        items = ModelDownload.get_list_by_status(['pending'], limit=30)
+        batch_limit = P.ModelSetting.get_int('download_batch_limit', 50)
+        items = ModelDownload.get_list_by_status(['pending'], limit=batch_limit)
         if not items:
             return
 
@@ -320,7 +326,8 @@ class TaskDownload:
     @staticmethod
     def process_local_staging():
         """AllDebrid 등 WebDAV/리모트 완료 파일을 작업별 고유 폴더 구조로 로컬 스테이징"""
-        items = ModelDownload.get_list_by_status(['pending_local_staging'], limit=5)
+        batch_limit = P.ModelSetting.get_int('download_batch_limit', 50)
+        items = ModelDownload.get_list_by_status(['pending_local_staging'], limit=batch_limit)
         if not items:
             return
 
@@ -427,7 +434,8 @@ class TaskDownload:
     @staticmethod
     def route_completed_downloads():
         """downloaded 항목의 목적지 라우팅 (115 내부 이동 또는 단순 로컬 완료)"""
-        items = ModelDownload.get_list_by_status(['downloaded'], limit=20)
+        batch_limit = P.ModelSetting.get_int('download_batch_limit', 50)
+        items = ModelDownload.get_list_by_status(['downloaded'], limit=batch_limit)
         if not items:
             return
 
@@ -482,7 +490,8 @@ class TaskDownload:
     @staticmethod
     def process_uploads():
         """pending_upload 항목의 구글 드라이브 계정 로테이션 업로드 실행"""
-        items = ModelDownload.get_list_by_status(['pending_upload'], limit=10)
+        batch_limit = P.ModelSetting.get_int('download_batch_limit', 50)
+        items = ModelDownload.get_list_by_status(['pending_upload'], limit=batch_limit)
         if not items:
             return
 
@@ -493,6 +502,7 @@ class TaskDownload:
     @staticmethod
     def retry_move_failed():
         """move_failed 상태 항목의 서버사이드 이동 주기적 재시도"""
+        batch_limit = P.ModelSetting.get_int('download_batch_limit', 50)
         one_hour_ago = datetime.now() - timedelta(hours=1)
         items = (
             db.session.query(ModelDownload)
@@ -500,7 +510,7 @@ class TaskDownload:
                 ModelDownload.status == 'move_failed',
                 (ModelDownload.last_move_attempt_time.is_(None) | (ModelDownload.last_move_attempt_time < one_hour_ago))
             )
-            .limit(5)
+            .limit(batch_limit)
             .all()
         )
         if not items:

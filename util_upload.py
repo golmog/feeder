@@ -109,14 +109,14 @@ class GDriveAccountManager:
         config_data = FeedConfigUtil.load_yaml()
         global_cfg = config_data.get('GLOBAL', {})
 
-        self.rclone_conf = config_data.get('rclone', {}).get('conf_path', '')
+        self.rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or config_data.get('rclone', {}).get('conf_path', '')
         self.accounts = FeedConfigUtil.get_gdrive_accounts()
         self.busy_accounts = set()
 
-        self.limit_user = parse_size_bytes(global_cfg.get('gdrive_upload_limit', '700GB'))
-        self.limit_shared = parse_size_bytes(global_cfg.get('shared_drive_upload_limit', '3TB'))
-        self.threshold = parse_size_bytes(global_cfg.get('mydrive_upload_threshold', '14GB'))
-        self.reset_time_str = global_cfg.get('shared_drive_quota_reset_time', '16:00')
+        self.limit_user = parse_size_bytes(P.ModelSetting.get('download_gdrive_upload_limit', '700GB'))
+        self.limit_shared = parse_size_bytes(P.ModelSetting.get('download_shared_drive_upload_limit', '3TB'))
+        self.threshold = parse_size_bytes(P.ModelSetting.get('download_mydrive_upload_threshold', '14GB'))
+        self.reset_time_str = P.ModelSetting.get('download_shared_drive_quota_reset_time', '16:00')
 
         self.usage_map = self._get_24h_usage_summary()
         self.shared_usage = self.usage_map.get('SHARED_DRIVE_UPLOAD', 0)
