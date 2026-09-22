@@ -33,7 +33,7 @@
     <!-- 탭 1: 기본 설정 -->
     {{ macros.m_tab_content_start('basic', true) }}
       {{ macros.setting_input_int('download_feed_sync_days', '다운로드 대상 피드 기간 (일)', value=arg['download_feed_sync_days'], min='1', placeholder='3', desc=['최근 N일 이내에 수집된 피드 게시물만 다운로드 대상으로 큐에 추가합니다 (과거 게시물 다운로드 폭탄 방지, 기본값: 3일)']) }}
-      {{ macros.setting_input_int('download_batch_limit', '주기당 최대 배치 작업 수', value=arg['download_batch_limit'], min='1', placeholder='50', desc=['스케줄 1주기마다 동시에 탐색 및 처리할 최대 작업 수 (하드코딩 제거, 기본값: 50개)']) }}
+      {{ macros.setting_input_int('download_batch_limit', '주기당 최대 배치 작업 수', value=arg['download_batch_limit'], min='1', placeholder='50', desc=['스케줄 1주기마다 동시에 탐색 및 처리할 최대 작업 수 (기본값: 50개)']) }}
       {{ macros.setting_input_text('download_local_staging_path', '로컬 스테이징(임시) 경로', value=arg['download_local_staging_path'], placeholder='예: /data/tmp/staging', desc=['원격 클라우드 다운로드 후 로컬 버퍼로 수신할 임시 디렉터리 (비워두면 기본 임시 폴더 사용)']) }}
       {{ macros.setting_checkbox('download_enable_sse', '실시간 SSE 브로드캐스트', value=arg['download_enable_sse'], desc=['On: 큐 대시보드 화면에서 실시간 진행 현황을 자동 수신합니다.']) }}
       {{ macros.m_hr() }}

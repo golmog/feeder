@@ -630,11 +630,30 @@ class FeedScraper:
                     cffi_sess.cookies.set(k, v, domain=host)
 
     @classmethod
-    def get_html(cls, url: str, site_info: dict = None, scheduler_instance=None, referer: str = None, max_retries: int = 3, retry_interval: float = 1.5, wait_tag: str = None) -> str | None:
+    def get_html(cls, url: str, site_info: dict = None, scheduler_instance=None, referer: str = None, max_retries: int = None, retry_interval: float = None, wait_tag: str = None) -> str | None:
         extra = site_info.get('EXTRA', []) if site_info else []
         cookie = site_info.get('COOKIE') if site_info else None
         proxies = cls.get_proxies(scheduler_instance)
         host = urlparse(url).hostname or ''
+
+        # 재시도 횟수 및 간격 동적 해석 (크롤러 개별 설정 우선 -> 전역 기본 설정값 -> 기본값)
+        try:
+            if max_retries is None:
+                inst_retries = getattr(scheduler_instance, 'max_retries', None) if scheduler_instance else None
+                max_retries = int(inst_retries) if inst_retries not in [None, ''] else int(P.ModelSetting.get('feed_crawler_max_retries', '3'))
+            if max_retries < 1:
+                max_retries = 1
+        except Exception:
+            max_retries = 3
+
+        try:
+            if retry_interval is None:
+                inst_interval = getattr(scheduler_instance, 'retry_interval', None) if scheduler_instance else None
+                retry_interval = float(inst_interval) if inst_interval not in [None, ''] else float(P.ModelSetting.get('feed_crawler_retry_interval', '1.5'))
+            if retry_interval < 0:
+                retry_interval = 1.5
+        except Exception:
+            retry_interval = 1.5
 
         # 옵션 해석 (개별 스케줄 우선 -> 사이트 설정 -> 전역 설정)
         if scheduler_instance:
@@ -665,11 +684,16 @@ class FeedScraper:
         # FlareSolverr가 켜져 있고 유효한 clearance가 아직 없다면, 403을 유발하지 않고 FlareSolverr를 최우선 호출하여 인가 획득
         if use_fs and not cls._has_valid_clearance(host):
             logger.info(f"[Scraper] [{host}] Cloudflare 사이트 감지 -> FlareSolverr 최우선 인가 요청: {url}")
-            tree, fs_html = cls.get_by_flaresolverr(url, proxies=proxies)
-            if fs_html and 'Just a moment...' not in fs_html and 'cf-turnstile' not in fs_html:
-                logger.info(f"[Scraper] [{host}] FlareSolverr 인가 및 1차 페이지 수신 완료 -> 하위 세션 동기화")
-                return fs_html
-            logger.warning(f"[Scraper] [{host}] FlareSolverr 1차 인가 실패, HTTP 세션으로 폴백 시도")
+            for fs_try in range(1, max_retries + 1):
+                tree, fs_html = cls.get_by_flaresolverr(url, proxies=proxies)
+                if fs_html and 'Just a moment...' not in fs_html and 'cf-turnstile' not in fs_html:
+                    logger.info(f"[Scraper] [{host}] FlareSolverr 인가 및 1차 페이지 수신 완료 -> 하위 세션 동기화")
+                    return fs_html
+                if fs_try < max_retries:
+                    logger.debug(f"[Scraper] [{host}] FlareSolverr 초기 인가 재시도 ({fs_try}/{max_retries})...")
+                    time.sleep(retry_interval)
+
+            logger.warning(f"[Scraper] [{host}] FlareSolverr 초기 인가 {max_retries}회 실패, HTTP 세션으로 폴백 시도")
 
         # 인가받은 User-Agent 및 쿠키 헤더 조립
         headers = cls.DEFAULT_HEADERS.copy()

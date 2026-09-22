@@ -18,7 +18,7 @@ class TaskBase:
 
     @F.celery.task(bind=True, acks_late=False)
     def start(self, *args):
-        logger.info(f"[Feeder] Celery Task 수신 인자: {args}")
+        logger.debug(f"[Feeder] Celery Task 수신 인자: {args}")
         delivery_info = getattr(self.request, 'delivery_info', {}) or {}
         is_redelivered = delivery_info.get('redelivered') or getattr(self.request, 'redelivered', False)
 
@@ -139,7 +139,9 @@ class Task:
                         proxy_url=crawler.get('proxy_url', '').strip(),
                         use_flaresolverr=crawler.get('use_flaresolverr', False),
                         use_selenium=crawler.get('use_selenium', False),
-                        use_torrent_info=crawler.get('use_torrent_info', False)
+                        use_torrent_info=crawler.get('use_torrent_info', False),
+                        max_retries=crawler.get('max_retries', ''),
+                        retry_interval=crawler.get('retry_interval', '')
                     )
 
                     logger.info(f"[Feeder] [Celery Task] 사이트 크롤러 시작: [{site_name}] (대상 게시판={len(boards)}개, 최대 탐색={max_page}p)")
