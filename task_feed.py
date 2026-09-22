@@ -20,27 +20,29 @@ class TaskBase:
     def start(self, *args):
         logger.info(f"[Feeder] Celery Task 수신 인자: {args}")
         job_type = "default"
+        target_crawler_id = None
         for arg in args:
-            if isinstance(arg, str) and arg in ["default", "manual"]:
+            if isinstance(arg, str) and arg in ["default", "manual", "missing"]:
                 job_type = arg
-                break
+            elif isinstance(arg, (int, str)) and str(arg).isdigit():
+                target_crawler_id = int(arg)
 
         delivery_info = getattr(self.request, 'delivery_info', {}) or {}
         is_redelivered = delivery_info.get('redelivered') or getattr(self.request, 'redelivered', False)
 
         if is_redelivered:
-            logger.warning(f"[Feeder] [{job_type}] 이전 세션 비정상 종료로 재전송(redelivered)된 고아 태스크 실행을 취소합니다.")
+            logger.warning(f"[Feeder] [{job_type}] 이전 세션 비정상 종료로 재전송된 고아 태스크 실행 취소")
             return
 
-        Task.start(job_type)
+        Task.start(job_type, target_crawler_id=target_crawler_id)
 
 
 class Task:
 
     @staticmethod
-    def start(job_type="default"):
-        is_manual = (job_type == "manual")
-        Task.run_crawl(manual=is_manual)
+    def start(job_type="default", target_crawler_id: int = None):
+        is_missing_scan = (job_type in ["manual", "missing"])
+        Task.run_crawl(is_missing_scan=is_missing_scan, target_crawler_id=target_crawler_id)
 
     @staticmethod
     def parse_board_info(board: str, subcat: str = None) -> tuple[str, str, str]:
@@ -99,16 +101,26 @@ class Task:
             return rule.format(URL=site_url, BOARD_NAME=board_id, PAGE=page)
 
     @staticmethod
-    def run_crawl(manual=False):
+    def run_crawl(is_missing_scan: bool = False, target_crawler_id: int = None):
         with F.app.app_context():
             try:
-                mode_str = "수동 1회 실행" if manual else "스케쥴러 자동 실행"
-                logger.info(f"[Feeder] [Celery Task] 전체 크롤링 수집 작업 시작 ({mode_str})")
+                if is_missing_scan:
+                    target_str = f"수집기 ID: {target_crawler_id}" if target_crawler_id else "전체 수집기"
+                    logger.info(f"[Feeder] [Celery Task] 누락 포스트 수집 작업 시작 ({target_str} / max_id 무시, 최대 페이지 전체 탐색)")
+                else:
+                    logger.info("[Feeder] [Celery Task] 전체 크롤링 수집 작업 시작 (스케쥴러 자동 증분 실행 - max_id 도래 시 조기 종료)")
 
                 crawlers = FeedConfigUtil.get_crawlers()
                 if not crawlers:
                     logger.info("[Feeder] [Celery Task] 등록된 수집기(CRAWLERS)가 없습니다.")
                     return
+
+                # 특정 수집기만 지정된 경우 필터링
+                if target_crawler_id is not None:
+                    crawlers = [c for c in crawlers if int(c.get('id', -1)) == int(target_crawler_id)]
+                    if not crawlers:
+                        logger.warning(f"[Feeder] 대상 수집기(ID: {target_crawler_id})를 찾을 수 없습니다.")
+                        return
 
                 current_count = P.ModelSetting.get_int('feed_scheduler_count') + 1
                 P.ModelSetting.set('feed_scheduler_count', str(current_count))
@@ -120,12 +132,12 @@ class Task:
 
                 total_crawled_count = 0
                 for crawler in crawlers:
-                    if not crawler.get('enabled', True):
+                    if not is_missing_scan and not crawler.get('enabled', True):
                         logger.debug(f"[Feeder] 비활성화된 수집기 건너뜀: {crawler.get('site')}")
                         continue
 
                     target_interval = int(crawler.get('interval', 1))
-                    if not manual and target_interval > 1:
+                    if not is_missing_scan and target_interval > 1:
                         if (current_count % target_interval) != 0:
                             logger.info(f"[Feeder] 스케쥴 빈도({target_interval}회당 1회) 미도래로 건너뜀: {crawler.get('site')}")
                             continue
@@ -149,10 +161,9 @@ class Task:
                         use_torrent_info=crawler.get('use_torrent_info', False)
                     )
 
-                    logger.info(f"[Feeder] [Celery Task] 사이트 크롤러 시작: [{site_name}] (대상 게시판={len(boards)}개, 기본 최대 탐색={max_page}p)")
+                    logger.info(f"[Feeder] [Celery Task] 사이트 크롤러 시작: [{site_name}] (대상 게시판={len(boards)}개, 최대 탐색={max_page}p)")
 
                     try:
-                        # 동일 사이트 내의 모든 게시판을 단일 세션으로 연속 탐색
                         for b in boards:
                             board_id = b.get('board')
                             subcat_id = str(b.get('subcat', '')).strip()
@@ -162,17 +173,16 @@ class Task:
                             max_id = 0
                             extra = site_entity.info.get('EXTRA', []) if site_entity.info else []
 
-                            # 스케줄러 자동 실행 시에만 기존 수집 지점(max_id)을 적용하여 조기 종료
-                            # 수동 1회 실행 시에는 max_id를 0으로 두어 지정된 max_page까지 전체 탐색
-                            if not manual and 'USING_POST_CHAR_ID' not in extra and last_bbs and last_bbs.post_id:
+                            # 누락 포스트 수집(is_missing_scan) 모드에서는 max_id를 0으로 고정하여 max_page까지 전체 페이지 탐색
+                            if not is_missing_scan and 'USING_POST_CHAR_ID' not in extra and last_bbs and last_bbs.post_id:
                                 max_id = last_bbs.post_id
 
                             target_cfg.subcat_id = subcat_id
 
-                            if manual:
-                                logger.info(f"[Feeder] [{site_name}] 수동 실행: {full_board_key} (기존 수집 지점 무시, 최대 {max_page}p 전체 탐색)")
+                            if is_missing_scan:
+                                logger.info(f"[Feeder] [{site_name}] 누락 수집 모드: {full_board_key} (기존 수집 지점 무시, 최대 {max_page}p 전체 재탐색)")
                             else:
-                                logger.info(f"[Feeder] [{site_name}] 스케쥴 실행: {full_board_key} (최근 수집 ID: {max_id})")
+                                logger.info(f"[Feeder] [{site_name}] 스케쥴 증분 모드: {full_board_key} (최근 수집 ID: {max_id})")
 
                             crawled = Task.execute_board_crawl(
                                 site_entity.info,
@@ -183,6 +193,7 @@ class Task:
                                 max_count=0,
                                 target_cfg=target_cfg
                             )
+
                             if crawled:
                                 total_crawled_count += len(crawled)
                                 logger.info(f"[Feeder] [{site_name}] {full_board_key}: {len(crawled)}개 항목 수집 완료")

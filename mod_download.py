@@ -77,7 +77,7 @@ class ModuleDownload(PluginModuleBase):
                 return self.one_execute()
 
             # 큐 및 이력 웹 리스트
-            elif sub == 'web_list' or command == 'web_list':
+            if sub == 'web_list' or command == 'web_list':
                 return jsonify(self.web_list_model.web_list(req))
 
             # 설정 관리: 다운로더
@@ -358,20 +358,8 @@ class ModuleDownload(PluginModuleBase):
 
         return {'usage_24h': usage_map, 'blocked_remains': blocked_map}
 
-    def one_execute(self):
-        """수동 1회 실행 요청 처리 (모드: manual)"""
-        logger.info(f"[{self.name}] 수동 1회 실행(one_execute) 요청 -> 다운로드 워커 전달 (모드: manual)")
-        self.start_celery(TaskDownloadBase.start, None, "manual")
-        return jsonify({'ret': 'success', 'msg': '다운로드 파이프라인 작업을 Celery 워커에서 시작했습니다 (수동 모드).'})
-
-    def scheduler_once(self):
-        """스케줄러 탭 1회 실행 요청 처리 (모드: manual)"""
-        logger.info(f"[{self.name}] 스케줄러 1회 실행(scheduler_once) 요청 -> 다운로드 워커 전달 (모드: manual)")
-        self.start_celery(TaskDownloadBase.start, None, "manual")
-        return jsonify({'ret': 'success', 'msg': '다운로드 파이프라인 작업을 Celery 워커에서 시작했습니다 (수동 모드).'})
-
     def scheduler_function(self):
-        """스케줄러 주기 타이머 도래 시 자동 실행 (모드: default)"""
+        """다운로드 스케줄러 주기 타이머 및 프레임워크 1회 실행 표준 호출"""
         if P.ModelSetting.get_bool(f"{self.name}_db_auto_delete"):
             try:
                 day = P.ModelSetting.get_int(f"{self.name}_db_delete_day")

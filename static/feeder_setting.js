@@ -299,6 +299,7 @@ function render_crawlers(data) {
     str += '      <button type="button" class="btn btn-primary text-white crawler_edit_btn" data-id="' + item.id + '" data-index="' + i + '">수정</button>';
     str += '      <button type="button" class="btn btn-danger text-white remove_crawler_btn" data-id="' + item.id + '">삭제</button>';
     str += '      <button type="button" class="btn btn-secondary text-white remove_crawler_db_btn" data-id="' + item.id + '">DB 비우기</button>';
+    str += '      <button type="button" class="btn btn-outline-warning crawler_scan_missing_single_btn" data-id="' + item.id + '" data-site="' + item.site + '" title="해당 수집기만 기존 수집 지점 무시하고 최대 페이지까지 전체 재탐색">누락 수집</button>';
     str += '    </div>';
     str += '  </td>';
     str += '</tr>';
@@ -612,6 +613,42 @@ $(document).on('click', '#crawler_reload_btn', function(e){
   e.preventDefault();
   load_all_data();
   notify('새로고침 완료', 'info');
+});
+
+// 상단 및 수집기 탭 [누락 포스트 전체 수집] 버튼
+$(document).on('click', '#btn_feed_scan_missing_all, #crawler_scan_missing_btn', function(e){
+  e.preventDefault();
+  if (!confirm('기존 최근 수집 지점(ID)을 무시하고, 설정된 최대 탐색 페이지(feed_max_page)까지 전체 재탐색하여 누락된 글을 수집합니다. 시작하시겠습니까?')) return;
+
+  notify('누락 포스트 전체 수집 작업을 Celery 워커에 전달합니다...', 'info');
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/scan_missing',
+    type: "POST",
+    data: {},
+    dataType: "json",
+    success: function(data) {
+      notify(data.msg || '누락 수집 작업이 시작되었습니다.', 'success');
+    }
+  });
+});
+
+// 개별 수집기 단독 [누락 수집] 버튼
+$(document).on('click', '.crawler_scan_missing_single_btn', function(e){
+  e.preventDefault();
+  var cId = $(this).data('id');
+  var site = $(this).data('site');
+  if (!confirm('[' + site + '] 수집기의 최근 수집 지점을 무시하고, 최대 페이지까지 전체 재탐색하여 누락된 글을 수집하시겠습니까?')) return;
+
+  notify('[' + site + '] 누락 수집 작업을 Celery 워커에 전달합니다...', 'info');
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/scan_missing',
+    type: "POST",
+    data: {crawler_id: cId},
+    dataType: "json",
+    success: function(data) {
+      notify(data.msg || '작업이 시작되었습니다.', 'success');
+    }
+  });
 });
 
 function render_modal_feed_sources() {

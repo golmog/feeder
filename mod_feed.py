@@ -93,9 +93,6 @@ class ModuleFeed(PluginModuleBase):
             if sub == 'web_list' or command == 'web_list':
                 return jsonify(self.web_list_model.web_list(req))
 
-            if sub in ['one_execute', 'scheduler_once'] or command in ['one_execute', 'scheduler_once']:
-                return self.one_execute()
-
             if command:
                 res = self.process_command(command, req.form.get('arg1', ''), req.form.get('arg2', ''), req.form.get('arg3', ''), req)
                 if res is not None:
@@ -113,6 +110,14 @@ class ModuleFeed(PluginModuleBase):
             logger.info(f"[{self.name}] 1회 실행 명령 수신 -> Celery 워커 전달")
             self.start_celery(TaskBase.start, None, "manual")
             return jsonify({'ret': 'success', 'msg': '수집 작업을 Celery 워커에서 시작했습니다.'})
+
+        elif command == 'scan_missing':
+            crawler_id = req.form.get('crawler_id')
+            c_id = int(crawler_id) if crawler_id and str(crawler_id).isdigit() else None
+            desc_target = f"수집기 ID: {c_id}" if c_id else "전체 수집기"
+            logger.info(f"[{self.name}] 누락 포스트 수집 명령 수신 -> Celery 워커 전달 (모드: missing, 대상: {desc_target})")
+            self.start_celery(TaskBase.start, None, "missing", c_id)
+            return jsonify({'ret': 'success', 'msg': f'누락 포스트 수집 작업을 Celery 워커에서 시작했습니다 ({desc_target}, 최대 페이지 전체 탐색).'})
 
         # 사이트 관리 명령
         elif command == 'load_site':
@@ -752,20 +757,8 @@ class ModuleFeed(PluginModuleBase):
         xml += '</rss>'
         return xml
 
-    def one_execute(self):
-        """상단 '1회 실행' 버튼 클릭 시 즉시 수동 모드로 Celery 전달"""
-        logger.info(f"[{self.name}] 수동 1회 실행(one_execute) 요청 -> 크롤링 워커 전달 (모드: manual)")
-        self.start_celery(TaskBase.start, None, "manual")
-        return jsonify({'ret': 'success', 'msg': '수집 작업을 Celery 워커에서 시작했습니다 (수동 모드).'})
-
-    def scheduler_once(self):
-        """스케줄러 탭 '1회 실행' 버튼 클릭 시 즉시 수동 모드로 Celery 전달"""
-        logger.info(f"[{self.name}] 스케줄러 1회 실행(scheduler_once) 요청 -> 크롤링 워커 전달 (모드: manual)")
-        self.start_celery(TaskBase.start, None, "manual")
-        return jsonify({'ret': 'success', 'msg': '수집 작업을 Celery 워커에서 시작했습니다 (수동 모드).'})
-
     def scheduler_function(self):
-        """스케줄러 주기 타이머 도래 시 자동 실행 (모드: default)"""
+        """스케줄러 주기 타이머 및 프레임워크 1회 실행 표준 호출"""
         if P.ModelSetting.get_bool(f"{self.name}_db_auto_delete"):
             try:
                 day = P.ModelSetting.get_int(f"{self.name}_db_delete_day")
@@ -780,8 +773,8 @@ class ModuleFeed(PluginModuleBase):
                 logger.error(f"[Feeder] db auto delete 에러: {e}")
                 db.session.rollback()
 
-        logger.info(f"[{self.name}] 스케줄러 주기 실행 -> 크롤링 워커 작업 전달 (모드: default)")
-        self.start_celery(TaskBase.start, None, "default")
+        logger.info(f"[{self.name}] 크롤링 워커 작업 전달")
+        self.start_celery(TaskBase.start, None)
 
     def delete_task_db(self, task: dict) -> str:
         try:
