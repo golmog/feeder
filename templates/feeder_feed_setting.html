@@ -12,7 +12,6 @@
 {{ macros.m_button_group([
   ['globalSettingSaveBtn', '설정 저장'],
   ['globalOneExecuteBtn', '1회 실행'],
-  ['btn_feed_scan_missing_all', '누락 포스트 수집'],
   ['globalEditBtn', 'YAML 편집', [['file', arg['yaml_filepath']]]]
 ]) }}
 {{ macros.m_row_start('5') }}
@@ -34,7 +33,8 @@
     <!-- 탭: 기본 설정 -->
     {{ macros.m_tab_content_start('basic', true) }}
       {{ macros.setting_input_int('feed_feed_count', 'RSS 피드 수', value=arg['feed_feed_count'], min='1', placeholder='100', desc=['생성할 RSS XML에 포함될 최대 피드 항목 수']) }}
-      {{ macros.setting_input_int('feed_max_page', '최대 수집 페이지 수', value=arg['feed_max_page'], min='1', desc=['최초 수집 또는 수동 실행 시 탐색할 게시판 페이지 수']) }}
+      {{ macros.setting_input_int('feed_max_page', '최대 수집 페이지 수', value=arg['feed_max_page'], min='1', desc=['수집시 탐색할 게시판 페이지 수']) }}
+      {{ macros.setting_checkbox('feed_always_max_page', '항상 최대 페이지 수집', value=arg['feed_always_max_page'], desc=['On: 최근 수집 지점(ID)에 도달해도 멈추지 않고, 설정된 최대 페이지까지 항상 탐색하여 네트워크 불안정 등으로 인한 누락 게시물을 자동 수집합니다.', 'Off: 최근 수집 지점에 도달하면 조기 종료합니다.']) }}
       {{ macros.setting_input_int('feed_test_count', '테스트 수집 개수', value=arg['feed_test_count'], min='1', desc=['사이트 관리 메뉴에서 테스트 시 가져올 항목 수']) }}
       {{ macros.setting_input_text('feed_crawler_delay', '크롤링 기본 딜레이 (초)', value=arg['feed_crawler_delay'], placeholder='2.0', desc=['요청 간격 대기 시간(초, 소수점 가능). 사이트 규칙에 DELAY 값이 선언되어 있으면 해당 값이 우선 적용됩니다.']) }}
       {{ macros.setting_checkbox('feed_allow_duplicate_magnet', '마그넷 중복 허용', value=arg['feed_allow_duplicate_magnet'], desc=['On: 마그넷 중복 검사 없이 수집 (단, 동일 게시판 내 중복 불가)', 'Off: 게시판에 관계없이 이미 DB에 등록된 마그넷은 수집 제외']) }}
@@ -107,9 +107,6 @@
       <div class="mb-2 d-flex justify-content-between align-items-center">
         <div>
           <button type="button" id="crawler_add_btn" class="btn btn-sm btn-primary">수집기 추가</button>
-          <button type="button" id="crawler_scan_missing_btn" class="btn btn-sm btn-outline-warning ml-1">
-            <i class="fa fa-search mr-1"></i>누락 포스트 전체 수집 (최대 탐색)
-          </button>
         </div>
         <button type="button" id="crawler_reload_btn" class="btn btn-sm btn-secondary">수집기 새로고침</button>
       </div>

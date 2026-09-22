@@ -34,8 +34,8 @@ class ModuleFeed(PluginModuleBase):
             f"{self.name}_db_auto_delete": "False",
             # 수집 및 일반 설정
             f"{self.name}_feed_count": "100",
-            f"{self.name}_web_page_size": "25",
             f"{self.name}_max_page": "5",
+            f"{self.name}_always_max_page": "False",
             f"{self.name}_test_count": "3",
             f"{self.name}_crawler_delay": "2.0",
             f"{self.name}_allow_duplicate_magnet": "False",
@@ -110,14 +110,6 @@ class ModuleFeed(PluginModuleBase):
             logger.info(f"[{self.name}] 1회 실행 명령 수신 -> Celery 워커 전달")
             self.start_celery(TaskBase.start, None)
             return jsonify({'ret': 'success', 'msg': '수집 작업을 Celery 워커에서 시작했습니다.'})
-
-        elif command == 'scan_missing':
-            crawler_id = req.form.get('crawler_id')
-            c_id = int(crawler_id) if crawler_id and str(crawler_id).isdigit() else None
-            desc_target = f"수집기 ID: {c_id}" if c_id else "전체 수집기"
-            logger.info(f"[{self.name}] 누락 포스트 수집 명령 수신 -> Celery 워커 전달 (모드: missing, 대상: {desc_target})")
-            self.start_celery(TaskBase.start, None, "missing", c_id)
-            return jsonify({'ret': 'success', 'msg': f'누락 포스트 수집 작업을 Celery 워커에서 시작했습니다 ({desc_target}, 최대 페이지 전체 탐색).'})
 
         # 사이트 관리 명령
         elif command == 'load_site':
