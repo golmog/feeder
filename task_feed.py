@@ -22,7 +22,7 @@ class TaskBase:
         job_type = "default"
         target_crawler_id = None
         for arg in args:
-            if isinstance(arg, str) and arg in ["default", "manual", "missing"]:
+            if isinstance(arg, str) and arg in ["default", "missing"]:
                 job_type = arg
             elif isinstance(arg, (int, str)) and str(arg).isdigit():
                 target_crawler_id = int(arg)
@@ -41,7 +41,7 @@ class Task:
 
     @staticmethod
     def start(job_type="default", target_crawler_id: int = None):
-        is_missing_scan = (job_type in ["manual", "missing"])
+        is_missing_scan = (job_type == "missing")
         Task.run_crawl(is_missing_scan=is_missing_scan, target_crawler_id=target_crawler_id)
 
     @staticmethod
@@ -354,10 +354,10 @@ class Task:
 
                 detail_count = 0
                 for idx, item in enumerate(raw_list):
-                    # 테스트 모드: 지정된 max_count(예: 3개) 초과 시 상세 페이지를 방문하지 않고 목록 정보만 bbs_list에 보존
-                    if is_test and max_count > 0 and detail_count >= max_count:
-                        bbs_list.append(item)
-                        continue
+                    # 테스트 모드 시 지정된 테스트 개수에 도달하면 즉시 순회를 중단하고 결과 반환
+                    if is_test and max_count > 0 and len(bbs_list) >= max_count:
+                        stop_crawl = True
+                        break
 
                     post_id = item.get('id', '')
 
@@ -431,7 +431,8 @@ class Task:
                     bbs_list.append(item)
                     detail_count += 1
 
-                    if not is_test and max_count > 0 and len(bbs_list) >= max_count:
+                    # 최대 지정 개수가 설정된 경우(테스트 모드 포함) 목표 개수 도달 시 루프 종료
+                    if max_count > 0 and len(bbs_list) >= max_count:
                         stop_crawl = True
                         break
 
@@ -504,9 +505,17 @@ class Task:
                         magnets.append(raw_ed2k)
 
         else:
-            pattern, template = magnet_rule
+            # MAGNET_REGEX 규칙이 단일 문자열이거나 리스트 형태인 경우 모두 안전하게 처리
+            if isinstance(magnet_rule, (list, tuple)) and len(magnet_rule) >= 2:
+                pattern, template = magnet_rule[0], magnet_rule[1]
+            elif isinstance(magnet_rule, (list, tuple)) and len(magnet_rule) == 1:
+                pattern, template = magnet_rule[0], "%s"
+            else:
+                pattern, template = str(magnet_rule), "%s"
+
             for m in re.findall(pattern, page_html):
-                formatted = (template % m).lower()
+                extracted_str = m[0] if isinstance(m, tuple) else m
+                formatted = (template % extracted_str).lower() if '%s' in template else extracted_str.lower()
                 info_hash = extract_info_hash(formatted)
                 if info_hash:
                     if info_hash in seen_hashes:

@@ -188,7 +188,7 @@ class GDriveAccountManager:
                 self.busy_accounts.remove(username)
 
     def add_usage(self, key: str, size: int):
-        stat = ModelFeedDownloadStat(
+        stat = ModelDownloadStat(
             stat_type='gdrive_usage',
             stat_key=key,
             stat_value=float(size),
@@ -202,12 +202,12 @@ class GDriveAccountManager:
             block_hours = 0.5 if is_rate_limit else 24.0
             unblock_time = int(time.time()) + int(block_hours * 3600)
 
-            db.session.query(ModelFeedDownloadStat).filter_by(
+            db.session.query(ModelDownloadStat).filter_by(
                 stat_type='account_block',
                 stat_key=username
             ).delete()
 
-            stat = ModelFeedDownloadStat(
+            stat = ModelDownloadStat(
                 stat_type='account_block',
                 stat_key=username,
                 stat_value=float(unblock_time),
@@ -234,12 +234,12 @@ class GDriveAccountManager:
             except Exception:
                 unblock_time = int(time.time()) + 86400
 
-            db.session.query(ModelFeedDownloadStat).filter_by(
+            db.session.query(ModelDownloadStat).filter_by(
                 stat_type='account_block',
                 stat_key='SHARED_DRIVE_UPLOAD'
             ).delete()
 
-            stat = ModelFeedDownloadStat(
+            stat = ModelDownloadStat(
                 stat_type='account_block',
                 stat_key='SHARED_DRIVE_UPLOAD',
                 stat_value=float(unblock_time),
@@ -256,11 +256,12 @@ class GDriveAccountManager:
         """모든 SA 계정의 내 드라이브 잔여 고아 파일을 목적지 공유 드라이브로 밀어내고 휴지통 비우기"""
         config_data = FeedConfigUtil.load_yaml()
         rclone_cfg = config_data.get('rclone', {})
-        rclone_conf = rclone_cfg.get('conf_path', '')
-        base_remote = rclone_cfg.get('remote_name', 'net')
-        dst_drive_id = rclone_cfg.get('shared_drive_id', '')
+        rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or rclone_cfg.get('conf_path', '')
+        base_remote = P.ModelSetting.get('download_rclone_remote_name') or rclone_cfg.get('remote_name', 'net')
+        dst_drive_id = P.ModelSetting.get('download_shared_drive_id') or rclone_cfg.get('shared_drive_id', '')
 
         if not rclone_conf or not dst_drive_id:
+            logger.debug("[GDriveDrain] Rclone 설정 파일 경로 또는 공유 드라이브 ID가 설정되지 않아 SA 정리 건너뜀")
             return
 
         target_root = f"{base_remote}:{{{dst_drive_id}}}/"
@@ -314,11 +315,11 @@ class GDriveUploadHandler:
         item.file_size = fsize
 
         rclone_cfg = FeedConfigUtil.load_yaml().get('rclone', {})
-        rclone_conf = rclone_cfg.get('conf_path', '')
-        remote_net = rclone_cfg.get('remote_name', 'net')
-        remote_shared = rclone_cfg.get('shared_remote_name', 'gf')
+        rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or rclone_cfg.get('conf_path', '')
+        remote_net = P.ModelSetting.get('download_rclone_remote_name') or rclone_cfg.get('remote_name', 'net')
+        remote_shared = P.ModelSetting.get('download_rclone_shared_remote_name') or rclone_cfg.get('shared_remote_name', 'gf')
 
-        target_drive_id = item.gdrive_remote_id or rclone_cfg.get('shared_drive_id', '')
+        target_drive_id = item.gdrive_remote_id or P.ModelSetting.get('download_shared_drive_id') or rclone_cfg.get('shared_drive_id', '')
         if not target_drive_id:
             logger.error("[GDriveUpload] 목적지 공유 드라이브 ID(shared_drive_id)가 설정되지 않았습니다.")
             item.status = 'failed'

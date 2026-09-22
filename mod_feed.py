@@ -108,7 +108,7 @@ class ModuleFeed(PluginModuleBase):
         # 수동 1회 실행 명령
         if command == 'one_execute':
             logger.info(f"[{self.name}] 1회 실행 명령 수신 -> Celery 워커 전달")
-            self.start_celery(TaskBase.start, None, "manual")
+            self.start_celery(TaskBase.start, None)
             return jsonify({'ret': 'success', 'msg': '수집 작업을 Celery 워커에서 시작했습니다.'})
 
         elif command == 'scan_missing':

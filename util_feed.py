@@ -578,25 +578,8 @@ class FeedScraper:
 
     @classmethod
     def _sync_cookies_to_sessions(cls, host: str):
-        """FlareSolverr에서 획득한 쿠키와 User-Agent를 활성 HTTP 세션에 동기화"""
-        cookies = cls._cf_cookies.get(host, {})
-        ua = cls._cf_user_agents.get(host)
-
-        req_sess = cls._requests_sessions.get(host)
-        if req_sess:
-            if ua:
-                req_sess.headers['User-Agent'] = ua
-            for k, v in cookies.items():
-                if not k.startswith('_'):
-                    req_sess.cookies.set(k, v, domain=host)
-
-        cffi_sess = cls._cffi_sessions.get(host)
-        if cffi_sess:
-            if ua:
-                cffi_sess.headers['User-Agent'] = ua
-            for k, v in cookies.items():
-                if not k.startswith('_'):
-                    cffi_sess.cookies.set(k, v, domain=host)
+        """레거시 및 외부 호출 호환용 별칭 (동일 로직 호출)"""
+        cls._sync_clearance_to_sessions(host)
 
     @classmethod
     def get_proxies(cls, scheduler_instance=None):

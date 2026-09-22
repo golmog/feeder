@@ -23,7 +23,7 @@ class TaskDownloadBase:
         logger.info(f"[DownloadTask] Celery Task 수신 인자: {args}")
         job_type = "default"
         for arg in args:
-            if isinstance(arg, str) and arg in ["default", "manual"]:
+            if isinstance(arg, str) and arg == "default":
                 job_type = arg
                 break
 
@@ -34,7 +34,7 @@ class TaskDownloadBase:
             logger.warning(f"[DownloadTask] [{job_type}] 이전 세션 비정상 종료로 재전송된 고아 태스크 실행 취소")
             return
 
-        TaskDownload.run_pipeline(manual=(job_type == "manual"))
+        TaskDownload.run_pipeline()
 
 
 class TaskDownload:
@@ -393,11 +393,14 @@ class TaskDownload:
 
             # 단일 파일이면 copyto, 폴더면 copy
             rclone_cmd_type = "copyto" if is_single_file else "copy"
+            rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or FeedConfigUtil.load_yaml().get('rclone', {}).get('conf_path', '')
             cmd = [
                 "rclone", rclone_cmd_type, src_path, dest_download_path,
                 "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE",
                 "--retries", "1", "--timeout", "15m"
             ]
+            if rclone_conf:
+                cmd.extend(["--config", rclone_conf])
 
             success = False
             try:
