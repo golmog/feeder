@@ -213,8 +213,8 @@
           </div>
 
           {{ macros.setting_input_int('crawler_interval', '스케쥴 빈도', value='1', min='1', desc=['스케쥴러 몇 회 주기마다 1회 실행할지 설정 (기본: 1)']) }}
-          {{ macros.setting_input_text('crawler_max_retries', '개별 최대 재시도 횟수', value='', placeholder='미입력 시 기본 설정 (3회) 사용', desc=['해당 수집기 개별 재시도 횟수 (미입력 시 기본 설정 적용)']) }}
-          {{ macros.setting_input_text('crawler_retry_interval', '개별 재시도 대기 간격 (초)', value='', placeholder='미입력 시 기본 설정 (1.5초) 사용', desc=['재시도 시도 간 대기 시간(초, 소수점 가능. 미입력 시 기본 설정 적용)']) }}
+          {{ macros.setting_input_text('crawler_max_retries', '개별 최대 재시도 횟수', value='', placeholder='미입력 시 기본 설정 사용', desc=['해당 수집기 개별 재시도 횟수 (미입력 시 기본 설정 적용)']) }}
+          {{ macros.setting_input_text('crawler_retry_interval', '개별 재시도 대기 간격 (초)', value='', placeholder='미입력 시 기본 설정 사용', desc=['재시도 시도 간 대기 시간(초, 소수점 가능. 미입력 시 기본 설정 적용)']) }}
           {{ macros.setting_checkbox('crawler_enabled', '수집 활성화', value='On') }}
           {{ macros.setting_checkbox('crawler_use_torrent_info', 'Torrent Info 사용', value='', desc=['On: 마그넷 메타데이터를 사전 분석하여 원본 파일명을 취득합니다.']) }}
           {{ macros.setting_checkbox('crawler_use_proxy', 'Proxy 사용', value='') }}

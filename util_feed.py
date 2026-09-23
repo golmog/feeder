@@ -914,30 +914,34 @@ class FeedScraper:
                         solution = data.get('solution', {})
                         sol_cookies = solution.get('cookies') or []
                         user_agent = solution.get('userAgent') or ''
+                        html_resp = solution.get('response') or ''
                         cookie_names = [c.get('name') for c in sol_cookies]
 
-                        # cf_clearance 쿠키 포함 여부 필수 검증 (조기 반환 차단)
                         has_clearance = any(c.get('name') == 'cf_clearance' and c.get('value') for c in sol_cookies)
-                        if not has_clearance:
-                            logger.warning(f"[Scraper] [{host}] FlareSolverr cf_clearance 누락 조기 반환 감지 (쿠키: {cookie_names}) -> 재시도 ({attempt}/{max_retries})")
-                            if attempt < max_retries:
-                                time.sleep(retry_interval)
-                            continue
+                        is_challenge = any(k in html_resp for k in ["Just a moment...", "cf-turnstile", "challenge-platform"])
 
-                        # 플랫폼 세션 캐시 동기화
-                        if host not in cls._cf_cookies:
-                            cls._cf_cookies[host] = {}
-                        for c in sol_cookies:
-                            cls._cf_cookies[host][c['name']] = c['value']
-                        cls._cf_cookies[host]['_timestamp'] = time.time()
-                        if user_agent:
-                            cls._cf_user_agents[host] = user_agent
+                        # cf_clearance가 발급되었거나, 챌린지가 없어 본진 사이트로 프리패스 통과한 경우 모두 성공으로 인정
+                        if has_clearance or (not is_challenge and len(sol_cookies) > 0):
+                            if host not in cls._cf_cookies:
+                                cls._cf_cookies[host] = {}
+                            for c in sol_cookies:
+                                cls._cf_cookies[host][c['name']] = c['value']
+                            cls._cf_cookies[host]['_timestamp'] = time.time()
+                            if user_agent:
+                                cls._cf_user_agents[host] = user_agent
 
-                        cls._sync_clearance_to_sessions(host)
-                        logger.info(f"[Scraper] [{host}] FlareSolverr 인가 성공 (쿠키 {len(sol_cookies)}개: {cookie_names})")
-                        return sol_cookies, user_agent
+                            cls._sync_clearance_to_sessions(host)
+                            logger.info(f"[Scraper] [{host}] FlareSolverr 인가 성공 (쿠키 {len(sol_cookies)}개: {cookie_names})")
+                            return sol_cookies, user_agent
+
+                        # 챌린지 화면인데 토큰이 누락된 조기 반환인 경우에만 재시도
+                        logger.warning(f"[Scraper] [{host}] FlareSolverr 미해결 조기 반환 감지 (쿠키: {cookie_names}) -> 재시도 ({attempt}/{max_retries})")
+                        if attempt < max_retries:
+                            time.sleep(retry_interval)
+                        continue
                     else:
                         logger.warning(f"[Scraper] [{host}] FlareSolverr 응답 오류 ({attempt}/{max_retries}): {data.get('message')}")
+
             except Exception as e:
                 logger.warning(f"[Scraper] [{host}] FlareSolverr 통신 실패 ({attempt}/{max_retries}): {e}")
 
@@ -1067,6 +1071,7 @@ class FeedScraper:
             selenium_timeout = 20
 
         # FlareSolverr가 설정된 경우 clearance 토큰 사전 확보
+                # FlareSolverr가 설정된 경우 clearance 토큰 사전 확보
         use_fs = getattr(scheduler_instance, 'use_flaresolverr', False) if scheduler_instance else P.ModelSetting.get_bool('feed_use_flaresolverr')
         if site_info and ('USE_FLARESOLVERR' in site_info.get('EXTRA', []) or site_info.get('USE_FLARESOLVERR')):
             use_fs = True
@@ -1074,6 +1079,10 @@ class FeedScraper:
         raw_cf_cookies, cf_user_agent = [], ""
         if use_fs:
             raw_cf_cookies, cf_user_agent = cls.get_flaresolverr_clearance(site_url, scheduler_instance=scheduler_instance)
+            # FlareSolverr 필수 사이트에서 인가에 실패한 경우 Selenium 기동 중단 (좀비 세션 방지)
+            if not raw_cf_cookies and not cf_user_agent:
+                logger.error(f"[Scraper] [{host}] FlareSolverr 인가 실패로 인해 Selenium 기동을 중단합니다.")
+                return None
 
         from selenium import webdriver
         options = webdriver.ChromeOptions()
@@ -1140,13 +1149,17 @@ class FeedScraper:
                         pass
             logger.info(f"[Scraper] [{host}] Selenium에 clearance 쿠키 {injected_count}개 정밀 주입 완료")
 
-        # 사이트 기본 고정 쿠키가 있다면 추가 주입
+        # 사이트 자체 고정 쿠키가 있다면 주입하되, 이전 세션의 만료된 Cloudflare 찌꺼기는 주입 차단
         if site_info and site_info.get('COOKIE'):
             for part in site_info['COOKIE'].split(';'):
                 if '=' in part:
                     k, v = part.strip().split('=', 1)
+                    k_clean = k.strip()
+                    # 이전 세션의 오염된 Cloudflare 토큰 주입 원천 배제
+                    if k_clean in ['cf_clearance', '__cf_bm', '_cfuvid']:
+                        continue
                     try:
-                        driver.add_cookie({'name': k.strip(), 'value': v.strip(), 'path': '/'})
+                        driver.add_cookie({'name': k_clean, 'value': v.strip(), 'path': '/'})
                     except Exception:
                         pass
 
