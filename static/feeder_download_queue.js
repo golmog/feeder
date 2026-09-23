@@ -84,9 +84,9 @@ function render_queue_rows(list) {
     str += '  <td class="small text-muted">' + (it.updated_time || it.created_time || '') + '</td>';
     str += '  <td>';
     str += '    <div class="btn-group btn-group-sm">';
-    str += '      <button type="button" class="btn btn-outline-warning queue_action_btn" data-action="retry" data-id="' + it.id + '">재시도</button>';
-    str += '      <button type="button" class="btn btn-outline-success queue_action_btn" data-action="force_complete" data-id="' + it.id + '">완료</button>';
-    str += '      <button type="button" class="btn btn-outline-danger queue_action_btn" data-action="delete" data-id="' + it.id + '">삭제</button>';
+    str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold queue_action_btn" data-action="retry" data-id="' + it.id + '">재시도</button>';
+    str += '      <button type="button" class="btn btn-success text-white queue_action_btn" data-action="force_complete" data-id="' + it.id + '">완료</button>';
+    str += '      <button type="button" class="btn btn-danger text-white queue_action_btn" data-action="delete" data-id="' + it.id + '">삭제</button>';
     str += '    </div>';
     str += '  </td>';
     str += '</tr>';

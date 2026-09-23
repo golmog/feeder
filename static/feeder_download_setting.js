@@ -158,8 +158,8 @@ function render_downloaders(data) {
     str += '  <td class="text-left small">' + connDetail + '</td>';
     str += '  <td>';
     str += '    <div class="btn-group btn-group-sm">';
-    str += '      <button type="button" class="btn btn-outline-primary edit_dl_btn" data-index="' + i + '">수정</button>';
-    str += '      <button type="button" class="btn btn-outline-danger delete_dl_btn" data-name="' + item.name + '">삭제</button>';
+    str += '      <button type="button" class="btn btn-primary text-white edit_dl_btn" data-index="' + i + '">수정</button>';
+    str += '      <button type="button" class="btn btn-danger text-white delete_dl_btn" data-name="' + item.name + '">삭제</button>';
     str += '    </div>';
     str += '  </td>';
     str += '</tr>';
@@ -201,8 +201,8 @@ function render_dynamic_engine_fields(engine_id, current_values) {
     var descHtml = f.desc ? '<small class="form-text text-muted">' + f.desc + '</small>' : '';
 
     html += '<div class="form-group row mb-2">';
-    html += '  <label class="col-sm-3 col-form-label text-right font-weight-bold">' + f.label + '</label>';
-    html += '  <div class="col-sm-9">';
+    html += '  <label class="col-sm-2 col-form-label text-right font-weight-bold">' + f.label + '</label>';
+    html += '  <div class="col-sm-10">';
 
     if (f.type === 'checkbox') {
       var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
@@ -503,8 +503,8 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
     var descHtml = f.desc ? '<small class="form-text text-muted">' + f.desc + '</small>' : '';
 
     html += '<div class="form-group row mb-2">';
-    html += '  <label class="col-sm-3 col-form-label text-right font-weight-bold">' + f.label + '</label>';
-    html += '  <div class="col-sm-9">';
+    html += '  <label class="col-sm-2 col-form-label text-right font-weight-bold">' + f.label + '</label>';
+    html += '  <div class="col-sm-10">';
 
     if (f.type === 'checkbox') {
       var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
@@ -559,8 +559,8 @@ function render_profiles(data) {
     str += '  <td>' + destInfo + '</td>';
     str += '  <td>';
     str += '    <div class="btn-group btn-group-sm">';
-    str += '      <button type="button" class="btn btn-outline-primary edit_profile_btn" data-index="' + i + '">수정</button>';
-    str += '      <button type="button" class="btn btn-outline-danger delete_profile_btn" data-name="' + p.name + '">삭제</button>';
+    str += '      <button type="button" class="btn btn-primary text-white edit_profile_btn" data-index="' + i + '">수정</button>';
+    str += '      <button type="button" class="btn btn-danger text-white delete_profile_btn" data-name="' + p.name + '">삭제</button>';
     str += '    </div>';
     str += '  </td>';
     str += '</tr>';
@@ -624,9 +624,9 @@ function render_chain_table() {
     str += '  <td class="text-left font-weight-bold text-primary">' + engine + '</td>';
     str += '  <td>';
     str += '    <div class="btn-group btn-group-sm">';
-    str += '      <button type="button" class="btn btn-xs btn-outline-secondary chain-move-btn" data-dir="up" data-index="' + i + '" ' + (i === 0 ? 'disabled' : '') + '>▲</button>';
-    str += '      <button type="button" class="btn btn-xs btn-outline-secondary chain-move-btn" data-dir="down" data-index="' + i + '" ' + (i === modal_profile_chain.length - 1 ? 'disabled' : '') + '>▼</button>';
-    str += '      <button type="button" class="btn btn-xs btn-outline-danger chain-remove-btn" data-index="' + i + '">제외</button>';
+    str += '      <button type="button" class="btn btn-xs btn-secondary text-white chain-move-btn" data-dir="up" data-index="' + i + '" ' + (i === 0 ? 'disabled' : '') + '>▲</button>';
+    str += '      <button type="button" class="btn btn-xs btn-secondary text-white chain-move-btn" data-dir="down" data-index="' + i + '" ' + (i === modal_profile_chain.length - 1 ? 'disabled' : '') + '>▼</button>';
+    str += '      <button type="button" class="btn btn-xs btn-danger text-white chain-remove-btn" data-index="' + i + '">제외</button>';
     str += '    </div>';
     str += '  </td>';
     str += '</tr>';
@@ -841,7 +841,7 @@ function render_accounts(accounts, stats) {
     str += '  <td><code>' + (acc.mydrive_rclone_id || '-') + '</code></td>';
     str += '  <td>' + remoteDisplay + '</td>';
     str += '  <td>' + gb + ' GB (' + mb + ' MB)</td>';
-    str += '  <td><button type="button" class="btn btn-xs btn-outline-danger remove_acc_btn" data-index="' + i + '">제외</button></td>';
+    str += '  <td><button type="button" class="btn btn-xs btn-danger text-white remove_acc_btn" data-index="' + i + '">제외</button></td>';
     str += '</tr>';
   }
   tbody.html(str);

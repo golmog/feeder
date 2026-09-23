@@ -214,9 +214,9 @@ function render_sites(data) {
     str += '      <div class="input-group input-group-sm">';
     str += '        <input id="board_id_' + item.id + '" type="text" class="form-control col-md-5" placeholder="게시판 ID (예: 2_2, 103, 166:875)">';
     str += '        <div class="input-group-append">';
-    str += '          <button type="button" class="btn btn-outline-info test_btn" data-site_id="' + item.id + '">수집 테스트</button>';
-    str += '          <button type="button" class="btn btn-outline-primary site_edit_btn" data-site_id="' + item.id + '" data-index="' + i + '">규칙 수정</button>';
-    str += '          <button type="button" class="btn btn-outline-danger remove_site_btn" data-site_id="' + item.id + '">삭제</button>';
+    str += '          <button type="button" class="btn btn-info text-white test_btn" data-site_id="' + item.id + '">수집 테스트</button>';
+    str += '          <button type="button" class="btn btn-primary text-white site_edit_btn" data-site_id="' + item.id + '" data-index="' + i + '">규칙 수정</button>';
+    str += '          <button type="button" class="btn btn-danger text-white remove_site_btn" data-site_id="' + item.id + '">삭제</button>';
     str += '        </div>';
     str += '      </div>';
     str += '    </div>';
@@ -452,7 +452,7 @@ function render_modal_crawler_boards() {
     str += '<tr>';
     str += '  <td><strong>' + b.board + '</strong></td>';
     str += '  <td>' + (b.subcat ? '<span class="badge badge-light">' + b.subcat + '</span>' : '<span class="text-muted">-</span>') + '</td>';
-    str += '  <td><button type="button" class="btn btn-xs btn-outline-danger remove_crawler_board_btn" data-index="' + i + '">삭제</button></td>';
+    str += '  <td><button type="button" class="btn btn-xs btn-danger text-white remove_crawler_board_btn" data-index="' + i + '">삭제</button></td>';
     str += '</tr>';
   }
   tbody.html(str);
@@ -634,7 +634,7 @@ function render_modal_feed_sources() {
     str += '  <td><span class="badge badge-secondary">' + s.site + '</span></td>';
     str += '  <td><strong>' + s.board + '</strong></td>';
     str += '  <td>' + (s.subcat ? '<span class="badge badge-light">' + s.subcat + '</span>' : '<span class="text-muted">-</span>') + '</td>';
-    str += '  <td><button type="button" class="btn btn-xs btn-outline-danger remove_feed_source_btn" data-index="' + i + '">제외</button></td>';
+    str += '  <td><button type="button" class="btn btn-xs btn-danger text-white remove_feed_source_btn" data-index="' + i + '">제외</button></td>';
     str += '</tr>';
   }
   tbody.html(str);

@@ -91,7 +91,6 @@
   resize: none;
 }
 
-/* 사이트 옵션 원클릭 토글 배지 (다크/라이트 테마 범용 고대비) */
 .site_opt_toggle {
   cursor: pointer;
   user-select: none;
@@ -128,4 +127,50 @@
   background-color: #007bff !important;
   color: #ffffff !important;
   border-color: #0056b3 !important;
+}
+
+.table th, .table td {
+  vertical-align: middle !important;
+}
+
+.table .btn-group .btn,
+.table .btn-xs,
+.table .btn-sm {
+  font-size: 0.8rem;
+  padding: 2px 8px;
+  border-radius: 3px;
+  opacity: 0.9;
+  border-width: 1px;
+}
+.table .btn-group .btn:hover,
+.table .btn-xs:hover,
+.table .btn-sm:hover {
+  opacity: 1.0;
+}
+
+.btn-xs {
+  padding: 0.22rem 0.6rem !important;
+  font-size: 0.76rem !important;
+  line-height: 1.25 !important;
+  border-radius: 3px !important;
+  min-width: 44px !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
+
+.btn-list-retry {
+  background-color: #594519 !important;
+  border-color: #7d6123 !important;
+  color: #ffeeba !important;
+}
+.btn-list-complete {
+  background-color: #244b32 !important;
+  border-color: #326946 !important;
+  color: #d4edda !important;
+}
+.btn-list-delete {
+  background-color: #582427 !important;
+  border-color: #7c3438 !important;
+  color: #f8d7da !important;
 }

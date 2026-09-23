@@ -14,12 +14,6 @@
   ['globalEditBtn', 'YAML 편집', [['file', arg['yaml_filepath']]]]
 ]) }}
 
-<div class="mb-2 text-right">
-  <button type="button" id="history_import_modal_btn" class="btn btn-sm btn-outline-info">
-    <i class="fa fa-database mr-1"></i>과거 이력 가져오기 (마이그레이션)
-  </button>
-</div>
-
 {{ macros.m_row_start('5') }}
 {{ macros.m_row_end() }}
 
@@ -57,6 +51,15 @@
       {{ macros.setting_input_text('download_gdrive_upload_limit', '개인 계정 일일 업로드 한도', value=arg['download_gdrive_upload_limit'], placeholder='700GB', desc=['개인 SA 계정당 24시간 안전 업로드 제한량 (기본값: 700GB)']) }}
       {{ macros.setting_input_text('download_shared_drive_upload_limit', '공유 드라이브 일일 업로드 한도', value=arg['download_shared_drive_upload_limit'], placeholder='3TB', desc=['공유 드라이브 전체 24시간 안전 업로드 제한량 (기본값: 3TB)']) }}
       {{ macros.setting_input_text('download_shared_drive_quota_reset_time', '공유 드라이브 쿼터 리셋 시간', value=arg['download_shared_drive_quota_reset_time'], placeholder='16:00', desc=['구글 드라이브 일일 쿼터가 초기화되는 시각 (기본값: 16:00 KST)']) }}
+      {{ macros.m_hr() }}
+      <div class="mt-3 mb-2 text-center">
+        <button type="button" id="history_import_modal_btn" class="btn btn-sm btn-secondary">
+          <i class="fa fa-database mr-1"></i>과거 이력 가져오기 (마이그레이션)
+        </button>
+        <div class="small text-muted mt-1">
+          기존 오프라인 다운로더의 SQLite DB(.db) 또는 마그넷 목록을 불러와 완료(completed) 이력으로 등록합니다.
+        </div>
+      </div>
     {{ macros.m_tab_content_end() }}
 
     <!-- 탭 2: 다운로더 엔진 관리 -->
@@ -251,8 +254,8 @@
               <div class="input-group input-group-sm mb-2">
                 <select id="profile_feed_select" class="form-control mr-1"></select>
                 <div class="input-group-append">
-                  <button type="button" id="btn_add_profile_feed" class="btn btn-outline-primary">피드 추가</button>
-                  <button type="button" id="btn_add_all_feed" class="btn btn-outline-secondary ml-1">전체 피드(*)</button>
+                  <button type="button" id="btn_add_profile_feed" class="btn btn-primary text-white px-3">피드 추가</button>
+                  <button type="button" id="btn_add_all_feed" class="btn btn-secondary text-white ml-1 px-2">전체 피드(*)</button>
                 </div>
               </div>
               <div id="profile_selected_feeds_container" class="p-2 border rounded d-flex flex-wrap align-items-center" style="min-height: 38px; background: rgba(128,128,128,0.05);">
@@ -269,7 +272,7 @@
               <div class="input-group input-group-sm mb-2">
                 <select id="profile_engine_select" class="form-control mr-1"></select>
                 <div class="input-group-append">
-                  <button type="button" id="btn_add_profile_engine" class="btn btn-outline-primary">엔진 추가</button>
+                  <button type="button" id="btn_add_profile_engine" class="btn btn-primary text-white px-3">엔진 추가</button>
                 </div>
               </div>
               <div class="table-responsive rounded border" style="max-height: 180px; overflow-y: auto;">
