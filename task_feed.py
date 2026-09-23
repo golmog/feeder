@@ -247,24 +247,21 @@ class Task:
 
 
     @staticmethod
-    def get_crawl_delay(site_info: dict, target_cfg=None) -> float:
-        """딜레이 우선순위 해석: 크롤러 개별 딜레이 -> 전역/사이트 딜레이 최대값 -> 기본값 2.0"""
+    def get_crawl_delay(site_info: dict = None, target_cfg=None) -> float:
+        """딜레이 해석: 크롤러 개별 딜레이 -> 전역 기본 딜레이 -> 기본값 2.0 (사이트 규칙 간섭 완전 배제)"""
         try:
-            # 1순위: 크롤러 모달에 입력된 개별 딜레이 (사용자 지정 4초 등)
-            cfg_delay = getattr(target_cfg, 'delay', None) if target_cfg else None
-            if cfg_delay not in [None, '']:
-                return float(cfg_delay)
+            # 1순위: 크롤러 모달에 입력된 개별 딜레이 (예: 4.0)
+            if target_cfg:
+                cfg_delay = getattr(target_cfg, 'delay', None) or getattr(target_cfg, 'crawler_delay', None)
+                if cfg_delay not in [None, '']:
+                    return float(cfg_delay)
 
-            # 2순위: 기본 설정의 전역 딜레이
+            # 2순위: 기본 설정 탭의 전역 딜레이 (예: 3.0)
             global_delay = P.ModelSetting.get('feed_crawler_delay')
-            g_val = float(global_delay) if global_delay not in [None, ''] else 2.0
+            if global_delay not in [None, '']:
+                return float(global_delay)
 
-            # 사이트 JSON에 DELAY가 명시되어 있을 때, 사용자가 설정한 전역 딜레이와 비교하여 안전한 값 채택
-            if site_info and 'DELAY' in site_info and site_info['DELAY'] not in [None, '']:
-                s_val = float(site_info['DELAY'])
-                return max(g_val, s_val)
-
-            return g_val
+            return 2.0
         except Exception:
             return 2.0
 
@@ -284,17 +281,25 @@ class Task:
         index_step = xpath_dict.get('INDEX_STEP', 1)
         index_start = xpath_dict.get('INDEX_START', 1)
 
-        if 'ID_REGEX' in site_info:
-            id_regexs = [site_info['ID_REGEX']]
-        else:
-            id_regexs = [
-                r'wr_id=(?P<id>\d+)',
-                r'thread-(?P<id>\d+)',
-                r'tid=(?P<id>\d+)',
-                r'/view/(?P<id>\d+)',
-                r'/(?P<id>\d+)\.html',
-                r'/(?P<id>\d+)$'
-            ]
+        id_regexs = []
+        raw_id_rule = site_info.get('ID_REGEX')
+        if raw_id_rule:
+            if isinstance(raw_id_rule, list):
+                id_regexs.extend(raw_id_rule)
+            else:
+                id_regexs.append(raw_id_rule)
+
+        standard_regexs = [
+            r'tid=(?P<id>\d+)',
+            r'thread-(?P<id>\d+)',
+            r'wr_id=(?P<id>\d+)',
+            r'/view/(?P<id>\d+)',
+            r'/(?P<id>\d+)\.html',
+            r'/(?P<id>\d+)$'
+        ]
+        for s_reg in standard_regexs:
+            if s_reg not in id_regexs:
+                id_regexs.append(s_reg)
 
         allow_duplicate_magnet = P.ModelSetting.get_bool('feed_allow_duplicate_magnet')
         target_pages = 1 if is_test else max(1, max_page)

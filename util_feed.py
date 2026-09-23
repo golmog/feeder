@@ -533,6 +533,7 @@ class FeedCustomManager:
 
     @classmethod
     def sync_default_site_info(cls):
+        """커스텀 훅 파일의 DEFAULT_SITE_INFO를 DB 레코드와 동기화"""
         try:
             with F.app.app_context():
                 from .model_feed import ModelFeedSite
@@ -544,12 +545,16 @@ class FeedCustomManager:
                             continue
 
                         existing = ModelFeedSite.get(name=target_name)
+                        content_str = json.dumps(default_info, ensure_ascii=False, indent=2)
                         if not existing:
-                            content_str = json.dumps(default_info, ensure_ascii=False, indent=2)
                             new_site = ModelFeedSite('custom', default_info, content_str)
                             db.session.add(new_site)
-                            db.session.commit()
-                            logger.info(f"[Feeder] 커스텀 훅 기반 사이트 템플릿 자동 등록: '{target_name}'")
+                            logger.info(f"[Feeder] 커스텀 훅 사이트 템플릿 신규 등록: '{target_name}'")
+                        else:
+                            existing.info = default_info
+                            existing.content = content_str
+
+                        db.session.commit()
         except Exception as e:
             logger.error(f"[Feeder] sync_default_site_info 에러: {e}")
             try:
