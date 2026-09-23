@@ -47,6 +47,44 @@
 </div>
 <div id="page2"></div>
 
+<!-- 모달: 다운로드 재시도 설정 모달 -->
+<div class="modal fade" id="download_retry_modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-md">
+    <div class="modal-content">
+      <div class="modal-header d-flex align-items-center justify-content-between">
+        <h5 class="modal-title font-weight-bold">
+          <i class="fa fa-repeat mr-1 text-warning"></i>다운로드 재시도 설정
+        </h5>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="modal_retry_item_id" value="">
+        <div class="form-group mb-2">
+          <label class="small text-muted font-weight-bold mb-1">대상 콘텐츠</label>
+          <div id="modal_retry_item_title" class="p-2 border rounded font-weight-bold small text-primary" style="background: rgba(128,128,128,0.08); word-break: break-all;"></div>
+        </div>
+
+        <div class="form-group mb-3">
+          <label class="small font-weight-bold mb-1">적용할 다운로드 프로필</label>
+          <select id="modal_retry_profile_select" class="form-control form-control-sm"></select>
+          <small class="form-text text-muted">선택한 프로필의 우선순위 체인(다운로더)과 목적지 경로로 다운로드를 다시 시작합니다.</small>
+        </div>
+
+        <div class="card bg-light border-0 p-2 small mb-1" style="background: rgba(128,128,128,0.06) !important;">
+          <div class="mb-1"><strong>우선순위 체인:</strong> <span id="modal_retry_chain_preview" class="text-info">-</span></div>
+          <div><strong>목적지 유형:</strong> <span id="modal_retry_dest_preview" class="text-secondary">-</span></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" id="btn_confirm_retry_execute" class="btn btn-sm btn-warning text-dark font-weight-bold">
+          <i class="fa fa-play mr-1"></i>재시도 시작
+        </button>
+        <button type="button" class="btn btn-sm btn-secondary" data-dismiss="modal">취소</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script type="text/javascript">
 var package_name = "{{ arg['package_name'] }}";
 var sub = "{{ arg['sub'] }}";

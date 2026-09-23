@@ -1,8 +1,22 @@
 var current_page = 1;
+var cached_download_list = [];
+var cached_download_profiles = [];
 
 $(document).ready(function(){
   request_download_list(1);
+  load_retry_profiles();
 });
+
+function load_retry_profiles() {
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/load_profiles',
+    type: "POST",
+    dataType: "json",
+    success: function(data) {
+      cached_download_profiles = data.profiles || [];
+    }
+  });
+}
 
 function request_download_list(page) {
   current_page = page || 1;
@@ -19,7 +33,8 @@ function request_download_list(page) {
     data: formData,
     dataType: "json",
     success: function(data) {
-      render_history_table(data.list || []);
+      cached_download_list = data.list || [];
+      render_history_table(cached_download_list);
       render_paging(data.paging);
     }
   });
@@ -67,9 +82,9 @@ function render_history_table(list) {
     str += '  <td class="small text-muted">' + timeStr + '</td>';
     str += '  <td>';
     str += '    <div class="btn-group btn-group-sm">';
-    str += '      <button type="button" class="btn btn-outline-warning btn_list_action" data-action="retry" data-id="' + it.id + '">재시도</button>';
-    str += '      <button type="button" class="btn btn-outline-success btn_list_action" data-action="force_complete" data-id="' + it.id + '">완료</button>';
-    str += '      <button type="button" class="btn btn-outline-danger btn_list_action" data-action="delete" data-id="' + it.id + '">삭제</button>';
+    str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold btn_list_action" data-action="retry" data-id="' + it.id + '">재시도</button>';
+    str += '      <button type="button" class="btn btn-success text-white btn_list_action" data-action="force_complete" data-id="' + it.id + '">완료</button>';
+    str += '      <button type="button" class="btn btn-danger text-white btn_list_action" data-action="delete" data-id="' + it.id + '">삭제</button>';
     str += '    </div>';
     str += '  </td>';
     str += '</tr>';
@@ -115,11 +130,67 @@ $('#reset_btn').click(function(e){
   request_download_list(1);
 });
 
+$('#modal_retry_profile_select').change(function(){
+  var pName = $(this).val();
+  var pObj = cached_download_profiles.find(function(p){ return p.name === pName; });
+  if (pObj) {
+    var chainStr = (pObj.priority_chain || []).join(' -> ') || '(비어있음)';
+    var dest = pObj.destination || {};
+    var destStr = dest.type || 'local';
+    if (dest.type === 'colab_gdrive') destStr += ' (Colab 무트래픽)';
+    else if (dest.type === 'gdrive_rotation') destStr += ' (SA 15GB 우회)';
+
+    $('#modal_retry_chain_preview').text(chainStr);
+    $('#modal_retry_dest_preview').text(destStr);
+  } else {
+    $('#modal_retry_chain_preview').text('(기본 활성 다운로더 전체)');
+    $('#modal_retry_dest_preview').text('local (로컬 디스크 보존)');
+  }
+});
+
 $(document).on('click', '.btn_list_action', function(e){
   e.preventDefault();
   var act = $(this).data('action');
   var id = $(this).data('id');
+  var item = cached_download_list.find(function(x){ return String(x.id) === String(id); });
+  var titleText = item ? item.title : ('ID: ' + id);
 
+  if (act === 'retry') {
+    $('#modal_retry_item_id').val(id);
+    $('#modal_retry_item_title').text(titleText);
+
+    var pSelect = $('#modal_retry_profile_select');
+    pSelect.empty();
+    if (cached_download_profiles && cached_download_profiles.length > 0) {
+      for (var i = 0; i < cached_download_profiles.length; i++) {
+        var p = cached_download_profiles[i];
+        pSelect.append('<option value="' + p.name + '">' + p.name + '</option>');
+      }
+      if (item && item.feed_name) {
+        var matchP = cached_download_profiles.find(function(p){
+          return (p.feeds || []).indexOf(item.feed_name) !== -1 || (p.feeds || []).indexOf('*') !== -1;
+        });
+        if (matchP) pSelect.val(matchP.name);
+      }
+    } else {
+      pSelect.append('<option value="">-- 기본 다운로더 전체 사용 --</option>');
+    }
+    pSelect.trigger('change');
+    $('#download_retry_modal').modal('show');
+    return;
+  }
+
+  if (act === 'force_complete') {
+    if (!confirm('[' + id + '번 항목]\n"' + titleText + '"\n\n해당 작업을 최종 완료(completed) 상태로 변경하시겠습니까?\n더 이상 다운로드나 이송을 시도하지 않습니다.')) {
+      return;
+    }
+  } else if (act === 'delete') {
+    if (!confirm('[' + id + '번 항목]\n"' + titleText + '"\n\n해당 작업을 DB에서 완전히 삭제하시겠습니까?\n(피드 동기화 기간 내의 글일 경우 다음 주기에 다시 수집될 수 있습니다)')) {
+      return;
+    }
+  }
+
+  notify('작업을 요청 중입니다...', 'info');
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/item_action',
     type: "POST",
@@ -127,10 +198,37 @@ $(document).on('click', '.btn_list_action', function(e){
     dataType: "json",
     success: function(data) {
       if (data.ret === 'success') {
-        notify('작업이 처리되었습니다.', 'info');
+        notify(data.msg || '작업이 처리되었습니다.', 'success');
         request_download_list(current_page);
       } else {
         notify(data.msg || '실패', 'warning');
+      }
+    }
+  });
+});
+
+$(document).on('click', '#btn_confirm_retry_execute', function(e){
+  e.preventDefault();
+  var id = $('#modal_retry_item_id').val();
+  var pName = $('#modal_retry_profile_select').val();
+
+  notify('다운로드 재시도 등록 중...', 'info');
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/item_action',
+    type: "POST",
+    data: {
+      action: 'retry',
+      id: id,
+      profile_name: pName
+    },
+    dataType: "json",
+    success: function(data) {
+      if (data.ret === 'success') {
+        notify(data.msg || '재시도 대기열에 등록되었습니다.', 'success');
+        $('#download_retry_modal').modal('hide');
+        request_download_list(current_page);
+      } else {
+        notify(data.msg || '재시도 실패', 'warning');
       }
     }
   });

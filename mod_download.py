@@ -369,31 +369,68 @@ class ModuleDownload(PluginModuleBase):
             # 큐 개별 항목 제어
             elif command == 'item_action':
                 action = req.form.get('action')
-                item_id = int(req.form.get('id', -1))
+                try:
+                    item_id = int(req.form.get('id', -1))
+                except Exception:
+                    item_id = -1
+
                 item = db.session.query(ModelDownload).filter_by(id=item_id).first()
                 if not item:
                     return jsonify({'ret': 'fail', 'msg': '항목을 찾을 수 없습니다.'})
 
                 if action == 'retry':
+                    profile_name = req.form.get('profile_name', '').strip()
+                    selected_profile = None
+
+                    # 지정된 프로필 조회 (없으면 피드명 매칭 또는 전체(*) 프로필 조회)
+                    if profile_name:
+                        for p in FeedConfigUtil.get_download_profiles():
+                            if p.get('name') == profile_name:
+                                selected_profile = p
+                                break
+                    if not selected_profile:
+                        selected_profile = FeedConfigUtil.get_download_profile_by_feed(item.feed_name)
+
+                    # 프로필 설정 적용 (우선순위 체인 및 목적지)
+                    if selected_profile:
+                        item.priority_chain = list(selected_profile.get('priority_chain', []))
+                        dest = selected_profile.get('destination', {})
+                        item.destination_type = dest.get('type', 'local')
+                        item.gdrive_upload_path = dest.get('upload_path', '')
+                        item.gdrive_complete_path = dest.get('complete_path', '')
+                        item.gdrive_remote_id = dest.get('shared_drive_id', '')
+                    else:
+                        # 프로필이 전혀 없는 경우: 등록된 활성 다운로더를 1순위 체인으로 자동 보강
+                        enabled_downloaders = [d['name'] for d in FeedConfigUtil.get_downloaders() if d.get('enabled', True)]
+                        if enabled_downloaders:
+                            item.priority_chain = enabled_downloaders
+                        item.destination_type = item.destination_type or 'local'
+
+                    # 상태 초기화
                     item.status = 'pending'
                     item.current_engine_index = 0
+                    item.current_engine_name = None
+                    item.engine_task_id = None
                     item.error_message = None
                     db.session.commit()
-                    logger.info(f"[{self.name}] 큐 항목 수동 재시도 설정: {item.title}")
-                    return jsonify({'ret': 'success'})
+
+                    chain_desc = ' -> '.join(item.priority_chain) if item.priority_chain else '기본'
+                    logger.info(f"[{self.name}] 다운로드 재시도 대기열 등록 완료: {item.title} (체인: {chain_desc}, 목적지: {item.destination_type})")
+                    return jsonify({'ret': 'success', 'msg': f'[{item.title[:25]}] 재시도 대기열에 등록되었습니다.'})
 
                 elif action == 'force_complete':
                     item.status = 'completed'
                     item.completed_time = datetime.now()
+                    item.error_message = None
                     db.session.commit()
-                    logger.info(f"[{self.name}] 큐 항목 강제 완료 처리: {item.title}")
-                    return jsonify({'ret': 'success'})
+                    logger.info(f"[{self.name}] 큐 항목 수동 완료 처리: {item.title} (ID: {item_id})")
+                    return jsonify({'ret': 'success', 'msg': '최종 완료(completed) 처리되었습니다.'})
 
                 elif action == 'delete':
                     db.session.delete(item)
                     db.session.commit()
-                    logger.info(f"[{self.name}] 큐 항목 삭제 완료 (ID: {item_id})")
-                    return jsonify({'ret': 'success'})
+                    logger.info(f"[{self.name}] 큐 항목 수동 삭제 완료: ID={item_id}")
+                    return jsonify({'ret': 'success', 'msg': '항목이 삭제되었습니다.'})
 
             return super(ModuleDownload, self).process_ajax(sub, req)
         except Exception as e:
