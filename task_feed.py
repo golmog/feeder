@@ -214,6 +214,11 @@ class Task:
                                 target_cfg=target_cfg
                             )
 
+                            # 세션 준비 실패(모든 프록시 인가 불가) 시 다음 게시판으로 건너뛰지 않고 즉시 수집 중단
+                            if crawled is None:
+                                logger.error(f"[Feeder] [{site_name}] 세션 초기화 실패(프록시 전체 차단)로 크롤러를 안전하게 조기 중단합니다.")
+                                break
+
                             if crawled:
                                 total_crawled_count += len(crawled)
                                 logger.info(f"[Feeder] [{site_name}] {full_board_key}: {len(crawled)}개 항목 수집 완료")
@@ -221,7 +226,7 @@ class Task:
                             logger.error(f"[Feeder] [{site_name}] {full_board_key} 수집 중 오류: {board_err}")
                             logger.error(traceback.format_exc())
                         finally:
-                            # 게시판별 세션 완전 격리: 이전 게시판의 세션 오염/차단이 다음 게시판에 전파되지 않도록 정리
+                            # 게시판별 세션 완전 격리
                             FeedScraper.close_sessions()
                             crawl_delay = Task.get_crawl_delay(site_entity.info, target_cfg=target_cfg)
                             if crawl_delay > 0:
@@ -317,6 +322,11 @@ class Task:
                 if hasattr(hook, 'on_init_session'):
                     logger.info(f"[{site_name}] 커스텀 훅 세션 초기화(on_init_session) 실행")
                     hook.on_init_session(site_info, target_cfg)
+
+            # 세션 초기화 실패로 드라이버가 생성되지 않은 경우 None 반환 (조기 중단 트리거)
+            if getattr(target_cfg, 'use_selenium', False) and FeedScraper._selenium_driver is None:
+                logger.error(f"[Feeder] [{site_name}] 세션 생성 실패로 게시판({full_board_key}) 수집을 시작할 수 없습니다.")
+                return None
 
             for cur_page in range(1, target_pages + 1):
                 if cur_page > 1 and crawl_delay > 0:

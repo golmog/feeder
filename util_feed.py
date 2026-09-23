@@ -710,6 +710,12 @@ class FeedScraper:
                 res_source = cls.get_by_remote_selenium(url, wait_tag=target_wait_tag, scheduler_instance=scheduler_instance, site_info=site_info)
                 if res_source:
                     return res_source
+
+                # 세션 초기화 자체가 실패한 경우 무의미한 재시도 없이 즉시 중단
+                if cls._selenium_driver is None:
+                    logger.warning(f"[Scraper] 브라우저 세션 초기화 실패로 재시도 중단: {url}")
+                    return None
+
                 if attempt < max_retries:
                     logger.debug(f"[Scraper] Selenium 재시도 ({attempt}/{max_retries}): {url}")
                     time.sleep(retry_interval)
@@ -899,15 +905,13 @@ class FeedScraper:
 
     @classmethod
     def get_flaresolverr_clearance(cls, url: str, scheduler_instance=None, max_retries: int = None, retry_interval: float = None) -> tuple[list[dict], str]:
-        """FlareSolverr를 통한 Cloudflare clearance 쿠키 및 User-Agent 공통 획득 (검증 및 재시도 포함)"""
+        """FlareSolverr를 통한 Cloudflare clearance 쿠키 및 User-Agent 획득 (프록시 풀 순환 및 검증 포함)"""
         fs_url = (P.ModelSetting.get('feed_flaresolverr_url') or '').rstrip('/')
         if not fs_url:
             return [], ""
 
         parsed = urlparse(url)
         host = parsed.hostname or ''
-        proxies = cls.get_proxies(scheduler_instance)
-        session_name = f"feeder_{host.replace('.', '_')}"
         fs_endpoint = f"{fs_url}/v1"
 
         try:
@@ -928,15 +932,23 @@ class FeedScraper:
         except Exception:
             retry_interval = 1.5
 
-        req_payload = {
-            "cmd": "request.get",
-            "url": url,
-            "maxTimeout": 45000,
-        }
-        if proxies and 'http' in proxies:
-            req_payload["proxy"] = {"url": proxies['http']}
+        p_list = cls._get_proxy_list(scheduler_instance)
+        total_tries = max(len(p_list), max_retries) if p_list else max_retries
 
-        for attempt in range(1, max_retries + 1):
+        for attempt in range(1, total_tries + 1):
+            proxies = cls.get_proxies(scheduler_instance)
+            proxy_str = proxies.get('http') if (proxies and 'http' in proxies) else '미사용'
+
+            req_payload = {
+                "cmd": "request.get",
+                "url": url,
+                "maxTimeout": 45000,
+            }
+            if proxies and 'http' in proxies:
+                req_payload["proxy"] = {"url": proxies['http']}
+
+            logger.info(f"[Scraper] [{host}] FlareSolverr 인가 요청 ({attempt}/{total_tries}, Proxy: {proxy_str}): {url}")
+
             try:
                 res = requests.post(fs_endpoint, json=req_payload, headers={'Content-Type': 'application/json'}, timeout=55)
                 if res.status_code == 200:
@@ -951,7 +963,7 @@ class FeedScraper:
                         has_clearance = any(c.get('name') == 'cf_clearance' and c.get('value') for c in sol_cookies)
                         is_challenge = any(k in html_resp for k in ["Just a moment...", "cf-turnstile", "challenge-platform"])
 
-                        # cf_clearance가 발급되었거나, 챌린지가 없어 본진 사이트로 프리패스 통과한 경우 모두 성공으로 인정
+                        # cf_clearance 발급 성공 또는 챌린지가 없어 본진 사이트로 프리패스 통과한 경우
                         if has_clearance or (not is_challenge and len(sol_cookies) > 0):
                             if host not in cls._cf_cookies:
                                 cls._cf_cookies[host] = {}
@@ -965,21 +977,20 @@ class FeedScraper:
                             logger.info(f"[Scraper] [{host}] FlareSolverr 인가 성공 (쿠키 {len(sol_cookies)}개: {cookie_names})")
                             return sol_cookies, user_agent
 
-                        # 챌린지 화면인데 토큰이 누락된 조기 반환인 경우에만 재시도
-                        logger.warning(f"[Scraper] [{host}] FlareSolverr 미해결 조기 반환 감지 (쿠키: {cookie_names}) -> 재시도 ({attempt}/{max_retries})")
-                        if attempt < max_retries:
-                            time.sleep(retry_interval)
-                        continue
+                        logger.warning(f"[Scraper] [{host}] FlareSolverr 챌린지 미해결 감지 (Proxy: {proxy_str}) -> 다음 프록시로 전환")
                     else:
-                        logger.warning(f"[Scraper] [{host}] FlareSolverr 응답 오류 ({attempt}/{max_retries}): {data.get('message')}")
-
+                        logger.warning(f"[Scraper] [{host}] FlareSolverr 응답 오류: {data.get('message')}")
+                else:
+                    logger.warning(f"[Scraper] [{host}] FlareSolverr HTTP 응답 오류: {res.status_code}")
             except Exception as e:
-                logger.warning(f"[Scraper] [{host}] FlareSolverr 통신 실패 ({attempt}/{max_retries}): {e}")
+                logger.warning(f"[Scraper] [{host}] FlareSolverr 통신 실패 (Proxy: {proxy_str}): {e}")
 
-            if attempt < max_retries:
+            # 실패 시 프록시 풀이 존재한다면 다음 순번 프록시로 즉시 로테이션하여 재시도
+            if attempt < total_tries:
+                cls.rotate_proxy(scheduler_instance=scheduler_instance, reason="FlareSolverr 인가 실패 대응")
                 time.sleep(retry_interval)
 
-        logger.error(f"[Scraper] [{host}] FlareSolverr {max_retries}회 재시도 모두 실패")
+        logger.error(f"[Scraper] [{host}] 프록시 풀 전체({total_tries}회)에서 FlareSolverr 인가 모두 실패")
         return [], ""
 
     @classmethod
