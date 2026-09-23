@@ -37,9 +37,8 @@
       {{ macros.setting_input_int('feed_max_page', '최대 수집 페이지 수', value=arg['feed_max_page'], min='1', desc=['수집시 탐색할 게시판 페이지 수']) }}
       {{ macros.setting_checkbox('feed_always_max_page', '항상 최대 페이지 수집', value=arg['feed_always_max_page'], desc=['On: 최근 수집 지점(ID)에 도달해도 멈추지 않고, 설정된 최대 페이지까지 항상 탐색하여 네트워크 불안정 등으로 인한 누락 게시물을 자동 수집합니다.', 'Off: 최근 수집 지점에 도달하면 조기 종료합니다.']) }}
       {{ macros.setting_input_int('feed_test_count', '테스트 수집 개수', value=arg['feed_test_count'], min='1', desc=['사이트 관리 메뉴에서 테스트 시 가져올 항목 수']) }}
-      {{ macros.setting_input_text('feed_crawler_delay', '크롤링 기본 딜레이 (초)', value=arg['feed_crawler_delay'], placeholder='2.0', desc=['요청 간격 대기 시간(초, 소수점 가능). 사이트 규칙에 DELAY 값이 선언되어 있으면 해당 값이 우선 적용됩니다.']) }}
+      {{ macros.setting_input_text('feed_crawler_delay', '크롤링 기본 딜레이 (초)', value=arg['feed_crawler_delay'], placeholder='2.0', desc=['요청 간격 대기 시간(초, 소수점 가능). 재시도 대기 시간으로도 공통 사용됩니다.']) }}
       {{ macros.setting_input_int('feed_crawler_max_retries', '크롤링 최대 재시도 횟수', value=arg['feed_crawler_max_retries'], min='1', placeholder='3', desc=['네트워크 실패, 보안 우회(FlareSolverr/Selenium) 지연 시 최대 재시도 횟수 (기본값: 3회)']) }}
-      {{ macros.setting_input_text('feed_crawler_retry_interval', '재시도 대기 간격 (초)', value=arg['feed_crawler_retry_interval'], placeholder='1.5', desc=['재시도 시도 간 대기 시간(초, 소수점 가능. 기본값: 1.5초)']) }}
       {{ macros.setting_checkbox('feed_allow_duplicate_magnet', '마그넷 중복 허용', value=arg['feed_allow_duplicate_magnet'], desc=['On: 마그넷 중복 검사 없이 수집 (단, 동일 게시판 내 중복 불가)', 'Off: 게시판에 관계없이 이미 DB에 등록된 마그넷은 수집 제외']) }}
       {{ macros.m_hr() }}
       {{ macros.setting_checkbox('feed_use_proxy', 'HTTP Proxy 사용', value=arg['feed_use_proxy'], desc=['On: 수집 및 요청 시 지정된 프록시 서버를 경유합니다.']) }}
@@ -213,8 +212,8 @@
           </div>
 
           {{ macros.setting_input_int('crawler_interval', '스케쥴 빈도', value='1', min='1', desc=['스케쥴러 몇 회 주기마다 1회 실행할지 설정 (기본: 1)']) }}
-          {{ macros.setting_input_text('crawler_max_retries', '개별 최대 재시도 횟수', value='', placeholder='미입력 시 기본 설정 사용', desc=['해당 수집기 개별 재시도 횟수 (미입력 시 기본 설정 적용)']) }}
-          {{ macros.setting_input_text('crawler_retry_interval', '개별 재시도 대기 간격 (초)', value='', placeholder='미입력 시 기본 설정 사용', desc=['재시도 시도 간 대기 시간(초, 소수점 가능. 미입력 시 기본 설정 적용)']) }}
+          {{ macros.setting_input_text('crawler_delay', '개별 딜레이 (초)', value='', placeholder='미입력 시 기본 설정값 사용', desc=['페이지 및 상세 요청 대기 시간(초, 소수점 가능). 미입력 시 전역 설정 적용']) }}
+          {{ macros.setting_input_text('crawler_max_retries', '개별 최대 재시도 횟수', value='', placeholder='미입력 시 기본 설정 (3회) 사용', desc=['해당 수집기 개별 재시도 횟수 (미입력 시 기본 설정 적용)']) }}
           {{ macros.setting_checkbox('crawler_enabled', '수집 활성화', value='On') }}
           {{ macros.setting_checkbox('crawler_use_torrent_info', 'Torrent Info 사용', value='', desc=['On: 마그넷 메타데이터를 사전 분석하여 원본 파일명을 취득합니다.']) }}
           {{ macros.setting_checkbox('crawler_use_proxy', 'Proxy 사용', value='') }}

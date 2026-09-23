@@ -39,7 +39,6 @@ class ModuleFeed(PluginModuleBase):
             f"{self.name}_test_count": "3",
             f"{self.name}_crawler_delay": "2.0",
             f"{self.name}_crawler_max_retries": "3",
-            f"{self.name}_crawler_retry_interval": "1.5",
             f"{self.name}_allow_duplicate_magnet": "False",
             f"{self.name}_scheduler_count": "0",
             # 태스크 런타임 상태 플래그
@@ -450,8 +449,8 @@ class ModuleFeed(PluginModuleBase):
             except Exception:
                 interval_val = 1
 
+            delay_raw = req.form.get('crawler_delay', '').strip()
             max_retries_raw = req.form.get('crawler_max_retries', '').strip()
-            retry_interval_raw = req.form.get('crawler_retry_interval', '').strip()
 
             enabled = (req.form.get('crawler_enabled') or req.form.get('enabled')) in ['True', 'on', 'true', True]
             use_proxy = (req.form.get('crawler_use_proxy') or req.form.get('use_proxy')) in ['True', 'on', 'true', True]
@@ -465,8 +464,8 @@ class ModuleFeed(PluginModuleBase):
                 'site': site,
                 'boards': boards,
                 'interval': interval_val,
+                'delay': float(delay_raw) if delay_raw else '',
                 'max_retries': int(max_retries_raw) if max_retries_raw.isdigit() else '',
-                'retry_interval': float(retry_interval_raw) if retry_interval_raw else '',
                 'enabled': enabled,
                 'use_proxy': use_proxy,
                 'proxy_url': proxy_url_val,
@@ -953,8 +952,8 @@ class ModuleFeed(PluginModuleBase):
             info['last'] = last_bbs.as_dict() if last_bbs else None
             info['boards'] = boards
             info['board_count'] = len(boards)
+            info['delay'] = c.get('delay', '')
             info['max_retries'] = c.get('max_retries', '')
-            info['retry_interval'] = c.get('retry_interval', '')
             info['enabled'] = str(c.get('enabled', True)).lower() in ['true', 'on', '1']
             info['use_proxy'] = str(c.get('use_proxy', False)).lower() in ['true', 'on', '1']
             info['proxy_url'] = c.get('proxy_url', '')

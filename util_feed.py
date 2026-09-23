@@ -688,12 +688,16 @@ class FeedScraper:
 
         try:
             if retry_interval is None:
-                inst_interval = getattr(scheduler_instance, 'retry_interval', None) if scheduler_instance else None
-                retry_interval = float(inst_interval) if inst_interval not in [None, ''] else float(P.ModelSetting.get('feed_crawler_retry_interval') or 1.5)
-            if retry_interval < 0:
-                retry_interval = 1.5
+                inst_delay = getattr(scheduler_instance, 'delay', None) if scheduler_instance else None
+                if inst_delay not in [None, '']:
+                    retry_interval = float(inst_delay)
+                else:
+                    global_delay = P.ModelSetting.get('feed_crawler_delay')
+                    retry_interval = float(global_delay) if global_delay not in [None, ''] else 2.0
+            if retry_interval < 0.5:
+                retry_interval = 0.5
         except Exception:
-            retry_interval = 1.5
+            retry_interval = 2.0
 
         # 옵션 해석 (개별 스케줄 우선 -> 사이트 설정 -> 전역 설정)
         if scheduler_instance:
@@ -928,14 +932,19 @@ class FeedScraper:
         except Exception:
             max_retries = 3
 
+        # 재시도 대기 시간은 사용자가 지정한 크롤링 딜레이 사용
         try:
             if retry_interval is None:
-                inst_interval = getattr(scheduler_instance, 'retry_interval', None) if scheduler_instance else None
-                retry_interval = float(inst_interval) if inst_interval not in [None, ''] else float(P.ModelSetting.get('feed_crawler_retry_interval') or 1.5)
-            if retry_interval < 0:
-                retry_interval = 1.5
+                inst_delay = getattr(scheduler_instance, 'delay', None) if scheduler_instance else None
+                if inst_delay not in [None, '']:
+                    retry_interval = float(inst_delay)
+                else:
+                    global_delay = P.ModelSetting.get('feed_crawler_delay')
+                    retry_interval = float(global_delay) if global_delay not in [None, ''] else 2.0
+            if retry_interval < 0.5:
+                retry_interval = 0.5
         except Exception:
-            retry_interval = 1.5
+            retry_interval = 2.0
 
         p_list = cls._get_proxy_list(scheduler_instance)
         total_tries = max(len(p_list), max_retries) if p_list else max_retries

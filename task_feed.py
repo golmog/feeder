@@ -173,8 +173,8 @@ class Task:
                         use_flaresolverr=crawler.get('use_flaresolverr', False),
                         use_selenium=crawler.get('use_selenium', False),
                         use_torrent_info=crawler.get('use_torrent_info', False),
-                        max_retries=crawler.get('max_retries', ''),
-                        retry_interval=crawler.get('retry_interval', '')
+                        delay=crawler.get('delay', ''),
+                        max_retries=crawler.get('max_retries', '')
                     )
 
                     logger.info(f"[Feeder] [{mode_label}] 사이트 크롤러 시작: [{site_name}] (대상 게시판={len(boards)}개, 최대 탐색={max_page}p)")
@@ -250,13 +250,13 @@ class Task:
     def get_crawl_delay(site_info: dict = None, target_cfg=None) -> float:
         """딜레이 해석: 크롤러 개별 딜레이 -> 전역 기본 딜레이 -> 기본값 2.0 (사이트 규칙 간섭 완전 배제)"""
         try:
-            # 1순위: 크롤러 모달에 입력된 개별 딜레이 (예: 4.0)
+            # 1순위: 크롤러 모달에 입력된 개별 딜레이
             if target_cfg:
                 cfg_delay = getattr(target_cfg, 'delay', None) or getattr(target_cfg, 'crawler_delay', None)
                 if cfg_delay not in [None, '']:
                     return float(cfg_delay)
 
-            # 2순위: 기본 설정 탭의 전역 딜레이 (예: 3.0)
+            # 2순위: 기본 설정 탭의 전역 딜레이
             global_delay = P.ModelSetting.get('feed_crawler_delay')
             if global_delay not in [None, '']:
                 return float(global_delay)

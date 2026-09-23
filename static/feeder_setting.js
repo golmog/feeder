@@ -558,8 +558,8 @@ $(document).on('click', '#crawler_add_btn', function(e){
   $('#modal_crawler_board_input').val('');
   $('#modal_crawler_subcat_input').val('');
   $('#crawler_interval').val('1');
+  $('#crawler_delay').val('');
   $('#crawler_max_retries').val('');
-  $('#crawler_retry_interval').val('');
   $('#crawler_proxy_url').val('');
   $('#modal_crawler_proxy_div').collapse('hide');
 
@@ -594,8 +594,8 @@ $(document).on('click', '.crawler_edit_btn', function(e){
   $('#modal_crawler_board_input').val('');
   $('#modal_crawler_subcat_input').val('');
   $('#crawler_interval').val(item.interval || 1);
+  $('#crawler_delay').val(item.delay !== undefined && item.delay !== null ? item.delay : '');
   $('#crawler_max_retries').val(item.max_retries !== undefined && item.max_retries !== null ? item.max_retries : '');
-  $('#crawler_retry_interval').val(item.retry_interval !== undefined && item.retry_interval !== null ? item.retry_interval : '');
   $('#crawler_proxy_url').val(item.proxy_url || '');
 
   set_modal_checkbox('crawler_enabled', item.enabled);
