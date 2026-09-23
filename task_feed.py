@@ -248,23 +248,23 @@ class Task:
 
     @staticmethod
     def get_crawl_delay(site_info: dict, target_cfg=None) -> float:
-        """딜레이 우선순위 해석: 크롤러 개별 딜레이 -> 사이트 JSON DELAY -> 전역 기본 딜레이"""
+        """딜레이 우선순위 해석: 크롤러 개별 딜레이 -> 전역/사이트 딜레이 최대값 -> 기본값 2.0"""
         try:
-            # 1순위: 크롤러 모달에 입력된 개별 딜레이 (예: 4초)
+            # 1순위: 크롤러 모달에 입력된 개별 딜레이 (사용자 지정 4초 등)
             cfg_delay = getattr(target_cfg, 'delay', None) if target_cfg else None
             if cfg_delay not in [None, '']:
                 return float(cfg_delay)
 
-            # 2순위: 사이트 JSON 규칙에 선언된 DELAY
-            if site_info and 'DELAY' in site_info and site_info['DELAY'] not in [None, '']:
-                return float(site_info['DELAY'])
-
-            # 3순위: 기본 설정의 전역 딜레이
+            # 2순위: 기본 설정의 전역 딜레이
             global_delay = P.ModelSetting.get('feed_crawler_delay')
-            if global_delay not in [None, '']:
-                return float(global_delay)
+            g_val = float(global_delay) if global_delay not in [None, ''] else 2.0
 
-            return 2.0
+            # 사이트 JSON에 DELAY가 명시되어 있을 때, 사용자가 설정한 전역 딜레이와 비교하여 안전한 값 채택
+            if site_info and 'DELAY' in site_info and site_info['DELAY'] not in [None, '']:
+                s_val = float(site_info['DELAY'])
+                return max(g_val, s_val)
+
+            return g_val
         except Exception:
             return 2.0
 
@@ -307,7 +307,10 @@ class Task:
                 proxy_url=P.ModelSetting.get('feed_proxy_url') or '',
                 use_flaresolverr=P.ModelSetting.get_bool('feed_use_flaresolverr'),
                 use_selenium=P.ModelSetting.get_bool('feed_use_selenium'),
-                use_torrent_info=P.ModelSetting.get_bool('feed_use_torrent_info')
+                use_torrent_info=P.ModelSetting.get_bool('feed_use_torrent_info'),
+                delay='',
+                max_retries='',
+                retry_interval=''
             )
 
         if not site_info.get('SELENIUM_REMOTE_URL'):
