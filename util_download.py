@@ -191,7 +191,8 @@ class TransporterManager:
         py_files = glob.glob(os.path.join(TRANSPORTERS_DIR, "*.py"))
         for fpath in py_files:
             fname = os.path.basename(fpath)
-            if fname.startswith("__"):
+            # 워커나 템플릿 스크립트는 임포트 대상에서 제외
+            if fname.startswith("__") or fname.endswith("_worker.py") or "worker" in fname:
                 continue
             module_name = f"feeder_trans_{os.path.splitext(fname)[0]}"
             try:
@@ -209,9 +210,9 @@ class TransporterManager:
                         t_id = getattr(obj, 'TRANSPORTER_ID', '').lower()
                         if t_id:
                             cls._transporter_classes[t_id] = obj
-                            # logger.debug(f"[TransporterManager] 이송 핸들러 로드 완료: '{t_id}' ({fname})")
-            except Exception as e:
-                logger.error(f"[TransporterManager] 이송 핸들러 로드 실패 ({fname}): {e}")
+                            logger.info(f"[TransporterManager] 이송 핸들러 로드 완료: '{t_id}' ({fname})")
+            except (Exception, SystemExit) as e:
+                logger.error(f"[TransporterManager] 이송 스크립트({fname}) 안전 로드 차단 (서버 보호): {e}")
 
     @classmethod
     def get_transporter_schemas(cls) -> list[dict]:
