@@ -242,11 +242,24 @@ class Task:
 
 
     @staticmethod
-    def get_crawl_delay(site_info: dict) -> float:
+    def get_crawl_delay(site_info: dict, target_cfg=None) -> float:
+        """딜레이 우선순위 해석: 크롤러 개별 딜레이 -> 사이트 JSON DELAY -> 전역 기본 딜레이"""
         try:
-            if site_info and 'DELAY' in site_info and site_info['DELAY'] is not None:
+            # 1순위: 크롤러 모달에 입력된 개별 딜레이 (예: 4초)
+            cfg_delay = getattr(target_cfg, 'delay', None) if target_cfg else None
+            if cfg_delay not in [None, '']:
+                return float(cfg_delay)
+
+            # 2순위: 사이트 JSON 규칙에 선언된 DELAY
+            if site_info and 'DELAY' in site_info and site_info['DELAY'] not in [None, '']:
                 return float(site_info['DELAY'])
-            return float(P.ModelSetting.get('feed_crawler_delay', '2.0'))
+
+            # 3순위: 기본 설정의 전역 딜레이
+            global_delay = P.ModelSetting.get('feed_crawler_delay')
+            if global_delay not in [None, '']:
+                return float(global_delay)
+
+            return 2.0
         except Exception:
             return 2.0
 
@@ -281,7 +294,7 @@ class Task:
         allow_duplicate_magnet = P.ModelSetting.get_bool('feed_allow_duplicate_magnet')
         target_pages = 1 if is_test else max(1, max_page)
         stop_crawl = False
-        crawl_delay = Task.get_crawl_delay(site_info)
+        crawl_delay = Task.get_crawl_delay(site_info, target_cfg=target_cfg)
 
         if target_cfg is None:
             target_cfg = SimpleNamespace(
@@ -307,6 +320,7 @@ class Task:
 
             for cur_page in range(1, target_pages + 1):
                 if cur_page > 1 and crawl_delay > 0:
+                    logger.debug(f"[Feeder] 다음 목록 페이지({cur_page}p) 이동 전 딜레이 대기: {crawl_delay}초")
                     time.sleep(crawl_delay)
 
                 board_url = Task.build_board_url(site_info, board_id, cur_page, subcat=subcat_id)
