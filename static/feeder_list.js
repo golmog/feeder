@@ -139,7 +139,7 @@ function update_board_select(selected_site) {
       var bName = (typeof item === 'object' && item !== null && item.name) ? item.name : item;
       if (bKey && bKey !== 'None' && bKey !== 'null') {
         var isSel = (bKey === saved_board) ? 'selected' : '';
-        var displayName = (bKey.indexOf(':') !== -1) ? '[' + bKey + ']' : bName;
+        var displayName = bKey;
         str += '<option value="' + bKey + '" ' + isSel + '>' + displayName + '</option>';
       }
     }
@@ -170,8 +170,7 @@ function make_list(data) {
 
       var bStr = String(item.board || '');
       if (bStr && bStr !== 'None' && bStr !== 'null') {
-        var boardDisplay = (bStr.indexOf(':') !== -1) ? '[' + bStr + ']' : bStr;
-        site_col += '<span class="badge badge-secondary">' + boardDisplay + '</span>';
+        site_col += '<span class="badge badge-secondary">' + bStr + '</span>';
       } else {
         site_col += '<span class="badge badge-secondary">기본</span>';
       }

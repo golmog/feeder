@@ -1005,7 +1005,7 @@ class ModuleFeed(PluginModuleBase):
                 if not f_key:
                     continue
 
-                display_name = f"[{f_key}]" if sub_val else str(b_val)
+                display_name = f_key if sub_val else str(b_val)
                 if not any(x['key'] == f_key for x in ret['board'][s]):
                     ret['board'][s].append({'key': f_key, 'name': display_name})
 
@@ -1020,7 +1020,7 @@ class ModuleFeed(PluginModuleBase):
                     ret['board'][s] = []
 
                 if not any(x['key'] == b for x in ret['board'][s]):
-                    disp = f"[{b}]" if ':' in b else str(b)
+                    disp = b
                     ret['board'][s].append({'key': b, 'name': disp})
         except Exception:
             pass
