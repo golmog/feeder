@@ -477,15 +477,55 @@ class ModuleDownload(PluginModuleBase):
         item.status = 'colab_transferring'
         db.session.commit()
 
-        # 서버에 보관된 rclone.conf 내용 읽기
+        # 서버에 보관된 rclone.conf 내용 읽기 및 서비스 어카운트 파일 추적
         rclone_conf_path = P.ModelSetting.get('download_rclone_conf_path') or FeedConfigUtil.load_yaml().get('rclone', {}).get('conf_path', '')
         rclone_conf_text = ""
+        sa_files = {}
+
         if rclone_conf_path and os.path.exists(rclone_conf_path):
             try:
                 with open(rclone_conf_path, 'r', encoding='utf-8') as f:
                     rclone_conf_text = f.read()
+
+                # rclone.conf 내 service_account_file = ... 경로 탐색 및 파일 내용 로드
+                conf_dir = os.path.dirname(rclone_conf_path)
+                sa_matches = re.findall(r'service_account_file\s*=\s*(.+)', rclone_conf_text)
+                for raw_sa_path in set(sa_matches):
+                    sa_path = raw_sa_path.strip().strip('"').strip("'")
+                    sa_fname = os.path.basename(sa_path)
+
+                    # 1차: 기재된 경로, 2차: rclone.conf 위치 기준, 3차: sa/ 하위 폴더 탐색
+                    candidate_paths = [
+                        sa_path,
+                        os.path.join(conf_dir, sa_fname),
+                        os.path.join(conf_dir, 'sa', sa_fname),
+                        os.path.join(path_data, sa_fname)
+                    ]
+                    found_content = None
+                    for cp in candidate_paths:
+                        if os.path.exists(cp):
+                            try:
+                                with open(cp, 'r', encoding='utf-8') as sf:
+                                    found_content = sf.read()
+                                break
+                            except Exception:
+                                pass
+
+                    if found_content:
+                        sa_files[sa_fname] = found_content
+                        # 코랩 VM 내부의 고정 경로로 rclone.conf 내용 자동 치환
+                        colab_sa_path = f"/root/.config/rclone/sa/{sa_fname}"
+                        rclone_conf_text = re.sub(
+                            rf'service_account_file\s*=\s*{re.escape(raw_sa_path)}',
+                            f'service_account_file = {colab_sa_path}',
+                            rclone_conf_text
+                        )
+                        logger.info(f"[{self.name}] [Colab API] SA 키 감지 및 코랩 경로 치환 완료: {sa_fname}")
+                    else:
+                        logger.warning(f"[{self.name}] [Colab API] SA 파일({sa_fname})을 서버에서 찾지 못했습니다.")
+
             except Exception as e:
-                logger.error(f"[{self.name}] rclone.conf 파일 읽기 실패: {e}")
+                logger.error(f"[{self.name}] rclone.conf 분석 실패: {e}")
 
         # 목적지 구글 드라이브 경로 조립
         profile = FeedConfigUtil.get_download_profile_by_feed(item.feed_name) or {}
@@ -519,7 +559,8 @@ class ModuleDownload(PluginModuleBase):
             'ret': 'success',
             'has_task': True,
             'item': task_data,
-            'rclone_conf': rclone_conf_text
+            'rclone_conf': rclone_conf_text,
+            'sa_files': sa_files
         })
 
     def _handle_colab_report(self, req):
