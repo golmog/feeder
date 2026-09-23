@@ -979,38 +979,67 @@ class FeedScraper:
         return False
 
     @classmethod
+    def reinit_session(cls, site_info: dict, scheduler_instance=None):
+        """세션 오염/차단 감지 시 FlareSolverr 캐시 및 Selenium 드라이버를 완전 파기하고 처음부터 무결점 재초기화"""
+        site_url = (site_info.get('TORRENT_SITE_URL') if site_info else '').rstrip('/')
+        parsed_url = urlparse(site_url)
+        host = parsed_url.hostname or ''
+
+        logger.warning(f"[Scraper] [{host}] 지속적 차단 감지 -> 브라우저 및 토큰 캐시 완전 파기 후 처음부터 재초기화 시작")
+
+        # 기존 오염된 셀레니움 및 네트워크 연결 완전 종료
+        cls.close_sessions()
+
+        # 캐시된 Cloudflare 토큰 강제 폐기
+        if host in cls._cf_cookies:
+            cls._cf_cookies.pop(host, None)
+        if host in cls._cf_user_agents:
+            cls._cf_user_agents.pop(host, None)
+
+        # 리다이렉트 없는 루트 도메인 기준으로 FlareSolverr 새 토큰 재인가
+        use_fs = getattr(scheduler_instance, 'use_flaresolverr', False) if scheduler_instance else P.ModelSetting.get_bool('feed_use_flaresolverr')
+        if site_info and ('USE_FLARESOLVERR' in site_info.get('EXTRA', []) or site_info.get('USE_FLARESOLVERR')):
+            use_fs = True
+
+        if use_fs and site_url:
+            cls.get_flaresolverr_clearance(site_url, scheduler_instance=scheduler_instance)
+
+        # 완전히 새로운 스텔스 Selenium 드라이버 기동
+        driver = cls.init_stealth_selenium(site_info or {}, scheduler_instance=scheduler_instance)
+
+        # 커스텀 훅의 성인 확인 클릭 절차 재수행
+        if site_info:
+            try:
+                hook = FeedCustomManager.get_hook(site_info.get('NAME'))
+                if hook and hasattr(hook, 'on_init_session'):
+                    logger.info(f"[{site_info.get('NAME')}] 세션 재초기화 훅(on_init_session) 재실행")
+                    hook.on_init_session(site_info, scheduler_instance)
+                    driver = cls._selenium_driver
+            except Exception as hook_err:
+                logger.debug(f"[Scraper] 세션 재초기화 훅 실행 예외: {hook_err}")
+
+        return driver
+
+    @classmethod
     def handle_turnstile_challenge(cls, driver, url: str, site_info: dict = None, scheduler_instance=None) -> bool:
-        """Cloudflare 챌린지 화면 감지 시 자동 클릭 및 토큰 재주입 복구 수행"""
+        """Cloudflare 챌린지 화면 감지 시 자동 클릭 시도 및 실패 시 전체 세션 재초기화"""
         page_title = driver.title or ""
         if not any(k in page_title for k in ["Just a moment", "Cloudflare", "Attention Required"]):
             return True
 
-        logger.info(f"[Scraper] Cloudflare 챌린지 화면 감지 ('{page_title}') -> 플랫폼 자동 해결 시도: {url}")
-        if cls.solve_turnstile_checkbox(driver, max_wait=5):
+        logger.info(f"[Scraper] Cloudflare 챌린지 화면 감지 ('{page_title}') -> 자동 해결 시도: {url}")
+        if cls.solve_turnstile_checkbox(driver, max_wait=4):
             return True
 
-        # 클릭으로 해결되지 않으면 FlareSolverr를 통해 새 토큰을 취득하여 현재 브라우저에 즉시 주입
-        logger.warning(f"[Scraper] Turnstile 자동 클릭 미통과 -> FlareSolverr 새 토큰 재인가 시작: {url}")
-        fresh_cookies, _ = cls.get_flaresolverr_clearance(url, scheduler_instance=scheduler_instance)
-        if fresh_cookies and any(c.get('name') == 'cf_clearance' and c.get('value') for c in fresh_cookies):
-            for c in fresh_cookies:
-                cookie_dict = {'name': c['name'], 'value': c['value'], 'path': c.get('path', '/')}
-                dom = c.get('domain', '')
-                if dom:
-                    cookie_dict['domain'] = dom.lstrip('.')
-                try:
-                    driver.add_cookie(cookie_dict)
-                except Exception:
-                    try:
-                        driver.add_cookie({'name': c['name'], 'value': c['value'], 'path': '/'})
-                    except Exception:
-                        pass
-            logger.info(f"[Scraper] 새 clearance 쿠키 {len(fresh_cookies)}개 브라우저 재주입 완료 -> 페이지 재접속")
-            driver.get(url)
+        # 클릭으로 해결되지 않으면 브라우저와 토큰을 모두 파기하고 처음부터 완전 재초기화
+        new_driver = cls.reinit_session(site_info or {}, scheduler_instance=scheduler_instance)
+        if new_driver:
+            logger.info(f"[Scraper] 완전히 재초기화된 새 브라우저로 대상 URL 재진입: {url}")
+            new_driver.get(url)
             time.sleep(2)
-            cls.solve_turnstile_checkbox(driver, max_wait=4)
+            cls.solve_turnstile_checkbox(new_driver, max_wait=4)
 
-        current_title = driver.title or ""
+        current_title = (cls._selenium_driver.title if cls._selenium_driver else "") or ""
         return not any(k in current_title for k in ["Just a moment", "Cloudflare", "Attention Required"])
 
     @classmethod
@@ -1146,10 +1175,11 @@ class FeedScraper:
             logger.debug(f"[Scraper] Selenium 페이지 로드: {url}")
             driver.get(url)
 
-            # 1. 플랫폼 차원의 Cloudflare Turnstile 챌린지 자동 검사 및 해결
+            # 플랫폼 차원의 Cloudflare Turnstile 챌린지 자동 검사 및 필요 시 세션 완전 재초기화
             cls.handle_turnstile_challenge(driver, url, site_info=site_info, scheduler_instance=scheduler_instance)
+            driver = cls._selenium_driver or driver
 
-            # 2. 커스텀 훅의 페이지 로드 직후 이벤트 호출 (사이트별 성인 확인 버튼 등)
+            # 커스텀 훅의 페이지 로드 직후 이벤트 호출 (사이트별 성인 확인 버튼 등)
             if site_info:
                 try:
                     hook = FeedCustomManager.get_hook(site_info.get('NAME'))
@@ -1164,13 +1194,22 @@ class FeedScraper:
                 try:
                     WebDriverWait(driver, selenium_timeout).until(EC.presence_of_element_located((By.XPATH, effective_wait_tag)))
                 except Exception as wait_ex:
-                    logger.warning(f"[Scraper] 태그 대기 타임아웃 ({effective_wait_tag}): {wait_ex}")
-                    try:
-                        debug_path = os.path.join(get_tmp_dir(), 'debug_selenium_failed.png')
-                        driver.save_screenshot(debug_path)
-                        logger.info(f"[Scraper] 실패 스크린샷 저장: {debug_path}")
-                    except Exception:
-                        pass
+                    # 태그 대기 타임아웃 발생 시, 화면이 Cloudflare 차단 상태인지 확인 후 최후 복구 시도
+                    curr_title = driver.title or ""
+                    if any(k in curr_title for k in ["Just a moment", "Cloudflare", "Attention Required"]):
+                        logger.warning(f"[Scraper] 태그 대기 중 Cloudflare 재차단 확인 ('{curr_title}') -> 세션 완전 재초기화 후 재시도: {url}")
+                        driver = cls.reinit_session(site_info or {}, scheduler_instance=scheduler_instance)
+                        if driver:
+                            driver.get(url)
+                            WebDriverWait(driver, selenium_timeout).until(EC.presence_of_element_located((By.XPATH, effective_wait_tag)))
+                    else:
+                        logger.warning(f"[Scraper] 태그 대기 타임아웃 ({effective_wait_tag}): {wait_ex}")
+                        try:
+                            debug_path = os.path.join(get_tmp_dir(), 'debug_selenium_failed.png')
+                            driver.save_screenshot(debug_path)
+                            logger.info(f"[Scraper] 실패 스크린샷 저장: {debug_path}")
+                        except Exception:
+                            pass
 
             return driver.page_source
         except Exception as e:
