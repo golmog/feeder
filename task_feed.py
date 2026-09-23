@@ -179,27 +179,27 @@ class Task:
 
                     logger.info(f"[Feeder] [{mode_label}] 사이트 크롤러 시작: [{site_name}] (대상 게시판={len(boards)}개, 최대 탐색={max_page}p)")
 
-                    try:
-                        for b in boards:
-                            board_id = b.get('board')
-                            subcat_id = str(b.get('subcat', '')).strip()
-                            full_board_key = b.get('full_board_key') or board_id
+                    for b in boards:
+                        board_id = b.get('board')
+                        subcat_id = str(b.get('subcat', '')).strip()
+                        full_board_key = b.get('full_board_key') or board_id
 
-                            last_bbs = ModelFeedBbs.get_last_bbs(site_name, full_board_key)
-                            max_id = 0
-                            extra = site_entity.info.get('EXTRA', []) if site_entity.info else []
+                        last_bbs = ModelFeedBbs.get_last_bbs(site_name, full_board_key)
+                        max_id = 0
+                        extra = site_entity.info.get('EXTRA', []) if site_entity.info else []
 
-                            # 항상 최대 페이지 수집 옵션이 꺼져 있을 때만 최근 수집 지점(max_id)을 적용하여 조기 종료
-                            if not always_max_page and 'USING_POST_CHAR_ID' not in extra and last_bbs and last_bbs.post_id:
-                                max_id = last_bbs.post_id
+                        # 항상 최대 페이지 수집 옵션이 꺼져 있을 때만 최근 수집 지점(max_id)을 적용하여 조기 종료
+                        if not always_max_page and 'USING_POST_CHAR_ID' not in extra and last_bbs and last_bbs.post_id:
+                            max_id = last_bbs.post_id
 
-                            target_cfg.subcat_id = subcat_id
+                        target_cfg.subcat_id = subcat_id
 
-                            if always_max_page:
-                                logger.info(f"[Feeder] [{site_name}] {full_board_key} [{mode_label}]: 항상 최대 페이지 탐색 (최대 {max_page}p 전체 탐색, 기수집건 스킵)")
-                            else:
-                                logger.info(f"[Feeder] [{site_name}] {full_board_key} [{mode_label}]: 증분 탐색 (최근 수집 ID: {max_id})")
+                        if always_max_page:
+                            logger.info(f"[Feeder] [{site_name}] {full_board_key} [{mode_label}]: 항상 최대 페이지 탐색 (최대 {max_page}p 전체 탐색, 기수집건 스킵)")
+                        else:
+                            logger.info(f"[Feeder] [{site_name}] {full_board_key} [{mode_label}]: 증분 탐색 (최근 수집 ID: {max_id})")
 
+                        try:
                             crawled = Task.execute_board_crawl(
                                 site_entity.info,
                                 board_id,
@@ -213,9 +213,15 @@ class Task:
                             if crawled:
                                 total_crawled_count += len(crawled)
                                 logger.info(f"[Feeder] [{site_name}] {full_board_key}: {len(crawled)}개 항목 수집 완료")
-                    finally:
-                        # 해당 사이트의 모든 소속 게시판 수집 완료 후 단일 세션 정리
-                        FeedScraper.close_sessions()
+                        except Exception as board_err:
+                            logger.error(f"[Feeder] [{site_name}] {full_board_key} 수집 중 오류: {board_err}")
+                            logger.error(traceback.format_exc())
+                        finally:
+                            # 게시판별 세션 완전 격리: 이전 게시판의 세션 오염/차단이 다음 게시판에 전파되지 않도록 정리
+                            FeedScraper.close_sessions()
+                            crawl_delay = Task.get_crawl_delay(site_entity.info)
+                            if crawl_delay > 0:
+                                time.sleep(crawl_delay)
 
                 logger.info(f"[Feeder] [Celery Task] 전체 수집 작업 완료: 총 {total_crawled_count}개 게시물 수집됨")
 
@@ -466,9 +472,8 @@ class Task:
 
             logger.info(f"[Feeder] 크롤링 루프 종료: 총 {len(bbs_list)}개 항목 처리 완료")
         finally:
-            # 단일 게시판 수집 테스트 시에만 즉시 세션 정리, 실제 수집 시에는 사이트 단위로 세션 유지
-            if is_test:
-                FeedScraper.close_sessions()
+            # 게시판 수집 완료 후 브라우저 및 네트워크 세션 즉시 정리 (오염 세션 잔류 방지)
+            FeedScraper.close_sessions()
 
         return bbs_list
 
