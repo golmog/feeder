@@ -44,7 +44,7 @@
       {{ macros.m_hr() }}
       {{ macros.setting_checkbox('feed_use_proxy', 'HTTP Proxy 사용', value=arg['feed_use_proxy'], desc=['On: 수집 및 요청 시 지정된 프록시 서버를 경유합니다.']) }}
       <div id="feed_use_proxy_div" class="collapse">
-        {{ macros.setting_input_text('feed_proxy_url', 'Proxy URL', value=arg['feed_proxy_url'], placeholder='예: http://127.0.0.1:8118 또는 socks5://127.0.0.1:1080') }}
+        {{ macros.setting_input_text('feed_proxy_url', 'Proxy URL', value=arg['feed_proxy_url'], placeholder='예: http://gluetun:8888, http://gluetun2:8888', desc=['단일 프록시 또는 쉼표(,), 줄바꿈으로 복수 프록시 등록 시 게시판 전환 및 차단 발생 시 자동 로테이션됩니다.']) }}
       </div>
       {{ macros.m_hr() }}
       {{ macros.setting_checkbox('feed_use_flaresolverr', 'FlareSolverr 사용', value=arg['feed_use_flaresolverr'], desc=['On: Cloudflare 차단 사이트 수집 시 FlareSolverr로 챌린지를 우회합니다.']) }}
@@ -219,7 +219,7 @@
           {{ macros.setting_checkbox('crawler_use_torrent_info', 'Torrent Info 사용', value='', desc=['On: 마그넷 메타데이터를 사전 분석하여 원본 파일명을 취득합니다.']) }}
           {{ macros.setting_checkbox('crawler_use_proxy', 'Proxy 사용', value='') }}
           <div id="modal_crawler_proxy_div" class="collapse">
-            {{ macros.setting_input_text('crawler_proxy_url', '개별 Proxy URL', value='', placeholder='미입력 시 기본 설정의 Proxy 사용') }}
+            {{ macros.setting_input_text('crawler_proxy_url', '개별 Proxy URL', value='', placeholder='미입력 시 기본 설정의 Proxy 사용', desc=['미입력 시 전역 Proxy 사용 (쉼표/줄바꿈으로 복수 프록시 등록 시 자동 로테이션)']) }}
           </div>
           {{ macros.setting_checkbox('crawler_use_flaresolverr', 'FlareSolverr 사용', value='') }}
           {{ macros.setting_checkbox('crawler_use_selenium', 'Selenium 사용', value='') }}

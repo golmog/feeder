@@ -179,7 +179,11 @@ class Task:
 
                     logger.info(f"[Feeder] [{mode_label}] 사이트 크롤러 시작: [{site_name}] (대상 게시판={len(boards)}개, 최대 탐색={max_page}p)")
 
-                    for b in boards:
+                    for b_idx, b in enumerate(boards):
+                        # 2번째 게시판부터는 게시판 전환 시마다 프록시를 다음 순번으로 선제 로테이션 (부하 분산)
+                        if b_idx > 0:
+                            FeedScraper.rotate_proxy(scheduler_instance=target_cfg, reason="게시판 전환 부하 분산")
+
                         board_id = b.get('board')
                         subcat_id = str(b.get('subcat', '')).strip()
                         full_board_key = b.get('full_board_key') or board_id
@@ -219,7 +223,7 @@ class Task:
                         finally:
                             # 게시판별 세션 완전 격리: 이전 게시판의 세션 오염/차단이 다음 게시판에 전파되지 않도록 정리
                             FeedScraper.close_sessions()
-                            crawl_delay = Task.get_crawl_delay(site_entity.info)
+                            crawl_delay = Task.get_crawl_delay(site_entity.info, target_cfg=target_cfg)
                             if crawl_delay > 0:
                                 time.sleep(crawl_delay)
 

@@ -573,6 +573,7 @@ class FeedScraper:
     _selenium_driver = None
     _cffi_sessions = {}
     _requests_sessions = {}
+    _proxy_index = 0
 
     DEFAULT_HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -581,24 +582,54 @@ class FeedScraper:
     }
 
     @classmethod
-    def _sync_cookies_to_sessions(cls, host: str):
-        """레거시 및 외부 호출 호환용 별칭 (동일 로직 호출)"""
-        cls._sync_clearance_to_sessions(host)
+    def _get_proxy_list(cls, scheduler_instance=None) -> list[str]:
+        """쉼표(,) 또는 줄바꿈으로 구분된 다중 프록시 목록 파싱"""
+        if scheduler_instance:
+            use_proxy = getattr(scheduler_instance, 'use_proxy', False)
+            raw_proxy = getattr(scheduler_instance, 'proxy_url', '')
+        else:
+            use_proxy = P.ModelSetting.get_bool('feed_use_proxy')
+            raw_proxy = ''
+
+        if not raw_proxy:
+            raw_proxy = P.ModelSetting.get('feed_proxy_url') or ''
+
+        if not use_proxy or not raw_proxy:
+            return []
+
+        proxies = []
+        for part in raw_proxy.replace('\n', ',').split(','):
+            p = part.strip()
+            if p and p not in proxies:
+                proxies.append(p)
+        return proxies
+
+    @classmethod
+    def get_current_proxy_url(cls, scheduler_instance=None) -> str:
+        """현재 활성화된 순번의 프록시 URL 1개 반환"""
+        p_list = cls._get_proxy_list(scheduler_instance)
+        if not p_list:
+            return ''
+        return p_list[cls._proxy_index % len(p_list)]
+
+    @classmethod
+    def rotate_proxy(cls, scheduler_instance=None, reason: str = "차단 감지") -> str:
+        """다음 순번 프록시로 포인터 전환 및 로그 출력"""
+        p_list = cls._get_proxy_list(scheduler_instance)
+        if not p_list:
+            return ''
+        if len(p_list) > 1:
+            cls._proxy_index = (cls._proxy_index + 1) % len(p_list)
+            active_proxy = p_list[cls._proxy_index]
+            logger.info(f"[Scraper] 프록시 로테이션 ({reason}) -> {active_proxy} ({cls._proxy_index + 1}/{len(p_list)}번)")
+            return active_proxy
+        return p_list[0]
 
     @classmethod
     def get_proxies(cls, scheduler_instance=None):
-        if scheduler_instance:
-            use_proxy = getattr(scheduler_instance, 'use_proxy', False)
-            proxy_url = getattr(scheduler_instance, 'proxy_url', '')
-        else:
-            use_proxy = P.ModelSetting.get_bool('feed_use_proxy')
-            proxy_url = ''
-
-        if not proxy_url:
-            proxy_url = P.ModelSetting.get('feed_proxy_url') or ''
-
-        if use_proxy and proxy_url:
-            return {"http": proxy_url, "https": proxy_url}
+        active_url = cls.get_current_proxy_url(scheduler_instance)
+        if active_url:
+            return {"http": active_url, "https": active_url}
         return None
 
     @classmethod
@@ -988,6 +1019,9 @@ class FeedScraper:
         site_url = (site_info.get('TORRENT_SITE_URL') if site_info else '').rstrip('/')
         parsed_url = urlparse(site_url)
         host = parsed_url.hostname or ''
+
+        # 지속 차단 시 등록된 프록시 풀에서 다음 프록시로 자동 교체
+        cls.rotate_proxy(scheduler_instance=scheduler_instance, reason="지속적 차단 대응")
 
         logger.warning(f"[Scraper] [{host}] 지속적 차단 감지 -> 브라우저 및 토큰 캐시 완전 파기 후 처음부터 재초기화 시작")
 
