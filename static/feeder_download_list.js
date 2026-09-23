@@ -3,7 +3,22 @@ var cached_download_list = [];
 var cached_download_profiles = [];
 
 $(document).ready(function(){
-  request_download_list(1);
+  try {
+    localStorage.setItem('feeder_last_download_page', 'list');
+    sync_feeder_header_navbar();
+  } catch(err) {}
+
+  var saved_status = localStorage.getItem(sub + '_status_filter');
+  if (saved_status) { $('#status_filter').val(saved_status); }
+
+  var saved_size = localStorage.getItem(sub + '_page_size');
+  if (saved_size) { $('#page_size').val(saved_size); }
+
+  var saved_word = localStorage.getItem(sub + '_search_word');
+  if (saved_word) { $('#search_word').val(saved_word); }
+
+  var saved_page = localStorage.getItem(sub + '_current_page') || '1';
+  request_download_list(parseInt(saved_page) || 1);
   load_retry_profiles();
 });
 
@@ -20,6 +35,8 @@ function load_retry_profiles() {
 
 function request_download_list(page) {
   current_page = page || 1;
+  localStorage.setItem(sub + '_current_page', current_page);
+
   var formData = {
     page: current_page,
     page_size: $('#page_size').val(),
@@ -61,9 +78,14 @@ function render_history_table(list) {
     if (it.status === 'completed') statusBadge = '<span class="badge badge-success">최종 완료</span>';
     else if (it.status === 'downloading') statusBadge = '<span class="badge badge-primary">다운로드 중</span>';
     else if (it.status === 'pending') statusBadge = '<span class="badge badge-warning">대기 (Pending)</span>';
+    else if (it.status === 'pending_local_staging' || it.status === 'local_staging') statusBadge = '<span class="badge badge-info">로컬 스테이징</span>';
+    else if (it.status === 'pending_colab') statusBadge = '<span class="badge badge-warning">Colab 대기</span>';
+    else if (it.status === 'colab_transferring') statusBadge = '<span class="badge badge-primary">Colab 전송 중</span>';
+    else if (it.status === 'downloaded') statusBadge = '<span class="badge badge-success">다운로드 완료</span>';
+    else if (it.status === 'pending_upload' || it.status === 'uploading') statusBadge = '<span class="badge badge-primary">업로드 중</span>';
     else if (it.status === 'move_failed') statusBadge = '<span class="badge badge-warning">이동 실패</span>';
     else if (it.status === 'failed') statusBadge = '<span class="badge badge-danger">실패</span>';
-    else statusBadge = '<span class="badge badge-info">' + it.status + '</span>';
+    else statusBadge = '<span class="badge badge-secondary">' + it.status + '</span>';
 
     var engineInfo = it.current_engine_name ? '<br><small class="text-muted">엔진: ' + it.current_engine_name + '</small>' : '';
     var errorMsg = it.error_message ? '<br><small class="text-danger">오류: ' + it.error_message + '</small>' : '';
@@ -115,10 +137,29 @@ function make_page_html(current, total, func_name) {
 
 $('#search_btn').click(function(e){
   e.preventDefault();
+  localStorage.setItem(sub + '_search_word', $('#search_word').val().trim());
+  localStorage.setItem(sub + '_current_page', '1');
   request_download_list(1);
 });
 
-$('#status_filter, #page_size').change(function(){
+$('#search_word').keydown(function(e) {
+  if (e.which == 13) {
+    e.preventDefault();
+    localStorage.setItem(sub + '_search_word', $('#search_word').val().trim());
+    localStorage.setItem(sub + '_current_page', '1');
+    request_download_list(1);
+  }
+});
+
+$('#status_filter').change(function(){
+  localStorage.setItem(sub + '_status_filter', $(this).val());
+  localStorage.setItem(sub + '_current_page', '1');
+  request_download_list(1);
+});
+
+$('#page_size').change(function(){
+  localStorage.setItem(sub + '_page_size', $(this).val());
+  localStorage.setItem(sub + '_current_page', '1');
   request_download_list(1);
 });
 
@@ -127,6 +168,12 @@ $('#reset_btn').click(function(e){
   $('#status_filter').val('all');
   $('#search_word').val('');
   $('#page_size').val('25');
+
+  localStorage.removeItem(sub + '_search_word');
+  localStorage.setItem(sub + '_status_filter', 'all');
+  localStorage.setItem(sub + '_page_size', '25');
+  localStorage.setItem(sub + '_current_page', '1');
+
   request_download_list(1);
 });
 
@@ -233,3 +280,12 @@ $(document).on('click', '#btn_confirm_retry_execute', function(e){
     }
   });
 });
+
+function sync_feeder_header_navbar() {
+  try {
+    var lastFeed = localStorage.getItem('feeder_last_feed_page') || 'setting';
+    var lastDl = localStorage.getItem('feeder_last_download_page') || 'setting';
+    $('.navbar a[href*="/' + package_name + '/feed"]').attr('href', '/' + package_name + '/feed/' + lastFeed);
+    $('.navbar a[href*="/' + package_name + '/download"]').attr('href', '/' + package_name + '/download/' + lastDl);
+  } catch(e) {}
+}

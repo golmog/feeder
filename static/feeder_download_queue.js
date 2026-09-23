@@ -1,6 +1,11 @@
 var sse_source = null;
 
 $(document).ready(function(){
+  try {
+    localStorage.setItem('feeder_last_download_page', 'queue');
+    sync_feeder_header_navbar();
+  } catch(err) {}
+
   request_active_queue();
   if (enable_sse) {
     init_sse_listener();
@@ -120,3 +125,12 @@ $(document).on('click', '.queue_action_btn', function(e){
     }
   });
 });
+
+function sync_feeder_header_navbar() {
+  try {
+    var lastFeed = localStorage.getItem('feeder_last_feed_page') || 'setting';
+    var lastDl = localStorage.getItem('feeder_last_download_page') || 'setting';
+    $('.navbar a[href*="/' + package_name + '/feed"]').attr('href', '/' + package_name + '/feed/' + lastFeed);
+    $('.navbar a[href*="/' + package_name + '/download"]').attr('href', '/' + package_name + '/download/' + lastDl);
+  } catch(e) {}
+}

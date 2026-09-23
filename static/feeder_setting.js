@@ -127,6 +127,61 @@ $(document).ready(function(){
   toggle_qb_setting();
   load_all_data();
   init_ace_editors();
+
+  try {
+    localStorage.setItem('feeder_last_feed_page', 'setting');
+    sync_feeder_header_navbar();
+  } catch(err) {}
+
+  restore_feed_subtab();
+  setTimeout(restore_feed_subtab, 80);
+});
+
+function restore_feed_subtab() {
+  try {
+    var saved_tab = localStorage.getItem(package_name + '_' + sub + '_active_tab');
+    if (saved_tab) {
+      var tabElem = $('#nav-tab a[href="' + saved_tab + '"]');
+      if (tabElem.length > 0 && !tabElem.hasClass('active')) {
+        tabElem.tab('show');
+      }
+    }
+  } catch(e) {}
+}
+
+$(document).on('shown.bs.tab', '#nav-tab a[data-toggle="tab"]', function(e){
+  try {
+    var targetTab = $(e.target).attr('href');
+    if (targetTab && targetTab.startsWith('#')) {
+      localStorage.setItem(package_name + '_' + sub + '_active_tab', targetTab);
+    }
+  } catch(err) {}
+});
+
+function sync_feeder_header_navbar() {
+  try {
+    var lastFeed = localStorage.getItem('feeder_last_feed_page') || 'setting';
+    var lastDl = localStorage.getItem('feeder_last_download_page') || 'setting';
+    $('.navbar a[href*="/' + package_name + '/feed"]').attr('href', '/' + package_name + '/feed/' + lastFeed);
+    $('.navbar a[href*="/' + package_name + '/download"]').attr('href', '/' + package_name + '/download/' + lastDl);
+  } catch(e) {}
+}
+
+$(document).on('click', '.navbar a', function(e){
+  var href = $(this).attr('href') || '';
+  if (href.indexOf('/' + package_name + '/feed') !== -1) {
+    var lastFeed = localStorage.getItem('feeder_last_feed_page');
+    if (lastFeed && lastFeed !== 'setting') {
+      e.preventDefault();
+      window.location.href = '/' + package_name + '/feed/' + lastFeed;
+    }
+  } else if (href.indexOf('/' + package_name + '/download') !== -1) {
+    var lastDl = localStorage.getItem('feeder_last_download_page');
+    if (lastDl && lastDl !== 'setting') {
+      e.preventDefault();
+      window.location.href = '/' + package_name + '/download/' + lastDl;
+    }
+  }
 });
 
 function toggle_qb_setting() {
@@ -1190,4 +1245,19 @@ $(document).on('change', '#custom_script_file_input', function(){
       }
     }
   });
+});
+
+$(document).on('click', 'nav a, .navbar a', function(){
+  var href = $(this).attr('href') || '';
+  if (href.indexOf('/' + package_name + '/feed') !== -1 && href.indexOf('manual') === -1 && href.indexOf('log') === -1) {
+    var lastFeedPage = localStorage.getItem('feeder_last_sub_feed');
+    if (lastFeedPage && lastFeedPage !== 'setting') {
+      $(this).attr('href', '/' + package_name + '/feed/' + lastFeedPage);
+    }
+  } else if (href.indexOf('/' + package_name + '/download') !== -1) {
+    var lastDlPage = localStorage.getItem('feeder_last_sub_download');
+    if (lastDlPage && lastDlPage !== 'setting') {
+      $(this).attr('href', '/' + package_name + '/download/' + lastDlPage);
+    }
+  }
 });

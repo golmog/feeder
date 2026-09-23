@@ -168,10 +168,10 @@
       <div class="modal-body">
         <form id="downloader_form">
           <input type="hidden" id="downloader_mode" value="add">
-          {{ macros.setting_input_text('dl_name', '식별명', placeholder='예: ad_main, 115_vip, qbit_local', desc=['프로필 체인에서 참조할 고유 식별 영문명']) }}
+          {{ macros.setting_input_text('dl_name', '식별명', col='9', placeholder='예: ad_main, 115_vip, qbit_local', desc=['프로필 체인에서 참조할 고유 식별 영문명']) }}
           <div class="form-group row mb-2">
-            <label class="col-sm-2 col-form-label text-right font-weight-bold">엔진 타입</label>
-            <div class="col-sm-10">
+            <label class="col-sm-3 col-form-label text-right font-weight-bold">엔진 타입</label>
+            <div class="col-sm-9">
               <select id="dl_engine_type" class="form-control form-control-sm"></select>
             </div>
           </div>
@@ -246,11 +246,11 @@
       <div class="modal-body">
         <form id="profile_form">
           <input type="hidden" id="profile_mode" value="add">
-          {{ macros.setting_input_text('profile_name', '프로필명', placeholder='예: default_profile, movies_direct_115') }}
+          {{ macros.setting_input_text('profile_name', '프로필명', col='9', placeholder='예: default_profile, movies_direct_115') }}
           <!-- 적용 피드 선택 영역 -->
           <div class="form-group row mb-2">
-            <label class="col-sm-2 col-form-label text-right font-weight-bold">적용 피드</label>
-            <div class="col-sm-10">
+            <label class="col-sm-3 col-form-label text-right font-weight-bold">적용 피드</label>
+            <div class="col-sm-9">
               <div class="input-group input-group-sm mb-2">
                 <select id="profile_feed_select" class="form-control mr-1"></select>
                 <div class="input-group-append">
@@ -267,8 +267,8 @@
 
           <!-- 우선순위 체인 설정 영역 -->
           <div class="form-group row mb-2">
-            <label class="col-sm-2 col-form-label text-right font-weight-bold">우선순위 체인</label>
-            <div class="col-sm-10">
+            <label class="col-sm-3 col-form-label text-right font-weight-bold">우선순위 체인</label>
+            <div class="col-sm-9">
               <div class="input-group input-group-sm mb-2">
                 <select id="profile_engine_select" class="form-control mr-1"></select>
                 <div class="input-group-append">
@@ -295,8 +295,8 @@
           {{ macros.setting_checkbox('profile_append_hash_on_conflict', '중복 시에만 폴더명 해시 추가', value='On', desc=['On: DB에 동일한 폴더명이 이미 존재할 때만 해시(_[hash])를 붙여 분리합니다. Off: 원본 폴더명을 항상 그대로 유지합니다.']) }}
           {{ macros.m_hr() }}
           <div class="form-group row mb-2">
-            <label class="col-sm-2 col-form-label text-right font-weight-bold">목적지 유형</label>
-            <div class="col-sm-10">
+            <label class="col-sm-3 col-form-label text-right font-weight-bold">목적지 유형</label>
+            <div class="col-sm-9">
               <select id="profile_dest_type" class="form-control form-control-sm"></select>
             </div>
           </div>
@@ -353,6 +353,40 @@
       <div class="modal-footer">
         <button id="transporter_script_save_btn" type="button" class="btn btn-primary">저장 및 핸들러 동적 로드</button>
         <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 모달: 구글 드라이브 계정 수정 -->
+<div class="modal fade" id="gdrive_account_modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-md">
+    <div class="modal-content">
+      <div class="modal-header d-flex align-items-center justify-content-between">
+        <h5 class="modal-title font-weight-bold" id="gdrive_account_modal_title">구글 드라이브 계정 수정</h5>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="modal_acc_index" value="-1">
+        <div class="form-group mb-2">
+          <label class="small font-weight-bold mb-1">계정 식별자 (이메일 / 사용자명)</label>
+          <input type="text" id="modal_acc_username" class="form-control form-control-sm" placeholder="예: saibi-fa001@golmog.net">
+          <small class="form-text text-muted">위임 사용 시 --drive-impersonate 대상 이메일 주소입니다.</small>
+        </div>
+        <div class="form-group mb-2">
+          <label class="small font-weight-bold mb-1">내 드라이브 폴더 ID (MyDrive Folder ID)</label>
+          <input type="text" id="modal_acc_mydrive_id" class="form-control form-control-sm" placeholder="예: 0AIoBxxxxxx_MyDriveFolderID">
+          <small class="form-text text-muted">1차 15GB 우회 업로드를 수행할 MyDrive 폴더의 Rclone ID입니다.</small>
+        </div>
+        <div class="form-group mb-2">
+          <label class="small font-weight-bold mb-1">지정 Rclone 리모트명 (비위임 시, 선택사항)</label>
+          <input type="text" id="modal_acc_remote_name" class="form-control form-control-sm" placeholder="예: gdrive_user01 (미입력 시 기본 리모트 사용)">
+          <small class="form-text text-muted">위임 미사용 시 해당 계정에 매핑된 rclone.conf 상의 개별 리모트 이름입니다.</small>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" id="gdrive_account_save_btn" class="btn btn-sm btn-primary text-white">저장</button>
+        <button type="button" class="btn btn-sm btn-secondary" data-dismiss="modal">닫기</button>
       </div>
     </div>
   </div>

@@ -2,17 +2,48 @@ var current_data = null;
 var site_info = null;
 
 $(document).ready(function(){
-  globalRequestSearch('1');
+  localStorage.setItem('feeder_last_feed_page', 'list');
+  sync_feeder_header_navbar();
+
+  var saved_size = localStorage.getItem(sub + '_page_size');
+  if (saved_size) { $("#page_size").val(saved_size); }
+
+  var saved_order = localStorage.getItem(sub + '_order');
+  if (saved_order) { $("#order").val(saved_order); }
+
+  var saved_search_select = localStorage.getItem(sub + '_search_select');
+  if (saved_search_select) { $("#search_select").val(saved_search_select); }
+
+  var saved_word = localStorage.getItem(sub + '_search_word');
+  if (saved_word) { $("#search_word").val(saved_word); }
+
+  var saved_page = localStorage.getItem(sub + '_current_page') || '1';
+  globalRequestSearch(saved_page);
 });
 
 $("#search").click(function(e) {
   e.preventDefault();
+  localStorage.setItem(sub + '_search_word', $('#search_word').val().trim());
+  localStorage.setItem(sub + '_current_page', '1');
   globalRequestSearch('1');
 });
 
-$("body").on('click', '#page', function(e){
+$("#search_word").keydown(function(e) {
+  if (e.which == 13) {
+    e.preventDefault();
+    localStorage.setItem(sub + '_search_word', $('#search_word').val().trim());
+    localStorage.setItem(sub + '_current_page', '1');
+    globalRequestSearch('1');
+  }
+});
+
+$("body").on('click', '#page, #gloablSearchPageBtn', function(e){
   e.preventDefault();
-  globalRequestSearch($(this).data('page'));
+  var targetPage = $(this).data('page');
+  if (targetPage && !isNaN(targetPage)) {
+    localStorage.setItem(sub + '_current_page', targetPage);
+    globalRequestSearch(String(targetPage));
+  }
 });
 
 $("#reset_btn").click(function(e){
@@ -22,50 +53,77 @@ $("#reset_btn").click(function(e){
   $("#page_size").val('25');
   $("#search_select").val('title');
   $("#search_word").val('');
+
+  localStorage.removeItem(sub + '_search_word');
+  localStorage.setItem(sub + '_site_select', 'all');
+  localStorage.setItem(sub + '_board_select', 'all');
+  localStorage.setItem(sub + '_order', 'desc');
+  localStorage.setItem(sub + '_page_size', '25');
+  localStorage.setItem(sub + '_search_select', 'title');
+  localStorage.setItem(sub + '_current_page', '1');
+
   globalRequestSearch('1');
 });
 
 $("body").on('change', '#site_select', function(e){
   e.preventDefault();
-  update_board_select($(this).val());
+  var selected_site = $(this).val();
+  localStorage.setItem(sub + '_site_select', selected_site);
+  localStorage.setItem(sub + '_board_select', 'all');
+  localStorage.setItem(sub + '_current_page', '1');
+  update_board_select(selected_site);
   globalRequestSearch('1');
 });
 
 $("body").on('change', '#board_select', function(e){
   e.preventDefault();
+  localStorage.setItem(sub + '_board_select', $(this).val());
+  localStorage.setItem(sub + '_current_page', '1');
   globalRequestSearch('1');
 });
 
 $("body").on('change', '#order', function(e){
   e.preventDefault();
+  localStorage.setItem(sub + '_order', $(this).val());
+  localStorage.setItem(sub + '_current_page', '1');
   globalRequestSearch('1');
 });
 
 $("body").on('change', '#page_size', function(e){
   e.preventDefault();
+  localStorage.setItem(sub + '_page_size', $(this).val());
+  localStorage.setItem(sub + '_current_page', '1');
   globalRequestSearch('1');
+});
+
+$("body").on('change', '#search_select', function(e){
+  e.preventDefault();
+  localStorage.setItem(sub + '_search_select', $(this).val());
 });
 
 function build_search_form(data) {
   if (!data || site_info) return;
   site_info = data;
 
+  var saved_site = localStorage.getItem(sub + '_site_select') || 'all';
   var site_str = '<select id="site_select" name="site_select" class="form-control form-control-sm"><option value="all">전체 사이트</option>';
   if (data.site) {
     for (var i = 0; i < data.site.length; i++) {
-      site_str += '<option value="' + data.site[i] + '">' + data.site[i] + '</option>';
+      var sName = data.site[i];
+      var isSel = (sName === saved_site) ? 'selected' : '';
+      site_str += '<option value="' + sName + '" ' + isSel + '>' + sName + '</option>';
     }
   }
   site_str += '</select>';
   $('#site_select_div').html(site_str);
 
-  update_board_select('all');
+  update_board_select(saved_site);
 }
 
 function update_board_select(selected_site) {
+  var saved_board = localStorage.getItem(sub + '_board_select') || 'all';
   var str = '<select id="board_select" name="board_select" class="form-control form-control-sm"';
   
-  // 전체 사이트 선택 시 게시판 드롭다운을 비활성화하여 혼란 방지
   if (selected_site === 'all') {
     str += ' disabled><option value="all">전체 게시판</option></select>';
     $('#board_select_div').html(str);
@@ -77,10 +135,11 @@ function update_board_select(selected_site) {
     var b_list = site_info.board[selected_site];
     for (var i = 0; i < b_list.length; i++) {
       var item = b_list[i];
-      if (typeof item === 'object' && item !== null && item.key) {
-        str += '<option value="' + item.key + '">' + item.name + '</option>';
-      } else if (item && item !== 'None' && item !== 'null') {
-        str += '<option value="' + item + '">' + item + '</option>';
+      var bKey = (typeof item === 'object' && item !== null && item.key) ? item.key : item;
+      var bName = (typeof item === 'object' && item !== null && item.name) ? item.name : item;
+      if (bKey && bKey !== 'None' && bKey !== 'null') {
+        var isSel = (bKey === saved_board) ? 'selected' : '';
+        str += '<option value="' + bKey + '" ' + isSel + '>' + bName + '</option>';
       }
     }
   }
@@ -105,7 +164,6 @@ function make_list(data) {
       str += j_row_start();
       str += j_col(1, item.id);
 
-      // 사이트, 게시판, 서브카테고리 뱃지 분리 표기
       var site_col = '<small class="text-muted">' + (item.created_time || '') + '</small><br>';
       site_col += '<span class="badge badge-info">' + item.site + '</span> ';
 
@@ -251,4 +309,29 @@ $(document).on('click', '.global_torrent_info_btn', function(e){
       notify('정보 조회 실패: ' + error, 'danger');
     }
   });
+});
+
+function sync_feeder_header_navbar() {
+  var lastFeed = localStorage.getItem('feeder_last_feed_page') || 'setting';
+  var lastDl = localStorage.getItem('feeder_last_download_page') || 'setting';
+
+  $('.navbar a[href*="/' + package_name + '/feed"]').attr('href', '/' + package_name + '/feed/' + lastFeed);
+  $('.navbar a[href*="/' + package_name + '/download"]').attr('href', '/' + package_name + '/download/' + lastDl);
+}
+
+$(document).on('click', '.navbar a', function(e){
+  var href = $(this).attr('href') || '';
+  if (href.indexOf('/' + package_name + '/feed') !== -1) {
+    var lastFeed = localStorage.getItem('feeder_last_feed_page');
+    if (lastFeed && lastFeed !== 'setting') {
+      e.preventDefault();
+      window.location.href = '/' + package_name + '/feed/' + lastFeed;
+    }
+  } else if (href.indexOf('/' + package_name + '/download') !== -1) {
+    var lastDl = localStorage.getItem('feeder_last_download_page');
+    if (lastDl && lastDl !== 'setting') {
+      e.preventDefault();
+      window.location.href = '/' + package_name + '/download/' + lastDl;
+    }
+  }
 });

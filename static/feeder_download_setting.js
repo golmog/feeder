@@ -26,6 +26,61 @@ $(document).ready(function(){
   load_all_download_config();
   init_dl_engine_editor();
   init_dl_trans_editor();
+
+  try {
+    localStorage.setItem('feeder_last_download_page', 'setting');
+    sync_feeder_header_navbar();
+  } catch(err) {}
+
+  restore_download_subtab();
+  setTimeout(restore_download_subtab, 80);
+});
+
+function restore_download_subtab() {
+  try {
+    var saved_tab = localStorage.getItem(package_name + '_' + sub + '_active_tab');
+    if (saved_tab) {
+      var tabElem = $('#nav-tab a[href="' + saved_tab + '"]');
+      if (tabElem.length > 0 && !tabElem.hasClass('active')) {
+        tabElem.tab('show');
+      }
+    }
+  } catch(e) {}
+}
+
+$(document).on('shown.bs.tab', '#nav-tab a[data-toggle="tab"]', function(e){
+  try {
+    var targetTab = $(e.target).attr('href');
+    if (targetTab && targetTab.startsWith('#')) {
+      localStorage.setItem(package_name + '_' + sub + '_active_tab', targetTab);
+    }
+  } catch(err) {}
+});
+
+function sync_feeder_header_navbar() {
+  try {
+    var lastFeed = localStorage.getItem('feeder_last_feed_page') || 'setting';
+    var lastDl = localStorage.getItem('feeder_last_download_page') || 'setting';
+    $('.navbar a[href*="/' + package_name + '/feed"]').attr('href', '/' + package_name + '/feed/' + lastFeed);
+    $('.navbar a[href*="/' + package_name + '/download"]').attr('href', '/' + package_name + '/download/' + lastDl);
+  } catch(e) {}
+}
+
+$(document).on('click', '.navbar a', function(e){
+  var href = $(this).attr('href') || '';
+  if (href.indexOf('/' + package_name + '/feed') !== -1) {
+    var lastFeed = localStorage.getItem('feeder_last_feed_page');
+    if (lastFeed && lastFeed !== 'setting') {
+      e.preventDefault();
+      window.location.href = '/' + package_name + '/feed/' + lastFeed;
+    }
+  } else if (href.indexOf('/' + package_name + '/download') !== -1) {
+    var lastDl = localStorage.getItem('feeder_last_download_page');
+    if (lastDl && lastDl !== 'setting') {
+      e.preventDefault();
+      window.location.href = '/' + package_name + '/download/' + lastDl;
+    }
+  }
 });
 
 function init_dl_engine_editor() {
@@ -201,8 +256,8 @@ function render_dynamic_engine_fields(engine_id, current_values) {
     var descHtml = f.desc ? '<small class="form-text text-muted">' + f.desc + '</small>' : '';
 
     html += '<div class="form-group row mb-2">';
-    html += '  <label class="col-sm-2 col-form-label text-right font-weight-bold">' + f.label + '</label>';
-    html += '  <div class="col-sm-10">';
+    html += '  <label class="col-sm-3 col-form-label text-right font-weight-bold">' + f.label + '</label>';
+    html += '  <div class="col-sm-9">';
 
     if (f.type === 'checkbox') {
       var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
@@ -503,8 +558,8 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
     var descHtml = f.desc ? '<small class="form-text text-muted">' + f.desc + '</small>' : '';
 
     html += '<div class="form-group row mb-2">';
-    html += '  <label class="col-sm-2 col-form-label text-right font-weight-bold">' + f.label + '</label>';
-    html += '  <div class="col-sm-10">';
+    html += '  <label class="col-sm-3 col-form-label text-right font-weight-bold">' + f.label + '</label>';
+    html += '  <div class="col-sm-9">';
 
     if (f.type === 'checkbox') {
       var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
@@ -841,11 +896,70 @@ function render_accounts(accounts, stats) {
     str += '  <td><code>' + (acc.mydrive_rclone_id || '-') + '</code></td>';
     str += '  <td>' + remoteDisplay + '</td>';
     str += '  <td>' + gb + ' GB (' + mb + ' MB)</td>';
-    str += '  <td><button type="button" class="btn btn-xs btn-danger text-white remove_acc_btn" data-index="' + i + '">제외</button></td>';
+    str += '  <td>';
+    str += '    <div class="btn-group btn-group-sm">';
+    str += '      <button type="button" class="btn btn-xs btn-primary text-white edit_acc_btn mr-1" data-index="' + i + '">수정</button>';
+    str += '      <button type="button" class="btn btn-xs btn-danger text-white remove_acc_btn" data-index="' + i + '">제외</button>';
+    str += '    </div>';
+    str += '  </td>';
     str += '</tr>';
   }
   tbody.html(str);
 }
+
+$(document).on('click', '.edit_acc_btn', function(e){
+  e.preventDefault();
+  var idx = parseInt($(this).data('index'));
+  var acc = current_accounts[idx];
+  if (!acc) return;
+
+  $('#modal_acc_index').val(idx);
+  $('#gdrive_account_modal_title').text('구글 드라이브 계정 수정: ' + acc.username);
+  $('#modal_acc_username').val(acc.username || '');
+  $('#modal_acc_mydrive_id').val(acc.mydrive_rclone_id || '');
+  $('#modal_acc_remote_name').val(acc.remote_name || '');
+  $('#gdrive_account_modal').modal('show');
+});
+
+$(document).on('click', '#gdrive_account_save_btn', function(e){
+  e.preventDefault();
+  var idx = parseInt($('#modal_acc_index').val());
+  var uname = $('#modal_acc_username').val().trim();
+  var mydrive_id = $('#modal_acc_mydrive_id').val().trim();
+  var rname = $('#modal_acc_remote_name').val().trim();
+
+  if (!uname) {
+    notify('계정 식별자(이메일)를 입력하세요.', 'warning');
+    return;
+  }
+  if (!mydrive_id) {
+    notify('내 드라이브 폴더 ID를 입력하세요.', 'warning');
+    return;
+  }
+
+  if (idx >= 0 && idx < current_accounts.length) {
+    current_accounts[idx].username = uname;
+    current_accounts[idx].mydrive_rclone_id = mydrive_id;
+    if (rname) {
+      current_accounts[idx].remote_name = rname;
+    } else {
+      delete current_accounts[idx].remote_name;
+    }
+  }
+
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/save_accounts',
+    type: "POST",
+    data: {accounts_json: JSON.stringify(current_accounts)},
+    dataType: "json",
+    success: function(data) {
+      notify('계정 정보가 수정되었습니다.', 'success');
+      $('#gdrive_account_modal').modal('hide');
+      current_accounts = data.accounts || [];
+      render_accounts(current_accounts, {});
+    }
+  });
+});
 
 $(document).on('click', '#gdrive_batch_modal_btn', function(e){
   e.preventDefault();
@@ -875,6 +989,10 @@ $(document).on('click', '#gdrive_batch_save_btn', function(e){
 $(document).on('click', '.remove_acc_btn', function(e){
   e.preventDefault();
   var idx = $(this).data('index');
+  var acc = current_accounts[idx];
+  var accName = acc ? acc.username : '해당';
+  if (!confirm('[' + accName + '] 계정을 계정 풀에서 제외하시겠습니까?')) return;
+
   current_accounts.splice(idx, 1);
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/save_accounts',
@@ -1075,4 +1193,19 @@ $(document).on('click', '#transporter_script_delete_btn', function(e){
       }
     }
   });
+});
+
+$(document).on('click', 'nav a, .navbar a', function(){
+  var href = $(this).attr('href') || '';
+  if (href.indexOf('/' + package_name + '/feed') !== -1 && href.indexOf('manual') === -1 && href.indexOf('log') === -1) {
+    var lastFeedPage = localStorage.getItem('feeder_last_sub_feed');
+    if (lastFeedPage && lastFeedPage !== 'setting') {
+      $(this).attr('href', '/' + package_name + '/feed/' + lastFeedPage);
+    }
+  } else if (href.indexOf('/' + package_name + '/download') !== -1) {
+    var lastDlPage = localStorage.getItem('feeder_last_sub_download');
+    if (lastDlPage && lastDlPage !== 'setting') {
+      $(this).attr('href', '/' + package_name + '/download/' + lastDlPage);
+    }
+  }
 });
