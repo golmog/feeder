@@ -4,9 +4,88 @@ var current_accounts = [];
 var available_feeds = [];
 var modal_profile_feeds = [];
 var modal_profile_chain = [];
+var available_engine_schemas = [];
+var available_transporter_schemas = [];
+var dl_engine_editor = null;
+var dl_trans_editor = null;
+
+var TRANSPORTER_SKELETON = '# -*- coding: utf-8 -*-\n' +
+  'from feeder.setup import logger\n' +
+  'from feeder.util_download import BaseTransporter\n\n' +
+  'class CustomTransporter(BaseTransporter):\n' +
+  '    TRANSPORTER_ID = "custom_trans"\n' +
+  '    TRANSPORTER_NAME = "커스텀 이송 핸들러"\n\n' +
+  '    CONFIG_SCHEMA = [\n' +
+  '        {"name": "target_path", "label": "대상 경로", "type": "text", "default": "/data/target"}\n' +
+  '    ]\n\n' +
+  '    def transport(self, item, source_path: str, dest_config: dict) -> tuple[bool, str, str]:\n' +
+  '        logger.info(f"이송 실행: {item.title} -> {dest_config.get(\'target_path\')}")\n' +
+  '        return True, "completed", "이송 완료"\n';
 
 $(document).ready(function(){
   load_all_download_config();
+  init_dl_engine_editor();
+  init_dl_trans_editor();
+});
+
+function init_dl_engine_editor() {
+  if ($('#download_script_code_editor').length && !dl_engine_editor && window.ace) {
+    dl_engine_editor = ace.edit("download_script_code_editor");
+    dl_engine_editor.setTheme("ace/theme/monokai");
+    dl_engine_editor.session.setMode("ace/mode/python");
+    dl_engine_editor.setFontSize(13);
+    dl_engine_editor.setShowPrintMargin(false);
+    dl_engine_editor.session.setTabSize(4);
+    dl_engine_editor.session.setUseSoftTabs(true);
+    dl_engine_editor.session.setUseWrapMode(true);
+  }
+}
+
+function init_dl_trans_editor() {
+  if ($('#transporter_script_code_editor').length && !dl_trans_editor && window.ace) {
+    dl_trans_editor = ace.edit("transporter_script_code_editor");
+    dl_trans_editor.setTheme("ace/theme/monokai");
+    dl_trans_editor.session.setMode("ace/mode/python");
+    dl_trans_editor.setFontSize(13);
+    dl_trans_editor.setShowPrintMargin(false);
+    dl_trans_editor.session.setTabSize(4);
+    dl_trans_editor.session.setUseSoftTabs(true);
+    dl_trans_editor.session.setUseWrapMode(true);
+  }
+}
+
+// 모달 표시 완료 시점 에디터 크기 렌더링 강제 동기화
+$('#download_script_modal').on('shown.bs.modal', function () {
+  init_dl_engine_editor();
+  if (dl_engine_editor) {
+    dl_engine_editor.resize();
+    dl_engine_editor.renderer.updateFull();
+  }
+});
+
+$('#transporter_script_modal').on('shown.bs.modal', function () {
+  init_dl_trans_editor();
+  if (dl_trans_editor) {
+    dl_trans_editor.resize();
+    dl_trans_editor.renderer.updateFull();
+  }
+});
+
+// 모달 전체화면 확대/복원 지원
+$(document).on('click', '.modal-fullscreen-btn', function(e){
+  e.preventDefault();
+  var modalDialog = $(this).closest('.modal-dialog');
+  modalDialog.toggleClass('modal-fullscreen');
+  var icon = $(this).find('i');
+  if (modalDialog.hasClass('modal-fullscreen')) {
+    icon.removeClass('fa-expand').addClass('fa-compress');
+  } else {
+    icon.removeClass('fa-compress').addClass('fa-expand');
+  }
+  setTimeout(function(){
+    if (dl_engine_editor) dl_engine_editor.resize();
+    if (dl_trans_editor) dl_trans_editor.resize();
+  }, 150);
 });
 
 function load_all_download_config() {
@@ -16,7 +95,9 @@ function load_all_download_config() {
     dataType: "json",
     success: function(data) {
       current_downloaders = data.downloaders || [];
+      available_engine_schemas = data.schemas || [];
       render_downloaders(current_downloaders);
+      update_engine_type_dropdown();
     }
   });
 
@@ -27,7 +108,9 @@ function load_all_download_config() {
     success: function(data) {
       current_profiles = data.profiles || [];
       available_feeds = data.feeds || [];
+      available_transporter_schemas = data.transporter_schemas || [];
       render_profiles(current_profiles);
+      update_profile_dest_type_dropdown();
     }
   });
 
@@ -53,15 +136,19 @@ function render_downloaders(data) {
     var item = data[i];
     var isEnabled = (item.enabled === true || item.enabled === 'True' || item.enabled === 'on');
     var statusBadge = isEnabled ? '<span class="badge badge-success">활성</span>' : '<span class="badge badge-secondary">중지</span>';
-    var timeoutStr = (item.stalled_timeout_hours || 24) + '시간 타임아웃';
+    var rawTimeout = (item.stalled_timeout_hours !== undefined && item.stalled_timeout_hours !== null && item.stalled_timeout_hours !== '') ? parseInt(item.stalled_timeout_hours) : 24;
+    var timeoutStr = (rawTimeout <= 0) ? '<span class="text-info font-weight-bold">타임아웃 무제한</span>' : rawTimeout + '시간 타임아웃';
 
     var connDetail = '';
     if (item.engine_type === 'alldebrid') {
       connDetail = '리모트: <code>' + (item.remote_name || 'ad') + ':' + (item.rclone_base_path || 'magnets') + '</code>';
     } else if (item.engine_type === '115') {
-      connDetail = 'CD2: ' + item.cd2_addr + ':' + item.cd2_port + ' | 마운트: ' + (item.cd2_mount_path || '-');
+      connDetail = 'CD2: ' + (item.cd2_addr || '127.0.0.1') + ':' + (item.cd2_port || 19798) + ' | 마운트: ' + (item.cd2_mount_path || '-');
     } else if (item.engine_type === 'qbittorrent') {
-      connDetail = 'URL: ' + item.url + ' | 저장: ' + (item.save_path || '-');
+      connDetail = 'URL: ' + (item.url || '-') + ' | 저장: ' + (item.save_path || '-');
+    } else {
+      var keys = Object.keys(item).filter(function(k){ return ['name', 'engine_type', 'enabled', 'stalled_timeout_hours'].indexOf(k) === -1; });
+      connDetail = keys.slice(0, 3).map(function(k){ return k + ': ' + item[k]; }).join(' | ') || '-';
     }
 
     str += '<tr>';
@@ -80,10 +167,63 @@ function render_downloaders(data) {
   tbody.html(str);
 }
 
+function update_engine_type_dropdown(selected_type) {
+  var select = $('#dl_engine_type');
+  select.empty();
+  if (!available_engine_schemas || available_engine_schemas.length === 0) {
+    select.append('<option value="">-- 등록된 엔진 스크립트 없음 --</option>');
+    return;
+  }
+  for (var i = 0; i < available_engine_schemas.length; i++) {
+    var schema = available_engine_schemas[i];
+    var isSel = (schema.engine_id === selected_type) ? 'selected' : '';
+    select.append('<option value="' + schema.engine_id + '" ' + isSel + '>' + schema.engine_name + ' (' + schema.engine_id + ')</option>');
+  }
+}
+
+function render_dynamic_engine_fields(engine_id, current_values) {
+  var container = $('#dl_dynamic_engine_fields');
+  container.empty();
+
+  var schemaObj = available_engine_schemas.find(function(s){ return s.engine_id === engine_id; });
+  if (!schemaObj || !schemaObj.config_schema || schemaObj.config_schema.length === 0) {
+    container.html('<div class="text-muted small p-2 text-center">해당 엔진에 별도 설정 항목이 없습니다.</div>');
+    return;
+  }
+
+  var html = '<hr><h6 class="text-info font-weight-bold mb-3"><i class="fa fa-sliders mr-1"></i>' + schemaObj.engine_name + ' 상세 설정</h6>';
+  var fields = schemaObj.config_schema;
+
+  for (var i = 0; i < fields.length; i++) {
+    var f = fields[i];
+    var val = (current_values && current_values[f.name] !== undefined) ? current_values[f.name] : (f.default !== undefined ? f.default : '');
+    var ph = f.placeholder || '';
+    var descHtml = f.desc ? '<small class="form-text text-muted">' + f.desc + '</small>' : '';
+
+    html += '<div class="form-group row mb-2">';
+    html += '  <label class="col-sm-3 col-form-label text-right font-weight-bold">' + f.label + '</label>';
+    html += '  <div class="col-sm-9">';
+
+    if (f.type === 'checkbox') {
+      var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
+      html += '    <input type="checkbox" id="dl_field_' + f.name + '" class="mt-2" ' + isChk + '>';
+    } else if (f.type === 'number') {
+      html += '    <input type="number" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+    } else if (f.type === 'password') {
+      html += '    <input type="password" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+    } else {
+      html += '    <input type="text" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+    }
+
+    html += descHtml;
+    html += '  </div>';
+    html += '</div>';
+  }
+  container.html(html);
+}
+
 $('#dl_engine_type').change(function(){
-  var val = $(this).val();
-  $('.dl-engine-fields').hide();
-  $('#dl_fields_' + val).show();
+  render_dynamic_engine_fields($(this).val(), null);
 });
 
 $(document).on('click', '#downloader_add_btn', function(e){
@@ -91,10 +231,12 @@ $(document).on('click', '#downloader_add_btn', function(e){
   $('#downloader_modal_title').text('다운로더 엔진 추가');
   $('#downloader_mode').val('add');
   $('#dl_name').val('').prop('readonly', false);
-  $('#dl_engine_type').val('alldebrid').trigger('change');
   $('#dl_enabled').prop('checked', true);
-  $('#dl_stalled_timeout_hours').val('24');
-  $('#dl_ad_apikey').val('');
+
+  var default_engine = available_engine_schemas.length > 0 ? available_engine_schemas[0].engine_id : '';
+  update_engine_type_dropdown(default_engine);
+  render_dynamic_engine_fields(default_engine, null);
+
   $('#downloader_modal').modal('show');
 });
 
@@ -106,28 +248,57 @@ $(document).on('click', '.edit_dl_btn', function(e){
   $('#downloader_modal_title').text('다운로더 엔진 수정: ' + item.name);
   $('#downloader_mode').val('edit');
   $('#dl_name').val(item.name).prop('readonly', true);
-  $('#dl_engine_type').val(item.engine_type).trigger('change');
   $('#dl_enabled').prop('checked', item.enabled);
-  $('#dl_stalled_timeout_hours').val(item.stalled_timeout_hours || 24);
 
-  if (item.engine_type === 'alldebrid') {
-    $('#dl_ad_apikey').val(item.apikey || '');
-    $('#dl_ad_remote').val(item.remote_name || 'ad');
-    $('#dl_ad_base_path').val(item.rclone_base_path || 'magnets');
-  } else if (item.engine_type === '115') {
-    $('#dl_115_addr').val(item.cd2_addr || '127.0.0.1');
-    $('#dl_115_port').val(item.cd2_port || 19798);
-    $('#dl_115_token').val(item.cd2_token || '');
-    $('#dl_115_vpath').val(item.cd2_virtual_path || '115open/云下载');
-    $('#dl_115_mpath').val(item.cd2_mount_path || '');
-    $('#dl_115_cpath').val(item.cd2_completed_path || '');
-  } else if (item.engine_type === 'qbittorrent') {
-    $('#dl_qb_url').val(item.url || 'http://127.0.0.1:8080');
-    $('#dl_qb_user').val(item.username || 'admin');
-    $('#dl_qb_pass').val(item.password || '');
-    $('#dl_qb_save_path').val(item.save_path || '');
-  }
+  update_engine_type_dropdown(item.engine_type);
+  render_dynamic_engine_fields(item.engine_type, item);
+
   $('#downloader_modal').modal('show');
+});
+
+$(document).on('click', '#downloader_test_btn', function(e){
+  e.preventDefault();
+  var name = $('#dl_name').val().trim() || 'test_engine';
+  var e_type = $('#dl_engine_type').val();
+  if (!e_type) { notify('엔진 타입을 선택하세요.', 'warning'); return; }
+
+  var cfg = {
+    name: name,
+    engine_type: e_type
+  };
+
+  var schemaObj = available_engine_schemas.find(function(s){ return s.engine_id === e_type; });
+  if (schemaObj && schemaObj.config_schema) {
+    for (var i = 0; i < schemaObj.config_schema.length; i++) {
+      var f = schemaObj.config_schema[i];
+      var el = $('#dl_field_' + f.name);
+      if (f.type === 'checkbox') {
+        cfg[f.name] = el.is(':checked');
+      } else if (f.type === 'number') {
+        cfg[f.name] = parseInt(el.val()) || 0;
+      } else {
+        cfg[f.name] = el.val().trim();
+      }
+    }
+  }
+
+  notify('다운로더 엔진 연결 테스트 중...', 'info');
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/test_downloader',
+    type: "POST",
+    data: {downloader_json: JSON.stringify(cfg)},
+    dataType: "json",
+    success: function(data) {
+      if (data.ret === 'success') {
+        notify(data.msg || '연결 성공', 'success');
+      } else {
+        notify('연결 실패: ' + (data.msg || '알 수 없는 오류'), 'warning');
+      }
+    },
+    error: function() {
+      notify('연결 테스트 통신 실패', 'danger');
+    }
+  });
 });
 
 $(document).on('click', '#downloader_save_btn', function(e){
@@ -135,30 +306,27 @@ $(document).on('click', '#downloader_save_btn', function(e){
   var name = $('#dl_name').val().trim();
   var e_type = $('#dl_engine_type').val();
   if (!name) { notify('식별명을 입력하세요.', 'warning'); return; }
+  if (!e_type) { notify('엔진 타입을 선택하세요.', 'warning'); return; }
 
   var cfg = {
     name: name,
     engine_type: e_type,
-    enabled: $('#dl_enabled').is(':checked'),
-    stalled_timeout_hours: parseInt($('#dl_stalled_timeout_hours').val()) || 24
+    enabled: $('#dl_enabled').is(':checked')
   };
 
-  if (e_type === 'alldebrid') {
-    cfg.apikey = $('#dl_ad_apikey').val().trim();
-    cfg.remote_name = $('#dl_ad_remote').val().trim() || 'ad';
-    cfg.rclone_base_path = $('#dl_ad_base_path').val().trim() || 'magnets';
-  } else if (e_type === '115') {
-    cfg.cd2_addr = $('#dl_115_addr').val().trim();
-    cfg.cd2_port = parseInt($('#dl_115_port').val()) || 19798;
-    cfg.cd2_token = $('#dl_115_token').val().trim();
-    cfg.cd2_virtual_path = $('#dl_115_vpath').val().trim();
-    cfg.cd2_mount_path = $('#dl_115_mpath').val().trim();
-    cfg.cd2_completed_path = $('#dl_115_cpath').val().trim();
-  } else if (e_type === 'qbittorrent') {
-    cfg.url = $('#dl_qb_url').val().trim();
-    cfg.username = $('#dl_qb_user').val().trim();
-    cfg.password = $('#dl_qb_pass').val();
-    cfg.save_path = $('#dl_qb_save_path').val().trim();
+  var schemaObj = available_engine_schemas.find(function(s){ return s.engine_id === e_type; });
+  if (schemaObj && schemaObj.config_schema) {
+    for (var i = 0; i < schemaObj.config_schema.length; i++) {
+      var f = schemaObj.config_schema[i];
+      var el = $('#dl_field_' + f.name);
+      if (f.type === 'checkbox') {
+        cfg[f.name] = el.is(':checked');
+      } else if (f.type === 'number') {
+        cfg[f.name] = parseInt(el.val()) || 0;
+      } else {
+        cfg[f.name] = el.val().trim();
+      }
+    }
   }
 
   $.ajax({
@@ -192,16 +360,175 @@ $(document).on('click', '.delete_dl_btn', function(e){
   });
 });
 
-// 프로필 목적지 유형에 따른 폼 필드 토글
-$('#profile_dest_type').change(function(){
-  var val = $(this).val();
-  $('.dest-type-fields').hide();
-  if (val === 'gdrive_rotation') {
-    $('#profile_fields_gdrive_rotation').show();
-  } else if (val === 'rclone_simple') {
-    $('#profile_fields_rclone_simple').show();
-  }
+$(document).on('click', '#download_script_manage_btn', function(e){
+  e.preventDefault();
+  load_download_script_list();
+  $('#download_script_modal').modal('show');
+  setTimeout(function(){ if (dl_engine_editor) dl_engine_editor.resize(); }, 200);
 });
+
+function load_download_script_list(selected_name) {
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/download_script_list',
+    type: "POST",
+    dataType: "json",
+    success: function(data) {
+      var files = data.files || [];
+      var select = $('#download_script_select');
+      select.empty();
+      select.append('<option value="">-- 파일 선택 --</option>');
+      for (var i = 0; i < files.length; i++) {
+        var isSel = (files[i] === selected_name) ? 'selected' : '';
+        select.append('<option value="' + files[i] + '" ' + isSel + '>' + files[i] + '</option>');
+      }
+      if (selected_name) {
+        select.val(selected_name).trigger('change');
+      } else if (files.length > 0) {
+        select.val(files[0]).trigger('change');
+      } else {
+        $('#download_script_new_btn').trigger('click');
+      }
+    }
+  });
+}
+
+$(document).on('change', '#download_script_select', function(){
+  var filename = $(this).val();
+  if (!filename) return;
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/download_script_read',
+    type: "POST",
+    data: {filename: filename},
+    dataType: "json",
+    success: function(data) {
+      if (data.ret === 'success') {
+        $('#download_script_name').val(data.filename);
+        $('#download_script_code').val(data.content);
+        if (dl_engine_editor) dl_engine_editor.setValue(data.content, -1);
+        $('#download_script_status').text('불러오기 완료');
+      } else {
+        notify('파일 로드 실패: ' + (data.log || data.ret), 'warning');
+      }
+    }
+  });
+});
+
+$(document).on('click', '#download_script_new_btn', function(e){
+  e.preventDefault();
+  $('#download_script_select').val('');
+  $('#download_script_name').val('engine_new.py');
+  $('#download_script_code').val(ENGINE_SKELETON);
+  if (dl_engine_editor) dl_engine_editor.setValue(ENGINE_SKELETON, -1);
+  $('#download_script_status').text('새 엔진 템플릿 로드');
+});
+
+$(document).on('click', '#download_script_save_btn', function(e){
+  e.preventDefault();
+  var filename = $('#download_script_name').val().trim();
+  var content = dl_engine_editor ? dl_engine_editor.getValue() : $('#download_script_code').val();
+  if (!filename) { notify('파일명을 입력하세요.', 'warning'); return; }
+
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/download_script_save',
+    type: "POST",
+    data: {filename: filename, content: content},
+    dataType: "json",
+    success: function(data) {
+      if (data.ret === 'success') {
+        notify('엔진 스크립트가 저장 및 동적 로드되었습니다.', 'success');
+        $('#download_script_status').text('저장 및 엔진 로드 완료 (' + filename + ')');
+        load_download_script_list(data.filename);
+        available_engine_schemas = data.schemas || [];
+        update_engine_type_dropdown();
+      } else {
+        notify('저장 실패: ' + (data.log || data.ret), 'danger');
+      }
+    }
+  });
+});
+
+$(document).on('click', '#download_script_delete_btn', function(e){
+  e.preventDefault();
+  var filename = $('#download_script_name').val().trim();
+  if (!filename) return;
+  if (!confirm('[' + filename + '] 엔진 스크립트를 삭제하시겠습니까?')) return;
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/download_script_delete',
+    type: "POST",
+    data: {filename: filename},
+    dataType: "json",
+    success: function(data) {
+      if (data.ret === 'success') {
+        notify('삭제되었습니다.', 'success');
+        load_download_script_list();
+      } else {
+        notify('삭제 실패: ' + (data.log || data.ret), 'danger');
+      }
+    }
+  });
+});
+
+function update_profile_dest_type_dropdown(selected_type) {
+  var select = $('#profile_dest_type');
+  select.empty();
+  if (!available_transporter_schemas || available_transporter_schemas.length === 0) {
+    select.append('<option value="">-- 등록된 이송 핸들러 없음 --</option>');
+    return;
+  }
+  for (var i = 0; i < available_transporter_schemas.length; i++) {
+    var s = available_transporter_schemas[i];
+    var isSel = (s.transporter_id === selected_type) ? 'selected' : '';
+    select.append('<option value="' + s.transporter_id + '" ' + isSel + '>' + s.transporter_name + ' (' + s.transporter_id + ')</option>');
+  }
+}
+
+// 목적지 유형의 CONFIG_SCHEMA에 따라 폼 동적 빌드
+function render_dynamic_dest_fields(transporter_id, current_values) {
+  var container = $('#profile_dynamic_dest_fields');
+  container.empty();
+
+  var schemaObj = available_transporter_schemas.find(function(s){ return s.transporter_id === transporter_id; });
+  if (!schemaObj || !schemaObj.config_schema || schemaObj.config_schema.length === 0) {
+    container.html('<div class="text-muted small p-2 text-center">해당 목적지에 별도 세부 설정 항목이 없습니다.</div>');
+    return;
+  }
+
+  var html = '<hr><h6 class="text-info font-weight-bold mb-3"><i class="fa fa-folder-open mr-1"></i>' + schemaObj.transporter_name + ' 세부 설정</h6>';
+  var fields = schemaObj.config_schema;
+
+  for (var i = 0; i < fields.length; i++) {
+    var f = fields[i];
+    var val = (current_values && current_values[f.name] !== undefined) ? current_values[f.name] : (f.default !== undefined ? f.default : '');
+    var ph = f.placeholder || '';
+    var descHtml = f.desc ? '<small class="form-text text-muted">' + f.desc + '</small>' : '';
+
+    html += '<div class="form-group row mb-2">';
+    html += '  <label class="col-sm-3 col-form-label text-right font-weight-bold">' + f.label + '</label>';
+    html += '  <div class="col-sm-9">';
+
+    if (f.type === 'checkbox') {
+      var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
+      html += '    <input type="checkbox" id="dest_field_' + f.name + '" class="mt-2" ' + isChk + '>';
+    } else if (f.type === 'number') {
+      html += '    <input type="number" id="dest_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+    } else if (f.type === 'password') {
+      html += '    <input type="password" id="dest_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+    } else {
+      html += '    <input type="text" id="dest_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+    }
+
+    html += descHtml;
+    html += '  </div>';
+    html += '</div>';
+  }
+  container.html(html);
+}
+
+// 목적지 유형 변경 시 즉시 동적 폼 재빌드
+$('#profile_dest_type').change(function(){
+  render_dynamic_dest_fields($(this).val(), null);
+});
+
 function render_profiles(data) {
   var tbody = $('#profile_list_tbody');
   if (!data || data.length === 0) {
@@ -220,6 +547,9 @@ function render_profiles(data) {
     var destInfo = '<span class="badge badge-dark">' + (dest.type || 'local') + '</span>';
     if (dest.type === 'rclone_simple' && dest.remote_path) {
       destInfo += '<br><small class="text-muted">' + dest.remote_path + '</small>';
+    } else if (dest.type === 'colab_gdrive') {
+      destInfo = '<span class="badge badge-primary">Colab GDrive</span>';
+      if (dest.remote_name) destInfo += '<br><small class="text-muted">' + dest.remote_name + ' (' + (dest.buffer_limit_gb || 50) + 'GB 버퍼)</small>';
     }
 
     str += '<tr>';
@@ -238,7 +568,6 @@ function render_profiles(data) {
   tbody.html(str);
 }
 
-// 모달 내 피드 및 다운로더 선택 드롭다운 갱신
 function update_profile_modal_dropdowns() {
   var feedSelect = $('#profile_feed_select');
   feedSelect.empty();
@@ -263,7 +592,6 @@ function update_profile_modal_dropdowns() {
   }
 }
 
-// 선택된 피드 뱃지 렌더링
 function render_selected_feeds() {
   var container = $('#profile_selected_feeds_container');
   container.empty();
@@ -282,7 +610,6 @@ function render_selected_feeds() {
   }
 }
 
-// 우선순위 체인 테이블 렌더링
 function render_chain_table() {
   var tbody = $('#profile_chain_table_tbody');
   tbody.empty();
@@ -307,7 +634,6 @@ function render_chain_table() {
   }
 }
 
-// 피드 추가 버튼 클릭
 $(document).on('click', '#btn_add_profile_feed', function(e){
   e.preventDefault();
   var sel = $('#profile_feed_select').val();
@@ -320,7 +646,6 @@ $(document).on('click', '#btn_add_profile_feed', function(e){
   render_selected_feeds();
 });
 
-// 전체 피드(*) 원클릭 추가
 $(document).on('click', '#btn_add_all_feed', function(e){
   e.preventDefault();
   if (modal_profile_feeds.indexOf('*') !== -1) return;
@@ -328,7 +653,6 @@ $(document).on('click', '#btn_add_all_feed', function(e){
   render_selected_feeds();
 });
 
-// 선택된 피드 뱃지 삭제
 $(document).on('click', '.remove-profile-feed-btn', function(e){
   e.preventDefault();
   var target = $(this).data('feed');
@@ -336,7 +660,6 @@ $(document).on('click', '.remove-profile-feed-btn', function(e){
   render_selected_feeds();
 });
 
-// 체인 엔진 추가 버튼 클릭
 $(document).on('click', '#btn_add_profile_engine', function(e){
   e.preventDefault();
   var eng = $('#profile_engine_select').val();
@@ -349,7 +672,6 @@ $(document).on('click', '#btn_add_profile_engine', function(e){
   render_chain_table();
 });
 
-// 체인 순서 위/아래 이동 및 제외
 $(document).on('click', '.chain-move-btn', function(e){
   e.preventDefault();
   var idx = parseInt($(this).data('index'));
@@ -373,18 +695,16 @@ $(document).on('click', '.chain-remove-btn', function(e){
   render_chain_table();
 });
 
-// 프로필 추가 모달 열기
 $(document).on('click', '#profile_add_btn', function(e){
   e.preventDefault();
   $('#profile_modal_title').text('다운로드 프로필 추가');
   $('#profile_mode').val('add');
   $('#profile_name').val('').prop('readonly', false);
   $('#profile_append_hash_on_conflict').prop('checked', true);
-  $('#profile_dest_type').val('gdrive_rotation').trigger('change');
-  $('#profile_gdrive_upload_path').val('incoming/default');
-  $('#profile_gdrive_complete_path').val('uploads/default');
-  $('#profile_gdrive_remote_id').val('');
-  $('#profile_simple_remote_path').val('');
+
+  var default_trans = available_transporter_schemas.length > 0 ? available_transporter_schemas[0].transporter_id : '';
+  update_profile_dest_type_dropdown(default_trans);
+  render_dynamic_dest_fields(default_trans, null);
 
   modal_profile_feeds = ['*'];
   modal_profile_chain = [];
@@ -395,7 +715,6 @@ $(document).on('click', '#profile_add_btn', function(e){
   $('#profile_modal').modal('show');
 });
 
-// 프로필 수정 모달 열기
 $(document).on('click', '.edit_profile_btn', function(e){
   e.preventDefault();
   var idx = $(this).data('index');
@@ -407,11 +726,8 @@ $(document).on('click', '.edit_profile_btn', function(e){
   $('#profile_append_hash_on_conflict').prop('checked', p.append_hash_on_conflict !== false);
 
   var dest = p.destination || {};
-  $('#profile_dest_type').val(dest.type || 'gdrive_rotation').trigger('change');
-  $('#profile_gdrive_upload_path').val(dest.upload_path || 'incoming/default');
-  $('#profile_gdrive_complete_path').val(dest.complete_path || 'uploads/default');
-  $('#profile_gdrive_remote_id').val(dest.shared_drive_id || '');
-  $('#profile_simple_remote_path').val(dest.remote_path || '');
+  update_profile_dest_type_dropdown(dest.type || '');
+  render_dynamic_dest_fields(dest.type || '', dest);
 
   modal_profile_feeds = (p.feeds && p.feeds.length > 0) ? JSON.parse(JSON.stringify(p.feeds)) : ['*'];
   modal_profile_chain = (p.priority_chain && p.priority_chain.length > 0) ? JSON.parse(JSON.stringify(p.priority_chain)) : [];
@@ -422,7 +738,6 @@ $(document).on('click', '.edit_profile_btn', function(e){
   $('#profile_modal').modal('show');
 });
 
-// 프로필 저장 버튼 클릭
 $(document).on('click', '#profile_save_btn', function(e){
   e.preventDefault();
   var name = $('#profile_name').val().trim();
@@ -439,12 +754,21 @@ $(document).on('click', '#profile_save_btn', function(e){
 
   var destType = $('#profile_dest_type').val();
   var destObj = {type: destType};
-  if (destType === 'gdrive_rotation') {
-    destObj.upload_path = $('#profile_gdrive_upload_path').val().trim();
-    destObj.complete_path = $('#profile_gdrive_complete_path').val().trim();
-    destObj.shared_drive_id = $('#profile_gdrive_remote_id').val().trim();
-  } else if (destType === 'rclone_simple') {
-    destObj.remote_path = $('#profile_simple_remote_path').val().trim();
+
+  // 선택된 트랜스포터 스키마에 따라 동적 필드 값 수집
+  var schemaObj = available_transporter_schemas.find(function(s){ return s.transporter_id === destType; });
+  if (schemaObj && schemaObj.config_schema) {
+    for (var i = 0; i < schemaObj.config_schema.length; i++) {
+      var f = schemaObj.config_schema[i];
+      var el = $('#dest_field_' + f.name);
+      if (f.type === 'checkbox') {
+        destObj[f.name] = el.is(':checked');
+      } else if (f.type === 'number') {
+        destObj[f.name] = parseInt(el.val()) || 0;
+      } else {
+        destObj[f.name] = el.val().trim();
+      }
+    }
   }
 
   var profile_obj = {
@@ -502,6 +826,7 @@ function render_accounts(accounts, stats) {
     var bytes = usageMap[uname] || 0;
     var mb = (bytes / (1024 * 1024)).toFixed(1);
     var gb = (bytes / (1024 * 1024 * 1024)).toFixed(2);
+    var remoteDisplay = acc.remote_name ? '<code>' + acc.remote_name + '</code>' : '<span class="text-muted small">기본 리모트 사용</span>';
 
     var blockBadge = '';
     if (blockedMap[uname]) {
@@ -514,6 +839,7 @@ function render_accounts(accounts, stats) {
     str += '<tr>';
     str += '  <td class="font-weight-bold text-left">' + uname + blockBadge + '</td>';
     str += '  <td><code>' + (acc.mydrive_rclone_id || '-') + '</code></td>';
+    str += '  <td>' + remoteDisplay + '</td>';
     str += '  <td>' + gb + ' GB (' + mb + ' MB)</td>';
     str += '  <td><button type="button" class="btn btn-xs btn-outline-danger remove_acc_btn" data-index="' + i + '">제외</button></td>';
     str += '</tr>';
@@ -583,7 +909,6 @@ $(document).on('click', '#history_import_modal_btn', function(e){
   $('#history_import_modal').modal('show');
 });
 
-// 텍스트 마그넷 목록 임포트
 $(document).on('click', '#btn_run_import_text', function(e){
   e.preventDefault();
   var text = $('#import_text_content').val().trim();
@@ -609,7 +934,6 @@ $(document).on('click', '#btn_run_import_text', function(e){
   });
 });
 
-// SQLite DB 파일 통째 임포트
 $(document).on('click', '#btn_run_import_db', function(e){
   e.preventDefault();
   var dbPath = $('#import_db_path').val().trim();
@@ -645,3 +969,110 @@ $(document).on('click', '#btn_run_import_db', function(e){
   });
 });
 
+$(document).on('click', '#transporter_script_manage_btn', function(e){
+  e.preventDefault();
+  load_transporter_script_list();
+  $('#transporter_script_modal').modal('show');
+  setTimeout(function(){ if (dl_trans_editor) dl_trans_editor.resize(); }, 200);
+});
+
+function load_transporter_script_list(selected_name) {
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/transporter_script_list',
+    type: "POST",
+    dataType: "json",
+    success: function(data) {
+      var files = data.files || [];
+      var select = $('#transporter_script_select');
+      select.empty();
+      select.append('<option value="">-- 파일 선택 --</option>');
+      for (var i = 0; i < files.length; i++) {
+        var isSel = (files[i] === selected_name) ? 'selected' : '';
+        select.append('<option value="' + files[i] + '" ' + isSel + '>' + files[i] + '</option>');
+      }
+      if (selected_name) {
+        select.val(selected_name).trigger('change');
+      } else if (files.length > 0) {
+        select.val(files[0]).trigger('change');
+      } else {
+        $('#transporter_script_new_btn').trigger('click');
+      }
+    }
+  });
+}
+
+$(document).on('change', '#transporter_script_select', function(){
+  var filename = $(this).val();
+  if (!filename) return;
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/transporter_script_read',
+    type: "POST",
+    data: {filename: filename},
+    dataType: "json",
+    success: function(data) {
+      if (data.ret === 'success') {
+        $('#transporter_script_name').val(data.filename);
+        $('#transporter_script_code').val(data.content);
+        if (dl_trans_editor) dl_trans_editor.setValue(data.content, -1);
+        $('#transporter_script_status').text('불러오기 완료');
+      } else {
+        notify('파일 로드 실패: ' + (data.log || data.ret), 'warning');
+      }
+    }
+  });
+});
+
+$(document).on('click', '#transporter_script_new_btn', function(e){
+  e.preventDefault();
+  $('#transporter_script_select').val('');
+  $('#transporter_script_name').val('trans_new.py');
+  $('#transporter_script_code').val(TRANSPORTER_SKELETON);
+  if (dl_trans_editor) dl_trans_editor.setValue(TRANSPORTER_SKELETON, -1);
+  $('#transporter_script_status').text('새 이송 템플릿 로드');
+});
+
+$(document).on('click', '#transporter_script_save_btn', function(e){
+  e.preventDefault();
+  var filename = $('#transporter_script_name').val().trim();
+  var content = dl_trans_editor ? dl_trans_editor.getValue() : $('#transporter_script_code').val();
+  if (!filename) { notify('파일명을 입력하세요.', 'warning'); return; }
+
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/transporter_script_save',
+    type: "POST",
+    data: {filename: filename, content: content},
+    dataType: "json",
+    success: function(data) {
+      if (data.ret === 'success') {
+        notify('이송 스크립트가 저장 및 동적 로드되었습니다.', 'success');
+        $('#transporter_script_status').text('저장 및 핸들러 로드 완료 (' + filename + ')');
+        load_transporter_script_list(data.filename);
+        available_transporter_schemas = data.transporter_schemas || [];
+        update_profile_dest_type_dropdown();
+      } else {
+        notify('저장 실패: ' + (data.log || data.ret), 'danger');
+      }
+    }
+  });
+});
+
+$(document).on('click', '#transporter_script_delete_btn', function(e){
+  e.preventDefault();
+  var filename = $('#transporter_script_name').val().trim();
+  if (!filename) return;
+  if (!confirm('[' + filename + '] 이송 스크립트를 삭제하시겠습니까?')) return;
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/transporter_script_delete',
+    type: "POST",
+    data: {filename: filename},
+    dataType: "json",
+    success: function(data) {
+      if (data.ret === 'success') {
+        notify('삭제되었습니다.', 'success');
+        load_transporter_script_list();
+      } else {
+        notify('삭제 실패: ' + (data.log || data.ret), 'danger');
+      }
+    }
+  });
+});

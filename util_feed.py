@@ -498,16 +498,20 @@ class FeedCustomManager:
 
     @classmethod
     def get_custom_dir(cls) -> str:
-        os.makedirs(CUSTOM_DIR, exist_ok=True)
-        return CUSTOM_DIR
+        sites_dir = os.path.join(CUSTOM_DIR, 'sites')
+        os.makedirs(sites_dir, exist_ok=True)
+        return sites_dir
 
     @classmethod
     def load_hooks(cls):
         cls._hooks = {}
         custom_dir = cls.get_custom_dir()
-        py_files = glob.glob(os.path.join(custom_dir, "*.py"))
 
-        for fpath in py_files:
+        # sites/ 하위 디렉터리 우선 스캔 (기존 루트 잔여 파일도 호환 탐색)
+        candidate_files = glob.glob(os.path.join(custom_dir, "*.py"))
+        candidate_files.extend(glob.glob(os.path.join(CUSTOM_DIR, "site_*.py")))
+
+        for fpath in set(candidate_files):
             fname = os.path.basename(fpath)
             if fname.startswith("__"):
                 continue

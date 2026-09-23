@@ -32,8 +32,11 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_feed_sync_days": "3",
             f"{self.name}_batch_limit": "50",
             f"{self.name}_local_staging_path": "",
+            f"{self.name}_exclude_pattern": "",
+            f"{self.name}_enable_sse": "True",
             f"{self.name}_rclone_conf_path": "",
             f"{self.name}_rclone_remote_name": "net",
+            f"{self.name}_gdrive_use_impersonate": "False",
             f"{self.name}_rclone_shared_remote_name": "gf",
             f"{self.name}_shared_drive_id": "",
             f"{self.name}_rclone_bind_ip": "",
@@ -81,12 +84,12 @@ class ModuleDownload(PluginModuleBase):
             if sub == 'web_list' or command == 'web_list':
                 return jsonify(self.web_list_model.web_list(req))
 
-            # 설정 관리: 다운로더
+            # 설정 관리: 다운로더 엔진
             elif command == 'load_downloaders':
                 DownloaderManager.load_engines()
                 return jsonify({
                     'downloaders': FeedConfigUtil.get_downloaders(),
-                    'available_types': list(DownloaderManager._engine_classes.keys())
+                    'schemas': DownloaderManager.get_engine_schemas()
                 })
 
             elif command == 'save_downloader':
@@ -95,17 +98,69 @@ class ModuleDownload(PluginModuleBase):
                 ret = FeedConfigUtil.save_downloader(item_data)
                 return jsonify({'ret': ret, 'downloaders': FeedConfigUtil.get_downloaders()})
 
+            elif command == 'test_downloader':
+                cfg_json = req.form.get('downloader_json', '{}')
+                item_data = json.loads(cfg_json)
+                engine = DownloaderManager.create_instance(item_data)
+                if not engine:
+                    return jsonify({'ret': 'fail', 'msg': f"엔진 인스턴스 생성 실패 ({item_data.get('engine_type')})"})
+                success, msg = engine.test_connection()
+                return jsonify({'ret': 'success' if success else 'fail', 'msg': msg})
+
             elif command == 'delete_downloader':
                 target_name = req.form.get('name', '').strip()
                 ok = FeedConfigUtil.delete_downloader(target_name)
                 return jsonify({'ret': 'success' if ok else 'fail', 'downloaders': FeedConfigUtil.get_downloaders()})
 
+            # 다운로드 전용 엔진 스크립트 관리
+            elif command == 'download_script_list':
+                from .util_download import ENGINES_DIR, ensure_custom_dirs
+                ensure_custom_dirs()
+                files = [f for f in os.listdir(ENGINES_DIR) if f.endswith('.py') and not f.startswith('__')]
+                files.sort()
+                return jsonify({'ret': 'success', 'files': files})
+
+            elif command == 'download_script_read':
+                from .util_download import ENGINES_DIR
+                filename = os.path.basename(req.form.get('filename', '').strip())
+                fpath = os.path.join(ENGINES_DIR, filename)
+                if not filename or not os.path.exists(fpath):
+                    return jsonify({'ret': 'not_exist', 'log': '파일이 존재하지 않습니다.'})
+                try:
+                    with open(fpath, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    return jsonify({'ret': 'success', 'filename': filename, 'content': content})
+                except Exception as e:
+                    return jsonify({'ret': 'error', 'log': str(e)})
+
+            elif command == 'download_script_save':
+                from .util_download import ENGINES_DIR
+                filename = os.path.basename(req.form.get('filename', '').strip())
+                content = req.form.get('content', '')
+                if not filename:
+                    return jsonify({'ret': 'empty_filename', 'log': '파일명이 올바르지 않습니다.'})
+                if not filename.endswith('.py'):
+                    filename += '.py'
+                fpath = os.path.join(ENGINES_DIR, filename)
+                try:
+                    with open(fpath, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    DownloaderManager.load_engines()
+                    files = [f for f in os.listdir(ENGINES_DIR) if f.endswith('.py') and not f.startswith('__')]
+                    files.sort()
+                    return jsonify({'ret': 'success', 'filename': filename, 'files': files, 'schemas': DownloaderManager.get_engine_schemas()})
+                except Exception as e:
+                    return jsonify({'ret': 'error', 'log': str(e)})
+
             # 설정 관리: 프로필
             elif command == 'load_profiles':
+                from .util_download import TransporterManager
+                TransporterManager.load_transporters()
                 return jsonify({
                     'profiles': FeedConfigUtil.get_download_profiles(),
                     'downloaders': FeedConfigUtil.get_downloaders(),
-                    'feeds': FeedConfigUtil.get_feeds()
+                    'feeds': FeedConfigUtil.get_feeds(),
+                    'transporter_schemas': TransporterManager.get_transporter_schemas()
                 })
 
             elif command == 'save_profile':
@@ -121,6 +176,46 @@ class ModuleDownload(PluginModuleBase):
                 yaml_data['DOWNLOAD_PROFILES'] = profiles
                 FeedConfigUtil.save_yaml(yaml_data)
                 return jsonify({'ret': 'success', 'profiles': FeedConfigUtil.get_download_profiles()})
+
+            # 이송 핸들러(Transporter) 전용 스크립트 관리
+            elif command == 'transporter_script_list':
+                from .util_download import TRANSPORTERS_DIR, ensure_custom_dirs
+                ensure_custom_dirs()
+                files = [f for f in os.listdir(TRANSPORTERS_DIR) if f.endswith('.py') and not f.startswith('__')]
+                files.sort()
+                return jsonify({'ret': 'success', 'files': files})
+
+            elif command == 'transporter_script_read':
+                from .util_download import TRANSPORTERS_DIR
+                filename = os.path.basename(req.form.get('filename', '').strip())
+                fpath = os.path.join(TRANSPORTERS_DIR, filename)
+                if not filename or not os.path.exists(fpath):
+                    return jsonify({'ret': 'not_exist', 'log': '파일이 존재하지 않습니다.'})
+                try:
+                    with open(fpath, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    return jsonify({'ret': 'success', 'filename': filename, 'content': content})
+                except Exception as e:
+                    return jsonify({'ret': 'error', 'log': str(e)})
+
+            elif command == 'transporter_script_save':
+                from .util_download import TRANSPORTERS_DIR, TransporterManager
+                filename = os.path.basename(req.form.get('filename', '').strip())
+                content = req.form.get('content', '')
+                if not filename:
+                    return jsonify({'ret': 'empty_filename', 'log': '파일명이 올바르지 않습니다.'})
+                if not filename.endswith('.py'):
+                    filename += '.py'
+                fpath = os.path.join(TRANSPORTERS_DIR, filename)
+                try:
+                    with open(fpath, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    TransporterManager.load_transporters()
+                    files = [f for f in os.listdir(TRANSPORTERS_DIR) if f.endswith('.py') and not f.startswith('__')]
+                    files.sort()
+                    return jsonify({'ret': 'success', 'filename': filename, 'files': files, 'transporter_schemas': TransporterManager.get_transporter_schemas()})
+                except Exception as e:
+                    return jsonify({'ret': 'error', 'log': str(e)})
 
             # 설정 관리: 구글 계정 풀
             elif command == 'load_accounts':
@@ -143,14 +238,21 @@ class ModuleDownload(PluginModuleBase):
                     line = line.strip()
                     if not line or line.startswith('#') or ':' not in line:
                         continue
-                    parts = line.split(':', 1)
-                    uname = parts[0].strip()
-                    mydrive_id = parts[1].strip()
-                    if not any(a.get('username') == uname for a in accounts):
-                        accounts.append({'username': uname, 'mydrive_rclone_id': mydrive_id})
-                        added_count += 1
+                    parts = [p.strip() for p in line.split(':')]
+                    if len(parts) >= 2:
+                        uname = parts[0]
+                        mydrive_id = parts[1]
+                        remote_name = parts[2] if len(parts) >= 3 else ''
+
+                        if not any(a.get('username') == uname for a in accounts):
+                            acc_dict = {'username': uname, 'mydrive_rclone_id': mydrive_id}
+                            if remote_name:
+                                acc_dict['remote_name'] = remote_name
+                            accounts.append(acc_dict)
+                            added_count += 1
+
                 FeedConfigUtil.save_gdrive_accounts(accounts)
-                logger.info(f"[{self.name}] 구글 드라이브 SA 계정 일괄 등록: {added_count}개 추가됨")
+                logger.info(f"[{self.name}] 구글 드라이브 계정 풀 일괄 등록: {added_count}개 추가됨")
                 return jsonify({'ret': 'success', 'added_count': added_count, 'accounts': accounts})
 
             elif command == 'reset_blocked_accounts':
@@ -306,20 +408,132 @@ class ModuleDownload(PluginModuleBase):
                     stream_with_context(self.generate_sse_stream()),
                     mimetype='text/event-stream'
                 )
+            elif sub == 'colab_claim':
+                return self._handle_colab_claim(req)
+            elif sub == 'colab_report':
+                return self._handle_colab_report(req)
             return jsonify({'ret': 'fail', 'msg': f'알 수 없는 API 명령: {sub}'}), 404
         except Exception as e:
             logger.error(f"[{self.name}] process_api 에러 ({sub}): {e}")
             return jsonify({'ret': 'error', 'msg': str(e)}), 500
+
+    def _verify_api_auth(self, req) -> bool:
+        client_key = req.args.get('apikey') or req.form.get('apikey')
+        if not client_key and req.is_json:
+            client_key = (req.get_json(silent=True) or {}).get('apikey')
+        return bool(client_key and client_key == get_system_apikey())
+
+    def _handle_colab_claim(self, req):
+        if not self._verify_api_auth(req):
+            return jsonify({'ret': 'fail', 'msg': 'API 인증 실패'}), 401
+
+        item = (
+            db.session.query(ModelDownload)
+            .filter_by(status='pending_colab')
+            .order_by(ModelDownload.id.asc())
+            .first()
+        )
+        if not item:
+            return jsonify({'ret': 'success', 'has_task': False, 'msg': '대기 중인 Colab 전송 작업이 없습니다.'})
+
+        # 선점 상태로 전환
+        item.status = 'colab_transferring'
+        db.session.commit()
+
+        # 서버에 보관된 rclone.conf 내용 읽기
+        rclone_conf_path = P.ModelSetting.get('download_rclone_conf_path') or FeedConfigUtil.load_yaml().get('rclone', {}).get('conf_path', '')
+        rclone_conf_text = ""
+        if rclone_conf_path and os.path.exists(rclone_conf_path):
+            try:
+                with open(rclone_conf_path, 'r', encoding='utf-8') as f:
+                    rclone_conf_text = f.read()
+            except Exception as e:
+                logger.error(f"[{self.name}] rclone.conf 파일 읽기 실패: {e}")
+
+        # 목적지 구글 드라이브 경로 조립
+        profile = FeedConfigUtil.get_download_profile_by_feed(item.feed_name) or {}
+        dest_cfg = profile.get('destination', {})
+        remote_name = dest_cfg.get('remote_name') or P.ModelSetting.get('download_rclone_shared_remote_name') or 'gf'
+        shared_drive_id = item.gdrive_remote_id or dest_cfg.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
+        complete_path = (item.gdrive_complete_path or dest_cfg.get('complete_path') or 'uploads/default').strip('/')
+        folder_name = item.file_name or f"item_{item.id}"
+
+        if shared_drive_id:
+            dest_full_path = f"{remote_name}:{{{shared_drive_id}}}/{complete_path}/{folder_name}"
+        else:
+            dest_full_path = f"{remote_name}:{complete_path}/{folder_name}"
+
+        # AllDebrid 원격 소스 경로
+        src_full_path = item.local_path or f"ad:magnets/{folder_name}"
+        buffer_limit_gb = dest_cfg.get('buffer_limit_gb', 50)
+
+        task_data = {
+            'id': item.id,
+            'title': item.title,
+            'file_name': folder_name,
+            'file_size': item.file_size or 0,
+            'remote_source_path': src_full_path,
+            'dest_path': dest_full_path,
+            'buffer_limit_bytes': int(buffer_limit_gb) * 1024 * 1024 * 1024
+        }
+
+        logger.info(f"[{self.name}] [Colab API] 작업 선점 완료: {item.title} (ID: {item.id}) -> {dest_full_path}")
+        return jsonify({
+            'ret': 'success',
+            'has_task': True,
+            'item': task_data,
+            'rclone_conf': rclone_conf_text
+        })
+
+    def _handle_colab_report(self, req):
+        if not self._verify_api_auth(req):
+            return jsonify({'ret': 'fail', 'msg': 'API 인증 실패'}), 401
+
+        data = req.get_json(silent=True) or req.form or {}
+        task_id = int(data.get('id', -1))
+        is_success = bool(data.get('success', False))
+        error_msg = data.get('error_msg', '')
+        bytes_transferred = int(data.get('bytes_transferred', 0))
+
+        item = db.session.query(ModelDownload).filter_by(id=task_id).first()
+        if not item:
+            return jsonify({'ret': 'fail', 'msg': '해당 작업 ID를 찾을 수 없습니다.'}), 404
+
+        if is_success:
+            item.status = 'completed'
+            item.completed_time = datetime.now()
+            item.error_message = None
+            if bytes_transferred > 0:
+                item.file_size = bytes_transferred
+
+            # 다운로더(AllDebrid) 클라우드 원본 정리
+            downloader_cfg = FeedConfigUtil.get_downloader_by_name(item.current_engine_name)
+            if downloader_cfg and item.engine_task_id:
+                try:
+                    engine = DownloaderManager.create_instance(downloader_cfg)
+                    if engine:
+                        engine.delete_task(item.engine_task_id)
+                except Exception as ex:
+                    logger.debug(f"[{self.name}] AllDebrid 원본 마그넷 삭제 실패 (무시): {ex}")
+
+            logger.info(f"[{self.name}] [Colab API] 전송 최종 완료 확정: {item.title} (ID: {item.id})")
+        else:
+            item.status = 'failed'
+            item.error_message = f"Colab 전송 실패: {error_msg}"
+            logger.warning(f"[{self.name}] [Colab API] 전송 실패 보고 수신: {item.title} ({error_msg})")
+
+        db.session.commit()
+        return jsonify({'ret': 'success'})
 
     def generate_sse_stream(self):
         while True:
             try:
                 with F.app.app_context():
                     counts = {
-                        'pending': db.session.query(ModelDownload).filter_by(status='pending').count(),
+                        'pending': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending', 'pending_colab'])).count(),
                         'downloading': db.session.query(ModelDownload).filter_by(status='downloading').count(),
                         'staging': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_local_staging', 'local_staging'])).count(),
-                        'uploading': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_upload', 'uploading'])).count(),
+                        'uploading': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_upload', 'uploading', 'colab_transferring'])).count(),
                         'completed': db.session.query(ModelDownload).filter_by(status='completed').count(),
                         'failed': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['failed', 'move_failed'])).count(),
                     }

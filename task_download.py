@@ -12,7 +12,7 @@ from .setup import *
 from .model_feed import ModelFeedBbs
 from .model_download import ModelDownload, ModelDownloadStat
 from .util_feed import FeedConfigUtil, FeedFilter, extract_info_hash, get_tmp_dir
-from .util_download import DownloaderManager
+from .util_download import DownloaderManager, TransporterManager
 from .util_upload import GDriveAccountManager, GDriveUploadHandler
 
 
@@ -256,7 +256,10 @@ class TaskDownload:
             status_map_by_tid = {str(s.get('task_id')): s for s in status_list if s.get('task_id')}
             status_map_by_hash = {str(s.get('hash')).lower(): s for s in status_list if s.get('hash')}
 
-            stalled_hours = int(downloader_cfg.get('stalled_timeout_hours', 24))
+            try:
+                stalled_hours = int(downloader_cfg.get('stalled_timeout_hours', 24))
+            except Exception:
+                stalled_hours = 24
 
             for it in engine_items:
                 matched_status = status_map_by_tid.get(str(it.engine_task_id))
@@ -294,19 +297,27 @@ class TaskDownload:
                             it.file_name = fname
                             logger.info(f"[DownloadPoll] 동일 파일명의 다른 릴그룹 감지! 충돌 방지를 위해 대상을 '{fname}'(으)로 분리: {it.title}")
 
-                    # 115 전용 내부 이동 대상인 경우 즉시 완료 단계로 인계
-                    if downloader_cfg.get('engine_type') == '115' and it.destination_type == '115_internal':
-                        it.status = 'downloaded'
-                        logger.info(f"[DownloadPoll] [{engine_name}] 115 클라우드 다운로드 완료 확인: {it.title}")
+                    profile = FeedConfigUtil.get_download_profile_by_feed(it.feed_name) or {}
+                    dest_cfg = profile.get('destination', {})
+                    dest_type = it.destination_type or dest_cfg.get('type', 'local')
+
+                    # 목적지 유형별 수득 완료 분기 (Colab은 로컬 스테이징 완전 우회)
+                    if dest_type == 'colab_gdrive':
+                        transporter = TransporterManager.get_transporter('colab_gdrive')
+                        if transporter:
+                            transporter.transport(it, source_path, dest_cfg)
+                        else:
+                            it.status = 'pending_colab'
+                        logger.info(f"[DownloadPoll] [{engine_name}] 원격 완료 확인 -> Colab 릴레이 대기열로 인계: {it.title}")
                     elif source_path.startswith(('ad:', 'http://', 'https://')):
                         it.status = 'pending_local_staging'
-                        logger.info(f"[DownloadPoll] [{engine_name}] 원격 완료 확인 -> 로컬 스테이징(다운로드) 대기열로 인계: {it.title}")
+                        logger.info(f"[DownloadPoll] [{engine_name}] 원격 완료 확인 -> 로컬 스테이징 대기열로 인계: {it.title}")
                     else:
                         it.status = 'downloaded'
-                        logger.info(f"[DownloadPoll] [{engine_name}] 다운로드 완료 확인: {it.title}")
+                        logger.info(f"[DownloadPoll] [{engine_name}] 다운로드 완료 확인 (이송 대기): {it.title}")
 
-                # 에러 또는 지연 타임아웃 발생 시 다음 우선순위 엔진으로 폴백
-                elif std_status == 'error' or (it.engine_added_time and (now - it.engine_added_time).total_seconds() > stalled_hours * 3600):
+                # 에러 또는 지연 타임아웃 발생 시 다음 우선순위 엔진으로 폴백 (stalled_hours가 0 이하이면 시간 무제한)
+                elif std_status == 'error' or (stalled_hours > 0 and it.engine_added_time and (now - it.engine_added_time).total_seconds() > stalled_hours * 3600):
                     reason = "다운로더 에러" if std_status == 'error' else f"지연 제한시간({stalled_hours}시간) 초과"
                     logger.warning(f"[DownloadPoll] [{engine_name}] {reason} 감지 -> 이전 작업 정리 및 다음 엔진 폴백: {it.title}")
 
@@ -436,8 +447,14 @@ class TaskDownload:
 
     @staticmethod
     def route_completed_downloads():
-        """downloaded 항목의 목적지 라우팅 (115 내부 이동 또는 단순 로컬 완료)"""
-        batch_limit = P.ModelSetting.get_int('download_batch_limit', 50)
+        """downloaded 항목을 목적지 이송 핸들러(Transporter)에 전달하여 최종 이송 처리"""
+        try:
+            batch_limit = P.ModelSetting.get_int('download_batch_limit')
+        except Exception:
+            batch_limit = 50
+        if not batch_limit or batch_limit <= 0:
+            batch_limit = 50
+
         items = ModelDownload.get_list_by_status(['downloaded'], limit=batch_limit)
         if not items:
             return
@@ -445,47 +462,36 @@ class TaskDownload:
         now = datetime.now()
 
         for item in items:
-            # 115 클라우드 전용 내부 폴더 정리
-            if item.destination_type == '115_internal':
-                downloader_cfg = FeedConfigUtil.get_downloader_by_name(item.current_engine_name)
-                comp_dir = downloader_cfg.get('cd2_completed_path', '') if downloader_cfg else ''
-                mount_dir = downloader_cfg.get('cd2_mount_path', '') if downloader_cfg else ''
+            profile = FeedConfigUtil.get_download_profile_by_feed(item.feed_name) or {}
+            dest_cfg = profile.get('destination', {})
+            dest_type = item.destination_type or dest_cfg.get('type', 'local')
 
-                if comp_dir and mount_dir and item.file_name:
-                    src_file = os.path.join(mount_dir, item.file_name)
-                    dst_file = os.path.join(comp_dir, item.file_name)
-                    os.makedirs(comp_dir, exist_ok=True)
-                    try:
-                        if os.path.exists(dst_file) and os.path.abspath(src_file) != os.path.abspath(dst_file):
-                            short_hash = (item.infohash[:6] if item.infohash else "alt")
-                            n, e = os.path.splitext(item.file_name)
-                            new_name = f"{n}_({short_hash}){e}" if os.path.isfile(src_file) else f"{item.file_name}_({short_hash})"
-                            dst_file = os.path.join(comp_dir, new_name)
-                            item.file_name = new_name
-                            logger.info(f"[RouteComplete] 115 완료 폴더 내 동일 파일명 존재 감지 -> '{new_name}'(으)로 분리 격리")
-
-                        if os.path.exists(src_file) and src_file != dst_file:
-                            shutil.move(src_file, dst_file)
-                            item.local_path = dst_file
-                            logger.info(f"[RouteComplete] 115 마운트 완료 폴더로 이동 완료: {item.file_name}")
-                    except Exception as e:
-                        logger.warning(f"[RouteComplete] 115 마운트 이동 중 오류 (다음 주기 재시도): {e}")
-                        continue
-
+            transporter = TransporterManager.get_transporter(dest_type)
+            if not transporter:
+                logger.warning(f"[RouteComplete] 등록되지 않은 이송 핸들러({dest_type}) -> 로컬 완료로 대체 처리: {item.title}")
                 item.status = 'completed'
                 item.completed_time = now
-                logger.info(f"[RouteComplete] 115 다운로드 작업 최종 완료(completed): {item.title}")
+                continue
 
-            # 단순 로컬 저장 대상인 경우
-            elif item.destination_type == 'local':
-                item.status = 'completed'
-                item.completed_time = now
-                logger.info(f"[RouteComplete] 로컬 다운로드 작업 최종 완료(completed): {item.title}")
+            logger.info(f"[RouteComplete] 이송 핸들러 [{dest_type}] 호출 시작: {item.title}")
+            try:
+                success, next_status, msg = transporter.transport(item, item.local_path, dest_cfg)
+                item.status = next_status
 
-            # 구글 드라이브 계정 로테이션 업로드 대상인 경우 (추후 Uploader 워커 연계)
-            elif item.destination_type in ['gdrive_rotation', 'gdrive']:
-                item.status = 'pending_upload'
-                logger.info(f"[RouteComplete] 구글 드라이브 업로드 대기열로 인계: {item.title}")
+                if next_status == 'completed':
+                    item.completed_time = now
+                    item.error_message = None
+                    logger.info(f"[RouteComplete] 최종 완료 확정: {item.title} ({msg})")
+                elif next_status == 'failed':
+                    item.error_message = msg
+                    logger.warning(f"[RouteComplete] 이송 실패: {item.title} ({msg})")
+                else:
+                    logger.info(f"[RouteComplete] 중간 상태 전이 ({next_status}): {item.title} ({msg})")
+
+            except Exception as ex:
+                logger.error(f"[RouteComplete] 이송 핸들러 실행 중 예외 ({dest_type}): {ex}")
+                item.status = 'failed'
+                item.error_message = f"이송 핸들러 예외: {str(ex)}"
 
         db.session.commit()
 

@@ -42,24 +42,30 @@
   height: 100% !important;
   min-height: 300px;
 }
-#custom_script_modal .modal-body {
+#custom_script_modal .modal-body,
+#download_script_modal .modal-body,
+#transporter_script_modal .modal-body {
   display: flex;
   flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
   height: 100%;
 }
-#custom_script_modal .custom-script-editor-wrapper {
+#custom_script_modal .custom-script-editor-wrapper,
+#download_script_modal .custom-script-editor-wrapper,
+#transporter_script_modal .custom-script-editor-wrapper {
   display: flex;
   flex-direction: column;
   flex: 1 1 auto;
   min-height: 0;
   width: 100%;
 }
-#custom_script_modal #custom_script_code_editor {
+#custom_script_modal #custom_script_code_editor,
+#download_script_modal #download_script_code_editor,
+#transporter_script_modal #transporter_script_code_editor {
   flex: 1 1 auto;
   height: 100% !important;
-  min-height: 350px;
+  min-height: 380px;
   width: 100% !important;
 }
 

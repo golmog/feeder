@@ -266,31 +266,36 @@ class GDriveAccountManager:
 
         target_root = f"{base_remote}:{{{dst_drive_id}}}/"
         accounts = FeedConfigUtil.get_gdrive_accounts()
+        use_impersonate = P.ModelSetting.get_bool('download_gdrive_use_impersonate')
 
         for acc in accounts:
             email = acc.get('username')
             if not email:
                 continue
+
+            current_remote = base_remote if use_impersonate else (acc.get('remote_name') or base_remote)
             try:
-                # 1. SA 내 드라이브 잔여 파일을 공유 드라이브로 서버사이드 이동
+                # SA 내 드라이브 잔여 파일을 공유 드라이브로 서버사이드 이동
                 cmd_move = [
-                    "rclone", "move", f"{base_remote}:", target_root,
+                    "rclone", "move", f"{current_remote}:", target_root,
                     "--config", rclone_conf,
-                    "--drive-impersonate", email,
                     "--drive-server-side-across-configs",
                     "--drive-use-trash=false",
                     "--delete-empty-src-dirs",
                     "--log-level", "ERROR"
                 ]
+                if use_impersonate:
+                    cmd_move.extend(["--drive-impersonate", email])
                 run_rclone(cmd_move, log_output=False)
 
-                # 2. 내 드라이브 휴지통 영구 삭제 (15GB 공간 완전 회복)
+                # 내 드라이브 휴지통 영구 삭제 (15GB 공간 완전 회복)
                 cmd_cleanup = [
-                    "rclone", "cleanup", f"{base_remote}:",
+                    "rclone", "cleanup", f"{current_remote}:",
                     "--config", rclone_conf,
-                    "--drive-impersonate", email,
                     "--log-level", "ERROR"
                 ]
+                if use_impersonate:
+                    cmd_cleanup.extend(["--drive-impersonate", email])
                 run_rclone(cmd_cleanup, log_output=False)
             except Exception as ex:
                 logger.debug(f"[GDriveDrain] {email} 내 드라이브 정리 중 예외 (무시): {ex}")
@@ -338,42 +343,40 @@ class GDriveUploadHandler:
 
         comp_path = (item.gdrive_complete_path or 'uploads/default').strip('/')
         up_path = (item.gdrive_upload_path or 'incoming/default').strip('/')
+        use_impersonate = P.ModelSetting.get_bool('download_gdrive_use_impersonate')
 
-        # 1차 업로드 목적지 incoming 경로 구성 (무조건 폴더 단위)
+        # 1차 업로드 목적지 incoming 경로 구성 (위임 여부에 따른 리모트 결정)
         if mode == 'mydrive':
-            dest_incoming = f"{remote_net}:{{{acc.get('mydrive_rclone_id')}}}/{comp_path}/{folder_name}"
+            effective_remote = remote_net if use_impersonate else (acc.get('remote_name') or remote_net)
+            impersonate_arg = ["--drive-impersonate", acc_name] if use_impersonate else []
+            dest_incoming = f"{effective_remote}:{{{acc.get('mydrive_rclone_id')}}}/{comp_path}/{folder_name}"
         else:
+            effective_remote = remote_shared
+            impersonate_arg = []
             dest_incoming = f"{remote_shared}:{{{target_drive_id}}}/{up_path}/{folder_name}"
 
-        # [핵심 원칙] 이전 비정상 종료로 incoming에 해당 고유 폴더 잔여물이 남아있다면 무조건 깨끗하게 선삭제(Fail-Clean)
-        clean_chk = ["rclone", "lsjson", dest_incoming, "--stat", "--config", rclone_conf]
-        if mode == 'mydrive':
-            clean_chk.extend(["--drive-impersonate", acc_name])
+        # 이전 비정상 종료 찌꺼기 선삭제(Fail-Clean)
+        clean_chk = ["rclone", "lsjson", dest_incoming, "--stat", "--config", rclone_conf] + impersonate_arg
         csuc, cout = run_rclone(clean_chk, log_output=False)
         if csuc and cout.strip() and cout.strip() not in ["{}", "[]"]:
             logger.warning(f"[GDriveUpload] 이전 세션 비정상 중단 찌꺼기 발견 -> incoming 폴더 즉시 초기화: {dest_incoming}")
-            clean_cmd = ["rclone", "purge", dest_incoming, "--config", rclone_conf]
-            if mode == 'mydrive':
-                clean_cmd.extend(["--drive-impersonate", acc_name])
+            clean_cmd = ["rclone", "purge", dest_incoming, "--config", rclone_conf] + impersonate_arg
             run_rclone(clean_cmd, log_output=False)
 
         item.status = 'uploading'
         item.gdrive_account = acc_name
         db.session.commit()
 
-        logger.info(f"[GDriveUpload] 업로드 시작: {folder_name} [{format_bytes(fsize)}] -> {mode} ({acc_name})")
+        logger.info(f"[GDriveUpload] 업로드 시작: {folder_name} [{format_bytes(fsize)}] -> {mode} ({acc_name}, 리모트: {effective_remote})")
         manager.add_usage(usage_key, fsize)
 
-        # 모든 대상이 폴더이므로 rclone copy 명령으로 단일화
         cmd = [
             "rclone", "copy", local_path, dest_incoming,
             "--config", rclone_conf,
             "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE",
             "--drive-chunk-size", "256M",
             "--retries", "1", "--timeout", "30m", "--contimeout", "30s"
-        ]
-        if mode == 'mydrive':
-            cmd.extend(["--drive-impersonate", acc_name])
+        ] + impersonate_arg
 
         success, out = run_rclone(cmd, f"업로드 {folder_name}")
 
@@ -415,13 +418,13 @@ class GDriveUploadHandler:
         ]
 
         if mode == 'mydrive':
-            # 내 드라이브 -> 타 조직 공유 드라이브 최종 위치로 서버사이드 이동
-            src_m = f"{remote_net}:{{{acc.get('mydrive_rclone_id')}}}/{comp_path}/{folder_name}"
+            # 내 드라이브 -> 공유 드라이브 최종 위치로 서버사이드 이동
+            src_m = f"{effective_remote}:{{{acc.get('mydrive_rclone_id')}}}/{comp_path}/{folder_name}"
             dst_m = f"{remote_net}:{{{target_drive_id}}}/{comp_path}/{folder_name}"
-            move_cmd = ["rclone", "move", src_m, dst_m, "--drive-impersonate", acc_name, "--delete-empty-src-dirs"] + base_move_opts
+            move_cmd = ["rclone", "move", src_m, dst_m, "--delete-empty-src-dirs"] + impersonate_arg + base_move_opts
             move_success, _ = run_rclone(move_cmd, f"서버사이드 폴더 이동(Across) {folder_name}")
         else:
-            # 공유 드라이브 내부: incoming 폴더에서 uploads 부모 폴더 ID로 초고속 chpar 변경
+            # 공유 드라이브 내부: incoming 폴더에서 uploads 부모 폴더 ID로 원자적 chpar 변경
             dst_parent = f"{remote_shared}:{{{target_drive_id}}}/{comp_path}"
             chpar_cmd = ["rclone", "backend", "chpar", dest_incoming, dst_parent, "--config", rclone_conf, "--log-level", "NOTICE"]
             move_success, _ = run_rclone(chpar_cmd, f"원자적 부모폴더 변경(chpar) {folder_name}")
@@ -435,7 +438,7 @@ class GDriveUploadHandler:
                 pass
 
         if mode == 'mydrive':
-            cleanup_cmd = ["rclone", "cleanup", f"{remote_net}:", "--config", rclone_conf, "--drive-impersonate", acc_name, "--log-level", "NOTICE"]
+            cleanup_cmd = ["rclone", "cleanup", f"{effective_remote}:", "--config", rclone_conf, "--log-level", "NOTICE"] + impersonate_arg
             run_rclone(cleanup_cmd, log_output=False)
             manager.release_account(acc_name)
 

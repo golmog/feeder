@@ -1,6 +1,11 @@
 {% extends "base.html" %}
 {% block content %}
 
+<!-- Ace Editor 외부 라이브러리 연동 -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.7/ace.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.7/mode-python.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.7/theme-monokai.min.js"></script>
+
 <link rel="stylesheet" href="{{ url_for('.static', filename='feeder.css') }}">
 
 {{ macros.m_button_group([
@@ -8,6 +13,7 @@
   ['globalOneExecuteBtn', '1회 실행'],
   ['globalEditBtn', 'YAML 편집', [['file', arg['yaml_filepath']]]]
 ]) }}
+
 <div class="mb-2 text-right">
   <button type="button" id="history_import_modal_btn" class="btn btn-sm btn-outline-info">
     <i class="fa fa-database mr-1"></i>과거 이력 가져오기 (마이그레이션)
@@ -32,14 +38,16 @@
 
     <!-- 탭 1: 기본 설정 -->
     {{ macros.m_tab_content_start('basic', true) }}
-      {{ macros.setting_input_int('download_feed_sync_days', '다운로드 대상 피드 기간 (일)', value=arg['download_feed_sync_days'], min='1', placeholder='3', desc=['최근 N일 이내에 수집된 피드 게시물만 다운로드 대상으로 큐에 추가합니다 (과거 게시물 다운로드 폭탄 방지, 기본값: 3일)']) }}
+      {{ macros.setting_input_int('download_feed_sync_days', '다운로드 대상 피드 기간 (일)', value=arg['download_feed_sync_days'], min='1', placeholder='3', desc=['최근 N일 이내에 수집된 피드 게시물만 다운로드 대상으로 큐에 추가합니다 (기본값: 3일)']) }}
       {{ macros.setting_input_int('download_batch_limit', '주기당 최대 배치 작업 수', value=arg['download_batch_limit'], min='1', placeholder='50', desc=['스케줄 1주기마다 동시에 탐색 및 처리할 최대 작업 수 (기본값: 50개)']) }}
       {{ macros.setting_input_text('download_local_staging_path', '로컬 스테이징(임시) 경로', value=arg['download_local_staging_path'], placeholder='예: /data/tmp/staging', desc=['원격 클라우드 다운로드 후 로컬 버퍼로 수신할 임시 디렉터리 (비워두면 기본 임시 폴더 사용)']) }}
+      {{ macros.setting_input_textarea('download_exclude_pattern', '전송 제외/삭제 파일 패턴', value=arg['download_exclude_pattern'], row='3', desc=['전송하지 않고 삭제하거나 제외할 파일/폴더 패턴 (줄바꿈으로 구분, Rclone --exclude 규격 지원)', '예시: *.nfo, *.txt, *.exe, Sample, *.sample.mkv']) }}
       {{ macros.setting_checkbox('download_enable_sse', '실시간 SSE 브로드캐스트', value=arg['download_enable_sse'], desc=['On: 큐 대시보드 화면에서 실시간 진행 현황을 자동 수신합니다.']) }}
       {{ macros.m_hr() }}
       <h6 class="font-weight-bold text-info"><i class="fa fa-hdd-o mr-1"></i>Rclone 공통 및 구글 드라이브 우회 수치 설정</h6>
       {{ macros.setting_input_text('download_rclone_conf_path', 'Rclone 설정 파일 경로', value=arg['download_rclone_conf_path'], placeholder='예: /root/.config/rclone/rclone.conf') }}
-      {{ macros.setting_input_text('download_rclone_remote_name', '내 드라이브 SA 기본 리모트', value=arg['download_rclone_remote_name'], placeholder='net', desc=['개인/SA 계정의 15GB MyDrive 바이패스용 rclone 리모트 이름']) }}
+      {{ macros.setting_checkbox('download_gdrive_use_impersonate', 'Google Workspace Impersonate', value=arg['download_gdrive_use_impersonate'], desc=['On: 단일 SA 기본 리모트에서 --drive-impersonate 옵션으로 각 구성원의 15GB MyDrive에 접근합니다 (도메인 전체 위임 필수).', 'Off: 위임 없이 각 계정별로 별도 등록된 독립 Rclone 리모트를 직접 사용합니다 (계정 풀에서 계정별 리모트명 지정 필요).']) }}
+      {{ macros.setting_input_text('download_rclone_remote_name', '내 드라이브 SA 기본 리모트', value=arg['download_rclone_remote_name'], placeholder='net', desc=['위임(Impersonate) 사용 시 기준이 되는 서비스 계정(SA) rclone 리모트 이름']) }}
       {{ macros.setting_input_text('download_rclone_shared_remote_name', '공유 드라이브 직행 리모트', value=arg['download_rclone_shared_remote_name'], placeholder='gf', desc=['임계값 초과 대용량 파일 또는 라이트 유저 공유 드라이브 직행용 rclone 리모트 이름']) }}
       {{ macros.setting_input_text('download_shared_drive_id', '기본 목적지 공유 드라이브 ID', value=arg['download_shared_drive_id'], placeholder='예: 0ABCDE12345678') }}
       {{ macros.setting_input_text('download_rclone_bind_ip', 'Rclone 바인드 IP', value=arg['download_rclone_bind_ip'], placeholder='예: 192.168.1.100 (특정 네트워크 인터페이스 고정 시 입력)') }}
@@ -54,7 +62,10 @@
     <!-- 탭 2: 다운로더 엔진 관리 -->
     {{ macros.m_tab_content_start('downloaders', false) }}
       <div class="mb-2 d-flex justify-content-between align-items-center">
-        <button type="button" id="downloader_add_btn" class="btn btn-sm btn-primary">다운로더 추가</button>
+        <div>
+          <button type="button" id="downloader_add_btn" class="btn btn-sm btn-primary">다운로더 추가</button>
+          <button type="button" id="download_script_manage_btn" class="btn btn-sm btn-outline-info ml-1">엔진 스크립트 관리</button>
+        </div>
         <button type="button" id="downloader_reload_btn" class="btn btn-sm btn-secondary">새로고침</button>
       </div>
       <div class="table-responsive">
@@ -78,7 +89,10 @@
     <!-- 탭 3: 다운로드 라우팅 프로필 -->
     {{ macros.m_tab_content_start('profiles', false) }}
       <div class="mb-2 d-flex justify-content-between align-items-center">
-        <button type="button" id="profile_add_btn" class="btn btn-sm btn-primary">프로필 추가</button>
+        <div>
+          <button type="button" id="profile_add_btn" class="btn btn-sm btn-primary">프로필 추가</button>
+          <button type="button" id="transporter_script_manage_btn" class="btn btn-sm btn-outline-info ml-1">이송 스크립트 관리</button>
+        </div>
         <button type="button" id="profile_reload_btn" class="btn btn-sm btn-secondary">새로고침</button>
       </div>
       <div class="table-responsive">
@@ -112,17 +126,19 @@
         <table class="table table-sm table-striped table-hover text-center align-middle">
           <thead class="thead-dark">
             <tr>
-              <th style="width: 35%;">계정 이메일 (User / Impersonate)</th>
-              <th style="width: 25%;">내 드라이브 Rclone ID</th>
-              <th style="width: 25%;">24시간 누적 사용량 / 차단 상태</th>
-              <th style="width: 15%;">관리</th>
+              <th style="width: 30%;">계정 식별자 (User / Impersonate)</th>
+              <th style="width: 20%;">내 드라이브 폴더 ID</th>
+              <th style="width: 20%;">지정 리모트명 (비위임 시)</th>
+              <th style="width: 20%;">24시간 누적 사용량 / 차단 상태</th>
+              <th style="width: 10%;">관리</th>
             </tr>
           </thead>
           <tbody id="gdrive_account_list_tbody">
-            <tr><td colspan="4" class="py-4 text-muted">등록된 구글 드라이브 계정이 없습니다.</td></tr>
+            <tr><td colspan="5" class="py-4 text-muted">등록된 구글 드라이브 계정이 없습니다.</td></tr>
           </tbody>
         </table>
       </div>
+
     {{ macros.m_tab_content_end() }}
 
     <!-- 탭 5: 자동 & DB정리 -->
@@ -150,42 +166,66 @@
         <form id="downloader_form">
           <input type="hidden" id="downloader_mode" value="add">
           {{ macros.setting_input_text('dl_name', '식별명', placeholder='예: ad_main, 115_vip, qbit_local', desc=['프로필 체인에서 참조할 고유 식별 영문명']) }}
-          {{ macros.setting_select('dl_engine_type', '엔진 타입', [
-              ['alldebrid', 'AllDebrid (오프라인 고속 캐시)'],
-              ['115', '115 Cloud (CD2 gRPC 연동)'],
-              ['qbittorrent', 'qBittorrent (로컬 다운로더)']
-            ]) }}
+          <div class="form-group row mb-2">
+            <label class="col-sm-2 col-form-label text-right font-weight-bold">엔진 타입</label>
+            <div class="col-sm-10">
+              <select id="dl_engine_type" class="form-control form-control-sm"></select>
+            </div>
+          </div>
           {{ macros.setting_checkbox('dl_enabled', '활성화', value='On') }}
-          {{ macros.setting_input_int('dl_stalled_timeout_hours', '지연 타임아웃 (시간)', value='24', min='1', desc=['해당 시간 동안 미완료/지연 시 다음 엔진으로 자동 폴백']) }}
 
-          <div id="dl_fields_alldebrid" class="dl-engine-fields">
-            {{ macros.m_hr() }}
-            {{ macros.setting_input_text('dl_ad_apikey', 'AllDebrid API Key', placeholder='AllDebrid 개인 API 키 입력') }}
-            {{ macros.setting_input_text('dl_ad_remote', 'Rclone 리모트명', value='ad', placeholder='ad') }}
-            {{ macros.setting_input_text('dl_ad_base_path', 'Rclone 마그넷 경로', value='magnets', placeholder='magnets') }}
-          </div>
-
-          <div id="dl_fields_115" class="dl-engine-fields" style="display: none;">
-            {{ macros.m_hr() }}
-            {{ macros.setting_input_text('dl_115_addr', 'CD2 gRPC 주소', value='127.0.0.1', placeholder='127.0.0.1') }}
-            {{ macros.setting_input_int('dl_115_port', 'CD2 gRPC 포트', value='19798') }}
-            {{ macros.setting_input_text('dl_115_token', 'CD2 인증 토큰', placeholder='CloudDrive2 API Token') }}
-            {{ macros.setting_input_text('dl_115_vpath', 'CD2 가상 다운로드 경로', value='115open/云下载') }}
-            {{ macros.setting_input_text('dl_115_mpath', 'CD2 로컬 마운트 경로', placeholder='예: /mnt/cd2/115open/云下载') }}
-            {{ macros.setting_input_text('dl_115_cpath', '115 내부 완료 경로', placeholder='예: /mnt/cd2/115open/uploads') }}
-          </div>
-
-          <div id="dl_fields_qbittorrent" class="dl-engine-fields" style="display: none;">
-            {{ macros.m_hr() }}
-            {{ macros.setting_input_text('dl_qb_url', 'Web UI 주소', value='http://127.0.0.1:8080') }}
-            {{ macros.setting_input_text('dl_qb_user', '사용자명', value='admin') }}
-            {{ macros.setting_input_text('dl_qb_pass', '비밀번호', type='password') }}
-            {{ macros.setting_input_text('dl_qb_save_path', '다운로드 완료 경로', placeholder='예: /data/downloads') }}
-          </div>
+          <!-- 스크립트의 CONFIG_SCHEMA에 따라 자동 생성되는 동적 입력 필드 컨테이너 -->
+          <div id="dl_dynamic_engine_fields" class="mt-3"></div>
         </form>
       </div>
       <div class="modal-footer">
+        <button id="downloader_test_btn" type="button" class="btn btn-outline-info mr-auto"><i class="fa fa-plug mr-1"></i>연결 테스트</button>
         <button id="downloader_save_btn" type="button" class="btn btn-primary">저장</button>
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 모달: 다운로드 엔진 커스텀 스크립트 관리 (feeder_custom/engines) -->
+<div class="modal fade modal-resizable" id="download_script_modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-xl">
+    <div class="modal-content">
+      <div class="modal-header d-flex align-items-center justify-content-between">
+        <h4 class="modal-title">다운로드 엔진 스크립트 관리 <small class="text-muted">(data/db/feeder_custom/engines)</small></h4>
+        <div class="d-flex align-items-center">
+          <button type="button" class="modal-fullscreen-btn mr-2" title="화면 최대화/복원"><i class="fa fa-expand"></i></button>
+          <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+        </div>
+      </div>
+      <div class="modal-body d-flex flex-column" style="flex: 1 1 auto; min-height: 0;">
+        <div class="form-inline mb-2 justify-content-between flex-shrink-0">
+          <div class="form-inline">
+            <label class="mr-2 font-weight-bold">엔진 파일:</label>
+            <select id="download_script_select" class="form-control form-control-sm mr-2" style="min-width: 240px;">
+              <option value="">-- 파일 선택 --</option>
+            </select>
+            <button type="button" id="download_script_new_btn" class="btn btn-sm btn-outline-success mr-1">새 엔진 템플릿</button>
+            <button type="button" id="download_script_delete_btn" class="btn btn-sm btn-outline-danger">삭제</button>
+          </div>
+          <div>
+            <span id="download_script_status" class="small text-info"></span>
+          </div>
+        </div>
+
+        <div class="form-group mb-2 flex-shrink-0">
+          <label class="small text-muted mb-1">파일명 (.py)</label>
+          <input type="text" id="download_script_name" class="form-control form-control-sm font-weight-bold" placeholder="예: engine_pikpak.py">
+        </div>
+
+        <div class="form-group mb-0 custom-script-editor-wrapper" style="flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0;">
+          <label class="small text-muted mb-1 flex-shrink-0">파이썬 코드 (BaseDownloadEngine 상속)</label>
+          <textarea id="download_script_code" name="download_script_code" style="display: none;"></textarea>
+          <div id="download_script_code_editor" class="feeder-editor-box" style="flex: 1 1 auto; height: 100%; width: 100%; min-height: 380px;"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="download_script_save_btn" type="button" class="btn btn-primary">저장 및 엔진 동적 로드</button>
         <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
       </div>
     </div>
@@ -251,28 +291,64 @@
           </div>
           {{ macros.setting_checkbox('profile_append_hash_on_conflict', '중복 시에만 폴더명 해시 추가', value='On', desc=['On: DB에 동일한 폴더명이 이미 존재할 때만 해시(_[hash])를 붙여 분리합니다. Off: 원본 폴더명을 항상 그대로 유지합니다.']) }}
           {{ macros.m_hr() }}
-          {{ macros.setting_select('profile_dest_type', '목적지 유형', [
-              ['gdrive_rotation', 'Google Drive 계정 풀 로테이션 (MyDrive 경유용)'],
-              ['rclone_simple', '일반 Rclone 리모트 단순 업로드 (전용 단일 리모트)'],
-              ['115_internal', '115 Cloud 내부 완료 폴더 이동 (115 전용)'],
-              ['local', '로컬 디스크 보존 (단순 완료)']
-            ]) }}
-
-          <!-- 구글 드라이브 로테이션 목적지 필드 -->
-          <div id="profile_fields_gdrive_rotation" class="dest-type-fields">
-            {{ macros.setting_input_text('profile_gdrive_upload_path', '임시 수신 경로 (Incoming)', value='incoming/default') }}
-            {{ macros.setting_input_text('profile_gdrive_complete_path', '최종 라이브러리 경로 (Complete)', value='uploads/default') }}
-            {{ macros.setting_input_text('profile_gdrive_remote_id', '공유 드라이브 ID (Shared Drive ID)', placeholder='미입력 시 기본 설정값 사용') }}
+          <div class="form-group row mb-2">
+            <label class="col-sm-2 col-form-label text-right font-weight-bold">목적지 유형</label>
+            <div class="col-sm-10">
+              <select id="profile_dest_type" class="form-control form-control-sm"></select>
+            </div>
           </div>
 
-          <!-- 일반 Rclone 리모트 단순 업로드 필드 -->
-          <div id="profile_fields_rclone_simple" class="dest-type-fields" style="display: none;">
-            {{ macros.setting_input_text('profile_simple_remote_path', 'Rclone 목적지 경로', placeholder='예: my_gdrive:media/movies 또는 onedrive:incoming') }}
-          </div>
+          <!-- 트랜스포터 스크립트의 CONFIG_SCHEMA에 따라 자동 생성되는 동적 목적지 폼 컨테이너 -->
+          <div id="profile_dynamic_dest_fields" class="mt-2"></div>
         </form>
       </div>
       <div class="modal-footer">
         <button id="profile_save_btn" type="button" class="btn btn-primary">저장</button>
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 모달: 이송 핸들러 커스텀 스크립트 관리 (feeder_custom/transporters) -->
+<div class="modal fade modal-resizable" id="transporter_script_modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-xl">
+    <div class="modal-content">
+      <div class="modal-header d-flex align-items-center justify-content-between">
+        <h4 class="modal-title">이송 핸들러(Transporter) 스크립트 관리 <small class="text-muted">(data/db/feeder_custom/transporters)</small></h4>
+        <div class="d-flex align-items-center">
+          <button type="button" class="modal-fullscreen-btn mr-2" title="화면 최대화/복원"><i class="fa fa-expand"></i></button>
+          <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
+        </div>
+      </div>
+      <div class="modal-body d-flex flex-column" style="flex: 1 1 auto; min-height: 0;">
+        <div class="form-inline mb-2 justify-content-between flex-shrink-0">
+          <div class="form-inline">
+            <label class="mr-2 font-weight-bold">이송 파일:</label>
+            <select id="transporter_script_select" class="form-control form-control-sm mr-2" style="min-width: 240px;">
+              <option value="">-- 파일 선택 --</option>
+            </select>
+            <button type="button" id="transporter_script_new_btn" class="btn btn-sm btn-outline-success mr-1">새 이송 템플릿</button>
+            <button type="button" id="transporter_script_delete_btn" class="btn btn-sm btn-outline-danger">삭제</button>
+          </div>
+          <div>
+            <span id="transporter_script_status" class="small text-info"></span>
+          </div>
+        </div>
+
+        <div class="form-group mb-2 flex-shrink-0">
+          <label class="small text-muted mb-1">파일명 (.py)</label>
+          <input type="text" id="transporter_script_name" class="form-control form-control-sm font-weight-bold" placeholder="예: trans_custom.py">
+        </div>
+
+        <div class="form-group mb-0 custom-script-editor-wrapper" style="flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0;">
+          <label class="small text-muted mb-1 flex-shrink-0">파이썬 코드 (BaseTransporter 상속)</label>
+          <textarea id="transporter_script_code" name="transporter_script_code" style="display: none;"></textarea>
+          <div id="transporter_script_code_editor" class="feeder-editor-box" style="flex: 1 1 auto; height: 100%; width: 100%; min-height: 380px;"></div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button id="transporter_script_save_btn" type="button" class="btn btn-primary">저장 및 핸들러 동적 로드</button>
         <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
       </div>
     </div>
@@ -289,12 +365,14 @@
       </div>
       <div class="modal-body">
         <p class="small text-muted mb-2">
-          줄바꿈으로 구분하여 <code>이메일:내드라이브폴더ID</code> 형식으로 붙여넣으세요.<br>
+          줄바꿈으로 구분하여 입력하세요:<br>
+          - 위임(Impersonate) 사용 시: <code>이메일:내드라이브폴더ID</code><br>
+          - 비위임(개별 리모트) 사용 시: <code>이메일:내드라이브폴더ID:리모트명</code><br>
           예시:<br>
-          <code>user01@example.com:0AIoBxxxxxx_MyDriveFolderID</code><br>
-          <code>user02@example.com:0AIoByyyyyy_MyDriveFolderID</code>
+          <code>user01@example.com:0AIoBxxxxxx_MyDriveID:gdrive_user01</code><br>
+          <code>user02@example.com:0AIoByyyyyy_MyDriveID:gdrive_user02</code>
         </p>
-        <textarea id="gdrive_batch_textarea" class="form-control" rows="12" style="font-family: monospace; font-size: 0.85rem;" placeholder="이메일:내드라이브ID"></textarea>
+        <textarea id="gdrive_batch_textarea" class="form-control" rows="12" style="font-family: monospace; font-size: 0.85rem;" placeholder="이메일:내드라이브ID:리모트명"></textarea>
       </div>
       <div class="modal-footer">
         <button id="gdrive_batch_save_btn" type="button" class="btn btn-primary">일괄 추가하기</button>

@@ -9,7 +9,8 @@ $(document).ready(function(){
 
 function init_sse_listener() {
   if (window.EventSource) {
-    sse_source = new EventSource('/' + package_name + '/api/' + sub + '/sse');
+    var sseUrl = '/' + package_name + '/api/' + sub + '/sse' + (apikey ? '?apikey=' + apikey : '');
+    sse_source = new EventSource(sseUrl);
     sse_source.onmessage = function(event) {
       try {
         var data = JSON.parse(event.data);
@@ -59,8 +60,12 @@ function render_queue_rows(list) {
     if (it.status === 'pending') statusBadge = '<span class="badge badge-warning">대기 (Pending)</span>';
     else if (it.status === 'downloading') statusBadge = '<span class="badge badge-primary">다운로드 중</span>';
     else if (it.status === 'pending_local_staging' || it.status === 'local_staging') statusBadge = '<span class="badge badge-info">로컬 스테이징</span>';
+    else if (it.status === 'pending_colab') statusBadge = '<span class="badge badge-warning">Colab 대기</span>';
+    else if (it.status === 'colab_transferring') statusBadge = '<span class="badge badge-primary">Colab 전송 중</span>';
     else if (it.status === 'downloaded') statusBadge = '<span class="badge badge-success">다운로드 완료</span>';
     else if (it.status === 'pending_upload' || it.status === 'uploading') statusBadge = '<span class="badge badge-primary">업로드 중</span>';
+    else if (it.status === 'completed') statusBadge = '<span class="badge badge-success">최종 완료</span>';
+    else if (it.status === 'failed') statusBadge = '<span class="badge badge-danger">실패</span>';
     else statusBadge = '<span class="badge badge-secondary">' + it.status + '</span>';
 
     var engineInfo = it.current_engine_name ? '<br><small class="text-muted">엔진: ' + it.current_engine_name + '</small>' : '';

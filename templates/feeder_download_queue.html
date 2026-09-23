@@ -80,6 +80,7 @@
 <script type="text/javascript">
 var package_name = "{{ arg['package_name'] }}";
 var sub = "{{ arg['sub'] }}";
+var apikey = "{{ arg['apikey'] }}";
 var enable_sse = ("{{ arg.get('download_enable_sse', 'True') }}" === 'True');
 </script>
 <script src="{{ url_for('.static', filename='feeder_download_queue.js') }}"></script>
