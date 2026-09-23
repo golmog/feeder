@@ -506,7 +506,7 @@ function render_modal_crawler_boards() {
     var b = modal_crawler_boards[i];
     str += '<tr>';
     str += '  <td><strong>' + b.board + '</strong></td>';
-    str += '  <td>' + (b.subcat ? '<span class="badge badge-light">' + b.subcat + '</span>' : '<span class="text-muted">-</span>') + '</td>';
+    str += '  <td>' + (b.subcat ? '<span class="badge badge-subcat">' + b.subcat + '</span>' : '<span class="text-muted">-</span>') + '</td>';
     str += '  <td><button type="button" class="btn btn-xs btn-danger text-white remove_crawler_board_btn" data-index="' + i + '">삭제</button></td>';
     str += '</tr>';
   }
@@ -688,7 +688,7 @@ function render_modal_feed_sources() {
     str += '<tr>';
     str += '  <td><span class="badge badge-secondary">' + s.site + '</span></td>';
     str += '  <td><strong>' + s.board + '</strong></td>';
-    str += '  <td>' + (s.subcat ? '<span class="badge badge-light">' + s.subcat + '</span>' : '<span class="text-muted">-</span>') + '</td>';
+    str += '  <td>' + (s.subcat ? '<span class="badge badge-subcat">' + s.subcat + '</span>' : '<span class="text-muted">-</span>') + '</td>';
     str += '  <td><button type="button" class="btn btn-xs btn-danger text-white remove_feed_source_btn" data-index="' + i + '">제외</button></td>';
     str += '</tr>';
   }

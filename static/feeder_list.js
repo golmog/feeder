@@ -172,7 +172,7 @@ function make_list(data) {
         if (bStr.indexOf(':') !== -1) {
           var parts = bStr.split(':');
           site_col += '<span class="badge badge-secondary">' + parts[0] + '</span> ';
-          site_col += '<span class="badge badge-light border text-muted" title="서브카테고리">서브: ' + parts[1] + '</span>';
+          site_col += '<span class="badge badge-subcat" title="서브카테고리">서브: ' + parts[1] + '</span>';
         } else {
           site_col += '<span class="badge badge-secondary">' + bStr + '</span>';
         }
