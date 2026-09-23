@@ -1005,7 +1005,7 @@ class ModuleFeed(PluginModuleBase):
                 if not f_key:
                     continue
 
-                display_name = f"{b_val} (서브: {sub_val})" if sub_val else str(b_val)
+                display_name = f"[{f_key}]" if sub_val else str(b_val)
                 if not any(x['key'] == f_key for x in ret['board'][s]):
                     ret['board'][s].append({'key': f_key, 'name': display_name})
 
@@ -1020,8 +1020,7 @@ class ModuleFeed(PluginModuleBase):
                     ret['board'][s] = []
 
                 if not any(x['key'] == b for x in ret['board'][s]):
-                    sub_str = b.split(':')[1] if ':' in b else ''
-                    disp = f"{b.split(':')[0]} (서브: {sub_str})" if sub_str else str(b)
+                    disp = f"[{b}]" if ':' in b else str(b)
                     ret['board'][s].append({'key': b, 'name': disp})
         except Exception:
             pass
