@@ -3,6 +3,7 @@
 import os
 import glob
 import shutil
+import subprocess
 import importlib.util
 
 from .setup import *
@@ -179,6 +180,127 @@ class BaseTransporter:
         raise NotImplementedError
 
 
+# ==============================================================================
+# 기본 내장 트랜스포터 (Built-in Transporters)
+# ==============================================================================
+
+class LocalTransporter(BaseTransporter):
+    """로컬 디스크 보존 및 디렉터리 이동 핸들러 (내장 기본)"""
+    TRANSPORTER_ID = "local"
+    TRANSPORTER_NAME = "로컬 디스크 보존 (단순 완료)"
+
+    CONFIG_SCHEMA = [
+        {"name": "target_folder", "label": "최종 이동 경로", "type": "text", "placeholder": "비워두면 수득 완료 위치 그대로 보존", "desc": "로컬 디스크 내 완료 파일이 이동될 최종 디렉터리 경로"}
+    ]
+
+    def transport(self, item, source_path: str, dest_config: dict) -> tuple[bool, str, str]:
+        target_folder = (dest_config.get('target_folder') or '').strip()
+        folder_name = item.file_name or os.path.basename(source_path)
+
+        if not source_path or not os.path.exists(source_path):
+            logger.error(f"[LocalTransporter] 로컬 소스 경로가 존재하지 않음: {source_path}")
+            return False, "failed", f"로컬 파일 없음: {source_path}"
+
+        final_path = source_path
+        if target_folder and os.path.abspath(source_path) != os.path.abspath(target_folder):
+            try:
+                os.makedirs(target_folder, exist_ok=True)
+                dest_file = os.path.join(target_folder, folder_name)
+                if os.path.exists(dest_file):
+                    short_hash = (item.infohash[:6] if item.infohash else "dup")
+                    n, e = os.path.splitext(folder_name)
+                    dest_file = os.path.join(target_folder, f"{n}_{short_hash}{e}" if e else f"{folder_name}_{short_hash}")
+
+                shutil.move(source_path, dest_file)
+                final_path = dest_file
+                logger.info(f"[LocalTransporter] 로컬 최종 경로 이동 완료: {final_path}")
+            except Exception as e:
+                logger.error(f"[LocalTransporter] 로컬 파일 이동 실패: {e}")
+                return False, "failed", f"로컬 이동 실패: {str(e)}"
+
+        item.local_path = final_path
+        return True, "completed", f"로컬 보존 완료 ({final_path})"
+
+
+class RcloneSimpleTransporter(BaseTransporter):
+    """일반 Rclone 단일 리모트 단순 업로드 핸들러 (내장 기본)"""
+    TRANSPORTER_ID = "rclone_simple"
+    TRANSPORTER_NAME = "일반 Rclone 리모트 단순 업로드"
+
+    CONFIG_SCHEMA = [
+        {"name": "remote_path", "label": "Rclone 목적지 경로", "type": "text", "required": True, "placeholder": "예: onedrive:media/movies 또는 my_gdrive:incoming"},
+        {"name": "chunk_size", "label": "업로드 청크 크기", "type": "text", "default": "128M"}
+    ]
+
+    def transport(self, item, source_path: str, dest_config: dict) -> tuple[bool, str, str]:
+        remote_dest = (dest_config.get('remote_path') or '').strip()
+        if not remote_dest:
+            return False, "failed", "Rclone 목적지 경로(remote_path) 미설정"
+
+        if not source_path or not os.path.exists(source_path):
+            return False, "failed", f"업로드 대상 소스 파일 없음: {source_path}"
+
+        from .util_feed import FeedConfigUtil
+        rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or FeedConfigUtil.load_yaml().get('rclone', {}).get('conf_path', '')
+        folder_name = item.file_name or os.path.basename(source_path)
+        dest_full = f"{remote_dest.rstrip('/')}/{folder_name}"
+        chunk_size = dest_config.get('chunk_size', '128M')
+
+        cmd = [
+            "rclone", "copy", source_path, dest_full,
+            "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE",
+            "--drive-chunk-size", chunk_size,
+            "--retries", "2"
+        ]
+        if rclone_conf:
+            cmd.extend(["--config", rclone_conf])
+
+        logger.info(f"[RcloneTransporter] 업로드 시작: {folder_name} -> {dest_full}")
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3600)
+            if res.returncode == 0:
+                logger.info(f"[RcloneTransporter] 업로드 완료: {dest_full}")
+                if os.path.isdir(source_path):
+                    shutil.rmtree(source_path, ignore_errors=True)
+                elif os.path.isfile(source_path):
+                    os.remove(source_path)
+                return True, "completed", f"Rclone 업로드 완료 ({dest_full})"
+            else:
+                err = res.stderr.strip() or "알 수 없는 Rclone 오류"
+                logger.error(f"[RcloneTransporter] Rclone 오류: {err}")
+                return False, "failed", f"Rclone 실패: {err[:120]}"
+        except Exception as ex:
+            logger.error(f"[RcloneTransporter] Rclone 실행 예외: {ex}")
+            return False, "failed", f"Rclone 실행 예외: {str(ex)}"
+
+
+class GDrivePoolTransporter(BaseTransporter):
+    """Google Drive SA 계정 풀 로테이션 및 MyDrive 15GB 우회 이송 핸들러 (내장 기본)"""
+    TRANSPORTER_ID = "gdrive_rotation"
+    TRANSPORTER_NAME = "Google Drive 계정 풀 로테이션 (MyDrive 경유용)"
+
+    CONFIG_SCHEMA = [
+        {"name": "upload_path", "label": "임시 수신 경로 (Incoming)", "type": "text", "default": "incoming/default"},
+        {"name": "complete_path", "label": "최종 라이브러리 경로 (Complete)", "type": "text", "default": "uploads/default"},
+        {"name": "shared_drive_id", "label": "공유 드라이브 ID (Shared Drive ID)", "type": "text", "placeholder": "미입력 시 기본 설정값 사용"}
+    ]
+
+    def transport(self, item, source_path: str, dest_config: dict) -> tuple[bool, str, str]:
+        item.destination_type = "gdrive_rotation"
+        item.gdrive_upload_path = dest_config.get('upload_path', 'incoming/default')
+        item.gdrive_complete_path = dest_config.get('complete_path', 'uploads/default')
+        item.gdrive_remote_id = dest_config.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
+        item.local_path = source_path
+
+        from .util_upload import GDriveAccountManager, GDriveUploadHandler
+        manager = GDriveAccountManager()
+        success = GDriveUploadHandler.execute_upload(item, manager)
+        if success:
+            return True, "completed", "구글 드라이브 최종 완료"
+        else:
+            return False, item.status, f"구글 드라이브 업로드 보류 또는 실패 ({item.error_message})"
+
+
 class TransporterManager:
     """data/db/feeder_custom/transporters/*.py 스크립트를 동적으로 로드하고 관리"""
     _transporter_classes = {}
@@ -186,13 +308,20 @@ class TransporterManager:
     @classmethod
     def load_transporters(cls):
         ensure_custom_dirs()
-        cls._transporter_classes = {}
+        # 기본 내장 트랜스포터 등록
+        cls._transporter_classes = {
+            LocalTransporter.TRANSPORTER_ID: LocalTransporter,
+            RcloneSimpleTransporter.TRANSPORTER_ID: RcloneSimpleTransporter,
+            GDrivePoolTransporter.TRANSPORTER_ID: GDrivePoolTransporter,
+        }
 
         py_files = glob.glob(os.path.join(TRANSPORTERS_DIR, "*.py"))
         for fpath in py_files:
             fname = os.path.basename(fpath)
-            # 워커나 템플릿 스크립트는 임포트 대상에서 제외
+            # 워커 스크립트 및 플랫폼 내장으로 통합된 이전 파일은 동적 임포트에서 제외
             if fname.startswith("__") or fname.endswith("_worker.py") or "worker" in fname:
+                continue
+            if fname in ["trans_local.py", "trans_rclone.py", "trans_gdrive_pool.py"]:
                 continue
             module_name = f"feeder_trans_{os.path.splitext(fname)[0]}"
             try:
@@ -210,7 +339,7 @@ class TransporterManager:
                         t_id = getattr(obj, 'TRANSPORTER_ID', '').lower()
                         if t_id:
                             cls._transporter_classes[t_id] = obj
-                            logger.info(f"[TransporterManager] 이송 핸들러 로드 완료: '{t_id}' ({fname})")
+                            logger.info(f"[TransporterManager] 외부 커스텀 이송 핸들러 로드 완료: '{t_id}' ({fname})")
             except (Exception, SystemExit) as e:
                 logger.error(f"[TransporterManager] 이송 스크립트({fname}) 안전 로드 차단 (서버 보호): {e}")
 

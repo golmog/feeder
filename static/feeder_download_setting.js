@@ -602,6 +602,9 @@ function render_profiles(data) {
     var destInfo = '<span class="badge badge-dark">' + (dest.type || 'local') + '</span>';
     if (dest.type === 'rclone_simple' && dest.remote_path) {
       destInfo += '<br><small class="text-muted">' + dest.remote_path + '</small>';
+    } else if (dest.type === 'gdrive_rotation') {
+      destInfo = '<span class="badge badge-success">GDrive 계정 풀</span>';
+      if (dest.complete_path) destInfo += '<br><small class="text-muted">' + dest.complete_path + '</small>';
     } else if (dest.type === 'colab_gdrive') {
       destInfo = '<span class="badge badge-primary">Colab GDrive</span>';
       if (dest.remote_name) destInfo += '<br><small class="text-muted">' + dest.remote_name + ' (' + (dest.buffer_limit_gb || 50) + 'GB 버퍼)</small>';
