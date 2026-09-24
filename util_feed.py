@@ -121,6 +121,31 @@ def clean_xml_string(value: str) -> str:
     )
 
 
+def split_magnets(magnet_str: str) -> list[str]:
+    """
+    magnet:? 및 ed2k:// 링크 문자열을 안전하게 분리.
+    """
+    if not magnet_str:
+        return []
+    raw = str(magnet_str).strip()
+    if not raw:
+        return []
+
+    matches = list(re.finditer(r'(?:magnet:\?|ed2k://)', raw, re.IGNORECASE))
+    if not matches:
+        sep = '\n' if '\n' in raw else '|'
+        return [m.strip() for m in raw.split(sep) if m.strip()]
+
+    result = []
+    for idx, match in enumerate(matches):
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(raw)
+        part = raw[start:end].strip().strip('|').strip()
+        if part:
+            result.append(part)
+    return result
+
+
 def get_paging_info(count, current_page, page_size):
     """웹 UI 페이지네이션 계산"""
     total_page = math.ceil(count / page_size) if page_size > 0 else 1

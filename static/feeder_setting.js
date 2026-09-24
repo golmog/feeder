@@ -911,6 +911,24 @@ $(document).on('click', '#feed_reload_btn', function(e){
   notify('새로고침 완료', 'info');
 });
 
+$(document).on('click', '#btn_fix_ed2k_db', function(e){
+  e.preventDefault();
+  if (!confirm('DB 내의 모든 마그넷 및 ed2k 링크 구조를 전수 검사하여 보정하시겠습니까?')) return;
+  notify('DB 링크 보정 작업 진행 중...', 'info');
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/fix_ed2k_db',
+    type: "POST",
+    dataType: "json",
+    success: function(data) {
+      if (data.ret === 'success') {
+        notify('DB 보정 완료: 수집 게시글 ' + data.bbs_fixed + '건 보정, 다운로드 큐 ' + data.dl_fixed + '건 복원', 'success');
+      } else {
+        notify('보정 실패: ' + (data.msg || '알 수 없는 오류'), 'danger');
+      }
+    }
+  });
+});
+
 $(document).on('click', '#my_site_add_btn', function(e){
   e.preventDefault();
   $('#site_modal_title').text('사이트 직접 추가');

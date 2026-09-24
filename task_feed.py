@@ -642,7 +642,7 @@ class Task:
             bbs.url = item.get('url', '')
             bbs.magnet_count = len(item['magnet']) if item.get('magnet') else 0
             bbs.file_count = len(item['download']) if item.get('download') else 0
-            bbs.magnet = '|'.join(item['magnet']) if item.get('magnet') else ''
+            bbs.magnet = '\n'.join(item['magnet']) if item.get('magnet') else ''
             bbs.torrent_info = item.get('torrent_info')
 
             if bbs.file_count > 0:
