@@ -107,11 +107,23 @@ class ModuleFeed(PluginModuleBase):
 
     def process_ajax(self, sub, req):
         try:
-            command = req.form.get('command') or sub
+            # 프레임워크 표준 설정 저장 처리 및 활성 스케줄러 주기 자동 갱신
+            if sub == 'setting_save':
+                ret = super(ModuleFeed, self).process_ajax(sub, req)
+                try:
+                    if F.scheduler.is_include(self.get_scheduler_name()):
+                        F.scheduler.remove_job(self.get_scheduler_name())
+                        F.scheduler.add_job_instance(self)
+                        logger.info(f"[{self.name}] 설정 저장에 따른 스케줄러 주기 갱신 완료 ({P.ModelSetting.get(f'{self.name}_interval')}분)")
+                except Exception as ex:
+                    logger.debug(f"[{self.name}] 스케줄러 갱신 예외: {ex}")
+                return ret
 
             # 웹 리스트 검색 요청 처리
-            if sub == 'web_list' or command == 'web_list':
+            if sub == 'web_list':
                 return jsonify(self.web_list_model.web_list(req))
+
+            command = req.form.get('command') or sub
 
             if command:
                 res = self.process_command(command, req.form.get('arg1', ''), req.form.get('arg2', ''), req.form.get('arg3', ''), req)
@@ -496,6 +508,15 @@ class ModuleFeed(PluginModuleBase):
             else:
                 ret = 'fail'
             return jsonify({'ret': ret, 'crawlers': self.get_crawler_list()})
+
+        elif command == 'clear_board_db':
+            site_val = req.form.get('site', '').strip()
+            board_val = req.form.get('board', '').strip()
+            subcat_val = req.form.get('subcat', '').strip()
+            if not site_val or not board_val:
+                return jsonify({'ret': 'fail', 'msg': '사이트 또는 게시판 정보 누락'})
+            ret = self.delete_board_db(site_val, board_val, subcat_val)
+            return jsonify({'ret': ret})
 
         # 피드 발행기 (FEEDS) 관리 명령
         elif command == 'load_feeds':
@@ -989,6 +1010,21 @@ class ModuleFeed(PluginModuleBase):
             return 'success'
         except Exception as e:
             logger.error(f"[Feeder] delete_crawler_db 에러: {e}")
+            db.session.rollback()
+        return 'fail'
+
+    def delete_board_db(self, site: str, board: str, subcat: str = '') -> str:
+        try:
+            from .task_feed import Task
+            _, _, full_board_key = Task.parse_board_info(board, subcat)
+            deleted = db.session.query(ModelFeedBbs).filter_by(site=site, board=full_board_key).delete()
+            db.session.commit()
+            if deleted > 0:
+                self.db_vacuum()
+            logger.info(f"[{self.name}] 개별 게시판 DB 비우기 완료: [{site}] {full_board_key} (삭제: {deleted}건)")
+            return 'success'
+        except Exception as e:
+            logger.error(f"[{self.name}] delete_board_db 에러: {e}")
             db.session.rollback()
         return 'fail'
 

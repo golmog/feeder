@@ -501,13 +501,21 @@ function render_modal_crawler_boards() {
     $('#crawler_boards_json').val('[]');
     return;
   }
+  var isEditMode = ($('#modal_crawler_id').val() !== '-1');
   var str = '';
   for (var i = 0; i < modal_crawler_boards.length; i++) {
     var b = modal_crawler_boards[i];
     str += '<tr>';
     str += '  <td><strong>' + b.board + '</strong></td>';
     str += '  <td>' + (b.subcat ? '<span class="badge badge-secondary">' + b.subcat + '</span>' : '<span class="text-muted">-</span>') + '</td>';
-    str += '  <td><button type="button" class="btn btn-xs btn-danger text-white remove_crawler_board_btn" data-index="' + i + '">삭제</button></td>';
+    str += '  <td>';
+    str += '    <div class="btn-group btn-group-sm">';
+    if (isEditMode) {
+      str += '      <button type="button" class="btn btn-xs btn-outline-warning clear_crawler_board_db_btn mr-1" data-index="' + i + '" title="해당 게시판의 수집 데이터만 비우기">DB 비우기</button>';
+    }
+    str += '      <button type="button" class="btn btn-xs btn-danger text-white remove_crawler_board_btn" data-index="' + i + '">삭제</button>';
+    str += '    </div>';
+    str += '  </td>';
     str += '</tr>';
   }
   tbody.html(str);
@@ -535,11 +543,65 @@ $(document).on('click', '#add_crawler_board_btn', function(e){
   $('#modal_crawler_subcat_input').val('');
 });
 
+$(document).on('click', '.clear_crawler_board_db_btn', function(e){
+  e.preventDefault();
+  var idx = $(this).data('index');
+  var b = modal_crawler_boards[idx];
+  var site = $('#crawler_site').val();
+  var boardDisplay = b.board + (b.subcat ? ':' + b.subcat : '');
+
+  if (!confirm('[' + site + ' - ' + boardDisplay + '] 게시판의 수집 데이터(DB)를 비우시겠습니까?\n(게시판 설정은 유지됩니다)')) return;
+
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/clear_board_db',
+    type: "POST",
+    data: {
+      site: site,
+      board: b.board,
+      subcat: b.subcat || ''
+    },
+    dataType: "json",
+    success: function(data) {
+      if (data.ret === 'success') {
+        notify('[' + boardDisplay + '] 게시판의 수집 데이터가 삭제되었습니다.', 'info');
+      } else {
+        notify('DB 비우기 실패: ' + (data.msg || data.ret), 'warning');
+      }
+    }
+  });
+});
+
 $(document).on('click', '.remove_crawler_board_btn', function(e){
   e.preventDefault();
   var idx = $(this).data('index');
-  modal_crawler_boards.splice(idx, 1);
-  render_modal_crawler_boards();
+  var b = modal_crawler_boards[idx];
+  var site = $('#crawler_site').val();
+  var boardDisplay = b.board + (b.subcat ? ':' + b.subcat : '');
+  var isEditMode = ($('#modal_crawler_id').val() !== '-1');
+
+  if (isEditMode) {
+    if (!confirm('[' + site + ' - ' + boardDisplay + '] 게시판을 수집 대상에서 삭제하시겠습니까?\n\n※ 경고: 해당 게시판의 모든 수집 데이터(DB)도 함께 영구 삭제됩니다.')) {
+      return;
+    }
+    $.ajax({
+      url: '/' + package_name + '/ajax/' + sub + '/clear_board_db',
+      type: "POST",
+      data: {
+        site: site,
+        board: b.board,
+        subcat: b.subcat || ''
+      },
+      dataType: "json",
+      success: function(data) {
+        modal_crawler_boards.splice(idx, 1);
+        render_modal_crawler_boards();
+        notify('[' + boardDisplay + '] 게시판 및 수집 데이터가 삭제되었습니다.', 'info');
+      }
+    });
+  } else {
+    modal_crawler_boards.splice(idx, 1);
+    render_modal_crawler_boards();
+  }
 });
 
 $(document).on('click', '#crawler_add_btn', function(e){
