@@ -491,8 +491,8 @@ class Task:
                             logger.info(f"[Feeder] 타 게시판/사이트에 이미 존재하는 마그넷이므로 수집 제외: {item['title'][:35]}...")
                             continue
 
-                    # 순수 DB 저장 (수집 단계에서 제외 없이 원본 보존)
-                    if not is_test and (item.get('magnet') or 'ONLY_FILE' in site_info.get('EXTRA', [])):
+                    # 순수 DB 저장 (수집 단계에서 제외 없이 원본 보존, 로그인 필요 등 특수 상태 포함)
+                    if not is_test and (item.get('magnet') or 'ONLY_FILE' in site_info.get('EXTRA', []) or item.get('broadcast_status')):
                         Task.save_single_bbs(site_name, full_board_key, item)
 
                     bbs_list.append(item)
@@ -644,6 +644,7 @@ class Task:
             bbs.file_count = len(item['download']) if item.get('download') else 0
             bbs.magnet = '\n'.join(item['magnet']) if item.get('magnet') else ''
             bbs.torrent_info = item.get('torrent_info')
+            bbs.broadcast_status = item.get('broadcast_status', '')
 
             if bbs.file_count > 0:
                 bbs.files = '||'.join(f"{x['link']}|{x['filename']}|NONE" for x in item['download'])
@@ -652,7 +653,10 @@ class Task:
 
             db.session.add(bbs)
             db.session.commit()
-            logger.info(f"[Feeder] DB 저장 완료: [{site_name}] {bbs.title[:30]}... (ID: {post_id})")
+            if bbs.broadcast_status == 'LOGIN_REQUIRED':
+                logger.info(f"[Feeder] DB 저장 완료 (로그인 필요 건너뜀 기록): [{site_name}] {bbs.title[:30]}... (ID: {post_id})")
+            else:
+                logger.info(f"[Feeder] DB 저장 완료: [{site_name}] {bbs.title[:30]}... (ID: {post_id})")
             return bbs
         except Exception as e:
             logger.error(f"[Feeder] 단일 항목 DB 저장 오류: {e}")

@@ -714,6 +714,11 @@ class ModuleFeed(PluginModuleBase):
             filtered_items = []
             for bbs in candidates:
                 bbs_dict = bbs.as_dict()
+
+                # 마그넷이나 첨부파일이 전혀 없는 항목(로그인 필요 등)은 RSS 피드 대상에서 제외
+                if not bbs_dict.get('magnet') and not bbs_dict.get('files'):
+                    continue
+
                 item_hashes = []
                 for m in bbs_dict.get('magnet', []):
                     h = extract_info_hash(m) or m
@@ -748,6 +753,11 @@ class ModuleFeed(PluginModuleBase):
             filtered_items = []
             for bbs in items:
                 bbs_dict = bbs.as_dict()
+
+                # 마그넷이나 첨부파일이 전혀 없는 항목(로그인 필요 등)은 RSS 피드 대상에서 제외
+                if not bbs_dict.get('magnet') and not bbs_dict.get('files'):
+                    continue
+
                 is_pass, _ = FeedFilter.evaluate(bbs_dict, None, global_cfg)
                 if is_pass:
                     filtered_items.append(bbs)

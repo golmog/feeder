@@ -174,6 +174,9 @@ function make_list(data) {
       } else {
         site_col += '<span class="badge badge-secondary">기본</span>';
       }
+      if (item.broadcast_status === 'LOGIN_REQUIRED') {
+        site_col += ' <span class="badge badge-warning">로그인 필요</span>';
+      }
       str += j_col(2, site_col);
 
       var detail_col = '<div class="mb-2"><strong><a href="' + item.url + '" target="_blank">' + item.title + '</a></strong></div>';
@@ -224,8 +227,21 @@ function make_list(data) {
         }
       }
 
+      if ((!item.magnet || item.magnet.length === 0) && (!item.files || item.files.length === 0)) {
+        if (item.broadcast_status === 'LOGIN_REQUIRED') {
+          detail_col += '<div class="p-2 mb-1 rounded small text-muted" style="background: rgba(255, 193, 7, 0.08); border-left: 3px solid #ffc107;">';
+          detail_col += '  <i class="fa fa-lock mr-1 text-warning"></i>사이트 첨부파일 다운로드 권한(로그인)이 필요하여 마그넷 수집이 제외된 항목입니다. (다음 수집 주기 시 탐색 건너뜀)';
+          detail_col += '</div>';
+        } else {
+          detail_col += '<div class="p-2 mb-1 rounded small text-muted" style="background: rgba(128, 128, 128, 0.06);">';
+          detail_col += '  <i class="fa fa-info-circle mr-1"></i>수집된 마그넷 또는 첨부파일이 없습니다.';
+          detail_col += '</div>';
+        }
+      }
+
       str += j_col(9, detail_col);
       str += j_row_end();
+
       if (i != data.length - 1) str += j_hr();
     }
     document.getElementById("list_div").innerHTML = str;
