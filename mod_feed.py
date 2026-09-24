@@ -77,10 +77,6 @@ class ModuleFeed(PluginModuleBase):
         except Exception as e:
             logger.debug(f"[{self.name}] plugin_load 초기화 예외: {e}")
         try:
-            self.fix_database_magnets()
-        except Exception as e:
-            logger.debug(f"[{self.name}] plugin_load DB 보정 예외: {e}")
-        try:
             super(ModuleFeed, self).plugin_load()
         except Exception:
             pass
@@ -928,57 +924,59 @@ class ModuleFeed(PluginModuleBase):
 
     def fix_database_magnets(self):
         """기존 DB에 잘못 분리되거나 | 구분자로 저장된 ed2k/마그넷 데이터 일괄 보정"""
-        try:
-            from .model_feed import ModelFeedBbs
-            from .model_download import ModelDownload
-            from .util_feed import split_magnets, extract_info_hash
+        with F.app.app_context():
+            try:
+                from .model_feed import ModelFeedBbs
+                from .model_download import ModelDownload
+                from .util_feed import split_magnets, extract_info_hash
 
-            fixed_bbs_count = 0
-            bbs_rows = db.session.query(ModelFeedBbs).filter(ModelFeedBbs.magnet.isnot(None)).all()
-            for row in bbs_rows:
-                if not row.magnet:
-                    continue
-                links = split_magnets(row.magnet)
-                if not links:
-                    continue
-                new_magnet_str = '\n'.join(links)
-                new_count = len(links)
-                if row.magnet != new_magnet_str or row.magnet_count != new_count:
-                    row.magnet = new_magnet_str
-                    row.magnet_count = new_count
-                    fixed_bbs_count += 1
+                fixed_bbs_count = 0
+                bbs_rows = db.session.query(ModelFeedBbs).filter(ModelFeedBbs.magnet.isnot(None)).all()
+                for row in bbs_rows:
+                    if not row.magnet:
+                        continue
+                    links = split_magnets(row.magnet)
+                    if not links:
+                        continue
+                    new_magnet_str = '\n'.join(links)
+                    new_count = len(links)
+                    if row.magnet != new_magnet_str or row.magnet_count != new_count:
+                        row.magnet = new_magnet_str
+                        row.magnet_count = new_count
+                        fixed_bbs_count += 1
 
-            fixed_dl_count = 0
-            deleted_dl_count = 0
-            dl_rows = db.session.query(ModelDownload).all()
-            for dl in dl_rows:
-                mag = (dl.magnet or '').strip()
-                if mag == 'ed2k://' or mag == 'file' or mag == '/' or (mag.startswith('ed2k://') and not mag.endswith('|/')):
-                    matched_bbs = None
-                    if dl.title:
-                        matched_bbs = db.session.query(ModelFeedBbs).filter(ModelFeedBbs.title == dl.title).first()
+                fixed_dl_count = 0
+                deleted_dl_count = 0
+                dl_rows = db.session.query(ModelDownload).all()
+                for dl in dl_rows:
+                    mag = (dl.magnet or '').strip()
+                    if mag == 'ed2k://' or mag == 'file' or mag == '/' or (mag.startswith('ed2k://') and not mag.endswith('|/')):
+                        matched_bbs = None
+                        if dl.title:
+                            matched_bbs = db.session.query(ModelFeedBbs).filter(ModelFeedBbs.title == dl.title).first()
 
-                    if matched_bbs and matched_bbs.magnet:
-                        bbs_links = split_magnets(matched_bbs.magnet)
-                        valid_ed2k = [l for l in bbs_links if l.startswith('ed2k://')]
-                        if valid_ed2k:
-                            dl.magnet = valid_ed2k[0]
-                            dl.infohash = extract_info_hash(dl.magnet)
-                            fixed_dl_count += 1
-                            continue
+                        if matched_bbs and matched_bbs.magnet:
+                            bbs_links = split_magnets(matched_bbs.magnet)
+                            valid_ed2k = [l for l in bbs_links if l.startswith('ed2k://')]
+                            if valid_ed2k:
+                                dl.magnet = valid_ed2k[0]
+                                dl.infohash = extract_info_hash(dl.magnet)
+                                fixed_dl_count += 1
+                                continue
 
-                    if dl.status != 'completed':
-                        db.session.delete(dl)
-                        deleted_dl_count += 1
+                        if dl.status != 'completed':
+                            db.session.delete(dl)
+                            deleted_dl_count += 1
 
-            db.session.commit()
-            logger.info(f"[{self.name}] DB 마그넷/ed2k 보정 완료: 수집게시판(BBS) {fixed_bbs_count}건 보정, 다운로드큐 {fixed_dl_count}건 복원, {deleted_dl_count}건 파편 레코드 삭제")
-            return {'ret': 'success', 'bbs_fixed': fixed_bbs_count, 'dl_fixed': fixed_dl_count, 'dl_deleted': deleted_dl_count}
-        except Exception as e:
-            logger.error(f"[{self.name}] fix_database_magnets 에러: {e}")
-            logger.error(traceback.format_exc())
-            db.session.rollback()
-            return {'ret': 'error', 'msg': str(e)}
+                db.session.commit()
+                db.session.expire_all()
+                logger.info(f"[{self.name}] DB 마그넷/ed2k 보정 완료: 수집게시판(BBS) {fixed_bbs_count}건 보정, 다운로드큐 {fixed_dl_count}건 복원, {deleted_dl_count}건 파편 레코드 삭제")
+                return {'ret': 'success', 'bbs_fixed': fixed_bbs_count, 'dl_fixed': fixed_dl_count, 'dl_deleted': deleted_dl_count}
+            except Exception as e:
+                logger.error(f"[{self.name}] fix_database_magnets 에러: {e}")
+                logger.error(traceback.format_exc())
+                db.session.rollback()
+                return {'ret': 'error', 'msg': str(e)}
 
     def delete_crawler_db(self, crawler: dict) -> str:
         try:

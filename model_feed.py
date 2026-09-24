@@ -118,7 +118,8 @@ class ModelFeedBbs(ModelBase):
     def as_dict(self):
         ret = {x.name: getattr(self, x.name) for x in self.__table__.columns}
         ret['created_time'] = self.created_time.strftime('%Y-%m-%d %H:%M:%S') if self.created_time else ''
-        ret['magnet'] = [m for m in self.magnet.split('|') if m] if ret.get('magnet') else []
+        from .util_feed import split_magnets
+        ret['magnet'] = split_magnets(self.magnet) if ret.get('magnet') else []
         if ret.get('files'):
             ret['files'] = [item.split('|') for item in self.files.split('||') if item]
         else:
