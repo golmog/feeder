@@ -526,6 +526,11 @@ class ModuleCrawl(PluginModuleBase):
                 return self._handle_download_stream(req.args.get('id'))
             elif sub == 'site_update':
                 return self._handle_site_update()
+            elif sub in ['feed', 'rss']:
+                feed_mod = P.get_module('feed')
+                if feed_mod:
+                    return feed_mod.process_api(sub, req)
+                return jsonify({'ret': 'fail', 'msg': '피드 모듈 비활성화 상태'}), 500
             return jsonify({'ret': 'fail', 'msg': f'알 수 없는 API 명령: {sub}'}), 404
         except Exception as e:
             logger.error(f"[CrawlAPI] process_api 에러 ({sub}): {e}")

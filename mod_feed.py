@@ -210,7 +210,7 @@ class ModuleFeed(PluginModuleBase):
             feed_list = []
             for f in feeds:
                 info = dict(f)
-                info['api'] = f"{ddns}/{P.package_name}/api/feed?name={f.get('name')}&apikey={apikey}"
+                info['api'] = f"{ddns}/{P.package_name}/api/feed/rss?name={f.get('name')}&apikey={apikey}"
                 info['use_rss_file'] = str(f.get('use_rss_file', False)).lower() in ['true', 'on', '1']
                 feed_list.append(info)
             return jsonify({'feeds': feed_list})
@@ -351,11 +351,13 @@ class ModuleFeed(PluginModuleBase):
 
     def process_api(self, sub, req):
         try:
-            if sub == 'feed':
+            if sub in ['feed', 'rss']:
                 feed_id = req.args.get('id')
                 feed_name = req.args.get('name')
                 if feed_id or feed_name:
+                    logger.debug(f"[FeedAPI] RSS 발행 요청 수신: sub='{sub}', id='{feed_id}', name='{feed_name}'")
                     return self._handle_feed_rss(feed_id=feed_id, feed_name=feed_name)
+                logger.warning(f"[FeedAPI] 피드 식별자 누락: {req.args}")
                 return jsonify({'ret': 'fail', 'msg': '피드 식별자 누락'}), 400
             return jsonify({'ret': 'fail', 'msg': f'알 수 없는 API 명령: {sub}'}), 404
         except Exception as e:
