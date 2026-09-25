@@ -128,9 +128,34 @@ $(document).on('click', '.queue_action_btn', function(e){
 
 function sync_feeder_header_navbar() {
   try {
+    var lastCrawl = localStorage.getItem('feeder_last_crawl_page') || 'setting';
     var lastFeed = localStorage.getItem('feeder_last_feed_page') || 'setting';
     var lastDl = localStorage.getItem('feeder_last_download_page') || 'setting';
+    $('.navbar a[href*="/' + package_name + '/crawl"]').attr('href', '/' + package_name + '/crawl/' + lastCrawl);
     $('.navbar a[href*="/' + package_name + '/feed"]').attr('href', '/' + package_name + '/feed/' + lastFeed);
     $('.navbar a[href*="/' + package_name + '/download"]').attr('href', '/' + package_name + '/download/' + lastDl);
   } catch(e) {}
 }
+
+$(document).on('click', '.navbar a', function(e){
+  var href = $(this).attr('href') || '';
+  if (href.indexOf('/' + package_name + '/crawl') !== -1) {
+    var lastCrawl = localStorage.getItem('feeder_last_crawl_page');
+    if (lastCrawl && lastCrawl !== 'setting') {
+      e.preventDefault();
+      window.location.href = '/' + package_name + '/crawl/' + lastCrawl;
+    }
+  } else if (href.indexOf('/' + package_name + '/feed') !== -1) {
+    var lastFeed = localStorage.getItem('feeder_last_feed_page');
+    if (lastFeed && lastFeed !== 'setting') {
+      e.preventDefault();
+      window.location.href = '/' + package_name + '/feed/' + lastFeed;
+    }
+  } else if (href.indexOf('/' + package_name + '/download') !== -1) {
+    var lastDl = localStorage.getItem('feeder_last_download_page');
+    if (lastDl && lastDl !== 'setting') {
+      e.preventDefault();
+      window.location.href = '/' + package_name + '/download/' + lastDl;
+    }
+  }
+});

@@ -14,7 +14,8 @@ from sqlalchemy import func
 
 from .setup import *
 from .model_download import ModelDownload, ModelDownloadStat
-from .util_feed import FeedConfigUtil, get_tmp_dir
+from .util_crawl import get_tmp_dir
+from .util_feed import FeedConfigUtil
 
 
 def parse_size_bytes(size_val) -> int:

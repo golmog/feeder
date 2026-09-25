@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
-
 import os
 import re
 import json
 import time
 import traceback
 from datetime import datetime, timedelta
-from flask import render_template, request, jsonify, Response, stream_with_context, has_request_context
-from sqlalchemy import desc, or_, and_, func
+from flask import render_template, request, jsonify, Response, stream_with_context
+from sqlalchemy import desc, func
 
 from .setup import *
 from .model_download import ModelDownload, ModelDownloadStat
-from .util_feed import FeedConfigUtil, get_ddns, get_system_apikey
-from .util_download import DownloaderManager
+from .util_crawl import get_ddns, get_system_apikey, extract_info_hash
+from .util_feed import FeedConfigUtil
+from .util_download import DownloaderManager, TransporterManager
 from .task_download import TaskDownloadBase
 
 name = 'download'
@@ -45,7 +45,6 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_gdrive_upload_limit": "700GB",
             f"{self.name}_shared_drive_upload_limit": "3TB",
             f"{self.name}_shared_drive_quota_reset_time": "16:00",
-            f"{self.name}_enable_sse": "True",
         }
 
     def process_menu(self, page_name, req):
@@ -66,7 +65,6 @@ class ModuleDownload(PluginModuleBase):
             elif page_name == 'queue':
                 return render_template(f'{P.package_name}_{self.name}_queue.html', arg=arg)
 
-            # 기본값: list (다운로드 리스트 이력 화면)
             return render_template(f'{P.package_name}_{self.name}_list.html', arg=arg)
         except Exception as e:
             logger.error(f"[{self.name}] process_menu 에러: {e}")
@@ -80,11 +78,9 @@ class ModuleDownload(PluginModuleBase):
             if sub in ['one_execute', 'scheduler_once'] or command in ['one_execute', 'scheduler_once']:
                 return self.one_execute()
 
-            # 큐 및 이력 웹 리스트
             if sub == 'web_list' or command == 'web_list':
                 return jsonify(self.web_list_model.web_list(req))
 
-            # 설정 관리: 다운로더 엔진
             elif command == 'load_downloaders':
                 DownloaderManager.load_engines()
                 return jsonify({
@@ -112,7 +108,6 @@ class ModuleDownload(PluginModuleBase):
                 ok = FeedConfigUtil.delete_downloader(target_name)
                 return jsonify({'ret': 'success' if ok else 'fail', 'downloaders': FeedConfigUtil.get_downloaders()})
 
-            # 다운로드 전용 엔진 스크립트 관리
             elif command == 'download_script_list':
                 from .util_download import ENGINES_DIR, ensure_custom_dirs
                 ensure_custom_dirs()
@@ -152,9 +147,7 @@ class ModuleDownload(PluginModuleBase):
                 except Exception as e:
                     return jsonify({'ret': 'error', 'log': str(e)})
 
-            # 설정 관리: 프로필
             elif command == 'load_profiles':
-                from .util_download import TransporterManager
                 TransporterManager.load_transporters()
                 return jsonify({
                     'profiles': FeedConfigUtil.get_download_profiles(),
@@ -177,7 +170,6 @@ class ModuleDownload(PluginModuleBase):
                 FeedConfigUtil.save_yaml(yaml_data)
                 return jsonify({'ret': 'success', 'profiles': FeedConfigUtil.get_download_profiles()})
 
-            # 이송 핸들러(Transporter) 전용 스크립트 관리
             elif command == 'transporter_script_list':
                 from .util_download import TRANSPORTERS_DIR, ensure_custom_dirs
                 ensure_custom_dirs()
@@ -199,7 +191,7 @@ class ModuleDownload(PluginModuleBase):
                     return jsonify({'ret': 'error', 'log': str(e)})
 
             elif command == 'transporter_script_save':
-                from .util_download import TRANSPORTERS_DIR, TransporterManager
+                from .util_download import TRANSPORTERS_DIR
                 filename = os.path.basename(req.form.get('filename', '').strip())
                 content = req.form.get('content', '')
                 if not filename:
@@ -217,7 +209,6 @@ class ModuleDownload(PluginModuleBase):
                 except Exception as e:
                     return jsonify({'ret': 'error', 'log': str(e)})
 
-            # 설정 관리: 구글 계정 풀
             elif command == 'load_accounts':
                 return jsonify({
                     'accounts': FeedConfigUtil.get_gdrive_accounts(),
@@ -261,14 +252,12 @@ class ModuleDownload(PluginModuleBase):
                 logger.info(f"[{self.name}] 구글 드라이브 계정 차단 목록 수동 초기화 완료")
                 return jsonify({'ret': 'success', 'stats': self.get_account_stats_summary()})
 
-            # 과거 이력 가져오기: 마그넷 텍스트 목록 일괄 임포트
             elif command == 'import_history_text':
                 raw_text = req.form.get('import_text', '').strip()
                 lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
                 now = datetime.now()
                 added_count, skipped_count = 0, 0
 
-                from .util_feed import extract_info_hash
                 for line in lines:
                     infohash = extract_info_hash(line)
                     target_mag = f"magnet:?xt=urn:btih:{infohash}" if infohash else line
@@ -290,10 +279,9 @@ class ModuleDownload(PluginModuleBase):
                     added_count += 1
 
                 db.session.commit()
-                logger.info(f"[{self.name}] 마그넷 텍스트 이력 임포트: {added_count}건 추가, {skipped_count}건 중복 스킵")
+                logger.info(f"[{self.name}] 마그넷 이력 임포트: {added_count}건 추가, {skipped_count}건 중복 스킵")
                 return jsonify({'ret': 'success', 'added': added_count, 'skipped': skipped_count})
 
-            # 과거 이력 가져오기: 외부 SQLite DB 파일 (.db) 범용 임포트
             elif command == 'import_history_db':
                 db_path = req.form.get('db_path', '').strip()
                 table_name = req.form.get('table_name', '').strip() or 'magnets'
@@ -306,8 +294,6 @@ class ModuleDownload(PluginModuleBase):
                     return jsonify({'ret': 'fail', 'msg': '지정한 DB 파일을 찾을 수 없습니다.'})
 
                 import sqlite3
-                from .util_feed import extract_info_hash
-
                 added_count, skipped_count = 0, 0
                 now = datetime.now()
 
@@ -316,7 +302,6 @@ class ModuleDownload(PluginModuleBase):
                     conn.row_factory = sqlite3.Row
                     cur = conn.cursor()
 
-                    # 범용 쿼리 조립: 사용자가 WHERE 조건을 입력했을 때만 필터링, 비워두면 테이블 전체 임포트
                     query = f"SELECT * FROM {table_name}"
                     if where_clause:
                         clean_where = re.sub(r'^\s*where\s+', '', where_clause, flags=re.IGNORECASE).strip()
@@ -359,14 +344,59 @@ class ModuleDownload(PluginModuleBase):
 
                     db.session.commit()
                     conn.close()
-                    logger.info(f"[{self.name}] 외부 DB ({os.path.basename(db_path)}) 범용 이력 임포트: {added_count}건 완료, {skipped_count}건 중복 제외")
+                    logger.info(f"[{self.name}] 외부 DB 이력 임포트: {added_count}건 완료, {skipped_count}건 중복 제외")
                     return jsonify({'ret': 'success', 'added': added_count, 'skipped': skipped_count})
                 except Exception as ex:
-                    logger.error(f"[{self.name}] 외부 DB 범용 임포트 중 오류: {ex}")
+                    logger.error(f"[{self.name}] 외부 DB 임포트 중 오류: {ex}")
                     db.session.rollback()
                     return jsonify({'ret': 'fail', 'msg': str(ex)})
 
-            # 큐 개별 항목 제어
+            elif command in ['direct_add', 'direct_download']:
+                title = req.form.get('title', '').strip()
+                magnet = req.form.get('magnet', '').strip()
+                profile_name = req.form.get('profile_name', '').strip()
+                feed_name = req.form.get('feed_name', 'DIRECT')
+
+                if not magnet:
+                    return jsonify({'ret': 'fail', 'msg': '마그넷/ed2k 링크가 누락되었습니다.'})
+
+                infohash = extract_info_hash(magnet)
+                existing = ModelDownload.get_by_infohash(infohash) if infohash else ModelDownload.get_by_magnet(magnet)
+                if existing:
+                    return jsonify({'ret': 'exist', 'msg': f'이미 다운로드 큐에 등록된 작업입니다 (상태: {existing.status}).'})
+
+                dl_item = ModelDownload(
+                    feed_name=feed_name,
+                    title=title or (infohash or magnet[:30]),
+                    magnet=magnet,
+                    infohash=infohash
+                )
+
+                selected_profile = None
+                if profile_name:
+                    for p in FeedConfigUtil.get_download_profiles():
+                        if p.get('name') == profile_name:
+                            selected_profile = p
+                            break
+
+                if selected_profile:
+                    dl_item.priority_chain = list(selected_profile.get('priority_chain', []))
+                    dest = selected_profile.get('destination', {})
+                    dl_item.destination_type = dest.get('type', 'local')
+                    dl_item.gdrive_upload_path = dest.get('upload_path', '')
+                    dl_item.gdrive_complete_path = dest.get('complete_path', '')
+                    dl_item.gdrive_remote_id = dest.get('shared_drive_id', '')
+                else:
+                    enabled_downloaders = [d['name'] for d in FeedConfigUtil.get_downloaders() if d.get('enabled', True)]
+                    dl_item.priority_chain = enabled_downloaders
+                    dl_item.destination_type = 'local'
+
+                dl_item.status = 'pending'
+                db.session.add(dl_item)
+                db.session.commit()
+                logger.info(f"[{self.name}] 다운로드 큐 직접 추가: {title} (체인: {' -> '.join(dl_item.priority_chain)})")
+                return jsonify({'ret': 'success', 'msg': '다운로드 큐에 성공적으로 등록되었습니다.'})
+
             elif command == 'item_action':
                 action = req.form.get('action')
                 try:
@@ -382,7 +412,6 @@ class ModuleDownload(PluginModuleBase):
                     profile_name = req.form.get('profile_name', '').strip()
                     selected_profile = None
 
-                    # 지정된 프로필 조회 (없으면 피드명 매칭 또는 전체(*) 프로필 조회)
                     if profile_name:
                         for p in FeedConfigUtil.get_download_profiles():
                             if p.get('name') == profile_name:
@@ -391,7 +420,6 @@ class ModuleDownload(PluginModuleBase):
                     if not selected_profile:
                         selected_profile = FeedConfigUtil.get_download_profile_by_feed(item.feed_name)
 
-                    # 프로필 설정 적용 (우선순위 체인 및 목적지)
                     if selected_profile:
                         item.priority_chain = list(selected_profile.get('priority_chain', []))
                         dest = selected_profile.get('destination', {})
@@ -400,13 +428,11 @@ class ModuleDownload(PluginModuleBase):
                         item.gdrive_complete_path = dest.get('complete_path', '')
                         item.gdrive_remote_id = dest.get('shared_drive_id', '')
                     else:
-                        # 프로필이 전혀 없는 경우: 등록된 활성 다운로더를 1순위 체인으로 자동 보강
                         enabled_downloaders = [d['name'] for d in FeedConfigUtil.get_downloaders() if d.get('enabled', True)]
                         if enabled_downloaders:
                             item.priority_chain = enabled_downloaders
                         item.destination_type = item.destination_type or 'local'
 
-                    # 상태 초기화
                     item.status = 'pending'
                     item.current_engine_index = 0
                     item.current_engine_name = None
@@ -415,7 +441,7 @@ class ModuleDownload(PluginModuleBase):
                     db.session.commit()
 
                     chain_desc = ' -> '.join(item.priority_chain) if item.priority_chain else '기본'
-                    logger.info(f"[{self.name}] 다운로드 재시도 대기열 등록 완료: {item.title} (체인: {chain_desc}, 목적지: {item.destination_type})")
+                    logger.info(f"[{self.name}] 다운로드 재시도 대기열 등록 완료: {item.title} (체인: {chain_desc})")
                     return jsonify({'ret': 'success', 'msg': f'[{item.title[:25]}] 재시도 대기열에 등록되었습니다.'})
 
                 elif action == 'force_complete':
@@ -423,7 +449,7 @@ class ModuleDownload(PluginModuleBase):
                     item.completed_time = datetime.now()
                     item.error_message = None
                     db.session.commit()
-                    logger.info(f"[{self.name}] 큐 항목 수동 완료 처리: {item.title} (ID: {item_id})")
+                    logger.info(f"[{self.name}] 수동 완료 처리: {item.title} (ID: {item_id})")
                     return jsonify({'ret': 'success', 'msg': '최종 완료(completed) 처리되었습니다.'})
 
                 elif action == 'delete':
@@ -473,11 +499,9 @@ class ModuleDownload(PluginModuleBase):
         if not item:
             return jsonify({'ret': 'success', 'has_task': False, 'msg': '대기 중인 Colab 전송 작업이 없습니다.'})
 
-        # 선점 상태로 전환
         item.status = 'colab_transferring'
         db.session.commit()
 
-        # 서버에 보관된 rclone.conf 내용 읽기 및 서비스 어카운트 파일 추적
         rclone_conf_path = P.ModelSetting.get('download_rclone_conf_path') or FeedConfigUtil.load_yaml().get('rclone', {}).get('conf_path', '')
         rclone_conf_text = ""
         sa_files = {}
@@ -487,14 +511,12 @@ class ModuleDownload(PluginModuleBase):
                 with open(rclone_conf_path, 'r', encoding='utf-8') as f:
                     rclone_conf_text = f.read()
 
-                # rclone.conf 내 service_account_file = ... 경로 탐색 및 파일 내용 로드
                 conf_dir = os.path.dirname(rclone_conf_path)
                 sa_matches = re.findall(r'service_account_file\s*=\s*(.+)', rclone_conf_text)
                 for raw_sa_path in set(sa_matches):
                     sa_path = raw_sa_path.strip().strip('"').strip("'")
                     sa_fname = os.path.basename(sa_path)
 
-                    # 1차: 기재된 경로, 2차: rclone.conf 위치 기준, 3차: sa/ 하위 폴더 탐색
                     candidate_paths = [
                         sa_path,
                         os.path.join(conf_dir, sa_fname),
@@ -513,21 +535,15 @@ class ModuleDownload(PluginModuleBase):
 
                     if found_content:
                         sa_files[sa_fname] = found_content
-                        # 코랩 VM 내부의 고정 경로로 rclone.conf 내용 자동 치환
                         colab_sa_path = f"/root/.config/rclone/sa/{sa_fname}"
                         rclone_conf_text = re.sub(
                             rf'service_account_file\s*=\s*{re.escape(raw_sa_path)}',
                             f'service_account_file = {colab_sa_path}',
                             rclone_conf_text
                         )
-                        logger.info(f"[{self.name}] [Colab API] SA 키 감지 및 코랩 경로 치환 완료: {sa_fname}")
-                    else:
-                        logger.warning(f"[{self.name}] [Colab API] SA 파일({sa_fname})을 서버에서 찾지 못했습니다.")
-
             except Exception as e:
                 logger.error(f"[{self.name}] rclone.conf 분석 실패: {e}")
 
-        # 목적지 구글 드라이브 경로 조립
         profile = FeedConfigUtil.get_download_profile_by_feed(item.feed_name) or {}
         dest_cfg = profile.get('destination', {})
         remote_name = dest_cfg.get('remote_name') or P.ModelSetting.get('download_rclone_shared_remote_name') or 'gf'
@@ -540,7 +556,6 @@ class ModuleDownload(PluginModuleBase):
         else:
             dest_full_path = f"{remote_name}:{complete_path}/{folder_name}"
 
-        # AllDebrid 원격 소스 경로
         src_full_path = item.local_path or f"ad:magnets/{folder_name}"
         buffer_limit_gb = dest_cfg.get('buffer_limit_gb', 50)
 
@@ -554,7 +569,7 @@ class ModuleDownload(PluginModuleBase):
             'buffer_limit_bytes': int(buffer_limit_gb) * 1024 * 1024 * 1024
         }
 
-        logger.info(f"[{self.name}] [Colab API] 작업 선점 완료: {item.title} (ID: {item.id}) -> {dest_full_path}")
+        logger.info(f"[{self.name}] [Colab API] 작업 선점 완료: {item.title} (ID: {item.id})")
         return jsonify({
             'ret': 'success',
             'has_task': True,
@@ -584,7 +599,6 @@ class ModuleDownload(PluginModuleBase):
             if bytes_transferred > 0:
                 item.file_size = bytes_transferred
 
-            # 다운로더(AllDebrid) 클라우드 원본 정리
             downloader_cfg = FeedConfigUtil.get_downloader_by_name(item.current_engine_name)
             if downloader_cfg and item.engine_task_id:
                 try:
@@ -592,13 +606,13 @@ class ModuleDownload(PluginModuleBase):
                     if engine:
                         engine.delete_task(item.engine_task_id)
                 except Exception as ex:
-                    logger.debug(f"[{self.name}] AllDebrid 원본 마그넷 삭제 실패 (무시): {ex}")
+                    logger.debug(f"[{self.name}] 원본 마그넷 삭제 실패 (무시): {ex}")
 
             logger.info(f"[{self.name}] [Colab API] 전송 최종 완료 확정: {item.title} (ID: {item.id})")
         else:
             item.status = 'failed'
             item.error_message = f"Colab 전송 실패: {error_msg}"
-            logger.warning(f"[{self.name}] [Colab API] 전송 실패 보고 수신: {item.title} ({error_msg})")
+            logger.warning(f"[{self.name}] [Colab API] 전송 실패 보고: {item.title} ({error_msg})")
 
         db.session.commit()
         return jsonify({'ret': 'success'})
@@ -652,7 +666,6 @@ class ModuleDownload(PluginModuleBase):
         return {'usage_24h': usage_map, 'blocked_remains': blocked_map}
 
     def scheduler_function(self):
-        """다운로드 스케줄러 주기 타이머 및 프레임워크 1회 실행 표준 호출"""
         if P.ModelSetting.get_bool(f"{self.name}_db_auto_delete"):
             try:
                 day = P.ModelSetting.get_int(f"{self.name}_db_delete_day")
@@ -673,5 +686,5 @@ class ModuleDownload(PluginModuleBase):
                 logger.error(f"[{self.name}] DB 자동 삭제 에러: {e}")
                 db.session.rollback()
 
-        logger.info(f"[{self.name}] 스케줄러 주기 실행 -> 다운로드 워커 작업 전달 (모드: default)")
+        logger.info(f"[{self.name}] 스케줄러 주기 실행 -> 다운로드 워커 작업 전달")
         self.start_celery(TaskDownloadBase.start, None, "default")

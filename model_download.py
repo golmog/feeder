@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
-
-import traceback
 from datetime import datetime
-from sqlalchemy import desc
+from sqlalchemy import desc, or_
 
 from .setup import *
 
@@ -20,7 +18,6 @@ class ModelDownload(ModelBase):
     updated_time = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
     completed_time = db.Column(db.DateTime, nullable=True)
 
-    # 피드 및 메타 정보
     feed_name = db.Column(db.String, index=True)
     title = db.Column(db.String, index=True)
     magnet = db.Column(db.String, index=True)
@@ -28,18 +25,13 @@ class ModelDownload(ModelBase):
     file_name = db.Column(db.String, nullable=True)
     file_size = db.Column(db.BigInteger, default=0)
 
-    # 상태 머신
-    # pending, downloading, downloaded, pending_local_staging, local_staging,
-    # uploading, completed, move_failed, failed, ignored
     status = db.Column(db.String, index=True, default='pending')
 
-    # 다운로더 우선순위 체인 및 현재 진행 엔진
     priority_chain = db.Column(db.JSON)
     current_engine_index = db.Column(db.Integer, default=0)
     current_engine_name = db.Column(db.String, nullable=True)
     engine_task_id = db.Column(db.String, nullable=True)
 
-    # 파일 및 경로 정보
     local_path = db.Column(db.String, nullable=True)
     destination_type = db.Column(db.String, default='local')
     gdrive_upload_path = db.Column(db.String, nullable=True)
@@ -47,12 +39,10 @@ class ModelDownload(ModelBase):
     gdrive_remote_id = db.Column(db.String, nullable=True)
     gdrive_account = db.Column(db.String, nullable=True)
 
-    # 시간 추적 및 타임아웃
     engine_added_time = db.Column(db.DateTime, nullable=True)
     last_status_time = db.Column(db.DateTime, nullable=True)
     last_move_attempt_time = db.Column(db.DateTime, nullable=True)
 
-    # 실패 사유
     error_message = db.Column(db.Text, nullable=True)
 
     def __init__(self, feed_name, title, magnet, infohash=None):
@@ -102,7 +92,6 @@ class ModelDownload(ModelBase):
             logger.error(f"ModelDownload.get_list_by_status 오류: {e}")
             return []
 
-
     @classmethod
     def web_list(cls, req):
         try:
@@ -131,20 +120,16 @@ class ModelDownload(ModelBase):
 
             total_count = query.count()
             items = query.order_by(desc(cls.id)).limit(page_size).offset((page - 1) * page_size).all()
-            total_page = (total_count + page_size - 1) // page_size if page_size > 0 else 1
 
+            from .util_crawl import get_paging_info
             return {
+                'success': True,
                 'list': [it.as_dict() for it in items],
-                'paging': {
-                    'page': page,
-                    'page_size': page_size,
-                    'total_page': total_page,
-                    'total_count': total_count
-                }
+                'paging': get_paging_info(total_count, page, page_size)
             }
         except Exception as e:
             logger.error(f"[ModelDownload] web_list 쿼리 오류: {e}")
-            return {'list': [], 'paging': {'page': 1, 'page_size': 25, 'total_page': 1, 'total_count': 0}}
+            return {'success': False, 'list': [], 'paging': None}
 
 
 class ModelDownloadStat(ModelBase):

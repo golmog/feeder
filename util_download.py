@@ -46,6 +46,7 @@ class BaseDownloadEngine:
     ENGINE_ID = "base"
     ENGINE_NAME = "Base Engine"
     OUTPUT_TYPE = "local"  # "local" (로컬 파일/폴더) 또는 "remote_cloud" (ad:..., 115:... 형태)
+    SUPPORTED_PROTOCOLS = ["magnet"]
 
     # UI 모달 폼을 동적으로 자동 생성하기 위한 설정 스키마 정의
     # 형식: [{"name": "변수명", "label": "라벨명", "type": "text|number|password|checkbox", "default": 기본값, "placeholder": 안내문구, "desc": 설명}]
@@ -77,6 +78,146 @@ class BaseDownloadEngine:
         return True, "연결 테스트가 정의되지 않은 엔진입니다."
 
 
+
+# ==============================================================================
+# 기본 내장 다운로드 엔진 (Built-in Engines)
+# ==============================================================================
+
+class QBittorrentEngine(BaseDownloadEngine):
+    ENGINE_ID = "qbittorrent"
+    ENGINE_NAME = "qBittorrent (로컬 다운로더)"
+    OUTPUT_TYPE = "local"
+    SUPPORTED_PROTOCOLS = ["magnet"]
+
+    CONFIG_SCHEMA = [
+        {"name": "url", "label": "Web UI 주소", "type": "text", "default": "http://127.0.0.1:8080", "required": True},
+        {"name": "username", "label": "사용자명", "type": "text", "default": "admin"},
+        {"name": "password", "label": "비밀번호", "type": "password"},
+        {"name": "save_path", "label": "다운로드 완료 경로", "type": "text", "default": "/data/downloads", "placeholder": "예: /data/downloads"},
+        {"name": "category", "label": "카테고리", "type": "text", "default": "feeder"},
+        {"name": "stalled_timeout_hours", "label": "지연 타임아웃 (시간)", "type": "number", "default": 24}
+    ]
+
+    def __init__(self, config: dict):
+        super(QBittorrentEngine, self).__init__(config)
+        self.url = self.config.get('url', 'http://127.0.0.1:8080').rstrip('/')
+        self.username = self.config.get('username', 'admin')
+        self.password = self.config.get('password', '')
+        self.save_path = self.config.get('save_path', '').strip()
+        self.category = self.config.get('category', 'feeder').strip()
+        self.session = None
+
+    def _get_session(self) -> requests.Session | None:
+        if self.session:
+            return self.session
+
+        s = requests.Session()
+        login_url = f"{self.url}/api/v2/auth/login"
+        try:
+            res = s.post(login_url, data={'username': self.username, 'password': self.password}, timeout=10)
+            if res.status_code in [200, 204] and 'Fails' not in res.text:
+                self.session = s
+                return s
+        except Exception as e:
+            logger.debug(f"[QBittorrentEngine] 로그인 예외: {e}")
+        return None
+
+    def add_magnet(self, link: str, title: str = None) -> tuple[bool, str, str]:
+        s = self._get_session()
+        if not s:
+            return False, "", "qBittorrent 로그인 실패"
+        if str(link).lower().startswith('ed2k://'):
+            return False, "", "ed2k 프로토콜 미지원 (115 등 지원 엔진 필요)"
+
+        add_url = f"{self.url}/api/v2/torrents/add"
+        payload = {
+            'urls': link,
+            'category': self.category,
+            'autoTMM': 'false'
+        }
+        if self.save_path:
+            payload['savepath'] = self.save_path
+
+        from .util_feed import extract_info_hash
+        info_hash = extract_info_hash(link)
+
+        try:
+            res = s.post(add_url, data=payload, timeout=15)
+            if res.status_code in [200, 204]:
+                task_id = info_hash or link[:40]
+                logger.info(f"[QBittorrentEngine] 작업 추가 성공: {task_id} ({title or link[:30]})")
+                return True, task_id, ""
+            return False, "", f"추가 실패: HTTP {res.status_code}"
+        except Exception as e:
+            return False, "", f"추가 통신 예외: {str(e)}"
+
+    def get_status(self, task_ids: list[str] = None) -> tuple[list[dict], str]:
+        s = self._get_session()
+        if not s:
+            return [], "qBittorrent 세션 없음"
+
+        info_url = f"{self.url}/api/v2/torrents/info"
+        try:
+            res = s.get(info_url, params={'category': self.category}, timeout=15)
+            if res.status_code != 200:
+                return [], f"조회 실패: HTTP {res.status_code}"
+
+            torrents = res.json()
+            ret = []
+            for t in torrents:
+                t_hash = t.get('hash', '').lower()
+                progress = t.get('progress', 0.0)
+                state = t.get('state', '')
+
+                if progress >= 1.0 or state in ['uploading', 'pausedUP', 'queuedUP']:
+                    std_status = 'completed'
+                elif state in ['error', 'missingFiles']:
+                    std_status = 'error'
+                else:
+                    std_status = 'downloading'
+
+                save_dir = t.get('save_path') or self.save_path
+                fname = t.get('name') or ''
+                full_local_path = os.path.join(save_dir, fname) if save_dir and fname else save_dir
+
+                ret.append({
+                    'task_id': t_hash,
+                    'hash': t_hash,
+                    'status': std_status,
+                    'filename': fname,
+                    'file_size': t.get('total_size', 0),
+                    'source_path': full_local_path
+                })
+            return ret, ""
+        except Exception as e:
+            return [], f"조회 통신 예외: {str(e)}"
+
+    def delete_task(self, task_id: str) -> bool:
+        s = self._get_session()
+        if not s or not task_id:
+            return False
+
+        del_url = f"{self.url}/api/v2/torrents/delete"
+        try:
+            res = s.post(del_url, data={'hashes': task_id, 'deleteFiles': 'false'}, timeout=10)
+            return res.status_code in [200, 204]
+        except Exception:
+            return False
+
+    def test_connection(self) -> tuple[bool, str]:
+        """qBittorrent Web UI 로그인 및 API 연결 테스트"""
+        s = self._get_session()
+        if not s:
+            return False, "qBittorrent 로그인 실패 (URL, 사용자명, 비밀번호 확인 필요)"
+        try:
+            res = s.get(f"{self.url}/api/v2/app/version", timeout=10)
+            if res.status_code == 200:
+                return True, f"qBittorrent 연결 성공 (버전: {res.text.strip()})"
+            return False, f"qBittorrent 응답 오류: HTTP {res.status_code}"
+        except Exception as e:
+            return False, f"qBittorrent 통신 예외: {str(e)}"
+
+
 class DownloaderManager:
     """data/db/feeder_custom/engines/*.py 스크립트를 동적으로 로드하고 관리"""
     _engine_classes = {}
@@ -84,7 +225,9 @@ class DownloaderManager:
     @classmethod
     def load_engines(cls):
         ensure_custom_dirs()
-        cls._engine_classes = {}
+        cls._engine_classes = {
+            QBittorrentEngine.ENGINE_ID: QBittorrentEngine,
+        }
 
         # engines 폴더 내 모든 파이썬 스크립트 스캔
         py_files = glob.glob(os.path.join(ENGINES_DIR, "*.py"))
@@ -92,6 +235,8 @@ class DownloaderManager:
         for fpath in py_files:
             fname = os.path.basename(fpath)
             if fname.startswith("__"):
+                continue
+            if fname in ["engine_qbittorrent.py", "dl_qbittorrent.py"]:
                 continue
             module_name = f"feeder_engine_{os.path.splitext(fname)[0]}"
             try:
@@ -339,7 +484,7 @@ class TransporterManager:
                         t_id = getattr(obj, 'TRANSPORTER_ID', '').lower()
                         if t_id:
                             cls._transporter_classes[t_id] = obj
-                            logger.info(f"[TransporterManager] 외부 커스텀 이송 핸들러 로드 완료: '{t_id}' ({fname})")
+                            logger.debug(f"[TransporterManager] 외부 커스텀 이송 핸들러 로드 완료: '{t_id}' ({fname})")
             except (Exception, SystemExit) as e:
                 logger.error(f"[TransporterManager] 이송 스크립트({fname}) 안전 로드 차단 (서버 보호): {e}")
 

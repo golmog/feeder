@@ -1,18 +1,11 @@
 {% extends "base.html" %}
 {% block content %}
 
-<!-- Ace Editor 외부 CDN 라이브러리 -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.7/ace.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.7/mode-json.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.7/mode-python.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.7/theme-monokai.min.js"></script>
-
 <link rel="stylesheet" href="{{ url_for('.static', filename='feeder.css') }}">
 
 {{ macros.m_button_group([
   ['globalSettingSaveBtn', '설정 저장'],
   ['globalOneExecuteBtn', '1회 실행'],
-  ['btn_manual_crawl', '즉시 실행'],
   ['globalEditBtn', 'YAML 편집', [['file', arg['yaml_filepath']]]]
 ]) }}
 {{ macros.m_row_start('5') }}
@@ -21,119 +14,34 @@
 <nav>
   {{ macros.m_tab_head_start() }}
     {{ macros.m_tab_head('basic', '기본 설정', true) }}
-    {{ macros.m_tab_head('site', '사이트 관리', false) }}
-    {{ macros.m_tab_head('crawlers', '수집 관리 (CRAWLERS)', false) }}
     {{ macros.m_tab_head('feeds', '피드 관리 (FEEDS)', false) }}
-    {{ macros.m_tab_head('auto', '자동 & DB정리', false) }}
+    {{ macros.m_tab_head('auto', '자동 & 스케줄링', false) }}
   {{ macros.m_tab_head_end() }}
 </nav>
 
 <form id="setting" name="setting">
   <div class="tab-content mb-4" id="nav-tabContent">
 
-    <!-- 탭: 기본 설정 -->
     {{ macros.m_tab_content_start('basic', true) }}
-      {{ macros.setting_input_int('feed_feed_count', 'RSS 피드 수', value=arg['feed_feed_count'], min='1', placeholder='100', desc=['생성할 RSS XML에 포함될 최대 피드 항목 수']) }}
-      {{ macros.setting_input_int('feed_max_page', '최대 수집 페이지 수', value=arg['feed_max_page'], min='1', desc=['수집시 탐색할 게시판 페이지 수']) }}
-      {{ macros.setting_checkbox('feed_always_max_page', '항상 최대 페이지 수집', value=arg['feed_always_max_page'], desc=['On: 최근 수집 지점(ID)에 도달해도 멈추지 않고, 설정된 최대 페이지까지 항상 탐색하여 네트워크 불안정 등으로 인한 누락 게시물을 자동 수집합니다.', 'Off: 최근 수집 지점에 도달하면 조기 종료합니다.']) }}
-      {{ macros.setting_input_int('feed_test_count', '테스트 수집 개수', value=arg['feed_test_count'], min='1', desc=['사이트 관리 메뉴에서 테스트 시 가져올 항목 수']) }}
-      {{ macros.setting_input_text('feed_crawler_delay', '크롤링 기본 딜레이 (초)', value=arg['feed_crawler_delay'], placeholder='2.0', desc=['요청 간격 대기 시간(초, 소수점 가능). 재시도 대기 시간으로도 공통 사용됩니다.']) }}
-      {{ macros.setting_input_int('feed_crawler_max_retries', '크롤링 최대 재시도 횟수', value=arg['feed_crawler_max_retries'], min='1', placeholder='3', desc=['네트워크 실패, 보안 우회(FlareSolverr/Selenium) 지연 시 최대 재시도 횟수 (기본값: 3회)']) }}
-      {{ macros.setting_checkbox('feed_allow_duplicate_magnet', '마그넷 중복 허용', value=arg['feed_allow_duplicate_magnet'], desc=['On: 마그넷 중복 검사 없이 수집 (단, 동일 게시판 내 중복 불가)', 'Off: 게시판에 관계없이 이미 DB에 등록된 마그넷은 수집 제외']) }}
+      {{ macros.setting_input_int('feed_feed_count', '실시간 RSS 피드 최대 수', value=arg['feed_feed_count'], min='1', placeholder='100', desc=['/api/feed 요청 시 반환될 최대 피드 항목 수']) }}
       {{ macros.m_hr() }}
-      {{ macros.setting_checkbox('feed_use_proxy', 'HTTP Proxy 사용', value=arg['feed_use_proxy'], desc=['On: 수집 및 요청 시 지정된 프록시 서버를 경유합니다.']) }}
-      <div id="feed_use_proxy_div" class="collapse">
-        {{ macros.setting_input_text('feed_proxy_url', 'Proxy URL', value=arg['feed_proxy_url'], placeholder='예: http://gluetun:8888, http://gluetun2:8888', desc=['단일 프록시 또는 쉼표(,), 줄바꿈으로 복수 프록시 등록 시 게시판 전환 및 차단 발생 시 자동 로테이션됩니다.']) }}
-      </div>
-      {{ macros.m_hr() }}
-      {{ macros.setting_checkbox('feed_use_flaresolverr', 'FlareSolverr 사용', value=arg['feed_use_flaresolverr'], desc=['On: Cloudflare 차단 사이트 수집 시 FlareSolverr로 챌린지를 우회합니다.']) }}
-      <div id="feed_use_flaresolverr_div" class="collapse">
-        {{ macros.setting_input_text('feed_flaresolverr_url', 'FlareSolverr URL', value=arg['feed_flaresolverr_url'], placeholder='예: http://flaresolverr:8191', desc=['FlareSolverr 서버 주소 (끝에 / 없이 입력)']) }}
-      </div>
-      {{ macros.m_hr() }}
-      {{ macros.setting_checkbox('feed_use_selenium', 'Selenium 사용', value=arg['feed_use_selenium'], desc=['On: 동적 렌더링 및 보안 우회가 필요한 사이트 수집 시 Selenium 원격 드라이버를 사용합니다.']) }}
-      <div id="feed_use_selenium_div" class="collapse">
-        {{ macros.setting_input_text('feed_selenium_remote_url', 'Selenium Remote URL', value=arg['feed_selenium_remote_url'], placeholder='예: http://selenium:4444/wd/hub', desc=['원격 Selenium 드라이버 서버 주소']) }}
-        {{ macros.setting_input_int('feed_selenium_timeout', 'Selenium 타임아웃 (초)', value=arg['feed_selenium_timeout'], min='5', placeholder='20', desc=['페이지 로딩 및 요소(태그) 탐색 대기 제한 시간(초). 기본값: 20초']) }}
-      </div>
-      {{ macros.m_hr() }}
-      {{ macros.setting_checkbox('feed_use_torrent_info', 'Torrent 메타데이터 취득', value=arg['feed_use_torrent_info'], desc=['On: 마그넷 분석을 통해 파일 목록과 원본 제목을 획득하여 피드 제목으로 사용합니다.']) }}
-      <div id="feed_use_torrent_info_div" class="collapse">
-        {{ macros.setting_radio_with_value('feed_torrent_info_method', '취득 방식', [
-            ['plugin', 'Torrent Info 플러그인 연동 (m2i API)'],
-            ['qbittorrent', 'qBittorrent Web API 연동 (추가 후 메타데이터 취득 즉시 삭제)']
-          ], value=arg['feed_torrent_info_method']) }}
-        <div id="qb_setting_div">
-          {{ macros.setting_input_text('feed_qb_url', 'qBittorrent URL', value=arg['feed_qb_url'], placeholder='예: http://localhost:8080') }}
-          {{ macros.setting_input_text('feed_qb_username', 'qBittorrent 사용자명', value=arg['feed_qb_username']) }}
-          {{ macros.setting_input_text('feed_qb_password', 'qBittorrent 비밀번호', value=arg['feed_qb_password'], type='password') }}
-          {{ macros.setting_input_text('feed_qb_temp_category', '임시 카테고리', value=arg['feed_qb_temp_category']) }}
-        </div>
-      </div>
-      {{ macros.m_hr() }}
-      {{ macros.setting_checkbox('feed_make_rss_file', 'RSS 파일 별도 생성', value=arg['feed_make_rss_file'], desc=['On: API Key 노출 없이 외부 배포가 가능한 RSS 피드 XML 파일을 로컬 디스크에 자동 생성합니다.']) }}
+      {{ macros.setting_checkbox('feed_make_rss_file', '공유용 RSS XML 파일 별도 생성', value=arg['feed_make_rss_file'], desc=['On: API Key 노출 없이 배포 가능한 정적 RSS XML 파일을 로컬 디스크에 자동 생성합니다.']) }}
       <div id="feed_make_rss_file_div" class="collapse">
-        {{ macros.setting_input_text('feed_rss_file_path', '저장 경로 (절대 경로)', value=arg['feed_rss_file_path'], placeholder='예: /data/rss 또는 /var/www/html/rss', desc=['XML 파일이 저장될 절대 경로 (폴더가 없으면 자동 생성됩니다)']) }}
-        {{ macros.setting_input_int('feed_rss_file_days', '피드 유지 기간 (일)', value=arg['feed_rss_file_days'], min='1', placeholder='14', desc=['생성된 RSS 파일 내 게시글 유지 기간(일 단위). 기간이 지난 항목은 XML에서 자동 제외됩니다. 기본값: 14일']) }}
-        {{ macros.setting_input_int('feed_rss_file_items', '피드 항목 수', value=arg['feed_rss_file_items'], min='1', placeholder='100', desc=['XML 파일에 포함될 최대 피드 항목 수. 오래된 항목부터 자동 제외됩니다. 기본값: 100개']) }}
+        {{ macros.setting_input_text('feed_rss_file_path', '기본 저장 경로 (절대 경로)', value=arg['feed_rss_file_path'], placeholder='예: /data/rss 또는 /var/www/html/rss', desc=['XML 파일이 저장될 절대 디렉터리 경로']) }}
+        {{ macros.setting_input_int('feed_rss_file_days', '피드 보관 기간 (일)', value=arg['feed_rss_file_days'], min='1', placeholder='14', desc=['생성된 RSS 파일 내 게시글 보관 기간(일). 기간 경과 항목은 XML에서 자동 제외됩니다. 기본값: 14일']) }}
+        {{ macros.setting_input_int('feed_rss_file_items', '피드 보관 최대 항목 수', value=arg['feed_rss_file_items'], min='1', placeholder='100', desc=['XML 파일에 포함될 최대 피드 항목 수. 기본값: 100개']) }}
+      </div>
+      {{ macros.m_hr() }}
+      {{ macros.setting_checkbox('feed_use_proxy', '외부 피드 요청 시 Proxy 사용', value=arg['feed_use_proxy']) }}
+      <div id="feed_use_proxy_div" class="collapse">
+        {{ macros.setting_input_text('feed_proxy_url', 'Proxy URL', value=arg['feed_proxy_url'], placeholder='예: http://gluetun:8888') }}
       </div>
     {{ macros.m_tab_content_end() }}
 
-    <!-- 탭: 사이트 관리 -->
-    {{ macros.m_tab_content_start('site', false) }}
-      <div class="mb-2 d-flex justify-content-between align-items-center">
-        <div>
-          <button type="button" id="my_site_add_btn" class="btn btn-sm btn-primary">사이트 직접 추가</button>
-          <button type="button" id="custom_script_manage_btn" class="btn btn-sm btn-outline-info ml-1">커스텀 스크립트 관리</button>
-        </div>
-      </div>
-      <div class="table-responsive">
-        <table class="table table-sm table-striped table-hover text-center align-middle">
-          <thead class="thead-dark">
-            <tr>
-              <th style="width: 8%;">ID</th>
-              <th style="width: 10%;">Type</th>
-              <th style="width: 25%;">사이트 정보</th>
-              <th style="width: 57%;">게시판 테스트 및 관리</th>
-            </tr>
-          </thead>
-          <tbody id="site_list_tbody">
-            <tr><td colspan="4" class="py-4 text-muted">등록된 사이트를 불러오는 중입니다...</td></tr>
-          </tbody>
-        </table>
-      </div>
-    {{ macros.m_tab_content_end() }}
-
-    <!-- 탭: 수집 관리 (CRAWLERS) -->
-    {{ macros.m_tab_content_start('crawlers', false) }}
-      <div class="mb-2 d-flex justify-content-between align-items-center">
-        <div>
-          <button type="button" id="crawler_add_btn" class="btn btn-sm btn-primary">수집기 추가</button>
-        </div>
-        <button type="button" id="crawler_reload_btn" class="btn btn-sm btn-secondary">수집기 새로고침</button>
-      </div>
-      <div class="table-responsive">
-        <table class="table table-sm table-striped table-hover text-center align-middle">
-          <thead class="thead-dark">
-            <tr>
-              <th style="width: 6%;">ID</th>
-              <th style="width: 22%;">사이트 / 대상 게시판</th>
-              <th style="width: 27%;">수집 네트워크 옵션</th>
-              <th style="width: 45%;">최근 수집 내역 및 관리</th>
-            </tr>
-          </thead>
-          <tbody id="crawler_list_tbody">
-            <tr><td colspan="4" class="py-4 text-muted">등록된 수집기가 없습니다.</td></tr>
-          </tbody>
-        </table>
-      </div>
-    {{ macros.m_tab_content_end() }}
-
-    <!-- 탭: 피드 관리 (FEEDS) -->
     {{ macros.m_tab_content_start('feeds', false) }}
       <div class="mb-2 d-flex justify-content-between align-items-center">
         <button type="button" id="feed_add_btn" class="btn btn-sm btn-primary">피드 추가</button>
-        <button type="button" id="feed_reload_btn" class="btn btn-sm btn-secondary">피드 새로고침</button>
+        <button type="button" id="feed_reload_btn" class="btn btn-sm btn-secondary">새로고침</button>
       </div>
       <div class="table-responsive">
         <table class="table table-sm table-striped table-hover text-center align-middle">
@@ -152,93 +60,14 @@
       </div>
     {{ macros.m_tab_content_end() }}
 
-    <!-- 탭: 자동 & DB정리 -->
     {{ macros.m_tab_content_start('auto', false) }}
       {{ macros.global_setting_scheduler_button(arg['is_include'], arg['is_running']) }}
       {{ macros.setting_input_text('feed_interval', '스케쥴링 실행 정보', value=arg['feed_interval'], col='3', desc=['Interval(분 단위) 또는 Cron 설정']) }}
-      {{ macros.setting_checkbox('feed_auto_start', '시작 시 자동 실행', value=arg['feed_auto_start'], desc=['On: 서버 시작 시 스케쥴러에 자동 등록']) }}
-      {{ macros.m_hr() }}
-      {{ macros.setting_input_text_and_buttons('feed_db_delete_day', 'DB 삭제 기간', [['globalDbDeleteDayBtn', '기간 적용 삭제', [['tag_id','feed_db_delete_day']]], ['globalDbDeleteBtn', '전체 삭제']], value=arg['feed_db_delete_day'], col='6') }}
-      {{ macros.setting_checkbox('feed_db_auto_delete', 'DB 자동 삭제', value=arg['feed_db_auto_delete'], desc=['On: 기간을 적용하여 오래된 수집 레코드를 주기적으로 자동 삭제합니다.']) }}
-      {{ macros.m_hr() }}
-      <div class="row">
-        <div class="col-sm-3" style="text-align:right"><strong>DB 링크 보정</strong></div>
-        <div class="col-sm-9">
-          <button id="btn_fix_ed2k_db" class="btn btn-sm btn-outline-warning">마그넷 / ed2k 링크 DB 일괄 보정</button>
-          <small class="form-text text-muted">과거 '|' 구분자로 인해 쪼개졌던 ed2k 링크 및 마그넷 데이터 구조를 전수 검사하여 정상 복원합니다.</small>
-        </div>
-      </div>
+      {{ macros.setting_checkbox('feed_auto_start', '시작 시 자동 실행', value=arg['feed_auto_start'], desc=['On: 서버 시작 시 피드 정기 갱신 스케쥴러에 자동 등록']) }}
     {{ macros.m_tab_content_end() }}
 
   </div>
 </form>
-
-<!-- 모달: 수집기(Crawler) 추가/수정 -->
-<div class="modal fade" id="crawler_modal" tabindex="-1" role="dialog" aria-hidden="true">
-  <div class="modal-dialog modal-lg">
-    <div class="modal-content">
-      <div class="modal-header d-flex align-items-center justify-content-between">
-        <h4 class="modal-title" id="crawler_modal_title">수집기(Crawler) 설정</h4>
-        <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
-      </div>
-      <div class="modal-body">
-        <form id="crawler_form" name="crawler_form">
-          <input type="hidden" name="modal_crawler_id" id="modal_crawler_id" value="-1">
-          <input type="hidden" name="boards_json" id="crawler_boards_json" value="[]">
-
-          {{ macros.setting_top('수집 사이트') }}
-          <div id="crawler_site_select_div" class="input-group col-sm-8"></div>
-          {{ macros.setting_bottom() }}
-
-          <!-- 다중 게시판 동적 추가 빌더 영역 -->
-          <div class="form-group row mb-2">
-            <label class="col-sm-2 col-form-label text-right font-weight-bold">수집 대상 게시판</label>
-            <div class="col-sm-10">
-              <div class="input-group input-group-sm mb-2">
-                <input type="text" id="modal_crawler_board_input" class="form-control mr-1" placeholder="게시판 ID (예: 2_2, offkab, 166)">
-                <input type="text" id="modal_crawler_subcat_input" class="form-control mr-1" placeholder="서브카테고리 ID (선택, 예: 875)">
-                <div class="input-group-append">
-                  <button type="button" id="add_crawler_board_btn" class="btn btn-primary text-white px-3">게시판 추가</button>
-                </div>
-              </div>
-              <div class="table-responsive rounded border" style="max-height: 160px; overflow-y: auto;">
-                <table class="table table-sm table-hover mb-0 text-center">
-                  <thead class="thead-light">
-                    <tr>
-                      <th style="width: 45%;">게시판 ID</th>
-                      <th style="width: 30%;">서브 카테고리 ID</th>
-                      <th style="width: 25%;">관리</th>
-                    </tr>
-                  </thead>
-                  <tbody id="modal_crawler_boards_tbody">
-                    <tr><td colspan="3" class="text-muted py-2">등록된 수집 대상 게시판이 없습니다.</td></tr>
-                  </tbody>
-                </table>
-              </div>
-              <small class="form-text text-muted">동일 사이트 내에서 수집할 모든 게시판을 등록하세요. 단일 세션으로 연속 탐색됩니다.</small>
-            </div>
-          </div>
-
-          {{ macros.setting_input_int('crawler_interval', '스케쥴 빈도', value='1', min='1', desc=['스케쥴러 몇 회 주기마다 1회 실행할지 설정 (기본: 1)']) }}
-          {{ macros.setting_input_text('crawler_delay', '개별 딜레이 (초)', value='', placeholder='미입력 시 기본 설정값 사용', desc=['페이지 및 상세 요청 대기 시간(초, 소수점 가능). 미입력 시 전역 설정 적용']) }}
-          {{ macros.setting_input_text('crawler_max_retries', '개별 최대 재시도 횟수', value='', placeholder='미입력 시 기본 설정 (3회) 사용', desc=['해당 수집기 개별 재시도 횟수 (미입력 시 기본 설정 적용)']) }}
-          {{ macros.setting_checkbox('crawler_enabled', '수집 활성화', value='On') }}
-          {{ macros.setting_checkbox('crawler_use_torrent_info', 'Torrent Info 사용', value='', desc=['On: 마그넷 메타데이터를 사전 분석하여 원본 파일명을 취득합니다.']) }}
-          {{ macros.setting_checkbox('crawler_use_proxy', 'Proxy 사용', value='') }}
-          <div id="modal_crawler_proxy_div" class="collapse">
-            {{ macros.setting_input_text('crawler_proxy_url', '개별 Proxy URL', value='', placeholder='미입력 시 기본 설정의 Proxy 사용', desc=['미입력 시 전역 Proxy 사용 (쉼표/줄바꿈으로 복수 프록시 등록 시 자동 로테이션)']) }}
-          </div>
-          {{ macros.setting_checkbox('crawler_use_flaresolverr', 'FlareSolverr 사용', value='') }}
-          {{ macros.setting_checkbox('crawler_use_selenium', 'Selenium 사용', value='') }}
-        </form>
-      </div>
-      <div class="modal-footer">
-        <button id="crawler_save_btn" type="button" class="btn btn-primary">저장</button>
-        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
-      </div>
-    </div>
-  </div>
-</div>
 
 <!-- 모달: 피드(Feed) 추가/수정 -->
 <div class="modal fade" id="feed_modal" tabindex="-1" role="dialog" aria-hidden="true">
@@ -253,9 +82,8 @@
           <input type="hidden" name="modal_feed_id" id="modal_feed_id" value="-1">
           <input type="hidden" name="sources_json" id="sources_json" value="[]">
 
-          {{ macros.setting_input_text('feed_name', '피드 이름', col='8', placeholder='예: offkab_cen, asian_movies', desc=['발행할 RSS 피드의 고유 이름 (URL 및 XML 파일명에 사용)']) }}
+          {{ macros.setting_input_text('feed_name', '피드 이름', col='8', placeholder='예: offkab_cen, 4k_movies', desc=['발행할 RSS 피드의 고유 식별 영문명']) }}
 
-          <!-- 소스 게시판 선택 및 빌더 영역 -->
           <div class="form-group row mb-2">
             <label class="col-sm-2 col-form-label text-right font-weight-bold">소스 게시판 지정</label>
             <div class="col-sm-10">
@@ -280,16 +108,16 @@
                   </tbody>
                 </table>
               </div>
-              <small class="form-text text-muted">등록된 수집기 중 이 피드에 포함할 게시판들을 선택하여 추가하세요 (복수 지정 시 통합 피드로 발행).</small>
+              <small class="form-text text-muted">수집기 중 이 피드에 묶어 발행할 소스 게시판들을 추가하세요 (복수 지정 시 통합 피드).</small>
             </div>
           </div>
 
-          {{ macros.setting_input_text('quality', '화질 필터 (Flexget 규격)', col='8', placeholder='예: 1080p+, 2160p+, 720p-1080p', desc=['비워두면 전역(GLOBAL) 화질 설정이 적용됩니다.']) }}
-
+          {{ macros.setting_input_text('quality', '화질 필터 (Flexget 규격)', col='8', placeholder='예: 1080p+, 2160p+, 720p-1080p') }}
           {{ macros.m_hr() }}
-          {{ macros.setting_checkbox('use_feed_filter', '정규식 필터 설정 (Flexget regexp)', value='', desc=['On: 해당 피드에만 개별 적용할 정규식 필터를 설정합니다.']) }}
+
+          {{ macros.setting_checkbox('use_feed_filter', '정규식 필터 설정 (Flexget regexp)', value='') }}
           <div id="modal_use_feed_filter_div" class="collapse">
-            {{ macros.setting_checkbox('accept_all', '미거부 항목 일괄 허용 (accept_all)', value='', desc=['On: reject 되지 않은 모든 게시글을 수집 허용합니다.']) }}
+            {{ macros.setting_checkbox('accept_all', '미거부 항목 일괄 허용 (accept_all)', value='') }}
             <div class="form-group row mb-2">
               <label class="col-sm-2 col-form-label text-right small font-weight-bold">거부 패턴<br>(reject)</label>
               <div class="col-sm-10">
@@ -299,7 +127,7 @@
             <div class="form-group row mb-2">
               <label class="col-sm-2 col-form-label text-right small font-weight-bold">허용 패턴<br>(accept)</label>
               <div class="col-sm-10">
-                <textarea id="filter_accept" name="filter_accept" class="form-control form-control-sm" rows="3" placeholder="매칭 시 수집 허용할 정규식 (줄바꿈 구분)&#10;예시:&#10;1080p&#10;\bKOR\b: {from: [title, link]}"></textarea>
+                <textarea id="filter_accept" name="filter_accept" class="form-control form-control-sm" rows="3" placeholder="매칭 시 허용할 정규식 (줄바꿈 구분)&#10;예시:&#10;1080p&#10;\bKOR\b: {from: [title, link]}"></textarea>
               </div>
             </div>
             <div class="form-group row mb-2">
@@ -311,12 +139,12 @@
           </div>
           {{ macros.m_hr() }}
 
-          {{ macros.setting_checkbox('use_rss_file', '공유용 RSS 파일 생성', value='') }}
+          {{ macros.setting_checkbox('use_rss_file', '공유용 RSS XML 파일 생성', value='') }}
           <div id="modal_use_feed_rss_file_div" class="collapse">
-            {{ macros.setting_input_text('rss_file', 'RSS 파일명', col='8', placeholder='예: offkab_cen.xml', desc=['외부 배포용 XML 파일명. 비워두면 [피드명.xml]로 자동 지정됩니다.']) }}
+            {{ macros.setting_input_text('rss_file', 'XML 파일명', col='8', placeholder='예: offkab_cen.xml') }}
             {{ macros.setting_input_text('rss_file_path', '개별 저장 경로', col='8', value='', placeholder='미입력 시 기본 설정 경로 사용') }}
             {{ macros.setting_input_text('rss_file_days', '개별 유지 기간 (일)', col='8', value='', placeholder='미입력 시 기본 설정 (14일) 사용') }}
-            {{ macros.setting_input_text('rss_file_items', '개별 최대 피드 수', col='8', value='', placeholder='미입력 시 기본 설정값 사용') }}
+            {{ macros.setting_input_text('rss_file_items', '개별 최대 항목 수', col='8', value='', placeholder='미입력 시 기본 설정값 사용') }}
           </div>
         </form>
       </div>
@@ -328,112 +156,10 @@
   </div>
 </div>
 
-<!-- 모달: 사이트 규칙 JSON 에디터 -->
-<div class="modal fade modal-resizable" id="site_modal" tabindex="-1" role="dialog" aria-hidden="true">
-  <div class="modal-dialog modal-lg">
-    <div class="modal-content">
-      <div class="modal-header d-flex align-items-center justify-content-between">
-        <h4 class="modal-title" id="site_modal_title">사이트 규칙 설정</h4>
-        <div class="d-flex align-items-center">
-          <button type="button" class="modal-fullscreen-btn mr-2" title="화면 최대화/복원"><i class="fa fa-expand"></i></button>
-          <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
-        </div>
-      </div>
-      <div class="modal-body">
-        <form id="site_form" name="site_form">
-          <input type="hidden" name="modal_site_id" id="modal_site_id" value="-1">
-          <textarea id="modal_site_json" name="modal_site_json" style="display: none;"></textarea>
-          <div id="modal_site_json_editor" class="feeder-editor-box" style="height: 480px;"></div>
-        </form>
-        <textarea id="modal_log" class="form-control text-muted mt-2" rows="2" disabled></textarea>
-      </div>
-      <div class="modal-footer">
-        <div class="custom-control custom-checkbox mr-auto">
-          <input type="checkbox" class="custom-control-input" id="modal_site_json_wrap_chk" checked>
-          <label class="custom-control-label small text-muted" for="modal_site_json_wrap_chk">자동 줄바꿈</label>
-        </div>
-        <button id="modal_json_format_btn" type="button" class="btn btn-outline-info">JSON 정렬 (Prettier)</button>
-        <button id="modal_json_test_btn" type="button" class="btn btn-info">JSON 검증</button>
-        <button id="modal_save_btn" type="button" class="btn btn-primary">저장</button>
-        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- 모달: 수집 테스트 결과 -->
-<div class="modal fade" id="test_result_modal" tabindex="-1" role="dialog" aria-hidden="true">
-  <div class="modal-dialog modal-lg">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h4 class="modal-title" id="test_modal_title">수집 테스트 결과</h4>
-        <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
-      </div>
-      <div class="modal-body">
-        <textarea id="test_modal_body" class="form-control" rows="22" style="font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace; font-size: 0.82rem; background-color: #1e1e1e; color: #d4d4d4; border: 1px solid #3c3c3c; line-height: 1.45;" readonly></textarea>
-      </div>
-      <div class="modal-footer">
-        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- 모달: 커스텀 스크립트 관리 -->
-<div class="modal fade modal-resizable" id="custom_script_modal" tabindex="-1" role="dialog" aria-hidden="true">
-  <div class="modal-dialog modal-xl">
-    <div class="modal-content">
-      <div class="modal-header d-flex align-items-center justify-content-between">
-        <h4 class="modal-title">커스텀 사이트 스크립트 관리 <small class="text-muted">(data/db/feeder_custom)</small></h4>
-        <div class="d-flex align-items-center">
-          <button type="button" class="modal-fullscreen-btn mr-2" title="화면 최대화/복원"><i class="fa fa-expand"></i></button>
-          <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
-        </div>
-      </div>
-      <div class="modal-body d-flex flex-column" style="flex: 1 1 auto; min-height: 0;">
-        <div class="form-inline mb-2 justify-content-between flex-shrink-0">
-          <div class="form-inline">
-            <label class="mr-2 font-weight-bold">스크립트 파일:</label>
-            <select id="custom_script_select" class="form-control form-control-sm mr-2" style="min-width: 220px;">
-              <option value="">-- 파일 선택 --</option>
-            </select>
-            <button type="button" id="custom_script_new_btn" class="btn btn-sm btn-outline-success mr-1">새 스크립트</button>
-            <input type="file" id="custom_script_file_input" accept=".py" style="display: none;">
-            <button type="button" id="custom_script_upload_trigger_btn" class="btn btn-sm btn-outline-primary mr-1">파일 업로드</button>
-            <button type="button" id="custom_script_delete_btn" class="btn btn-sm btn-outline-danger">삭제</button>
-          </div>
-          <div>
-            <span id="custom_script_status" class="small text-info"></span>
-          </div>
-        </div>
-
-        <div class="form-group mb-2 flex-shrink-0">
-          <label class="small text-muted mb-1">파일명 (.py)</label>
-          <input type="text" id="custom_script_name" class="form-control form-control-sm font-weight-bold" placeholder="예: site_sehuatang.py">
-        </div>
-
-        <div class="form-group mb-0 custom-script-editor-wrapper" style="flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0;">
-          <label class="small text-muted mb-1 flex-shrink-0">파이썬 코드 (Monokai 다크 에디터)</label>
-          <textarea id="custom_script_code" name="custom_script_code" style="display: none;"></textarea>
-          <div id="custom_script_code_editor" class="feeder-editor-box" style="flex: 1 1 auto; height: 100%; width: 100%;"></div>
-        </div>
-      </div>
-      <div class="modal-footer">
-        <div class="custom-control custom-checkbox mr-auto">
-          <input type="checkbox" class="custom-control-input" id="custom_script_wrap_chk">
-          <label class="custom-control-label small text-muted" for="custom_script_wrap_chk">자동 줄바꿈</label>
-        </div>
-        <button id="custom_script_save_btn" type="button" class="btn btn-primary">저장 및 훅 즉시 적용</button>
-        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
-      </div>
-    </div>
-  </div>
-</div>
-
 <script type="text/javascript">
 var package_name = "{{ arg['package_name'] }}";
 var sub = "{{ arg['sub'] }}";
 </script>
-<script src="{{ url_for('.static', filename='feeder_setting.js') }}"></script>
+<script src="{{ url_for('.static', filename='feeder_feed_setting.js') }}"></script>
 
 {% endblock %}

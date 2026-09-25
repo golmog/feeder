@@ -6,7 +6,7 @@ from .setup import *
 PACKAGE_NAME = P.package_name
 
 
-class ModelFeedSite(db.Model):
+class ModelCrawlSite(db.Model):
     __tablename__ = f'{PACKAGE_NAME}_site'
     __table_args__ = {'mysql_collate': 'utf8_general_ci'}
     __bind_key__ = PACKAGE_NAME
@@ -28,7 +28,6 @@ class ModelFeedSite(db.Model):
         self.content = content
 
     def get_options(self) -> dict:
-        """사이트별 프록시/FlareSolverr/Selenium/토렌트정보 기본 설정값 해석"""
         info = self.info or {}
         extra = info.get('EXTRA', [])
         return {
@@ -41,12 +40,7 @@ class ModelFeedSite(db.Model):
     def as_dict(self):
         ret = {x.name: getattr(self, x.name) for x in self.__table__.columns}
         ret['created_time'] = self.created_time.strftime('%Y-%m-%d %H:%M:%S') if self.created_time else ''
-        from .util_feed import split_magnets
-        ret['magnet'] = split_magnets(self.magnet) if ret.get('magnet') else []
-        if ret.get('files'):
-            ret['files'] = [item.split('|') for item in self.files.split('||') if item]
-        else:
-            ret['files'] = []
+        ret['options'] = self.get_options()
         return ret
 
     @classmethod
@@ -60,7 +54,7 @@ class ModelFeedSite(db.Model):
             entity = query.first()
             return entity.as_dict() if (entity and by_dict) else entity
         except Exception as e:
-            logger.error(f"ModelFeedSite.get error: {e}")
+            logger.error(f"ModelCrawlSite.get error: {e}")
             return None
 
     @classmethod
@@ -69,7 +63,7 @@ class ModelFeedSite(db.Model):
             items = db.session.query(cls).order_by(cls.id.asc()).all()
             return [x.as_dict() for x in items] if by_dict else items
         except Exception as e:
-            logger.error(f"ModelFeedSite.get_list error: {e}")
+            logger.error(f"ModelCrawlSite.get_list error: {e}")
             return []
 
     @classmethod
@@ -78,17 +72,17 @@ class ModelFeedSite(db.Model):
             site = cls.get(site_id=site_id)
             if not site:
                 return False
-            db.session.query(ModelFeedBbs).filter_by(site=site.name).delete()
+            db.session.query(ModelCrawlItem).filter_by(site=site.name).delete()
             db.session.delete(site)
             db.session.commit()
             return True
         except Exception as e:
-            logger.error(f"ModelFeedSite.delete error: {e}")
+            logger.error(f"ModelCrawlSite.delete error: {e}")
             db.session.rollback()
             return False
 
 
-class ModelFeedBbs(ModelBase):
+class ModelCrawlItem(ModelBase):
     P = P
     __tablename__ = f'{PACKAGE_NAME}_bbs'
     __table_args__ = {'mysql_collate': 'utf8_general_ci'}
@@ -118,7 +112,7 @@ class ModelFeedBbs(ModelBase):
     def as_dict(self):
         ret = {x.name: getattr(self, x.name) for x in self.__table__.columns}
         ret['created_time'] = self.created_time.strftime('%Y-%m-%d %H:%M:%S') if self.created_time else ''
-        from .util_feed import split_magnets
+        from .util_crawl import split_magnets
         ret['magnet'] = split_magnets(self.magnet) if ret.get('magnet') else []
         if ret.get('files'):
             ret['files'] = [item.split('|') for item in self.files.split('||') if item]
@@ -142,15 +136,15 @@ class ModelFeedBbs(ModelBase):
                 query = query.filter_by(post_char_id=str(post_char_id))
             return query.first()
         except Exception as e:
-            logger.error(f"ModelFeedBbs.get error: {e}")
+            logger.error(f"ModelCrawlItem.get error: {e}")
             return None
 
     @classmethod
-    def get_last_bbs(cls, site, board):
+    def get_last_item(cls, site, board):
         try:
             return db.session.query(cls).filter_by(site=site, board=board).order_by(cls.id.desc()).first()
         except Exception as e:
-            logger.error(f"ModelFeedBbs.get_last_bbs error: {e}")
+            logger.error(f"ModelCrawlItem.get_last_item error: {e}")
             return None
 
     @classmethod
@@ -158,7 +152,7 @@ class ModelFeedBbs(ModelBase):
         if not magnet_list:
             return False
         try:
-            from .util_feed import extract_info_hash
+            from .util_crawl import extract_info_hash
             for mag in magnet_list:
                 info_hash = extract_info_hash(mag)
                 if info_hash:
@@ -171,18 +165,38 @@ class ModelFeedBbs(ModelBase):
                         return True
             return False
         except Exception as e:
-            logger.error(f"ModelFeedBbs.is_exist_magnet error: {e}")
+            logger.error(f"ModelCrawlItem.is_exist_magnet error: {e}")
             return False
 
     @classmethod
     def make_query(cls, req, order='desc', search='', site_select='all', board_select='all', search_select='title'):
         with F.app.app_context():
             query = F.db.session.query(cls)
+            status_filter = req.form.get('status_filter', 'all')
 
             if site_select and site_select != 'all':
                 query = query.filter(cls.site == site_select)
             if board_select and board_select != 'all':
                 query = query.filter(cls.board == board_select)
+
+            # 상태별 필터 조건 처리
+            if status_filter and status_filter != 'all':
+                if status_filter == 'magnet':
+                    query = query.filter(cls.magnet.like('%magnet:%'))
+                elif status_filter == 'ed2k':
+                    query = query.filter(cls.magnet.like('%ed2k://%'))
+                elif status_filter == 'login_required':
+                    query = query.filter(cls.broadcast_status == 'LOGIN_REQUIRED')
+                elif status_filter == 'has_files':
+                    query = query.filter(cls.files.isnot(None), cls.files != '')
+                elif status_filter in ['download_completed', 'download_active']:
+                    from .model_download import ModelDownload
+                    target_statuses = ['completed'] if status_filter == 'download_completed' else ['downloading', 'pending', 'local_staging', 'uploading', 'colab_transferring']
+                    dl_hashes = [r[0] for r in db.session.query(ModelDownload.infohash).filter(ModelDownload.status.in_(target_statuses), ModelDownload.infohash.isnot(None)).distinct().all() if r[0]]
+                    if dl_hashes:
+                        query = query.filter(or_(*[cls.magnet.like(f"%{h}%") for h in dl_hashes]))
+                    else:
+                        query = query.filter(cls.id == -1)
 
             # 검색 키워드 필터링
             if search:
@@ -211,24 +225,19 @@ class ModelFeedBbs(ModelBase):
 
             return query
 
-
     @classmethod
     def web_list(cls, req):
         try:
             ret = {}
             page = 1
             if 'page' in req.form:
-                page = int(req.form['page'])
+                try: page = int(req.form['page'])
+                except: page = 1
 
-            try:
-                page_size = int(req.form.get('page_size', 25))
-            except Exception:
-                page_size = 25
+            try: page_size = int(req.form.get('page_size', 25))
+            except: page_size = 25
 
-            search = ''
-            if 'search_word' in req.form:
-                search = req.form['search_word'].strip()
-
+            search = req.form.get('search_word', '').strip()
             order = req.form.get('order', 'desc')
             site_select = req.form.get('site_select', 'all')
             board_select = req.form.get('board_select', 'all')
@@ -247,18 +256,48 @@ class ModelFeedBbs(ModelBase):
             query = query.limit(page_size).offset((page - 1) * page_size)
             lists = query.all()
 
-            ret['list'] = [item.as_dict() for item in lists]
-            ret['paging'] = cls.get_paging_info(count, page, page_size)
+            from .util_crawl import split_magnets, extract_info_hash, get_paging_info
+            from .model_download import ModelDownload
 
-            feed_mod = P.get_module('feed')
-            if feed_mod and hasattr(feed_mod, 'get_search_form_info'):
-                ret['info'] = feed_mod.get_search_form_info()
+            all_page_hashes = {}
+            for item_obj in lists:
+                m_list = split_magnets(item_obj.magnet)
+                for m_str in m_list:
+                    h = extract_info_hash(m_str)
+                    if h: all_page_hashes[h] = item_obj.id
+
+            dl_map = {}
+            if all_page_hashes:
+                dl_records = db.session.query(ModelDownload.infohash, ModelDownload.status, ModelDownload.id).filter(ModelDownload.infohash.in_(list(all_page_hashes.keys()))).all()
+                for d_hash, d_status, d_id in dl_records:
+                    dl_map[d_hash] = {'status': d_status, 'id': d_id}
+
+            item_dicts = []
+            for item_obj in lists:
+                d = item_obj.as_dict()
+                d_links = d.get('magnet', [])
+                matched_dl = None
+                for m_str in d_links:
+                    h = extract_info_hash(m_str)
+                    if h and h in dl_map:
+                        matched_dl = dl_map[h]
+                        break
+                d['download_info'] = matched_dl
+                item_dicts.append(d)
+
+            ret['success'] = True
+            ret['list'] = item_dicts
+            # 프레임워크 기본 ModelBase 대신 메타데이터 표준 get_paging_info 사용
+            ret['paging'] = get_paging_info(count, page, page_size)
+
+            crawl_mod = P.get_module('crawl')
+            if crawl_mod and hasattr(crawl_mod, 'get_search_form_info'):
+                ret['info'] = crawl_mod.get_search_form_info()
             else:
                 ret['info'] = {'site': [], 'board': {}}
 
             return ret
         except Exception as e:
-            logger.error(f"[Feeder] ModelFeedBbs.web_list error: {e}")
+            logger.error(f"[ModelCrawlItem] web_list error: {e}")
             logger.error(traceback.format_exc())
-            return {'ret': 'error', 'msg': str(e)}
-
+            return {'success': False, 'ret': 'error', 'msg': str(e), 'list': [], 'paging': None}

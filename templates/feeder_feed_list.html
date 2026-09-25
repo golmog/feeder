@@ -3,68 +3,94 @@
 
 <link rel="stylesheet" href="{{ url_for('.static', filename='feeder.css') }}">
 
-<div>
-  <form id="form_search" class="form-inline mb-3" style="text-align:left">
-    <div class="container-fluid pl-0 pr-0">
-      <div class="row show-grid align-items-center">
-        <span class="col-md-6 form-inline">
-          <div id="site_select_div" class="mr-2"></div>
-          <div id="board_select_div" class="mr-3">
-            <select id="board_select" name="board_select" class="form-control form-control-sm" disabled>
-              <option value="all">전체 게시판</option>
-            </select>
-          </div>
-        </span>
-
-        <span class="col-md-6 text-right form-inline justify-content-end">
-          <select id="order" name="order" class="form-control form-control-sm mr-1">
-            <option value="desc">최근순</option>
-            <option value="asc">오래된순</option>
-          </select>
-          <select id="page_size" name="page_size" class="form-control form-control-sm mr-1">
-            <option value="10">10개씩</option>
-            <option value="25" selected>25개씩</option>
-            <option value="50">50개씩</option>
-            <option value="100">100개씩</option>
-          </select>
-          <select id="search_select" name="search_select" class="form-control form-control-sm mr-1">
-            <option value="title">제목</option>
-            <option value="filename">파일명</option>
-            <option value="magnet">마그넷</option>
-          </select>
-          <input id="search_word" name="search_word" class="form-control form-control-sm mr-1" style="width: 180px;" type="text" placeholder="검색어 입력">
-          <button id="search" class="btn btn-sm btn-primary mr-1">검색</button>
-          <button id="reset_btn" class="btn btn-sm btn-outline-secondary">리셋</button>
-        </span>
-      </div>
+<form id="form_search" class="mb-3" style="text-align:left">
+  <div class="d-flex justify-content-between align-items-center flex-wrap">
+    <div class="form-inline mb-2">
+      <label class="mr-2 font-weight-bold">발행 피드:</label>
+      <select id="feed_select" name="feed_select" class="form-control form-control-sm mr-2" style="min-width: 180px;">
+        {% for f in arg['feeds'] %}
+        <option value="{{ f['name'] }}">{{ f['name'] }}</option>
+        {% endfor %}
+        {% if not arg['feeds'] %}
+        <option value="">-- 등록된 피드 없음 --</option>
+        {% endif %}
+      </select>
+      <select id="status_filter" name="status_filter" class="form-control form-control-sm mr-2">
+        <option value="all">전체 상태</option>
+        <option value="magnet">마그넷 링크</option>
+        <option value="ed2k">ed2k 링크</option>
+        <option value="download_completed">다운로드 완료</option>
+        <option value="download_active">다운로드 진행/대기중</option>
+        <option value="not_downloaded">미다운로드</option>
+      </select>
     </div>
-  </form>
+    <div class="form-inline mb-2 justify-content-end">
+      <select id="page_size" name="page_size" class="form-control form-control-sm mr-1">
+        <option value="15">15개씩</option>
+        <option value="25" selected>25개씩</option>
+        <option value="50">50개씩</option>
+        <option value="100">100개씩</option>
+      </select>
+      <div class="input-group input-group-sm mr-1">
+        <input id="search_word" name="search_word" class="form-control" style="width: 150px;" type="text" placeholder="제목 검색">
+        <div class="input-group-append">
+          <button id="search" class="btn btn-primary" type="button">검색</button>
+        </div>
+      </div>
+      <button id="reset_btn" class="btn btn-sm btn-outline-secondary" type="button">리셋</button>
+    </div>
+  </div>
+</form>
 
-  <div id='page1'></div>
-  {{ macros.m_hr_head_top() }}
-  {{ macros.m_row_start('0') }}
-  {{ macros.m_col(1, macros.m_strong('ID')) }}
-  {{ macros.m_col(2, macros.m_strong('수집일시 / 사이트')) }}
-  {{ macros.m_col(9, macros.m_strong('콘텐츠 정보')) }}
-  {{ macros.m_row_end() }}
-  {{ macros.m_hr_head_bottom() }}
-  <div id="list_div"></div>
-  <div id='page2'></div>
-</div>
+<div id="page1"></div>
+{{ macros.m_hr_head_top() }}
+{{ macros.m_row_start('0') }}
+{{ macros.m_col(1, macros.m_strong('ID')) }}
+{{ macros.m_col(2, macros.m_strong('소스 게시판')) }}
+{{ macros.m_col(9, macros.m_strong('콘텐츠 정보 / 다운로드')) }}
+{{ macros.m_row_end() }}
+{{ macros.m_hr_head_bottom() }}
+<div id="list_div"></div>
+<div id="page2"></div>
 
-<!-- Torrent Info 결과 모달 -->
-<div class="modal fade" id="torrent_info_modal" tabindex="-1" role="dialog" aria-hidden="true">
-  <div class="modal-dialog modal-lg">
+<!-- 모달: 직접 다운로드 큐 등록 모달 -->
+<div class="modal fade" id="direct_download_modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-md">
     <div class="modal-content">
-      <div class="modal-header">
-        <h4 class="modal-title" id="torrent_info_title">토렌트 정보</h4>
+      <div class="modal-header d-flex align-items-center justify-content-between">
+        <h5 class="modal-title font-weight-bold">
+          <i class="fa fa-download mr-1 text-primary"></i>다운로드 큐에 직접 추가
+        </h5>
         <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
       </div>
       <div class="modal-body">
-        <div id="torrent_info_content" style="word-break: break-all; font-size: 0.9rem;"></div>
+        <input type="hidden" id="modal_direct_feed_name" value="">
+        <div class="form-group mb-2">
+          <label class="small text-muted font-weight-bold mb-1">콘텐츠 제목</label>
+          <div id="modal_direct_title" class="p-2 border rounded font-weight-bold small text-light" style="background: rgba(255, 255, 255, 0.05); word-break: break-all;"></div>
+        </div>
+
+        <div class="form-group mb-2">
+          <label class="small text-muted font-weight-bold mb-1">대상 링크 (마그넷 / ed2k)</label>
+          <input type="text" id="modal_direct_magnet" class="form-control form-control-sm font-weight-bold" readonly>
+        </div>
+
+        <div class="form-group mb-3">
+          <label class="small font-weight-bold mb-1">적용할 다운로드 프로필</label>
+          <select id="modal_direct_profile_select" class="form-control form-control-sm"></select>
+          <small class="form-text text-muted">선택한 프로필의 우선순위 체인과 목적지 설정이 적용됩니다.</small>
+        </div>
+
+        <div class="card border-0 p-2 small mb-1" style="background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1);">
+          <div class="mb-1 text-light"><strong>우선순위 체인:</strong> <span id="modal_direct_chain_preview" class="text-warning font-weight-bold ml-1">-</span></div>
+          <div class="text-light"><strong>목적지 유형:</strong> <span id="modal_direct_dest_preview" class="text-info font-weight-bold ml-1">-</span></div>
+        </div>
       </div>
       <div class="modal-footer">
-        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
+        <button type="button" id="btn_confirm_direct_download" class="btn btn-sm btn-primary font-weight-bold">
+          <i class="fa fa-play mr-1"></i>다운로드 시작
+        </button>
+        <button type="button" class="btn btn-sm btn-secondary" data-dismiss="modal">취소</button>
       </div>
     </div>
   </div>
@@ -73,10 +99,8 @@
 <script type="text/javascript">
 var package_name = "{{ arg['package_name'] }}";
 var sub = "{{ arg['sub'] }}";
-var ddns = "{{ arg['ddns'] }}";
-var apikey = "{{ arg['apikey'] }}";
-var is_torrent_info_installed = ("{{ arg.get('is_torrent_info_installed', True) }}" === 'True');
 </script>
-<script src="{{ url_for('.static', filename='feeder_list.js') }}"></script>
+<script src="{{ url_for('.static', filename='feeder_list_base.js') }}"></script>
+<script src="{{ url_for('.static', filename='feeder_feed_list.js') }}"></script>
 
 {% endblock %}

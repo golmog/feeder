@@ -1,21 +1,31 @@
 # -*- coding: utf-8 -*-
+import os
+import traceback
 from plugin import *
 
 setting = {
     'filepath': __file__,
     'use_db': True,
     'use_default_setting': True,
-    'home_module': 'feed',
+    'home_module': 'crawl',
     'menu': {
         'uri': __package__,
         'name': 'FEEDER',
         'list': [
             {
+                'uri': 'crawl',
+                'name': 'CRAWL',
+                'list': [
+                    {'uri': 'setting', 'name': '설정 및 관리'},
+                    {'uri': 'list', 'name': '수집 리스트'}
+                ]
+            },
+            {
                 'uri': 'feed',
                 'name': 'FEED',
                 'list': [
                     {'uri': 'setting', 'name': '설정 및 관리'},
-                    {'uri': 'list', 'name': '토렌트 리스트'}
+                    {'uri': 'list', 'name': '피드 리스트'}
                 ]
             },
             {
@@ -45,12 +55,13 @@ logger = P.logger
 PLUGIN_ROOT = os.path.dirname(__file__)
 
 try:
-    from .model_feed import ModelFeedSite, ModelFeedBbs
+    from .model_crawl import ModelCrawlSite, ModelCrawlItem
     from .model_download import ModelDownload, ModelDownloadStat
+    from .mod_crawl import ModuleCrawl
     from .mod_feed import ModuleFeed
     from .mod_download import ModuleDownload
 
-    P.set_module_list([ModuleFeed, ModuleDownload])
+    P.set_module_list([ModuleCrawl, ModuleFeed, ModuleDownload])
 except Exception as e:
     P.logger.error(f'Exception: {str(e)}')
     P.logger.error(traceback.format_exc())

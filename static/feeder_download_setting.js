@@ -59,8 +59,10 @@ $(document).on('shown.bs.tab', '#nav-tab a[data-toggle="tab"]', function(e){
 
 function sync_feeder_header_navbar() {
   try {
+    var lastCrawl = localStorage.getItem('feeder_last_crawl_page') || 'setting';
     var lastFeed = localStorage.getItem('feeder_last_feed_page') || 'setting';
     var lastDl = localStorage.getItem('feeder_last_download_page') || 'setting';
+    $('.navbar a[href*="/' + package_name + '/crawl"]').attr('href', '/' + package_name + '/crawl/' + lastCrawl);
     $('.navbar a[href*="/' + package_name + '/feed"]').attr('href', '/' + package_name + '/feed/' + lastFeed);
     $('.navbar a[href*="/' + package_name + '/download"]').attr('href', '/' + package_name + '/download/' + lastDl);
   } catch(e) {}
@@ -68,7 +70,13 @@ function sync_feeder_header_navbar() {
 
 $(document).on('click', '.navbar a', function(e){
   var href = $(this).attr('href') || '';
-  if (href.indexOf('/' + package_name + '/feed') !== -1) {
+  if (href.indexOf('/' + package_name + '/crawl') !== -1) {
+    var lastCrawl = localStorage.getItem('feeder_last_crawl_page');
+    if (lastCrawl && lastCrawl !== 'setting') {
+      e.preventDefault();
+      window.location.href = '/' + package_name + '/crawl/' + lastCrawl;
+    }
+  } else if (href.indexOf('/' + package_name + '/feed') !== -1) {
     var lastFeed = localStorage.getItem('feeder_last_feed_page');
     if (lastFeed && lastFeed !== 'setting') {
       e.preventDefault();
@@ -109,7 +117,6 @@ function init_dl_trans_editor() {
   }
 }
 
-// 모달 표시 완료 시점 에디터 크기 렌더링 강제 동기화
 $('#download_script_modal').on('shown.bs.modal', function () {
   init_dl_engine_editor();
   if (dl_engine_editor) {
@@ -126,7 +133,6 @@ $('#transporter_script_modal').on('shown.bs.modal', function () {
   }
 });
 
-// 모달 전체화면 확대/복원 지원
 $(document).on('click', '.modal-fullscreen-btn', function(e){
   e.preventDefault();
   var modalDialog = $(this).closest('.modal-dialog');
@@ -226,7 +232,7 @@ function update_engine_type_dropdown(selected_type) {
   var select = $('#dl_engine_type');
   select.empty();
   if (!available_engine_schemas || available_engine_schemas.length === 0) {
-    select.append('<option value="">-- 등록된 엔진 스크립트 없음 --</option>');
+    select.append('<option value="">-- 등록된 엔진 없음 --</option>');
     return;
   }
   for (var i = 0; i < available_engine_schemas.length; i++) {
@@ -337,7 +343,7 @@ $(document).on('click', '#downloader_test_btn', function(e){
     }
   }
 
-  notify('다운로더 엔진 연결 테스트 중...', 'info');
+  notify('엔진 연결 테스트 중...', 'info');
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/test_downloader',
     type: "POST",
@@ -347,7 +353,7 @@ $(document).on('click', '#downloader_test_btn', function(e){
       if (data.ret === 'success') {
         notify(data.msg || '연결 성공', 'success');
       } else {
-        notify('연결 실패: ' + (data.msg || '알 수 없는 오류'), 'warning');
+        notify('연결 실패: ' + (data.msg || '오류'), 'warning');
       }
     },
     error: function() {
@@ -440,8 +446,6 @@ function load_download_script_list(selected_name) {
         select.val(selected_name).trigger('change');
       } else if (files.length > 0) {
         select.val(files[0]).trigger('change');
-      } else {
-        $('#download_script_new_btn').trigger('click');
       }
     }
   });
@@ -472,9 +476,10 @@ $(document).on('click', '#download_script_new_btn', function(e){
   e.preventDefault();
   $('#download_script_select').val('');
   $('#download_script_name').val('engine_new.py');
-  $('#download_script_code').val(ENGINE_SKELETON);
-  if (dl_engine_editor) dl_engine_editor.setValue(ENGINE_SKELETON, -1);
-  $('#download_script_status').text('새 엔진 템플릿 로드');
+  var SKELETON = '# -*- coding: utf-8 -*-\nfrom feeder.util_download import BaseDownloadEngine\n\nclass CustomEngine(BaseDownloadEngine):\n    ENGINE_ID = "custom"\n    ENGINE_NAME = "커스텀 다운로더"\n    CONFIG_SCHEMA = []\n    def add_magnet(self, link, title=None):\n        return True, "task_1", ""\n    def get_status(self, task_ids=None):\n        return [], ""\n    def delete_task(self, task_id):\n        return True\n';
+  $('#download_script_code').val(SKELETON);
+  if (dl_engine_editor) dl_engine_editor.setValue(SKELETON, -1);
+  $('#download_script_status').text('새 템플릿 로드');
 });
 
 $(document).on('click', '#download_script_save_btn', function(e){
@@ -490,8 +495,8 @@ $(document).on('click', '#download_script_save_btn', function(e){
     dataType: "json",
     success: function(data) {
       if (data.ret === 'success') {
-        notify('엔진 스크립트가 저장 및 동적 로드되었습니다.', 'success');
-        $('#download_script_status').text('저장 및 엔진 로드 완료 (' + filename + ')');
+        notify('엔진 스크립트가 저장되었습니다.', 'success');
+        $('#download_script_status').text('저장 완료 (' + filename + ')');
         load_download_script_list(data.filename);
         available_engine_schemas = data.schemas || [];
         update_engine_type_dropdown();
@@ -517,7 +522,7 @@ $(document).on('click', '#download_script_delete_btn', function(e){
         notify('삭제되었습니다.', 'success');
         load_download_script_list();
       } else {
-        notify('삭제 실패: ' + (data.log || data.ret), 'danger');
+        notify('삭제 실패', 'danger');
       }
     }
   });
@@ -537,7 +542,6 @@ function update_profile_dest_type_dropdown(selected_type) {
   }
 }
 
-// 목적지 유형의 CONFIG_SCHEMA에 따라 폼 동적 빌드
 function render_dynamic_dest_fields(transporter_id, current_values) {
   var container = $('#profile_dynamic_dest_fields');
   container.empty();
@@ -579,7 +583,6 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
   container.html(html);
 }
 
-// 목적지 유형 변경 시 즉시 동적 폼 재빌드
 $('#profile_dest_type').change(function(){
   render_dynamic_dest_fields($(this).val(), null);
 });
@@ -813,7 +816,6 @@ $(document).on('click', '#profile_save_btn', function(e){
   var destType = $('#profile_dest_type').val();
   var destObj = {type: destType};
 
-  // 선택된 트랜스포터 스키마에 따라 동적 필드 값 수집
   var schemaObj = available_transporter_schemas.find(function(s){ return s.transporter_id === destType; });
   if (schemaObj && schemaObj.config_schema) {
     for (var i = 0; i < schemaObj.config_schema.length; i++) {
@@ -871,7 +873,7 @@ $(document).on('click', '.delete_profile_btn', function(e){
 function render_accounts(accounts, stats) {
   var tbody = $('#gdrive_account_list_tbody');
   if (!accounts || accounts.length === 0) {
-    tbody.html('<tr><td colspan="4" class="py-4 text-muted">등록된 구글 드라이브 계정이 없습니다.</td></tr>');
+    tbody.html('<tr><td colspan="5" class="py-4 text-muted">등록된 구글 드라이브 계정이 없습니다.</td></tr>');
     return;
   }
   var usageMap = stats.usage_24h || {};
@@ -932,7 +934,7 @@ $(document).on('click', '#gdrive_account_save_btn', function(e){
   var rname = $('#modal_acc_remote_name').val().trim();
 
   if (!uname) {
-    notify('계정 식별자(이메일)를 입력하세요.', 'warning');
+    notify('계정 식별자를 입력하세요.', 'warning');
     return;
   }
   if (!mydrive_id) {
@@ -981,7 +983,7 @@ $(document).on('click', '#gdrive_batch_save_btn', function(e){
     data: {batch_text: text},
     dataType: "json",
     success: function(data) {
-      notify(data.added_count + '개 계정이 일괄 등록되었습니다.', 'success');
+      notify(data.added_count + '개 계정이 등록되었습니다.', 'success');
       $('#gdrive_batch_modal').modal('hide');
       current_accounts = data.accounts || [];
       render_accounts(current_accounts, {});
@@ -994,7 +996,7 @@ $(document).on('click', '.remove_acc_btn', function(e){
   var idx = $(this).data('index');
   var acc = current_accounts[idx];
   var accName = acc ? acc.username : '해당';
-  if (!confirm('[' + accName + '] 계정을 계정 풀에서 제외하시겠습니까?')) return;
+  if (!confirm('[' + accName + '] 계정을 제외하시겠습니까?')) return;
 
   current_accounts.splice(idx, 1);
   $.ajax({
@@ -1072,8 +1074,7 @@ $(document).on('click', '#btn_run_import_db', function(e){
     where_clause: $('#import_where_clause').val().trim()
   };
 
-  notify('기존 DB 파일 이력 흡수 중 (잠시 기다려주세요)...', 'info');
-
+  notify('DB 이력 흡수 중...', 'info');
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/import_history_db',
     type: "POST",
@@ -1081,10 +1082,10 @@ $(document).on('click', '#btn_run_import_db', function(e){
     dataType: "json",
     success: function(data) {
       if (data.ret === 'success') {
-        notify('DB 이력 흡수 완료: 총 ' + data.added + '건이 완료 상태로 등록되었습니다 (중복 ' + data.skipped + '건 스킵).', 'success');
+        notify('DB 이력 흡수 완료: 총 ' + data.added + '건 완료 등록 (중복 ' + data.skipped + '건 스킵)', 'success');
         $('#history_import_modal').modal('hide');
       } else {
-        notify('DB 임포트 실패: ' + (data.msg || '알 수 없는 오류'), 'danger');
+        notify('DB 임포트 실패: ' + (data.msg || '오류'), 'danger');
       }
     }
   });
@@ -1115,8 +1116,6 @@ function load_transporter_script_list(selected_name) {
         select.val(selected_name).trigger('change');
       } else if (files.length > 0) {
         select.val(files[0]).trigger('change');
-      } else {
-        $('#transporter_script_new_btn').trigger('click');
       }
     }
   });
@@ -1165,8 +1164,8 @@ $(document).on('click', '#transporter_script_save_btn', function(e){
     dataType: "json",
     success: function(data) {
       if (data.ret === 'success') {
-        notify('이송 스크립트가 저장 및 동적 로드되었습니다.', 'success');
-        $('#transporter_script_status').text('저장 및 핸들러 로드 완료 (' + filename + ')');
+        notify('이송 스크립트가 저장되었습니다.', 'success');
+        $('#transporter_script_status').text('저장 완료 (' + filename + ')');
         load_transporter_script_list(data.filename);
         available_transporter_schemas = data.transporter_schemas || [];
         update_profile_dest_type_dropdown();
@@ -1192,23 +1191,8 @@ $(document).on('click', '#transporter_script_delete_btn', function(e){
         notify('삭제되었습니다.', 'success');
         load_transporter_script_list();
       } else {
-        notify('삭제 실패: ' + (data.log || data.ret), 'danger');
+        notify('삭제 실패', 'danger');
       }
     }
   });
-});
-
-$(document).on('click', 'nav a, .navbar a', function(){
-  var href = $(this).attr('href') || '';
-  if (href.indexOf('/' + package_name + '/feed') !== -1 && href.indexOf('manual') === -1 && href.indexOf('log') === -1) {
-    var lastFeedPage = localStorage.getItem('feeder_last_sub_feed');
-    if (lastFeedPage && lastFeedPage !== 'setting') {
-      $(this).attr('href', '/' + package_name + '/feed/' + lastFeedPage);
-    }
-  } else if (href.indexOf('/' + package_name + '/download') !== -1) {
-    var lastDlPage = localStorage.getItem('feeder_last_sub_download');
-    if (lastDlPage && lastDlPage !== 'setting') {
-      $(this).attr('href', '/' + package_name + '/download/' + lastDlPage);
-    }
-  }
 });
