@@ -488,7 +488,7 @@ $(document).on('click', '.feed_edit_btn', function (e) {
   var accept_str = rules_to_string(regexp.accept);
   var reject_ex_str = rules_to_string(regexp.reject_excluding);
   var is_accept_all = (item.accept_all === true || item.accept_all === 'True' || item.accept_all === 'true' || item.accept_all === 'yes' || item.accept_all === 'on');
-  var has_filter = Boolean(reject_str || accept_str || reject_ex_str || is_accept_all);
+  var has_filter = Boolean(reject_str || accept_str || reject_ex_str);
 
   $('#filter_reject').val(reject_str);
   $('#filter_accept').val(accept_str);

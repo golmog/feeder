@@ -193,8 +193,9 @@ class ModuleFeed(PluginModuleBase):
                 'rss_file_items': rss_file_items,
             }
 
+            item_data['accept_all'] = accept_all
+
             if use_feed_filter:
-                item_data['accept_all'] = accept_all
                 regexp_data = {}
                 rej = parse_filter_lines(filter_reject)
                 if rej:

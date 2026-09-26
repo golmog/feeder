@@ -124,9 +124,11 @@
           {{ macros.setting_input_text('quality', '화질 필터 (Flexget 규격)', col='8', placeholder='예: 1080p+, 2160p+, 720p-1080p') }}
           {{ macros.m_hr() }}
 
+          {{ macros.setting_checkbox('accept_all', '미거부 항목 일괄 허용 (accept_all)', value='', desc=['On: 필터에서 거부되지 않고 살아남은 나머지 모든 항목을 허용(수집/발행)합니다.', 'Off: 정규식 허용(accept) 규칙이 있을 경우 해당 규칙에 일치하는 항목만 수집합니다.']) }}
+          {{ macros.m_hr() }}
+
           {{ macros.setting_checkbox('use_feed_filter', '정규식 필터 설정 (Flexget regexp)', value='') }}
           <div id="modal_use_feed_filter_div" class="collapse">
-            {{ macros.setting_checkbox('accept_all', '미거부 항목 일괄 허용 (accept_all)', value='') }}
             <div class="form-group row mb-2">
               <label class="col-sm-2 col-form-label text-right small font-weight-bold">거부 패턴<br>(reject)</label>
               <div class="col-sm-10">
