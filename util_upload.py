@@ -265,7 +265,7 @@ class UploadUtil:
         config_data = FeederUtil.load_yaml()
         rclone_cfg = config_data.get('rclone', {})
         rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or rclone_cfg.get('conf_path', '')
-        base_remote = P.ModelSetting.get('download_rclone_remote_name') or rclone_cfg.get('remote_name', 'net')
+        base_remote = P.ModelSetting.get('download_rclone_remote_name') or rclone_cfg.get('remote_name', 'gdrive_sa')
         dst_drive_id = P.ModelSetting.get('download_shared_drive_id') or rclone_cfg.get('shared_drive_id', '')
 
         if not rclone_conf or not dst_drive_id:
@@ -323,8 +323,8 @@ class UploadUtil:
 
         rclone_cfg = FeederUtil.load_yaml().get('rclone', {})
         rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or rclone_cfg.get('conf_path', '')
-        remote_net = P.ModelSetting.get('download_rclone_remote_name') or rclone_cfg.get('remote_name', 'net')
-        remote_shared = P.ModelSetting.get('download_rclone_shared_remote_name') or rclone_cfg.get('shared_remote_name', 'gf')
+        remote_net = P.ModelSetting.get('download_rclone_remote_name') or rclone_cfg.get('remote_name', 'gdrive_sa')
+        remote_shared = P.ModelSetting.get('download_rclone_shared_remote_name') or rclone_cfg.get('shared_remote_name', 'gdrive_shared')
 
         target_drive_id = item.gdrive_remote_id or P.ModelSetting.get('download_shared_drive_id') or rclone_cfg.get('shared_drive_id', '')
         if not target_drive_id:

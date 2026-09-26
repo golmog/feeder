@@ -41,8 +41,8 @@
       <h6 class="font-weight-bold text-info"><i class="fa fa-hdd-o mr-1"></i>Rclone 공통 및 구글 드라이브 우회 수치 설정</h6>
       {{ macros.setting_input_text('download_rclone_conf_path', 'Rclone 설정 파일 경로', value=arg['download_rclone_conf_path'], placeholder='예: /root/.config/rclone/rclone.conf') }}
       {{ macros.setting_checkbox('download_gdrive_use_impersonate', 'Google Workspace Impersonate', value=arg['download_gdrive_use_impersonate'], desc=['On: 단일 SA 기본 리모트에서 --drive-impersonate 옵션으로 각 구성원의 15GB MyDrive에 접근합니다 (도메인 전체 위임 필수).', 'Off: 위임 없이 각 계정별로 별도 등록된 독립 Rclone 리모트를 직접 사용합니다 (계정 풀에서 계정별 리모트명 지정 필요).']) }}
-      {{ macros.setting_input_text('download_rclone_remote_name', '내 드라이브 SA 기본 리모트', value=arg['download_rclone_remote_name'], placeholder='net', desc=['위임(Impersonate) 사용 시 기준이 되는 서비스 계정(SA) rclone 리모트 이름']) }}
-      {{ macros.setting_input_text('download_rclone_shared_remote_name', '공유 드라이브 직행 리모트', value=arg['download_rclone_shared_remote_name'], placeholder='gf', desc=['임계값 초과 대용량 파일 또는 라이트 유저 공유 드라이브 직행용 rclone 리모트 이름']) }}
+      {{ macros.setting_input_text('download_rclone_remote_name', '내 드라이브 SA 기본 리모트', value=arg['download_rclone_remote_name'], placeholder='예: gdrive_sa', desc=['위임(Impersonate) 사용 시 기준이 되는 서비스 계정(SA) rclone 리모트 이름']) }}
+      {{ macros.setting_input_text('download_rclone_shared_remote_name', '공유 드라이브 직행 리모트', value=arg['download_rclone_shared_remote_name'], placeholder='예: gdrive_shared', desc=['임계값 초과 대용량 파일 또는 라이트 유저 공유 드라이브 직행용 rclone 리모트 이름']) }}
       {{ macros.setting_input_text('download_shared_drive_id', '기본 목적지 공유 드라이브 ID', value=arg['download_shared_drive_id'], placeholder='예: 0ABCDE12345678') }}
       {{ macros.setting_input_text('download_rclone_bind_ip', 'Rclone 바인드 IP', value=arg['download_rclone_bind_ip'], placeholder='예: 192.168.1.100 (특정 네트워크 인터페이스 고정 시 입력)') }}
       {{ macros.setting_input_text('download_rclone_chunk_size', 'Rclone 청크 사이즈', value=arg['download_rclone_chunk_size'], placeholder='256M', desc=['구글 드라이브 업로드 청크 크기 (기본값: 256M)']) }}

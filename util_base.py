@@ -664,8 +664,8 @@ class FeederUtil:
         return True
 
     @classmethod
-    def add_direct_download(cls, title: str, magnet: str, profile_name: str = '', feed_name: str = 'DIRECT', caller_name: str = 'feeder') -> dict:
-        """다운로드 큐 직접 추가 공통 처리 로직"""
+    def add_direct_download(cls, title: str, magnet: str, profile_name: str = '', feed_name: str = 'DIRECT', caller_name: str = 'feeder', custom_chain: list = None, custom_dest_type: str = '', custom_dest_config: dict = None) -> dict:
+        """다운로드 큐 직접 추가 공통 처리 로직 (프로필 프리셋 및 커스텀 옵션 지원)"""
         if not magnet:
             return {'ret': 'fail', 'msg': '마그넷/ed2k 링크가 누락되었습니다.'}
 
@@ -683,30 +683,44 @@ class FeederUtil:
             infohash=infohash
         )
 
-        selected_profile = None
-        if profile_name:
+        # 사용자가 폼에서 직접 수정한 커스텀 옵션이 존재하는 경우 최우선 적용
+        if custom_chain is not None or custom_dest_type:
+            dl_item.priority_chain = list(custom_chain) if custom_chain else [d['name'] for d in cls.get_downloaders() if d.get('enabled', True)]
+            dl_item.destination_type = custom_dest_type or 'local'
+            cfg = custom_dest_config or {}
+            dl_item.gdrive_upload_path = cfg.get('upload_path', '')
+            dl_item.gdrive_complete_path = cfg.get('complete_path', '')
+            dl_item.gdrive_remote_id = cfg.get('shared_drive_id', '')
+
+        # 커스텀 옵션 없이 특정 프로필 프리셋만 선택된 경우 프로필 설정 적용
+        elif profile_name:
+            selected_profile = None
             for p in cls.get_download_profiles():
                 if p.get('name') == profile_name:
                     selected_profile = p
                     break
 
-        if selected_profile:
-            dl_item.priority_chain = list(selected_profile.get('priority_chain', []))
-            dest = selected_profile.get('destination', {})
-            dl_item.destination_type = dest.get('type', 'local')
-            dl_item.gdrive_upload_path = dest.get('upload_path', '')
-            dl_item.gdrive_complete_path = dest.get('complete_path', '')
-            dl_item.gdrive_remote_id = dest.get('shared_drive_id', '')
+            if selected_profile:
+                dl_item.priority_chain = list(selected_profile.get('priority_chain', []))
+                dest = selected_profile.get('destination', {})
+                dl_item.destination_type = dest.get('type', 'local')
+                dl_item.gdrive_upload_path = dest.get('upload_path', '')
+                dl_item.gdrive_complete_path = dest.get('complete_path', '')
+                dl_item.gdrive_remote_id = dest.get('shared_drive_id', '')
+            else:
+                dl_item.priority_chain = [d['name'] for d in cls.get_downloaders() if d.get('enabled', True)]
+                dl_item.destination_type = 'local'
+
+        # 기본 설정 fallback
         else:
-            enabled_downloaders = [d['name'] for d in cls.get_downloaders() if d.get('enabled', True)]
-            dl_item.priority_chain = enabled_downloaders
+            dl_item.priority_chain = [d['name'] for d in cls.get_downloaders() if d.get('enabled', True)]
             dl_item.destination_type = 'local'
 
         dl_item.status = 'pending'
         db.session.add(dl_item)
         db.session.commit()
         chain_desc = ' -> '.join(dl_item.priority_chain) if dl_item.priority_chain else '기본'
-        logger.info(f"[{caller_name}] 다운로드 큐 직접 추가: {title} (체인: {chain_desc})")
+        logger.info(f"[{caller_name}] 다운로드 큐 직접 추가: {title} (체인: {chain_desc}, 목적지: {dl_item.destination_type})")
         return {'ret': 'success', 'msg': '다운로드 큐에 성공적으로 등록되었습니다.'}
 
     # GDrive Accounts

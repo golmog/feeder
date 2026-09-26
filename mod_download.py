@@ -347,12 +347,22 @@ class ModuleDownload(PluginModuleBase):
                 magnet = req.form.get('magnet', '').strip()
                 profile_name = req.form.get('profile_name', '').strip()
                 feed_name = req.form.get('feed_name', 'DIRECT')
+
+                custom_chain_raw = req.form.get('priority_chain')
+                custom_chain = json.loads(custom_chain_raw) if custom_chain_raw else None
+                custom_dest_type = req.form.get('destination_type', '').strip()
+                custom_dest_cfg_raw = req.form.get('destination_config')
+                custom_dest_config = json.loads(custom_dest_cfg_raw) if custom_dest_cfg_raw else None
+
                 res = FeederUtil.add_direct_download(
                     title=title,
                     magnet=magnet,
                     profile_name=profile_name,
                     feed_name=feed_name,
-                    caller_name=self.name
+                    caller_name=self.name,
+                    custom_chain=custom_chain,
+                    custom_dest_type=custom_dest_type,
+                    custom_dest_config=custom_dest_config
                 )
                 return jsonify(res)
 
@@ -506,7 +516,7 @@ class ModuleDownload(PluginModuleBase):
 
         profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
         dest_cfg = profile.get('destination', {})
-        remote_name = dest_cfg.get('remote_name') or P.ModelSetting.get('download_rclone_shared_remote_name') or 'gf'
+        remote_name = dest_cfg.get('remote_name') or P.ModelSetting.get('download_rclone_shared_remote_name') or 'gdrive_shared'
         shared_drive_id = item.gdrive_remote_id or dest_cfg.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
         complete_path = (item.gdrive_complete_path or dest_cfg.get('complete_path') or 'uploads/default').strip('/')
         folder_name = item.file_name or f"item_{item.id}"

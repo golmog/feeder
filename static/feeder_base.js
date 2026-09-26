@@ -2,6 +2,9 @@ var cached_download_profiles = [];
 var current_search_xhr = null;
 var current_data = null;
 var feeder_ace_instances = [];
+var cached_downloaders = [];
+var cached_transporter_schemas = [];
+var modal_direct_chain = [];
 
 // =============================================================================
 // 플랫폼 공통 유틸리티
@@ -122,6 +125,8 @@ function load_download_profiles() {
     dataType: 'json',
     success: function (data) {
       cached_download_profiles = data.profiles || [];
+      cached_downloaders = data.downloaders || [];
+      cached_transporter_schemas = data.transporter_schemas || [];
     }
   });
 }
@@ -394,44 +399,216 @@ $(document).on('click', '.direct_download_btn', function (e) {
   $('#modal_direct_magnet').val(mag);
   $('#modal_direct_feed_name').val(feed);
 
-  var pSelect = $('#modal_direct_profile_select');
+  var pSelect = $('#modal_direct_preset_select');
   pSelect.empty();
+  pSelect.append('<option value="">-- 직접 설정 (커스텀) --</option>');
   if (cached_download_profiles && cached_download_profiles.length > 0) {
     for (var i = 0; i < cached_download_profiles.length; i++) {
       var p = cached_download_profiles[i];
       pSelect.append('<option value="' + p.name + '">' + p.name + '</option>');
     }
-  } else {
-    pSelect.append('<option value="">-- 기본 다운로더 전체 사용 --</option>');
   }
-  pSelect.trigger('change');
+
+  var engSelect = $('#modal_direct_engine_select');
+  engSelect.empty();
+  if (cached_downloaders && cached_downloaders.length > 0) {
+    for (var j = 0; j < cached_downloaders.length; j++) {
+      var d = cached_downloaders[j];
+      engSelect.append('<option value="' + d.name + '">' + d.name + ' (' + d.engine_type + ')</option>');
+    }
+  } else {
+    engSelect.append('<option value="">-- 등록된 다운로더 없음 --</option>');
+  }
+
+  var destSelect = $('#modal_direct_dest_type');
+  destSelect.empty();
+  if (cached_transporter_schemas && cached_transporter_schemas.length > 0) {
+    for (var k = 0; k < cached_transporter_schemas.length; k++) {
+      var s = cached_transporter_schemas[k];
+      destSelect.append('<option value="' + s.transporter_id + '">' + s.transporter_name + ' (' + s.transporter_id + ')</option>');
+    }
+  }
+
+  var matchedPreset = '';
+  if (cached_download_profiles && cached_download_profiles.length > 0) {
+    for (var pIdx = 0; pIdx < cached_download_profiles.length; pIdx++) {
+      var prof = cached_download_profiles[pIdx];
+      var feeds = prof.feeds || [];
+      if (feeds.indexOf(feed) !== -1 || feeds.indexOf('*') !== -1) {
+        matchedPreset = prof.name;
+        break;
+      }
+    }
+    if (!matchedPreset) matchedPreset = cached_download_profiles[0].name;
+  }
+
+  if (matchedPreset) {
+    pSelect.val(matchedPreset);
+    apply_direct_preset(matchedPreset);
+  } else {
+    pSelect.val('');
+    modal_direct_chain = (cached_downloaders && cached_downloaders.length > 0) ? [cached_downloaders[0].name] : [];
+    render_direct_chain_table();
+    destSelect.val(destSelect.find('option:first').val()).trigger('change');
+  }
+
   $('#direct_download_modal').modal('show');
 });
 
-$(document).on('change', '#modal_direct_profile_select', function () {
-  var pName = $(this).val();
-  var pObj = cached_download_profiles.find(function (p) { return p.name === pName; });
-  if (pObj) {
-    var chainStr = (pObj.priority_chain || []).join(' -> ') || '(비어있음)';
-    var dest = pObj.destination || {};
-    var destStr = dest.type || 'local';
-    if (dest.type === 'relay_worker' || dest.type === 'remote_relay') destStr += ' (원격 릴레이 워커)';
-    else if (dest.type === 'gdrive_rotation') destStr += ' (SA 15GB 우회)';
+function apply_direct_preset(presetName) {
+  if (!presetName) return;
+  var prof = cached_download_profiles.find(function (p) { return p.name === presetName; });
+  if (!prof) return;
 
-    $('#modal_direct_chain_preview').text(chainStr);
-    $('#modal_direct_dest_preview').text(destStr);
-  } else {
-    $('#modal_direct_chain_preview').text('(기본 활성 다운로더 전체)');
-    $('#modal_direct_dest_preview').text('local (로컬 디스크 보존)');
+  modal_direct_chain = (prof.priority_chain && prof.priority_chain.length > 0) ? JSON.parse(JSON.stringify(prof.priority_chain)) : [];
+  render_direct_chain_table();
+
+  var dest = prof.destination || {};
+  var destType = dest.type || 'local';
+  $('#modal_direct_dest_type').val(destType);
+  render_direct_dynamic_dest_fields(destType, dest);
+}
+
+$(document).on('change', '#modal_direct_preset_select', function () {
+  var pName = $(this).val();
+  if (pName) {
+    apply_direct_preset(pName);
   }
+});
+
+function render_direct_chain_table() {
+  var tbody = $('#modal_direct_chain_tbody');
+  tbody.empty();
+  if (!modal_direct_chain || modal_direct_chain.length === 0) {
+    tbody.html('<tr><td colspan="3" class="text-muted py-2">등록된 다운로더 엔진이 없습니다.</td></tr>');
+    return;
+  }
+  for (var i = 0; i < modal_direct_chain.length; i++) {
+    var engine = modal_direct_chain[i];
+    var str = '<tr>';
+    str += '  <td class="font-weight-bold">' + (i + 1) + '순위</td>';
+    str += '  <td class="text-left font-weight-bold text-primary">' + engine + '</td>';
+    str += '  <td>';
+    str += '    <div class="btn-group btn-group-sm">';
+    str += '      <button type="button" class="btn btn-xs btn-secondary text-white direct-chain-move-btn" data-dir="up" data-index="' + i + '" ' + (i === 0 ? 'disabled' : '') + '>▲</button>';
+    str += '      <button type="button" class="btn btn-xs btn-secondary text-white direct-chain-move-btn" data-dir="down" data-index="' + i + '" ' + (i === modal_direct_chain.length - 1 ? 'disabled' : '') + '>▼</button>';
+    str += '      <button type="button" class="btn btn-xs btn-danger text-white direct-chain-remove-btn" data-index="' + i + '">제외</button>';
+    str += '    </div>';
+    str += '  </td>';
+    str += '</tr>';
+    tbody.append(str);
+  }
+}
+
+$(document).on('click', '#btn_add_direct_chain_engine', function (e) {
+  e.preventDefault();
+  var eng = $('#modal_direct_engine_select').val();
+  if (!eng) return;
+  if (modal_direct_chain.indexOf(eng) !== -1) {
+    notify('이미 체인에 포함된 다운로더입니다.', 'warning');
+    return;
+  }
+  modal_direct_chain.push(eng);
+  render_direct_chain_table();
+});
+
+$(document).on('click', '.direct-chain-move-btn', function (e) {
+  e.preventDefault();
+  var idx = parseInt($(this).data('index'));
+  var dir = $(this).data('dir');
+  if (dir === 'up' && idx > 0) {
+    var temp = modal_direct_chain[idx - 1];
+    modal_direct_chain[idx - 1] = modal_direct_chain[idx];
+    modal_direct_chain[idx] = temp;
+  } else if (dir === 'down' && idx < modal_direct_chain.length - 1) {
+    var temp2 = modal_direct_chain[idx + 1];
+    modal_direct_chain[idx + 1] = modal_direct_chain[idx];
+    modal_direct_chain[idx] = temp2;
+  }
+  render_direct_chain_table();
+});
+
+$(document).on('click', '.direct-chain-remove-btn', function (e) {
+  e.preventDefault();
+  var idx = parseInt($(this).data('index'));
+  modal_direct_chain.splice(idx, 1);
+  render_direct_chain_table();
+});
+
+function render_direct_dynamic_dest_fields(transporter_id, current_values) {
+  var container = $('#modal_direct_dynamic_dest_fields');
+  container.empty();
+
+  var schemaObj = cached_transporter_schemas.find(function (s) { return s.transporter_id === transporter_id; });
+  if (!schemaObj || !schemaObj.config_schema || schemaObj.config_schema.length === 0) {
+    container.html('<div class="text-muted small p-2 text-center">해당 목적지에 별도 세부 설정 항목이 없습니다.</div>');
+    return;
+  }
+
+  var html = '<hr><h6 class="text-info font-weight-bold mb-3"><i class="fa fa-folder-open mr-1"></i>' + schemaObj.transporter_name + ' 세부 설정</h6>';
+  var fields = schemaObj.config_schema;
+
+  for (var i = 0; i < fields.length; i++) {
+    var f = fields[i];
+    var val = (current_values && current_values[f.name] !== undefined) ? current_values[f.name] : (f.default !== undefined ? f.default : '');
+    var ph = f.placeholder || '';
+    var descHtml = f.desc ? '<small class="form-text text-muted">' + f.desc + '</small>' : '';
+
+    html += '<div class="form-group row mb-2">';
+    html += '  <label class="col-sm-3 col-form-label text-right font-weight-bold">' + f.label + '</label>';
+    html += '  <div class="col-sm-9">';
+
+    if (f.type === 'checkbox') {
+      var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
+      html += '    <input type="checkbox" id="direct_dest_field_' + f.name + '" class="mt-2" ' + isChk + '>';
+    } else if (f.type === 'number') {
+      html += '    <input type="number" id="direct_dest_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+    } else if (f.type === 'password') {
+      html += '    <input type="password" id="direct_dest_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+    } else {
+      html += '    <input type="text" id="direct_dest_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+    }
+
+    html += descHtml;
+    html += '  </div>';
+    html += '</div>';
+  }
+  container.html(html);
+}
+
+$(document).on('change', '#modal_direct_dest_type', function () {
+  render_direct_dynamic_dest_fields($(this).val(), null);
 });
 
 $(document).on('click', '#btn_confirm_direct_download', function (e) {
   e.preventDefault();
   var mag = $('#modal_direct_magnet').val();
   var title = $('#modal_direct_title').text();
-  var pName = $('#modal_direct_profile_select').val();
+  var pName = $('#modal_direct_preset_select').val();
   var feed = $('#modal_direct_feed_name').val() || 'DIRECT';
+
+  if (!modal_direct_chain || modal_direct_chain.length === 0) {
+    notify('우선순위 체인에 다운로더 엔진을 1개 이상 추가하세요.', 'warning');
+    return;
+  }
+
+  var destType = $('#modal_direct_dest_type').val();
+  var destObj = { type: destType };
+
+  var schemaObj = cached_transporter_schemas.find(function (s) { return s.transporter_id === destType; });
+  if (schemaObj && schemaObj.config_schema) {
+    for (var i = 0; i < schemaObj.config_schema.length; i++) {
+      var f = schemaObj.config_schema[i];
+      var el = $('#direct_dest_field_' + f.name);
+      if (f.type === 'checkbox') {
+        destObj[f.name] = el.is(':checked');
+      } else if (f.type === 'number') {
+        destObj[f.name] = parseInt(el.val()) || 0;
+      } else {
+        destObj[f.name] = el.val().trim();
+      }
+    }
+  }
 
   notify('다운로드 큐 등록 요청 중...', 'info');
   $.ajax({
@@ -441,7 +618,10 @@ $(document).on('click', '#btn_confirm_direct_download', function (e) {
       title: title,
       magnet: mag,
       profile_name: pName,
-      feed_name: feed
+      feed_name: feed,
+      priority_chain: JSON.stringify(modal_direct_chain),
+      destination_type: destType,
+      destination_config: JSON.stringify(destObj)
     },
     dataType: 'json',
     success: function (data) {
