@@ -15,7 +15,7 @@
   {{ macros.m_tab_head_start() }}
     {{ macros.m_tab_head('basic', '기본 설정', true) }}
     {{ macros.m_tab_head('feeds', '피드 관리 (FEEDS)', false) }}
-    {{ macros.m_tab_head('auto', '자동 & 스케줄링', false) }}
+    {{ macros.m_tab_head('auto', '자동 & DB정리', false) }}
   {{ macros.m_tab_head_end() }}
 </nav>
 
@@ -64,6 +64,9 @@
       {{ macros.global_setting_scheduler_button(arg['is_include'], arg['is_running']) }}
       {{ macros.setting_input_text('feed_interval', '스케쥴링 실행 정보', value=arg['feed_interval'], col='3', desc=['Interval(분 단위) 또는 Cron 설정']) }}
       {{ macros.setting_checkbox('feed_auto_start', '시작 시 자동 실행', value=arg['feed_auto_start'], desc=['On: 서버 시작 시 피드 정기 갱신 스케쥴러에 자동 등록']) }}
+      {{ macros.m_hr() }}
+      {{ macros.setting_input_text_and_buttons('feed_db_delete_day', '피드 DB 삭제 기간', [['globalDbDeleteDayBtn', '기간 적용 삭제', [['tag_id','feed_db_delete_day']]], ['globalDbDeleteBtn', '전체 삭제']], value=arg['feed_db_delete_day'], col='6') }}
+      {{ macros.setting_checkbox('feed_db_auto_delete', '피드 DB 자동 삭제', value=arg['feed_db_auto_delete'], desc=['On: 보관 기간이 경과한 오래된 피드 DB 레코드를 주기적으로 자동 삭제합니다.']) }}
     {{ macros.m_tab_content_end() }}
 
   </div>
@@ -85,22 +88,28 @@
           {{ macros.setting_input_text('feed_name', '피드 이름', col='8', placeholder='예: offkab_cen, 4k_movies', desc=['발행할 RSS 피드의 고유 식별 영문명']) }}
 
           <div class="form-group row mb-2">
-            <label class="col-sm-2 col-form-label text-right font-weight-bold">소스 게시판 지정</label>
+            <label class="col-sm-2 col-form-label text-right font-weight-bold">소스 지정</label>
             <div class="col-sm-10">
               <div class="input-group input-group-sm mb-2">
                 <select id="feed_source_crawler_select" class="form-control mr-1"></select>
                 <div class="input-group-append">
-                  <button type="button" id="add_feed_source_btn" class="btn btn-primary text-white px-3">소스 추가</button>
+                  <button type="button" id="add_feed_source_btn" class="btn btn-primary text-white px-3">수집기 소스 추가</button>
+                </div>
+              </div>
+              <div class="input-group input-group-sm mb-2">
+                <input type="text" id="feed_source_rss_url_input" class="form-control mr-1" placeholder="외부 RSS 피드 URL 직접 입력 (예: https://example.com/rss.xml)">
+                <div class="input-group-append">
+                  <button type="button" id="add_feed_rss_source_btn" class="btn btn-outline-info px-3">외부 RSS 추가</button>
                 </div>
               </div>
               <div class="table-responsive rounded border" style="max-height: 160px; overflow-y: auto;">
                 <table class="table table-sm table-hover mb-0 text-center">
                   <thead class="thead-light">
                     <tr>
-                      <th style="width: 35%;">사이트</th>
-                      <th style="width: 35%;">게시판 ID</th>
-                      <th style="width: 20%;">서브 카테고리</th>
-                      <th style="width: 10%;">제외</th>
+                      <th style="width: 30%;">구분 / 사이트</th>
+                      <th style="width: 40%;">게시판 ID / RSS URL</th>
+                      <th style="width: 18%;">서브 카테고리</th>
+                      <th style="width: 12%;">제외</th>
                     </tr>
                   </thead>
                   <tbody id="modal_feed_sources_tbody">
@@ -108,7 +117,7 @@
                   </tbody>
                 </table>
               </div>
-              <small class="form-text text-muted">수집기 중 이 피드에 묶어 발행할 소스 게시판들을 추가하세요 (복수 지정 시 통합 피드).</small>
+              <small class="form-text text-muted">내부 수집기 게시판 또는 외부 RSS URL을 추가하세요 (복수 지정 시 통합 피드로 동작).</small>
             </div>
           </div>
 
@@ -160,6 +169,7 @@
 var package_name = "{{ arg['package_name'] }}";
 var sub = "{{ arg['sub'] }}";
 </script>
-<script src="{{ url_for('.static', filename='feeder_feed_setting.js') }}"></script>
+<script src="{{ url_for('.static', filename='feeder_base.js') }}"></script>
+<script src="{{ url_for('.static', filename='feeder_feed.js') }}"></script>
 
 {% endblock %}

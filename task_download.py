@@ -10,10 +10,10 @@ from types import SimpleNamespace
 from .setup import *
 from .model_crawl import ModelCrawlItem
 from .model_download import ModelDownload, ModelDownloadStat
-from .util_crawl import extract_info_hash, get_tmp_dir
-from .util_feed import FeedConfigUtil, FeedFilter
-from .util_download import DownloaderManager, TransporterManager
-from .util_upload import GDriveAccountManager, GDriveUploadHandler
+from .util_base import FeederUtil
+from .util_feed import FeedUtil
+from .util_download import DownloadUtil
+from .util_upload import UploadUtil
 
 
 class TaskDownloadBase:
@@ -46,12 +46,12 @@ class TaskDownload:
                 mode_str = "수동 실행" if manual else "스케쥴러 자동 실행"
                 logger.info(f"[DownloadPipeline] 다운로드 파이프라인 가동 ({mode_str})")
 
-                profiles = FeedConfigUtil.get_download_profiles()
+                profiles = FeederUtil.get_download_profiles()
                 if not profiles:
                     logger.debug("[DownloadPipeline] 등록된 다운로드 프로필(DOWNLOAD_PROFILES)이 없습니다.")
                     return
 
-                GDriveAccountManager.drain_all_sa_mydrives()
+                UploadUtil.drain_all_sa_mydrives()
 
                 TaskDownload.sync_feed_items(profiles)
                 TaskDownload.dispatch_pending_downloads()
@@ -69,8 +69,8 @@ class TaskDownload:
 
     @staticmethod
     def sync_feed_items(profiles: list[dict]):
-        global_cfg = FeedConfigUtil.get_global()
-        all_feeds = FeedConfigUtil.get_feeds()
+        global_cfg = FeederUtil.get_global()
+        all_feeds = FeederUtil.get_feeds()
         new_items_count = 0
 
         for profile in profiles:
@@ -125,7 +125,7 @@ class TaskDownload:
                         if not target_mag:
                             target_mag = magnets[0]
 
-                        infohash = extract_info_hash(target_mag)
+                        infohash = FeederUtil.extract_info_hash(target_mag)
 
                         existing = None
                         if infohash:
@@ -135,7 +135,7 @@ class TaskDownload:
                         if existing:
                             continue
 
-                        is_pass, _ = FeedFilter.evaluate(bbs_dict, feed, global_cfg)
+                        is_pass, _ = FeedUtil.evaluate(bbs_dict, feed, global_cfg)
                         if not is_pass:
                             continue
 
@@ -177,13 +177,13 @@ class TaskDownload:
                 continue
 
             engine_name = chain[curr_idx]
-            downloader_cfg = FeedConfigUtil.get_downloader_by_name(engine_name)
+            downloader_cfg = FeederUtil.get_downloader_by_name(engine_name)
             if not downloader_cfg or not downloader_cfg.get('enabled', True):
                 logger.warning(f"[DownloadDispatch] 다운로더 [{engine_name}] 비활성 또는 미등록. 다음 순위로 전환: {item.title}")
                 item.current_engine_index = curr_idx + 1
                 continue
 
-            engine = DownloaderManager.create_instance(downloader_cfg)
+            engine = DownloadUtil.create_engine(downloader_cfg)
             if not engine:
                 item.current_engine_index = curr_idx + 1
                 continue
@@ -229,11 +229,11 @@ class TaskDownload:
         now = datetime.now()
 
         for engine_name, engine_items in items_by_engine.items():
-            downloader_cfg = FeedConfigUtil.get_downloader_by_name(engine_name)
+            downloader_cfg = FeederUtil.get_downloader_by_name(engine_name)
             if not downloader_cfg:
                 continue
 
-            engine = DownloaderManager.create_instance(downloader_cfg)
+            engine = DownloadUtil.create_engine(downloader_cfg)
             if not engine:
                 continue
 
@@ -288,12 +288,12 @@ class TaskDownload:
                             it.file_name = fname
                             logger.info(f"[DownloadPoll] 동일 파일명 감지 -> '{fname}' 분리: {it.title}")
 
-                    profile = FeedConfigUtil.get_download_profile_by_feed(it.feed_name) or {}
+                    profile = FeederUtil.get_download_profile_by_feed(it.feed_name) or {}
                     dest_cfg = profile.get('destination', {})
                     dest_type = it.destination_type or dest_cfg.get('type', 'local')
 
                     if dest_type == 'colab_gdrive':
-                        transporter = TransporterManager.get_transporter('colab_gdrive')
+                        transporter = DownloadUtil.get_transporter('colab_gdrive')
                         if transporter:
                             transporter.transport(it, source_path, dest_cfg)
                         else:
@@ -329,7 +329,7 @@ class TaskDownload:
         if not items:
             return
 
-        staging_root = FeedConfigUtil.get_global().get('local_staging_path') or os.path.join(get_tmp_dir(), 'staging')
+        staging_root = FeederUtil.get_global().get('local_staging_path') or os.path.join(FeederUtil.get_tmp_dir(), 'staging')
         os.makedirs(staging_root, exist_ok=True)
 
         for item in items:
@@ -344,12 +344,12 @@ class TaskDownload:
             is_single_file = bool(ext and not raw_name.endswith(('/', '\\')))
             folder_base_name = base_name if is_single_file else raw_name
 
-            profile = FeedConfigUtil.get_download_profile_by_feed(item.feed_name)
+            profile = FeederUtil.get_download_profile_by_feed(item.feed_name)
             append_hash_opt = True
             if profile and 'append_hash_on_conflict' in profile:
                 append_hash_opt = bool(profile['append_hash_on_conflict'])
             else:
-                append_hash_opt = bool(FeedConfigUtil.get_global().get('append_hash_on_conflict', True))
+                append_hash_opt = bool(FeederUtil.get_global().get('append_hash_on_conflict', True))
 
             need_hash_suffix = False
             if append_hash_opt:
@@ -380,7 +380,7 @@ class TaskDownload:
             logger.info(f"[LocalStaging] 로컬 스테이징 다운로드 시작: {target_folder_name}")
 
             rclone_cmd_type = "copyto" if is_single_file else "copy"
-            rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or FeedConfigUtil.load_yaml().get('rclone', {}).get('conf_path', '')
+            rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or FeederUtil.load_yaml().get('rclone', {}).get('conf_path', '')
             cmd = [
                 "rclone", rclone_cmd_type, src_path, dest_download_path,
                 "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE",
@@ -399,9 +399,9 @@ class TaskDownload:
                 logger.error(f"[LocalStaging] Rclone 실행 예외: {ex}")
 
             if success and os.path.exists(item_staging_dir):
-                downloader_cfg = FeedConfigUtil.get_downloader_by_name(item.current_engine_name)
+                downloader_cfg = FeederUtil.get_downloader_by_name(item.current_engine_name)
                 if downloader_cfg:
-                    engine = DownloaderManager.create_instance(downloader_cfg)
+                    engine = DownloadUtil.create_engine(downloader_cfg)
                     if engine and item.engine_task_id:
                         engine.delete_task(item.engine_task_id)
 
@@ -433,11 +433,11 @@ class TaskDownload:
         now = datetime.now()
 
         for item in items:
-            profile = FeedConfigUtil.get_download_profile_by_feed(item.feed_name) or {}
+            profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
             dest_cfg = profile.get('destination', {})
             dest_type = item.destination_type or dest_cfg.get('type', 'local')
 
-            transporter = TransporterManager.get_transporter(dest_type)
+            transporter = DownloadUtil.get_transporter(dest_type)
             if not transporter:
                 logger.warning(f"[RouteComplete] 등록되지 않은 이송 핸들러({dest_type}) -> 로컬 완료 대체: {item.title}")
                 item.status = 'completed'
@@ -473,9 +473,9 @@ class TaskDownload:
         if not items:
             return
 
-        manager = GDriveAccountManager()
+        manager = UploadUtil.get_account_manager()
         for item in items:
-            GDriveUploadHandler.execute_upload(item, manager)
+            UploadUtil.execute_upload(item, manager)
 
     @staticmethod
     def retry_move_failed():
@@ -493,8 +493,8 @@ class TaskDownload:
         if not items:
             return
 
-        manager = GDriveAccountManager()
+        manager = UploadUtil.get_account_manager()
         for item in items:
             item.last_move_attempt_time = datetime.now()
             db.session.commit()
-            GDriveUploadHandler.execute_upload(item, manager)
+            UploadUtil.execute_upload(item, manager)

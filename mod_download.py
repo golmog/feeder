@@ -7,12 +7,12 @@ import traceback
 from datetime import datetime, timedelta
 from flask import render_template, request, jsonify, Response, stream_with_context
 from sqlalchemy import desc, func
+import sqlite3
 
 from .setup import *
 from .model_download import ModelDownload, ModelDownloadStat
-from .util_crawl import get_ddns, get_system_apikey, extract_info_hash
-from .util_feed import FeedConfigUtil
-from .util_download import DownloaderManager, TransporterManager
+from .util_base import FeederUtil
+from .util_download import DownloadUtil
 from .task_download import TaskDownloadBase
 
 name = 'download'
@@ -53,11 +53,11 @@ class ModuleDownload(PluginModuleBase):
             arg['package_name'] = P.package_name
             arg['sub'] = self.name
             arg['current_page'] = page_name
-            arg['ddns'] = get_ddns()
-            arg['apikey'] = get_system_apikey()
+            arg['ddns'] = FeederUtil.get_ddns()
+            arg['apikey'] = FeederUtil.get_system_apikey()
 
             if page_name == 'setting':
-                arg['yaml_filepath'] = FeedConfigUtil.get_filepath()
+                arg['yaml_filepath'] = FeederUtil.get_filepath()
                 arg['is_include'] = F.scheduler.is_include(self.get_scheduler_name())
                 arg['is_running'] = F.scheduler.is_running(self.get_scheduler_name())
                 return render_template(f'{P.package_name}_{self.name}_setting.html', arg=arg)
@@ -82,22 +82,22 @@ class ModuleDownload(PluginModuleBase):
                 return jsonify(self.web_list_model.web_list(req))
 
             elif command == 'load_downloaders':
-                DownloaderManager.load_engines()
+                DownloadUtil.load_engines()
                 return jsonify({
-                    'downloaders': FeedConfigUtil.get_downloaders(),
-                    'schemas': DownloaderManager.get_engine_schemas()
+                    'downloaders': FeederUtil.get_downloaders(),
+                    'schemas': DownloadUtil.get_engine_schemas()
                 })
 
             elif command == 'save_downloader':
                 cfg_json = req.form.get('downloader_json', '{}')
                 item_data = json.loads(cfg_json)
-                ret = FeedConfigUtil.save_downloader(item_data)
-                return jsonify({'ret': ret, 'downloaders': FeedConfigUtil.get_downloaders()})
+                ret = FeederUtil.save_downloader(item_data)
+                return jsonify({'ret': ret, 'downloaders': FeederUtil.get_downloaders()})
 
             elif command == 'test_downloader':
                 cfg_json = req.form.get('downloader_json', '{}')
                 item_data = json.loads(cfg_json)
-                engine = DownloaderManager.create_instance(item_data)
+                engine = DownloadUtil.create_engine(item_data)
                 if not engine:
                     return jsonify({'ret': 'fail', 'msg': f"엔진 인스턴스 생성 실패 ({item_data.get('engine_type')})"})
                 success, msg = engine.test_connection()
@@ -105,20 +105,18 @@ class ModuleDownload(PluginModuleBase):
 
             elif command == 'delete_downloader':
                 target_name = req.form.get('name', '').strip()
-                ok = FeedConfigUtil.delete_downloader(target_name)
-                return jsonify({'ret': 'success' if ok else 'fail', 'downloaders': FeedConfigUtil.get_downloaders()})
+                ok = FeederUtil.delete_downloader(target_name)
+                return jsonify({'ret': 'success' if ok else 'fail', 'downloaders': FeederUtil.get_downloaders()})
 
             elif command == 'download_script_list':
-                from .util_download import ENGINES_DIR, ensure_custom_dirs
-                ensure_custom_dirs()
-                files = [f for f in os.listdir(ENGINES_DIR) if f.endswith('.py') and not f.startswith('__')]
+                FeederUtil.ensure_custom_dirs()
+                files = [f for f in os.listdir(FeederUtil.ENGINES_DIR) if f.endswith('.py') and not f.startswith('__')]
                 files.sort()
                 return jsonify({'ret': 'success', 'files': files})
 
             elif command == 'download_script_read':
-                from .util_download import ENGINES_DIR
                 filename = os.path.basename(req.form.get('filename', '').strip())
-                fpath = os.path.join(ENGINES_DIR, filename)
+                fpath = os.path.join(FeederUtil.ENGINES_DIR, filename)
                 if not filename or not os.path.exists(fpath):
                     return jsonify({'ret': 'not_exist', 'log': '파일이 존재하지 않습니다.'})
                 try:
@@ -129,58 +127,52 @@ class ModuleDownload(PluginModuleBase):
                     return jsonify({'ret': 'error', 'log': str(e)})
 
             elif command == 'download_script_save':
-                from .util_download import ENGINES_DIR
                 filename = os.path.basename(req.form.get('filename', '').strip())
                 content = req.form.get('content', '')
                 if not filename:
                     return jsonify({'ret': 'empty_filename', 'log': '파일명이 올바르지 않습니다.'})
                 if not filename.endswith('.py'):
                     filename += '.py'
-                fpath = os.path.join(ENGINES_DIR, filename)
+                fpath = os.path.join(FeederUtil.ENGINES_DIR, filename)
                 try:
                     with open(fpath, 'w', encoding='utf-8') as f:
                         f.write(content)
-                    DownloaderManager.load_engines()
-                    files = [f for f in os.listdir(ENGINES_DIR) if f.endswith('.py') and not f.startswith('__')]
+                    DownloadUtil.load_engines()
+                    files = [f for f in os.listdir(FeederUtil.ENGINES_DIR) if f.endswith('.py') and not f.startswith('__')]
                     files.sort()
-                    return jsonify({'ret': 'success', 'filename': filename, 'files': files, 'schemas': DownloaderManager.get_engine_schemas()})
+                    return jsonify({'ret': 'success', 'filename': filename, 'files': files, 'schemas': DownloadUtil.get_engine_schemas()})
                 except Exception as e:
                     return jsonify({'ret': 'error', 'log': str(e)})
 
             elif command == 'load_profiles':
-                TransporterManager.load_transporters()
+                DownloadUtil.load_transporters()
                 return jsonify({
-                    'profiles': FeedConfigUtil.get_download_profiles(),
-                    'downloaders': FeedConfigUtil.get_downloaders(),
-                    'feeds': FeedConfigUtil.get_feeds(),
-                    'transporter_schemas': TransporterManager.get_transporter_schemas()
+                    'profiles': FeederUtil.get_download_profiles(),
+                    'downloaders': FeederUtil.get_downloaders(),
+                    'feeds': FeederUtil.get_feeds(),
+                    'transporter_schemas': DownloadUtil.get_transporter_schemas()
                 })
 
             elif command == 'save_profile':
                 cfg_json = req.form.get('profile_json', '{}')
                 item_data = json.loads(cfg_json)
-                ret = FeedConfigUtil.save_download_profile(item_data)
-                return jsonify({'ret': ret, 'profiles': FeedConfigUtil.get_download_profiles()})
+                ret = FeederUtil.save_download_profile(item_data)
+                return jsonify({'ret': ret, 'profiles': FeederUtil.get_download_profiles()})
 
             elif command == 'delete_profile':
                 target_name = req.form.get('name', '').strip()
-                yaml_data = FeedConfigUtil.load_yaml()
-                profiles = [p for p in yaml_data.get('DOWNLOAD_PROFILES', []) if p.get('name') != target_name]
-                yaml_data['DOWNLOAD_PROFILES'] = profiles
-                FeedConfigUtil.save_yaml(yaml_data)
-                return jsonify({'ret': 'success', 'profiles': FeedConfigUtil.get_download_profiles()})
+                ok = FeederUtil.delete_download_profile(target_name)
+                return jsonify({'ret': 'success' if ok else 'fail', 'profiles': FeederUtil.get_download_profiles()})
 
             elif command == 'transporter_script_list':
-                from .util_download import TRANSPORTERS_DIR, ensure_custom_dirs
-                ensure_custom_dirs()
-                files = [f for f in os.listdir(TRANSPORTERS_DIR) if f.endswith('.py') and not f.startswith('__')]
+                FeederUtil.ensure_custom_dirs()
+                files = [f for f in os.listdir(FeederUtil.TRANSPORTERS_DIR) if f.endswith('.py') and not f.startswith('__')]
                 files.sort()
                 return jsonify({'ret': 'success', 'files': files})
 
             elif command == 'transporter_script_read':
-                from .util_download import TRANSPORTERS_DIR
                 filename = os.path.basename(req.form.get('filename', '').strip())
-                fpath = os.path.join(TRANSPORTERS_DIR, filename)
+                fpath = os.path.join(FeederUtil.TRANSPORTERS_DIR, filename)
                 if not filename or not os.path.exists(fpath):
                     return jsonify({'ret': 'not_exist', 'log': '파일이 존재하지 않습니다.'})
                 try:
@@ -191,39 +183,38 @@ class ModuleDownload(PluginModuleBase):
                     return jsonify({'ret': 'error', 'log': str(e)})
 
             elif command == 'transporter_script_save':
-                from .util_download import TRANSPORTERS_DIR
                 filename = os.path.basename(req.form.get('filename', '').strip())
                 content = req.form.get('content', '')
                 if not filename:
                     return jsonify({'ret': 'empty_filename', 'log': '파일명이 올바르지 않습니다.'})
                 if not filename.endswith('.py'):
                     filename += '.py'
-                fpath = os.path.join(TRANSPORTERS_DIR, filename)
+                fpath = os.path.join(FeederUtil.TRANSPORTERS_DIR, filename)
                 try:
                     with open(fpath, 'w', encoding='utf-8') as f:
                         f.write(content)
-                    TransporterManager.load_transporters()
-                    files = [f for f in os.listdir(TRANSPORTERS_DIR) if f.endswith('.py') and not f.startswith('__')]
+                    DownloadUtil.load_transporters()
+                    files = [f for f in os.listdir(FeederUtil.TRANSPORTERS_DIR) if f.endswith('.py') and not f.startswith('__')]
                     files.sort()
-                    return jsonify({'ret': 'success', 'filename': filename, 'files': files, 'transporter_schemas': TransporterManager.get_transporter_schemas()})
+                    return jsonify({'ret': 'success', 'filename': filename, 'files': files, 'transporter_schemas': DownloadUtil.get_transporter_schemas()})
                 except Exception as e:
                     return jsonify({'ret': 'error', 'log': str(e)})
 
             elif command == 'load_accounts':
                 return jsonify({
-                    'accounts': FeedConfigUtil.get_gdrive_accounts(),
+                    'accounts': FeederUtil.get_gdrive_accounts(),
                     'stats': self.get_account_stats_summary()
                 })
 
             elif command == 'save_accounts':
                 acc_json = req.form.get('accounts_json', '[]')
                 accounts = json.loads(acc_json)
-                ok = FeedConfigUtil.save_gdrive_accounts(accounts)
-                return jsonify({'ret': 'success' if ok else 'fail', 'accounts': FeedConfigUtil.get_gdrive_accounts()})
+                ok = FeederUtil.save_gdrive_accounts(accounts)
+                return jsonify({'ret': 'success' if ok else 'fail', 'accounts': FeederUtil.get_gdrive_accounts()})
 
             elif command == 'batch_add_accounts':
                 batch_text = req.form.get('batch_text', '').strip()
-                accounts = FeedConfigUtil.get_gdrive_accounts()
+                accounts = FeederUtil.get_gdrive_accounts()
                 added_count = 0
                 for line in batch_text.splitlines():
                     line = line.strip()
@@ -242,7 +233,7 @@ class ModuleDownload(PluginModuleBase):
                             accounts.append(acc_dict)
                             added_count += 1
 
-                FeedConfigUtil.save_gdrive_accounts(accounts)
+                FeederUtil.save_gdrive_accounts(accounts)
                 logger.info(f"[{self.name}] 구글 드라이브 계정 풀 일괄 등록: {added_count}개 추가됨")
                 return jsonify({'ret': 'success', 'added_count': added_count, 'accounts': accounts})
 
@@ -259,7 +250,7 @@ class ModuleDownload(PluginModuleBase):
                 added_count, skipped_count = 0, 0
 
                 for line in lines:
-                    infohash = extract_info_hash(line)
+                    infohash = FeederUtil.extract_info_hash(line)
                     target_mag = f"magnet:?xt=urn:btih:{infohash}" if infohash else line
 
                     existing = ModelDownload.get_by_infohash(infohash) if infohash else ModelDownload.get_by_magnet(target_mag)
@@ -293,7 +284,6 @@ class ModuleDownload(PluginModuleBase):
                 if not os.path.exists(db_path):
                     return jsonify({'ret': 'fail', 'msg': '지정한 DB 파일을 찾을 수 없습니다.'})
 
-                import sqlite3
                 added_count, skipped_count = 0, 0
                 now = datetime.now()
 
@@ -317,7 +307,7 @@ class ModuleDownload(PluginModuleBase):
                         if not raw_mag:
                             continue
 
-                        infohash = extract_info_hash(raw_mag)
+                        infohash = FeederUtil.extract_info_hash(raw_mag)
                         target_mag = f"magnet:?xt=urn:btih:{infohash}" if infohash else raw_mag
 
                         existing = ModelDownload.get_by_infohash(infohash) if infohash else ModelDownload.get_by_magnet(target_mag)
@@ -356,46 +346,14 @@ class ModuleDownload(PluginModuleBase):
                 magnet = req.form.get('magnet', '').strip()
                 profile_name = req.form.get('profile_name', '').strip()
                 feed_name = req.form.get('feed_name', 'DIRECT')
-
-                if not magnet:
-                    return jsonify({'ret': 'fail', 'msg': '마그넷/ed2k 링크가 누락되었습니다.'})
-
-                infohash = extract_info_hash(magnet)
-                existing = ModelDownload.get_by_infohash(infohash) if infohash else ModelDownload.get_by_magnet(magnet)
-                if existing:
-                    return jsonify({'ret': 'exist', 'msg': f'이미 다운로드 큐에 등록된 작업입니다 (상태: {existing.status}).'})
-
-                dl_item = ModelDownload(
-                    feed_name=feed_name,
-                    title=title or (infohash or magnet[:30]),
+                res = FeederUtil.add_direct_download(
+                    title=title,
                     magnet=magnet,
-                    infohash=infohash
+                    profile_name=profile_name,
+                    feed_name=feed_name,
+                    caller_name=self.name
                 )
-
-                selected_profile = None
-                if profile_name:
-                    for p in FeedConfigUtil.get_download_profiles():
-                        if p.get('name') == profile_name:
-                            selected_profile = p
-                            break
-
-                if selected_profile:
-                    dl_item.priority_chain = list(selected_profile.get('priority_chain', []))
-                    dest = selected_profile.get('destination', {})
-                    dl_item.destination_type = dest.get('type', 'local')
-                    dl_item.gdrive_upload_path = dest.get('upload_path', '')
-                    dl_item.gdrive_complete_path = dest.get('complete_path', '')
-                    dl_item.gdrive_remote_id = dest.get('shared_drive_id', '')
-                else:
-                    enabled_downloaders = [d['name'] for d in FeedConfigUtil.get_downloaders() if d.get('enabled', True)]
-                    dl_item.priority_chain = enabled_downloaders
-                    dl_item.destination_type = 'local'
-
-                dl_item.status = 'pending'
-                db.session.add(dl_item)
-                db.session.commit()
-                logger.info(f"[{self.name}] 다운로드 큐 직접 추가: {title} (체인: {' -> '.join(dl_item.priority_chain)})")
-                return jsonify({'ret': 'success', 'msg': '다운로드 큐에 성공적으로 등록되었습니다.'})
+                return jsonify(res)
 
             elif command == 'item_action':
                 action = req.form.get('action')
@@ -413,12 +371,12 @@ class ModuleDownload(PluginModuleBase):
                     selected_profile = None
 
                     if profile_name:
-                        for p in FeedConfigUtil.get_download_profiles():
+                        for p in FeederUtil.get_download_profiles():
                             if p.get('name') == profile_name:
                                 selected_profile = p
                                 break
                     if not selected_profile:
-                        selected_profile = FeedConfigUtil.get_download_profile_by_feed(item.feed_name)
+                        selected_profile = FeederUtil.get_download_profile_by_feed(item.feed_name)
 
                     if selected_profile:
                         item.priority_chain = list(selected_profile.get('priority_chain', []))
@@ -428,7 +386,7 @@ class ModuleDownload(PluginModuleBase):
                         item.gdrive_complete_path = dest.get('complete_path', '')
                         item.gdrive_remote_id = dest.get('shared_drive_id', '')
                     else:
-                        enabled_downloaders = [d['name'] for d in FeedConfigUtil.get_downloaders() if d.get('enabled', True)]
+                        enabled_downloaders = [d['name'] for d in FeederUtil.get_downloaders() if d.get('enabled', True)]
                         if enabled_downloaders:
                             item.priority_chain = enabled_downloaders
                         item.destination_type = item.destination_type or 'local'
@@ -484,7 +442,7 @@ class ModuleDownload(PluginModuleBase):
         client_key = req.args.get('apikey') or req.form.get('apikey')
         if not client_key and req.is_json:
             client_key = (req.get_json(silent=True) or {}).get('apikey')
-        return bool(client_key and client_key == get_system_apikey())
+        return bool(client_key and client_key == FeederUtil.get_system_apikey())
 
     def _handle_colab_claim(self, req):
         if not self._verify_api_auth(req):
@@ -502,7 +460,7 @@ class ModuleDownload(PluginModuleBase):
         item.status = 'colab_transferring'
         db.session.commit()
 
-        rclone_conf_path = P.ModelSetting.get('download_rclone_conf_path') or FeedConfigUtil.load_yaml().get('rclone', {}).get('conf_path', '')
+        rclone_conf_path = P.ModelSetting.get('download_rclone_conf_path') or FeederUtil.load_yaml().get('rclone', {}).get('conf_path', '')
         rclone_conf_text = ""
         sa_files = {}
 
@@ -544,7 +502,7 @@ class ModuleDownload(PluginModuleBase):
             except Exception as e:
                 logger.error(f"[{self.name}] rclone.conf 분석 실패: {e}")
 
-        profile = FeedConfigUtil.get_download_profile_by_feed(item.feed_name) or {}
+        profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
         dest_cfg = profile.get('destination', {})
         remote_name = dest_cfg.get('remote_name') or P.ModelSetting.get('download_rclone_shared_remote_name') or 'gf'
         shared_drive_id = item.gdrive_remote_id or dest_cfg.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
@@ -599,10 +557,10 @@ class ModuleDownload(PluginModuleBase):
             if bytes_transferred > 0:
                 item.file_size = bytes_transferred
 
-            downloader_cfg = FeedConfigUtil.get_downloader_by_name(item.current_engine_name)
+            downloader_cfg = FeederUtil.get_downloader_by_name(item.current_engine_name)
             if downloader_cfg and item.engine_task_id:
                 try:
-                    engine = DownloaderManager.create_instance(downloader_cfg)
+                    engine = DownloadUtil.create_engine(downloader_cfg)
                     if engine:
                         engine.delete_task(item.engine_task_id)
                 except Exception as ex:
@@ -633,6 +591,11 @@ class ModuleDownload(PluginModuleBase):
                     yield f"data: {data_str}\n\n"
             except Exception as e:
                 logger.debug(f"[{self.name}] SSE 스트림 예외: {e}")
+            finally:
+                try:
+                    db.session.remove()
+                except Exception:
+                    pass
             time.sleep(3)
 
     def get_account_stats_summary(self) -> dict:

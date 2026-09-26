@@ -1,3 +1,9 @@
+// =============================================================================
+// DOWNLOAD 모듈 전용 스크립트 (Queue & List & Setting 통합)
+// =============================================================================
+var sse_source = null;
+var cached_download_list = [];
+
 var current_downloaders = [];
 var current_profiles = [];
 var current_accounts = [];
@@ -22,98 +28,391 @@ var TRANSPORTER_SKELETON = '# -*- coding: utf-8 -*-\n' +
   '        logger.info(f"이송 실행: {item.title} -> {dest_config.get(\'target_path\')}")\n' +
   '        return True, "completed", "이송 완료"\n';
 
-$(document).ready(function(){
-  load_all_download_config();
-  init_dl_engine_editor();
-  init_dl_trans_editor();
-
+// -----------------------------------------------------------------------------
+// 초기화 분기 (Queue 화면 vs List 화면 vs Setting 화면 자동 감지)
+// -----------------------------------------------------------------------------
+$(document).ready(function () {
   try {
-    localStorage.setItem('feeder_last_download_page', 'setting');
     sync_feeder_header_navbar();
-  } catch(err) {}
+  } catch (err) {}
 
-  restore_download_subtab();
-  setTimeout(restore_download_subtab, 80);
-});
+  // Queue 대시보드 화면 진입 시
+  if ($('#active_queue_tbody').length > 0) {
+    try {
+      localStorage.setItem('feeder_last_download_page', 'queue');
+      sync_feeder_header_navbar();
+    } catch (err) {}
 
-function restore_download_subtab() {
-  try {
-    var saved_tab = localStorage.getItem(package_name + '_' + sub + '_active_tab');
-    if (saved_tab) {
-      var tabElem = $('#nav-tab a[href="' + saved_tab + '"]');
-      if (tabElem.length > 0 && !tabElem.hasClass('active')) {
-        tabElem.tab('show');
-      }
+    request_active_queue();
+    if (typeof enable_sse !== 'undefined' && enable_sse) {
+      init_sse_listener();
     }
-  } catch(e) {}
-}
+  }
 
-$(document).on('shown.bs.tab', '#nav-tab a[data-toggle="tab"]', function(e){
-  try {
-    var targetTab = $(e.target).attr('href');
-    if (targetTab && targetTab.startsWith('#')) {
-      localStorage.setItem(package_name + '_' + sub + '_active_tab', targetTab);
-    }
-  } catch(err) {}
-});
+  // List 다운로드 이력 화면 진입 시
+  if ($('#download_list_tbody').length > 0) {
+    try {
+      localStorage.setItem('feeder_last_download_page', 'list');
+      sync_feeder_header_navbar();
+    } catch (err) {}
 
-function sync_feeder_header_navbar() {
-  try {
-    var lastCrawl = localStorage.getItem('feeder_last_crawl_page') || 'setting';
-    var lastFeed = localStorage.getItem('feeder_last_feed_page') || 'setting';
-    var lastDl = localStorage.getItem('feeder_last_download_page') || 'setting';
-    $('.navbar a[href*="/' + package_name + '/crawl"]').attr('href', '/' + package_name + '/crawl/' + lastCrawl);
-    $('.navbar a[href*="/' + package_name + '/feed"]').attr('href', '/' + package_name + '/feed/' + lastFeed);
-    $('.navbar a[href*="/' + package_name + '/download"]').attr('href', '/' + package_name + '/download/' + lastDl);
-  } catch(e) {}
-}
+    var saved_status = localStorage.getItem(sub + '_status_filter') || 'all';
+    $('#status_filter').val(saved_status);
 
-$(document).on('click', '.navbar a', function(e){
-  var href = $(this).attr('href') || '';
-  if (href.indexOf('/' + package_name + '/crawl') !== -1) {
-    var lastCrawl = localStorage.getItem('feeder_last_crawl_page');
-    if (lastCrawl && lastCrawl !== 'setting') {
-      e.preventDefault();
-      window.location.href = '/' + package_name + '/crawl/' + lastCrawl;
-    }
-  } else if (href.indexOf('/' + package_name + '/feed') !== -1) {
-    var lastFeed = localStorage.getItem('feeder_last_feed_page');
-    if (lastFeed && lastFeed !== 'setting') {
-      e.preventDefault();
-      window.location.href = '/' + package_name + '/feed/' + lastFeed;
-    }
-  } else if (href.indexOf('/' + package_name + '/download') !== -1) {
-    var lastDl = localStorage.getItem('feeder_last_download_page');
-    if (lastDl && lastDl !== 'setting') {
-      e.preventDefault();
-      window.location.href = '/' + package_name + '/download/' + lastDl;
-    }
+    var saved_size = localStorage.getItem(sub + '_page_size') || '25';
+    $('#page_size').val(saved_size);
+
+    var saved_word = localStorage.getItem(sub + '_search_word') || '';
+    $('#search_word').val(saved_word);
+
+    var saved_page = localStorage.getItem(sub + '_current_page') || '1';
+
+    load_retry_profiles();
+    window.globalRequestSearch(saved_page, false);
+  }
+
+  // Setting 화면 진입 시
+  if ($('#downloader_list_tbody').length > 0) {
+    try {
+      localStorage.setItem('feeder_last_download_page', 'setting');
+      sync_feeder_header_navbar();
+    } catch (err) {}
+
+    load_all_download_config();
+    init_dl_engine_editor();
+    init_dl_trans_editor();
+    restore_active_subtab('download');
+    setTimeout(function () { restore_active_subtab('download'); }, 80);
   }
 });
 
+// -----------------------------------------------------------------------------
+// [DOWNLOAD: QUEUE 대시보드 로직]
+// -----------------------------------------------------------------------------
+function init_sse_listener() {
+  if (window.EventSource) {
+    var sseUrl = '/' + package_name + '/api/' + sub + '/sse' + (apikey ? '?apikey=' + apikey : '');
+    sse_source = new EventSource(sseUrl);
+    sse_source.onmessage = function (event) {
+      try {
+        var data = JSON.parse(event.data);
+        if (data && data.counts) {
+          $('#stat_pending').text(data.counts.pending || 0);
+          $('#stat_downloading').text(data.counts.downloading || 0);
+          $('#stat_staging').text(data.counts.staging || 0);
+          $('#stat_uploading').text(data.counts.uploading || 0);
+          $('#stat_completed').text(data.counts.completed || 0);
+          $('#stat_failed').text(data.counts.failed || 0);
+        }
+      } catch (err) {}
+    };
+  }
+}
+
+function request_active_queue() {
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/web_list',
+    type: 'POST',
+    data: { page: 1, page_size: 50, status_filter: 'active' },
+    dataType: 'json',
+    success: function (data) {
+      render_queue_rows(data.list || []);
+    }
+  });
+}
+
+function render_queue_rows(list) {
+  var tbody = $('#active_queue_tbody');
+  if (!tbody.length) return;
+  if (!list || list.length === 0) {
+    tbody.html('<tr><td colspan="6" class="py-4 text-muted">현재 진행 중인 활성 작업이 없습니다.</td></tr>');
+    return;
+  }
+
+  var str = '';
+  for (var i = 0; i < list.length; i++) {
+    var it = list[i];
+    var statusBadge = '';
+    if (it.status === 'pending') statusBadge = '<span class="badge badge-warning">대기 (Pending)</span>';
+    else if (it.status === 'downloading') statusBadge = '<span class="badge badge-primary">다운로드 중</span>';
+    else if (it.status === 'pending_local_staging' || it.status === 'local_staging') statusBadge = '<span class="badge badge-info">로컬 스테이징</span>';
+    else if (it.status === 'pending_colab') statusBadge = '<span class="badge badge-warning">Colab 대기</span>';
+    else if (it.status === 'colab_transferring') statusBadge = '<span class="badge badge-primary">Colab 전송 중</span>';
+    else if (it.status === 'downloaded') statusBadge = '<span class="badge badge-success">다운로드 완료</span>';
+    else if (it.status === 'pending_upload' || it.status === 'uploading') statusBadge = '<span class="badge badge-primary">업로드 중</span>';
+    else if (it.status === 'completed') statusBadge = '<span class="badge badge-success">최종 완료</span>';
+    else if (it.status === 'failed') statusBadge = '<span class="badge badge-danger">실패</span>';
+    else statusBadge = '<span class="badge badge-secondary">' + it.status + '</span>';
+
+    var engineInfo = it.current_engine_name ? '<br><small class="text-muted">엔진: ' + it.current_engine_name + '</small>' : '';
+    var errorMsg = it.error_message ? '<br><small class="text-danger">오류: ' + it.error_message + '</small>' : '';
+    var pathDisplay = it.local_path ? '<div class="text-truncate small text-muted" style="max-width: 220px;" title="' + it.local_path + '">' + it.local_path + '</div>' : '<span class="text-muted">-</span>';
+
+    str += '<tr>';
+    str += '  <td class="font-weight-bold">' + it.id + '</td>';
+    str += '  <td>' + statusBadge + engineInfo + '</td>';
+    str += '  <td class="text-left">';
+    str += '    <span class="badge badge-dark mr-1">' + (it.feed_name || 'Feed') + '</span>';
+    str += '    <strong>' + it.title + '</strong>' + errorMsg;
+    if (it.file_name) str += '<br><small class="text-info font-weight-bold">폴더/파일: ' + it.file_name + '</small>';
+    str += '  </td>';
+    str += '  <td>' + format_bytes(it.file_size) + '<br>' + pathDisplay + '</td>';
+    str += '  <td class="small text-muted">' + (it.updated_time || it.created_time || '') + '</td>';
+    str += '  <td>';
+    str += '    <div class="btn-group btn-group-sm">';
+    str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold queue_action_btn" data-action="retry" data-id="' + it.id + '">재시도</button>';
+    str += '      <button type="button" class="btn btn-success text-white queue_action_btn" data-action="force_complete" data-id="' + it.id + '">완료</button>';
+    str += '      <button type="button" class="btn btn-danger text-white queue_action_btn" data-action="delete" data-id="' + it.id + '">삭제</button>';
+    str += '    </div>';
+    str += '  </td>';
+    str += '</tr>';
+  }
+  tbody.html(str);
+}
+
+$('#queue_refresh_btn').click(function (e) {
+  e.preventDefault();
+  request_active_queue();
+  notify('작업 큐를 새로고침했습니다.', 'info');
+});
+
+$(document).on('click', '.queue_action_btn', function (e) {
+  e.preventDefault();
+  var act = $(this).data('action');
+  var id = $(this).data('id');
+
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/item_action',
+    type: 'POST',
+    data: { action: act, id: id },
+    dataType: 'json',
+    success: function (data) {
+      if (data.ret === 'success') {
+        notify('작업이 처리되었습니다.', 'info');
+        request_active_queue();
+      } else {
+        notify(data.msg || '실패', 'warning');
+      }
+    }
+  });
+});
+
+// -----------------------------------------------------------------------------
+// [DOWNLOAD: LIST 이력 화면 로직]
+// -----------------------------------------------------------------------------
+function load_retry_profiles() {
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/load_profiles',
+    type: 'POST',
+    dataType: 'json',
+    success: function (data) {
+      cached_download_profiles = data.profiles || [];
+    }
+  });
+}
+
+function make_list(list) {
+  cached_download_list = list || [];
+  var tbody = $('#download_list_tbody');
+  if (!tbody.length) return;
+  if (!list || list.length === 0) {
+    tbody.html('<tr><td colspan="6" class="py-4 text-muted">검색 조건에 일치하는 다운로드 이력이 없습니다.</td></tr>');
+    return;
+  }
+
+  var str = '';
+  for (var i = 0; i < list.length; i++) {
+    var it = list[i];
+    var statusBadge = '';
+    if (it.status === 'completed') statusBadge = '<span class="badge badge-success">최종 완료</span>';
+    else if (it.status === 'downloading') statusBadge = '<span class="badge badge-primary">다운로드 중</span>';
+    else if (it.status === 'pending') statusBadge = '<span class="badge badge-warning">대기 (Pending)</span>';
+    else if (it.status === 'pending_local_staging' || it.status === 'local_staging') statusBadge = '<span class="badge badge-info">로컬 스테이징</span>';
+    else if (it.status === 'pending_colab') statusBadge = '<span class="badge badge-warning">Colab 대기</span>';
+    else if (it.status === 'colab_transferring') statusBadge = '<span class="badge badge-primary">Colab 전송 중</span>';
+    else if (it.status === 'downloaded') statusBadge = '<span class="badge badge-success">다운로드 완료</span>';
+    else if (it.status === 'pending_upload' || it.status === 'uploading') statusBadge = '<span class="badge badge-primary">업로드 중</span>';
+    else if (it.status === 'move_failed') statusBadge = '<span class="badge badge-warning">이동 실패</span>';
+    else if (it.status === 'failed') statusBadge = '<span class="badge badge-danger">실패</span>';
+    else statusBadge = '<span class="badge badge-secondary">' + it.status + '</span>';
+
+    var engineInfo = it.current_engine_name ? '<br><small class="text-muted">엔진: ' + it.current_engine_name + '</small>' : '';
+    var errorMsg = it.error_message ? '<br><small class="text-danger">오류: ' + it.error_message + '</small>' : '';
+    var pathDisplay = it.local_path ? '<div class="text-truncate small text-muted" style="max-width: 220px;" title="' + it.local_path + '">' + it.local_path + '</div>' : '<span class="text-muted">-</span>';
+    var timeStr = it.completed_time || it.updated_time || it.created_time || '';
+
+    str += '<tr>';
+    str += '  <td class="font-weight-bold">' + it.id + '</td>';
+    str += '  <td>' + statusBadge + engineInfo + '</td>';
+    str += '  <td class="text-left">';
+    str += '    <span class="badge badge-dark mr-1">' + (it.feed_name || 'Feed') + '</span>';
+    str += '    <strong>' + it.title + '</strong>' + errorMsg;
+    if (it.file_name) str += '<br><small class="text-info font-weight-bold">폴더/파일: ' + it.file_name + '</small>';
+    str += '  </td>';
+    str += '  <td>' + format_bytes(it.file_size) + '<br>' + pathDisplay + '</td>';
+    str += '  <td class="small text-muted">' + timeStr + '</td>';
+    str += '  <td>';
+    str += '    <div class="btn-group btn-group-sm">';
+    str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold btn_list_action" data-action="retry" data-id="' + it.id + '">재시도</button>';
+    str += '      <button type="button" class="btn btn-success text-white btn_list_action" data-action="force_complete" data-id="' + it.id + '">완료</button>';
+    str += '      <button type="button" class="btn btn-danger text-white btn_list_action" data-action="delete" data-id="' + it.id + '">삭제</button>';
+    str += '    </div>';
+    str += '  </td>';
+    str += '</tr>';
+  }
+  tbody.html(str);
+}
+
+$('#status_filter, #page_size').change(function () {
+  if ($('#download_list_tbody').length > 0) {
+    window.globalRequestSearch('1', false);
+  }
+});
+
+$('#reset_btn').click(function (e) {
+  e.preventDefault();
+  if ($('#download_list_tbody').length === 0) return;
+
+  $('#status_filter').val('all');
+  $('#search_word').val('');
+  $('#page_size').val('25');
+
+  localStorage.removeItem(sub + '_search_word');
+  localStorage.setItem(sub + '_status_filter', 'all');
+  localStorage.setItem(sub + '_page_size', '25');
+  localStorage.setItem(sub + '_current_page', '1');
+
+  window.globalRequestSearch('1', false);
+});
+
+$('#modal_retry_profile_select').change(function () {
+  var pName = $(this).val();
+  var pObj = cached_download_profiles.find(function (p) { return p.name === pName; });
+  if (pObj) {
+    var chainStr = (pObj.priority_chain || []).join(' -> ') || '(비어있음)';
+    var dest = pObj.destination || {};
+    var destStr = dest.type || 'local';
+    if (dest.type === 'colab_gdrive') destStr += ' (Colab 무트래픽)';
+    else if (dest.type === 'gdrive_rotation') destStr += ' (SA 15GB 우회)';
+
+    $('#modal_retry_chain_preview').text(chainStr);
+    $('#modal_retry_dest_preview').text(destStr);
+  } else {
+    $('#modal_retry_chain_preview').text('(기본 활성 다운로더 전체)');
+    $('#modal_retry_dest_preview').text('local (로컬 디스크 보존)');
+  }
+});
+
+$(document).on('click', '.btn_list_action', function (e) {
+  e.preventDefault();
+  var act = $(this).data('action');
+  var id = $(this).data('id');
+  var item = cached_download_list.find(function (x) { return String(x.id) === String(id); });
+  var titleText = item ? item.title : ('ID: ' + id);
+
+  if (act === 'retry') {
+    $('#modal_retry_item_id').val(id);
+    $('#modal_retry_item_title').text(titleText);
+
+    var pSelect = $('#modal_retry_profile_select');
+    pSelect.empty();
+    if (cached_download_profiles && cached_download_profiles.length > 0) {
+      for (var i = 0; i < cached_download_profiles.length; i++) {
+        var p = cached_download_profiles[i];
+        pSelect.append('<option value="' + p.name + '">' + p.name + '</option>');
+      }
+      if (item && item.feed_name) {
+        var matchP = cached_download_profiles.find(function (p) {
+          return (p.feeds || []).indexOf(item.feed_name) !== -1 || (p.feeds || []).indexOf('*') !== -1;
+        });
+        if (matchP) pSelect.val(matchP.name);
+      }
+    } else {
+      pSelect.append('<option value="">-- 기본 다운로더 전체 사용 --</option>');
+    }
+    pSelect.trigger('change');
+    $('#download_retry_modal').modal('show');
+    return;
+  }
+
+  if (act === 'force_complete') {
+    if (!confirm('[' + id + '번 항목]\n"' + titleText + '"\n\n해당 작업을 최종 완료(completed) 상태로 변경하시겠습니까?')) return;
+  } else if (act === 'delete') {
+    if (!confirm('[' + id + '번 항목]\n"' + titleText + '"\n\n해당 작업을 완전히 삭제하시겠습니까?')) return;
+  }
+
+  notify('작업 요청 중...', 'info');
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/item_action',
+    type: 'POST',
+    data: { action: act, id: id },
+    dataType: 'json',
+    success: function (data) {
+      if (data.ret === 'success') {
+        notify(data.msg || '작업이 처리되었습니다.', 'success');
+        window.globalRequestSearch(null, true);
+      } else {
+        notify(data.msg || '실패', 'warning');
+      }
+    }
+  });
+});
+
+$(document).on('click', '#btn_confirm_retry_execute', function (e) {
+  e.preventDefault();
+  var id = $('#modal_retry_item_id').val();
+  var pName = $('#modal_retry_profile_select').val();
+
+  notify('다운로드 재시도 등록 중...', 'info');
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/item_action',
+    type: 'POST',
+    data: {
+      action: 'retry',
+      id: id,
+      profile_name: pName
+    },
+    dataType: 'json',
+    success: function (data) {
+      if (data.ret === 'success') {
+        notify(data.msg || '재시도 대기열에 등록되었습니다.', 'success');
+        $('#download_retry_modal').modal('hide');
+        window.globalRequestSearch(null, true);
+      } else {
+        notify(data.msg || '재시도 실패', 'warning');
+      }
+    }
+  });
+});
+
+// -----------------------------------------------------------------------------
+// [DOWNLOAD: SETTING 화면 로직]
+// -----------------------------------------------------------------------------
 function init_dl_engine_editor() {
   if ($('#download_script_code_editor').length && !dl_engine_editor && window.ace) {
-    dl_engine_editor = ace.edit("download_script_code_editor");
-    dl_engine_editor.setTheme("ace/theme/monokai");
-    dl_engine_editor.session.setMode("ace/mode/python");
+    dl_engine_editor = ace.edit('download_script_code_editor');
+    dl_engine_editor.setTheme('ace/theme/monokai');
+    dl_engine_editor.session.setMode('ace/mode/python');
     dl_engine_editor.setFontSize(13);
     dl_engine_editor.setShowPrintMargin(false);
     dl_engine_editor.session.setTabSize(4);
     dl_engine_editor.session.setUseSoftTabs(true);
     dl_engine_editor.session.setUseWrapMode(true);
+    feeder_ace_instances.push(dl_engine_editor);
   }
 }
 
 function init_dl_trans_editor() {
   if ($('#transporter_script_code_editor').length && !dl_trans_editor && window.ace) {
-    dl_trans_editor = ace.edit("transporter_script_code_editor");
-    dl_trans_editor.setTheme("ace/theme/monokai");
-    dl_trans_editor.session.setMode("ace/mode/python");
+    dl_trans_editor = ace.edit('transporter_script_code_editor');
+    dl_trans_editor.setTheme('ace/theme/monokai');
+    dl_trans_editor.session.setMode('ace/mode/python');
     dl_trans_editor.setFontSize(13);
     dl_trans_editor.setShowPrintMargin(false);
     dl_trans_editor.session.setTabSize(4);
     dl_trans_editor.session.setUseSoftTabs(true);
     dl_trans_editor.session.setUseWrapMode(true);
+    feeder_ace_instances.push(dl_trans_editor);
   }
 }
 
@@ -133,28 +432,12 @@ $('#transporter_script_modal').on('shown.bs.modal', function () {
   }
 });
 
-$(document).on('click', '.modal-fullscreen-btn', function(e){
-  e.preventDefault();
-  var modalDialog = $(this).closest('.modal-dialog');
-  modalDialog.toggleClass('modal-fullscreen');
-  var icon = $(this).find('i');
-  if (modalDialog.hasClass('modal-fullscreen')) {
-    icon.removeClass('fa-expand').addClass('fa-compress');
-  } else {
-    icon.removeClass('fa-compress').addClass('fa-expand');
-  }
-  setTimeout(function(){
-    if (dl_engine_editor) dl_engine_editor.resize();
-    if (dl_trans_editor) dl_trans_editor.resize();
-  }, 150);
-});
-
 function load_all_download_config() {
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/load_downloaders',
-    type: "POST",
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    dataType: 'json',
+    success: function (data) {
       current_downloaders = data.downloaders || [];
       available_engine_schemas = data.schemas || [];
       render_downloaders(current_downloaders);
@@ -164,9 +447,9 @@ function load_all_download_config() {
 
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/load_profiles',
-    type: "POST",
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    dataType: 'json',
+    success: function (data) {
       current_profiles = data.profiles || [];
       available_feeds = data.feeds || [];
       available_transporter_schemas = data.transporter_schemas || [];
@@ -177,9 +460,9 @@ function load_all_download_config() {
 
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/load_accounts',
-    type: "POST",
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    dataType: 'json',
+    success: function (data) {
       current_accounts = data.accounts || [];
       render_accounts(current_accounts, data.stats || {});
     }
@@ -188,6 +471,7 @@ function load_all_download_config() {
 
 function render_downloaders(data) {
   var tbody = $('#downloader_list_tbody');
+  if (!tbody.length) return;
   if (!data || data.length === 0) {
     tbody.html('<tr><td colspan="5" class="py-4 text-muted">등록된 다운로더 엔진이 없습니다.</td></tr>');
     return;
@@ -208,8 +492,8 @@ function render_downloaders(data) {
     } else if (item.engine_type === 'qbittorrent') {
       connDetail = 'URL: ' + (item.url || '-') + ' | 저장: ' + (item.save_path || '-');
     } else {
-      var keys = Object.keys(item).filter(function(k){ return ['name', 'engine_type', 'enabled', 'stalled_timeout_hours'].indexOf(k) === -1; });
-      connDetail = keys.slice(0, 3).map(function(k){ return k + ': ' + item[k]; }).join(' | ') || '-';
+      var keys = Object.keys(item).filter(function (k) { return ['name', 'engine_type', 'enabled', 'stalled_timeout_hours'].indexOf(k) === -1; });
+      connDetail = keys.slice(0, 3).map(function (k) { return k + ': ' + item[k]; }).join(' | ') || '-';
     }
 
     str += '<tr>';
@@ -246,7 +530,7 @@ function render_dynamic_engine_fields(engine_id, current_values) {
   var container = $('#dl_dynamic_engine_fields');
   container.empty();
 
-  var schemaObj = available_engine_schemas.find(function(s){ return s.engine_id === engine_id; });
+  var schemaObj = available_engine_schemas.find(function (s) { return s.engine_id === engine_id; });
   if (!schemaObj || !schemaObj.config_schema || schemaObj.config_schema.length === 0) {
     container.html('<div class="text-muted small p-2 text-center">해당 엔진에 별도 설정 항목이 없습니다.</div>');
     return;
@@ -283,11 +567,11 @@ function render_dynamic_engine_fields(engine_id, current_values) {
   container.html(html);
 }
 
-$('#dl_engine_type').change(function(){
+$('#dl_engine_type').change(function () {
   render_dynamic_engine_fields($(this).val(), null);
 });
 
-$(document).on('click', '#downloader_add_btn', function(e){
+$(document).on('click', '#downloader_add_btn', function (e) {
   e.preventDefault();
   $('#downloader_modal_title').text('다운로더 엔진 추가');
   $('#downloader_mode').val('add');
@@ -301,7 +585,7 @@ $(document).on('click', '#downloader_add_btn', function(e){
   $('#downloader_modal').modal('show');
 });
 
-$(document).on('click', '.edit_dl_btn', function(e){
+$(document).on('click', '.edit_dl_btn', function (e) {
   e.preventDefault();
   var idx = $(this).data('index');
   var item = current_downloaders[idx];
@@ -317,52 +601,44 @@ $(document).on('click', '.edit_dl_btn', function(e){
   $('#downloader_modal').modal('show');
 });
 
-$(document).on('click', '#downloader_test_btn', function(e){
+$(document).on('click', '#downloader_test_btn', function (e) {
   e.preventDefault();
   var name = $('#dl_name').val().trim() || 'test_engine';
   var e_type = $('#dl_engine_type').val();
   if (!e_type) { notify('엔진 타입을 선택하세요.', 'warning'); return; }
 
-  var cfg = {
-    name: name,
-    engine_type: e_type
-  };
-
-  var schemaObj = available_engine_schemas.find(function(s){ return s.engine_id === e_type; });
+  var cfg = { name: name, engine_type: e_type };
+  var schemaObj = available_engine_schemas.find(function (s) { return s.engine_id === e_type; });
   if (schemaObj && schemaObj.config_schema) {
     for (var i = 0; i < schemaObj.config_schema.length; i++) {
       var f = schemaObj.config_schema[i];
       var el = $('#dl_field_' + f.name);
-      if (f.type === 'checkbox') {
-        cfg[f.name] = el.is(':checked');
-      } else if (f.type === 'number') {
-        cfg[f.name] = parseInt(el.val()) || 0;
-      } else {
-        cfg[f.name] = el.val().trim();
-      }
+      if (f.type === 'checkbox') cfg[f.name] = el.is(':checked');
+      else if (f.type === 'number') cfg[f.name] = parseInt(el.val()) || 0;
+      else cfg[f.name] = el.val().trim();
     }
   }
 
   notify('엔진 연결 테스트 중...', 'info');
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/test_downloader',
-    type: "POST",
-    data: {downloader_json: JSON.stringify(cfg)},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { downloader_json: JSON.stringify(cfg) },
+    dataType: 'json',
+    success: function (data) {
       if (data.ret === 'success') {
         notify(data.msg || '연결 성공', 'success');
       } else {
         notify('연결 실패: ' + (data.msg || '오류'), 'warning');
       }
     },
-    error: function() {
+    error: function () {
       notify('연결 테스트 통신 실패', 'danger');
     }
   });
 });
 
-$(document).on('click', '#downloader_save_btn', function(e){
+$(document).on('click', '#downloader_save_btn', function (e) {
   e.preventDefault();
   var name = $('#dl_name').val().trim();
   var e_type = $('#dl_engine_type').val();
@@ -375,27 +651,23 @@ $(document).on('click', '#downloader_save_btn', function(e){
     enabled: $('#dl_enabled').is(':checked')
   };
 
-  var schemaObj = available_engine_schemas.find(function(s){ return s.engine_id === e_type; });
+  var schemaObj = available_engine_schemas.find(function (s) { return s.engine_id === e_type; });
   if (schemaObj && schemaObj.config_schema) {
     for (var i = 0; i < schemaObj.config_schema.length; i++) {
       var f = schemaObj.config_schema[i];
       var el = $('#dl_field_' + f.name);
-      if (f.type === 'checkbox') {
-        cfg[f.name] = el.is(':checked');
-      } else if (f.type === 'number') {
-        cfg[f.name] = parseInt(el.val()) || 0;
-      } else {
-        cfg[f.name] = el.val().trim();
-      }
+      if (f.type === 'checkbox') cfg[f.name] = el.is(':checked');
+      else if (f.type === 'number') cfg[f.name] = parseInt(el.val()) || 0;
+      else cfg[f.name] = el.val().trim();
     }
   }
 
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/save_downloader',
-    type: "POST",
-    data: {downloader_json: JSON.stringify(cfg)},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { downloader_json: JSON.stringify(cfg) },
+    dataType: 'json',
+    success: function (data) {
       notify('다운로더 설정이 저장되었습니다.', 'success');
       $('#downloader_modal').modal('hide');
       current_downloaders = data.downloaders || [];
@@ -404,16 +676,16 @@ $(document).on('click', '#downloader_save_btn', function(e){
   });
 });
 
-$(document).on('click', '.delete_dl_btn', function(e){
+$(document).on('click', '.delete_dl_btn', function (e) {
   e.preventDefault();
   var target_name = $(this).data('name');
   if (!confirm('[' + target_name + '] 다운로더를 삭제하시겠습니까?')) return;
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/delete_downloader',
-    type: "POST",
-    data: {name: target_name},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { name: target_name },
+    dataType: 'json',
+    success: function (data) {
       notify('삭제되었습니다.', 'success');
       current_downloaders = data.downloaders || [];
       render_downloaders(current_downloaders);
@@ -421,19 +693,19 @@ $(document).on('click', '.delete_dl_btn', function(e){
   });
 });
 
-$(document).on('click', '#download_script_manage_btn', function(e){
+$(document).on('click', '#download_script_manage_btn', function (e) {
   e.preventDefault();
   load_download_script_list();
   $('#download_script_modal').modal('show');
-  setTimeout(function(){ if (dl_engine_editor) dl_engine_editor.resize(); }, 200);
+  setTimeout(function () { if (dl_engine_editor) dl_engine_editor.resize(); }, 200);
 });
 
 function load_download_script_list(selected_name) {
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/download_script_list',
-    type: "POST",
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    dataType: 'json',
+    success: function (data) {
       var files = data.files || [];
       var select = $('#download_script_select');
       select.empty();
@@ -451,15 +723,15 @@ function load_download_script_list(selected_name) {
   });
 }
 
-$(document).on('change', '#download_script_select', function(){
+$(document).on('change', '#download_script_select', function () {
   var filename = $(this).val();
   if (!filename) return;
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/download_script_read',
-    type: "POST",
-    data: {filename: filename},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { filename: filename },
+    dataType: 'json',
+    success: function (data) {
       if (data.ret === 'success') {
         $('#download_script_name').val(data.filename);
         $('#download_script_code').val(data.content);
@@ -472,7 +744,7 @@ $(document).on('change', '#download_script_select', function(){
   });
 });
 
-$(document).on('click', '#download_script_new_btn', function(e){
+$(document).on('click', '#download_script_new_btn', function (e) {
   e.preventDefault();
   $('#download_script_select').val('');
   $('#download_script_name').val('engine_new.py');
@@ -482,7 +754,7 @@ $(document).on('click', '#download_script_new_btn', function(e){
   $('#download_script_status').text('새 템플릿 로드');
 });
 
-$(document).on('click', '#download_script_save_btn', function(e){
+$(document).on('click', '#download_script_save_btn', function (e) {
   e.preventDefault();
   var filename = $('#download_script_name').val().trim();
   var content = dl_engine_editor ? dl_engine_editor.getValue() : $('#download_script_code').val();
@@ -490,10 +762,10 @@ $(document).on('click', '#download_script_save_btn', function(e){
 
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/download_script_save',
-    type: "POST",
-    data: {filename: filename, content: content},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { filename: filename, content: content },
+    dataType: 'json',
+    success: function (data) {
       if (data.ret === 'success') {
         notify('엔진 스크립트가 저장되었습니다.', 'success');
         $('#download_script_status').text('저장 완료 (' + filename + ')');
@@ -507,17 +779,17 @@ $(document).on('click', '#download_script_save_btn', function(e){
   });
 });
 
-$(document).on('click', '#download_script_delete_btn', function(e){
+$(document).on('click', '#download_script_delete_btn', function (e) {
   e.preventDefault();
   var filename = $('#download_script_name').val().trim();
   if (!filename) return;
   if (!confirm('[' + filename + '] 엔진 스크립트를 삭제하시겠습니까?')) return;
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/download_script_delete',
-    type: "POST",
-    data: {filename: filename},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { filename: filename },
+    dataType: 'json',
+    success: function (data) {
       if (data.ret === 'success') {
         notify('삭제되었습니다.', 'success');
         load_download_script_list();
@@ -546,7 +818,7 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
   var container = $('#profile_dynamic_dest_fields');
   container.empty();
 
-  var schemaObj = available_transporter_schemas.find(function(s){ return s.transporter_id === transporter_id; });
+  var schemaObj = available_transporter_schemas.find(function (s) { return s.transporter_id === transporter_id; });
   if (!schemaObj || !schemaObj.config_schema || schemaObj.config_schema.length === 0) {
     container.html('<div class="text-muted small p-2 text-center">해당 목적지에 별도 세부 설정 항목이 없습니다.</div>');
     return;
@@ -583,12 +855,13 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
   container.html(html);
 }
 
-$('#profile_dest_type').change(function(){
+$('#profile_dest_type').change(function () {
   render_dynamic_dest_fields($(this).val(), null);
 });
 
 function render_profiles(data) {
   var tbody = $('#profile_list_tbody');
+  if (!tbody.length) return;
   if (!data || data.length === 0) {
     tbody.html('<tr><td colspan="5" class="py-4 text-muted">등록된 다운로드 프로필이 없습니다.</td></tr>');
     return;
@@ -596,8 +869,8 @@ function render_profiles(data) {
   var str = '';
   for (var i = 0; i < data.length; i++) {
     var p = data[i];
-    var feedsHtml = (p.feeds || []).map(function(f){ return '<span class="badge badge-info mr-1">' + f + '</span>'; }).join('');
-    var chainHtml = (p.priority_chain || []).map(function(c, idx){
+    var feedsHtml = (p.feeds || []).map(function (f) { return '<span class="badge badge-info mr-1">' + f + '</span>'; }).join('');
+    var chainHtml = (p.priority_chain || []).map(function (c, idx) {
       return '<span class="badge badge-secondary mr-1">' + (idx + 1) + '. ' + c + '</span>';
     }).join(' <i class="fa fa-arrow-right text-muted small mr-1"></i> ');
 
@@ -695,7 +968,7 @@ function render_chain_table() {
   }
 }
 
-$(document).on('click', '#btn_add_profile_feed', function(e){
+$(document).on('click', '#btn_add_profile_feed', function (e) {
   e.preventDefault();
   var sel = $('#profile_feed_select').val();
   if (!sel) return;
@@ -707,21 +980,21 @@ $(document).on('click', '#btn_add_profile_feed', function(e){
   render_selected_feeds();
 });
 
-$(document).on('click', '#btn_add_all_feed', function(e){
+$(document).on('click', '#btn_add_all_feed', function (e) {
   e.preventDefault();
   if (modal_profile_feeds.indexOf('*') !== -1) return;
   modal_profile_feeds.push('*');
   render_selected_feeds();
 });
 
-$(document).on('click', '.remove-profile-feed-btn', function(e){
+$(document).on('click', '.remove-profile-feed-btn', function (e) {
   e.preventDefault();
   var target = $(this).data('feed');
-  modal_profile_feeds = modal_profile_feeds.filter(function(f){ return f !== target; });
+  modal_profile_feeds = modal_profile_feeds.filter(function (f) { return f !== target; });
   render_selected_feeds();
 });
 
-$(document).on('click', '#btn_add_profile_engine', function(e){
+$(document).on('click', '#btn_add_profile_engine', function (e) {
   e.preventDefault();
   var eng = $('#profile_engine_select').val();
   if (!eng) return;
@@ -733,7 +1006,7 @@ $(document).on('click', '#btn_add_profile_engine', function(e){
   render_chain_table();
 });
 
-$(document).on('click', '.chain-move-btn', function(e){
+$(document).on('click', '.chain-move-btn', function (e) {
   e.preventDefault();
   var idx = parseInt($(this).data('index'));
   var dir = $(this).data('dir');
@@ -749,14 +1022,14 @@ $(document).on('click', '.chain-move-btn', function(e){
   render_chain_table();
 });
 
-$(document).on('click', '.chain-remove-btn', function(e){
+$(document).on('click', '.chain-remove-btn', function (e) {
   e.preventDefault();
   var idx = parseInt($(this).data('index'));
   modal_profile_chain.splice(idx, 1);
   render_chain_table();
 });
 
-$(document).on('click', '#profile_add_btn', function(e){
+$(document).on('click', '#profile_add_btn', function (e) {
   e.preventDefault();
   $('#profile_modal_title').text('다운로드 프로필 추가');
   $('#profile_mode').val('add');
@@ -776,7 +1049,7 @@ $(document).on('click', '#profile_add_btn', function(e){
   $('#profile_modal').modal('show');
 });
 
-$(document).on('click', '.edit_profile_btn', function(e){
+$(document).on('click', '.edit_profile_btn', function (e) {
   e.preventDefault();
   var idx = $(this).data('index');
   var p = current_profiles[idx];
@@ -799,7 +1072,7 @@ $(document).on('click', '.edit_profile_btn', function(e){
   $('#profile_modal').modal('show');
 });
 
-$(document).on('click', '#profile_save_btn', function(e){
+$(document).on('click', '#profile_save_btn', function (e) {
   e.preventDefault();
   var name = $('#profile_name').val().trim();
   if (!name) { notify('프로필명을 입력하세요.', 'warning'); return; }
@@ -814,20 +1087,16 @@ $(document).on('click', '#profile_save_btn', function(e){
   }
 
   var destType = $('#profile_dest_type').val();
-  var destObj = {type: destType};
+  var destObj = { type: destType };
 
-  var schemaObj = available_transporter_schemas.find(function(s){ return s.transporter_id === destType; });
+  var schemaObj = available_transporter_schemas.find(function (s) { return s.transporter_id === destType; });
   if (schemaObj && schemaObj.config_schema) {
     for (var i = 0; i < schemaObj.config_schema.length; i++) {
       var f = schemaObj.config_schema[i];
       var el = $('#dest_field_' + f.name);
-      if (f.type === 'checkbox') {
-        destObj[f.name] = el.is(':checked');
-      } else if (f.type === 'number') {
-        destObj[f.name] = parseInt(el.val()) || 0;
-      } else {
-        destObj[f.name] = el.val().trim();
-      }
+      if (f.type === 'checkbox') destObj[f.name] = el.is(':checked');
+      else if (f.type === 'number') destObj[f.name] = parseInt(el.val()) || 0;
+      else destObj[f.name] = el.val().trim();
     }
   }
 
@@ -841,10 +1110,10 @@ $(document).on('click', '#profile_save_btn', function(e){
 
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/save_profile',
-    type: "POST",
-    data: {profile_json: JSON.stringify(profile_obj)},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { profile_json: JSON.stringify(profile_obj) },
+    dataType: 'json',
+    success: function (data) {
       notify('프로필이 저장되었습니다.', 'success');
       $('#profile_modal').modal('hide');
       current_profiles = data.profiles || [];
@@ -853,16 +1122,16 @@ $(document).on('click', '#profile_save_btn', function(e){
   });
 });
 
-$(document).on('click', '.delete_profile_btn', function(e){
+$(document).on('click', '.delete_profile_btn', function (e) {
   e.preventDefault();
   var target_name = $(this).data('name');
   if (!confirm('[' + target_name + '] 프로필을 삭제하시겠습니까?')) return;
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/delete_profile',
-    type: "POST",
-    data: {name: target_name},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { name: target_name },
+    dataType: 'json',
+    success: function (data) {
       notify('삭제되었습니다.', 'success');
       current_profiles = data.profiles || [];
       render_profiles(current_profiles);
@@ -872,6 +1141,7 @@ $(document).on('click', '.delete_profile_btn', function(e){
 
 function render_accounts(accounts, stats) {
   var tbody = $('#gdrive_account_list_tbody');
+  if (!tbody.length) return;
   if (!accounts || accounts.length === 0) {
     tbody.html('<tr><td colspan="5" class="py-4 text-muted">등록된 구글 드라이브 계정이 없습니다.</td></tr>');
     return;
@@ -912,7 +1182,7 @@ function render_accounts(accounts, stats) {
   tbody.html(str);
 }
 
-$(document).on('click', '.edit_acc_btn', function(e){
+$(document).on('click', '.edit_acc_btn', function (e) {
   e.preventDefault();
   var idx = parseInt($(this).data('index'));
   var acc = current_accounts[idx];
@@ -926,38 +1196,29 @@ $(document).on('click', '.edit_acc_btn', function(e){
   $('#gdrive_account_modal').modal('show');
 });
 
-$(document).on('click', '#gdrive_account_save_btn', function(e){
+$(document).on('click', '#gdrive_account_save_btn', function (e) {
   e.preventDefault();
   var idx = parseInt($('#modal_acc_index').val());
   var uname = $('#modal_acc_username').val().trim();
   var mydrive_id = $('#modal_acc_mydrive_id').val().trim();
   var rname = $('#modal_acc_remote_name').val().trim();
 
-  if (!uname) {
-    notify('계정 식별자를 입력하세요.', 'warning');
-    return;
-  }
-  if (!mydrive_id) {
-    notify('내 드라이브 폴더 ID를 입력하세요.', 'warning');
-    return;
-  }
+  if (!uname) { notify('계정 식별자를 입력하세요.', 'warning'); return; }
+  if (!mydrive_id) { notify('내 드라이브 폴더 ID를 입력하세요.', 'warning'); return; }
 
   if (idx >= 0 && idx < current_accounts.length) {
     current_accounts[idx].username = uname;
     current_accounts[idx].mydrive_rclone_id = mydrive_id;
-    if (rname) {
-      current_accounts[idx].remote_name = rname;
-    } else {
-      delete current_accounts[idx].remote_name;
-    }
+    if (rname) current_accounts[idx].remote_name = rname;
+    else delete current_accounts[idx].remote_name;
   }
 
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/save_accounts',
-    type: "POST",
-    data: {accounts_json: JSON.stringify(current_accounts)},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { accounts_json: JSON.stringify(current_accounts) },
+    dataType: 'json',
+    success: function (data) {
       notify('계정 정보가 수정되었습니다.', 'success');
       $('#gdrive_account_modal').modal('hide');
       current_accounts = data.accounts || [];
@@ -966,23 +1227,23 @@ $(document).on('click', '#gdrive_account_save_btn', function(e){
   });
 });
 
-$(document).on('click', '#gdrive_batch_modal_btn', function(e){
+$(document).on('click', '#gdrive_batch_modal_btn', function (e) {
   e.preventDefault();
   $('#gdrive_batch_textarea').val('');
   $('#gdrive_batch_modal').modal('show');
 });
 
-$(document).on('click', '#gdrive_batch_save_btn', function(e){
+$(document).on('click', '#gdrive_batch_save_btn', function (e) {
   e.preventDefault();
   var text = $('#gdrive_batch_textarea').val().trim();
   if (!text) { notify('입력된 계정 정보가 없습니다.', 'warning'); return; }
 
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/batch_add_accounts',
-    type: "POST",
-    data: {batch_text: text},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { batch_text: text },
+    dataType: 'json',
+    success: function (data) {
       notify(data.added_count + '개 계정이 등록되었습니다.', 'success');
       $('#gdrive_batch_modal').modal('hide');
       current_accounts = data.accounts || [];
@@ -991,7 +1252,7 @@ $(document).on('click', '#gdrive_batch_save_btn', function(e){
   });
 });
 
-$(document).on('click', '.remove_acc_btn', function(e){
+$(document).on('click', '.remove_acc_btn', function (e) {
   e.preventDefault();
   var idx = $(this).data('index');
   var acc = current_accounts[idx];
@@ -1001,10 +1262,10 @@ $(document).on('click', '.remove_acc_btn', function(e){
   current_accounts.splice(idx, 1);
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/save_accounts',
-    type: "POST",
-    data: {accounts_json: JSON.stringify(current_accounts)},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { accounts_json: JSON.stringify(current_accounts) },
+    dataType: 'json',
+    success: function (data) {
       notify('계정이 삭제되었습니다.', 'info');
       current_accounts = data.accounts || [];
       render_accounts(current_accounts, {});
@@ -1012,41 +1273,38 @@ $(document).on('click', '.remove_acc_btn', function(e){
   });
 });
 
-$(document).on('click', '#gdrive_reset_blocks_btn', function(e){
+$(document).on('click', '#gdrive_reset_blocks_btn', function (e) {
   e.preventDefault();
   if (!confirm('모든 구글 드라이브 계정의 차단 상태를 즉시 해제하시겠습니까?')) return;
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/reset_blocked_accounts',
-    type: "POST",
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    dataType: 'json',
+    success: function (data) {
       notify('모든 계정 차단이 해제되었습니다.', 'success');
       render_accounts(current_accounts, data.stats || {});
     }
   });
 });
 
-$(document).on('click', '#history_import_modal_btn', function(e){
+$(document).on('click', '#history_import_modal_btn', function (e) {
   e.preventDefault();
   $('#import_text_content').val('');
   $('#history_import_modal').modal('show');
 });
 
-$(document).on('click', '#btn_run_import_text', function(e){
+$(document).on('click', '#btn_run_import_text', function (e) {
   e.preventDefault();
   var text = $('#import_text_content').val().trim();
-  if (!text) {
-    notify('임포트할 마그넷 목록을 입력하세요.', 'warning');
-    return;
-  }
+  if (!text) { notify('임포트할 마그넷 목록을 입력하세요.', 'warning'); return; }
   notify('마그넷 목록 임포트 중...', 'info');
 
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/import_history_text',
-    type: "POST",
-    data: {import_text: text},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { import_text: text },
+    dataType: 'json',
+    success: function (data) {
       if (data.ret === 'success') {
         notify('이력 등록 완료: ' + data.added + '건 추가 (중복 ' + data.skipped + '건 스킵)', 'success');
         $('#history_import_modal').modal('hide');
@@ -1057,13 +1315,10 @@ $(document).on('click', '#btn_run_import_text', function(e){
   });
 });
 
-$(document).on('click', '#btn_run_import_db', function(e){
+$(document).on('click', '#btn_run_import_db', function (e) {
   e.preventDefault();
   var dbPath = $('#import_db_path').val().trim();
-  if (!dbPath) {
-    notify('SQLite DB 파일 경로를 입력하세요.', 'warning');
-    return;
-  }
+  if (!dbPath) { notify('SQLite DB 파일 경로를 입력하세요.', 'warning'); return; }
 
   var formData = {
     db_path: dbPath,
@@ -1077,10 +1332,10 @@ $(document).on('click', '#btn_run_import_db', function(e){
   notify('DB 이력 흡수 중...', 'info');
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/import_history_db',
-    type: "POST",
+    type: 'POST',
     data: formData,
-    dataType: "json",
-    success: function(data) {
+    dataType: 'json',
+    success: function (data) {
       if (data.ret === 'success') {
         notify('DB 이력 흡수 완료: 총 ' + data.added + '건 완료 등록 (중복 ' + data.skipped + '건 스킵)', 'success');
         $('#history_import_modal').modal('hide');
@@ -1091,19 +1346,19 @@ $(document).on('click', '#btn_run_import_db', function(e){
   });
 });
 
-$(document).on('click', '#transporter_script_manage_btn', function(e){
+$(document).on('click', '#transporter_script_manage_btn', function (e) {
   e.preventDefault();
   load_transporter_script_list();
   $('#transporter_script_modal').modal('show');
-  setTimeout(function(){ if (dl_trans_editor) dl_trans_editor.resize(); }, 200);
+  setTimeout(function () { if (dl_trans_editor) dl_trans_editor.resize(); }, 200);
 });
 
 function load_transporter_script_list(selected_name) {
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/transporter_script_list',
-    type: "POST",
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    dataType: 'json',
+    success: function (data) {
       var files = data.files || [];
       var select = $('#transporter_script_select');
       select.empty();
@@ -1121,15 +1376,15 @@ function load_transporter_script_list(selected_name) {
   });
 }
 
-$(document).on('change', '#transporter_script_select', function(){
+$(document).on('change', '#transporter_script_select', function () {
   var filename = $(this).val();
   if (!filename) return;
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/transporter_script_read',
-    type: "POST",
-    data: {filename: filename},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { filename: filename },
+    dataType: 'json',
+    success: function (data) {
       if (data.ret === 'success') {
         $('#transporter_script_name').val(data.filename);
         $('#transporter_script_code').val(data.content);
@@ -1142,7 +1397,7 @@ $(document).on('change', '#transporter_script_select', function(){
   });
 });
 
-$(document).on('click', '#transporter_script_new_btn', function(e){
+$(document).on('click', '#transporter_script_new_btn', function (e) {
   e.preventDefault();
   $('#transporter_script_select').val('');
   $('#transporter_script_name').val('trans_new.py');
@@ -1151,7 +1406,7 @@ $(document).on('click', '#transporter_script_new_btn', function(e){
   $('#transporter_script_status').text('새 이송 템플릿 로드');
 });
 
-$(document).on('click', '#transporter_script_save_btn', function(e){
+$(document).on('click', '#transporter_script_save_btn', function (e) {
   e.preventDefault();
   var filename = $('#transporter_script_name').val().trim();
   var content = dl_trans_editor ? dl_trans_editor.getValue() : $('#transporter_script_code').val();
@@ -1159,10 +1414,10 @@ $(document).on('click', '#transporter_script_save_btn', function(e){
 
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/transporter_script_save',
-    type: "POST",
-    data: {filename: filename, content: content},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { filename: filename, content: content },
+    dataType: 'json',
+    success: function (data) {
       if (data.ret === 'success') {
         notify('이송 스크립트가 저장되었습니다.', 'success');
         $('#transporter_script_status').text('저장 완료 (' + filename + ')');
@@ -1176,17 +1431,17 @@ $(document).on('click', '#transporter_script_save_btn', function(e){
   });
 });
 
-$(document).on('click', '#transporter_script_delete_btn', function(e){
+$(document).on('click', '#transporter_script_delete_btn', function (e) {
   e.preventDefault();
   var filename = $('#transporter_script_name').val().trim();
   if (!filename) return;
   if (!confirm('[' + filename + '] 이송 스크립트를 삭제하시겠습니까?')) return;
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/transporter_script_delete',
-    type: "POST",
-    data: {filename: filename},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { filename: filename },
+    dataType: 'json',
+    success: function (data) {
       if (data.ret === 'success') {
         notify('삭제되었습니다.', 'success');
         load_transporter_script_list();

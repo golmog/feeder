@@ -7,13 +7,13 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from flask import render_template, request, jsonify, abort, send_file
 from sqlalchemy import and_, or_, desc
+import threading
+from sqlalchemy.orm.attributes import flag_modified
 
 from .setup import *
 from .model_crawl import ModelCrawlSite, ModelCrawlItem
-from .util_crawl import (
-    get_ddns, get_system_apikey, CrawlConfigUtil, CrawlCustomManager,
-    CrawlScraper, CrawlTorrentInfo, split_magnets, extract_info_hash
-)
+from .util_base import FeederUtil
+from .util_crawl import CrawlUtil
 from .task_crawl import TaskCrawlBase, TaskCrawl
 
 name = 'crawl'
@@ -74,11 +74,11 @@ class ModuleCrawl(PluginModuleBase):
             arg['package_name'] = P.package_name
             arg['sub'] = self.name
             arg['current_page'] = page_name
-            arg['ddns'] = get_ddns()
-            arg['apikey'] = get_system_apikey()
+            arg['ddns'] = FeederUtil.get_ddns()
+            arg['apikey'] = FeederUtil.get_system_apikey()
 
             if page_name == 'setting':
-                arg['yaml_filepath'] = CrawlConfigUtil.get_filepath()
+                arg['yaml_filepath'] = FeederUtil.get_filepath()
                 arg['is_include'] = F.scheduler.is_include(self.get_scheduler_name())
                 arg['is_running'] = F.scheduler.is_running(self.get_scheduler_name())
                 return render_template(f'{P.package_name}_{self.name}_setting.html', arg=arg)
@@ -134,7 +134,6 @@ class ModuleCrawl(PluginModuleBase):
             target_c_id = int(crawler_id) if crawler_id and str(crawler_id).isdigit() else None
             target_desc = f"개별 수집기(ID: {target_c_id})" if target_c_id else "전체 수집기"
 
-            import threading
             def dispatch_celery_task():
                 try:
                     logger.info(f"[{self.name}] [즉시 실행] {target_desc} Celery 비동기 디스패치")
@@ -146,7 +145,7 @@ class ModuleCrawl(PluginModuleBase):
             return jsonify({'ret': 'success', 'msg': f'{target_desc} 즉시 실행을 시작했습니다.'})
 
         elif command == 'load_site':
-            CrawlCustomManager.sync_default_site_info()
+            CrawlUtil.sync_default_site_info()
             sites = ModelCrawlSite.get_list(by_dict=True)
             return jsonify({'site': sites})
 
@@ -180,7 +179,6 @@ class ModuleCrawl(PluginModuleBase):
                 info['EXTRA'] = extra
 
                 site.info = info
-                from sqlalchemy.orm.attributes import flag_modified
                 flag_modified(site, 'info')
                 db.session.commit()
                 logger.info(f"[{self.name}] 사이트 [{site.name}] 기본 옵션 변경: {option_name} -> {new_val}")
@@ -265,14 +263,14 @@ class ModuleCrawl(PluginModuleBase):
                 return jsonify({'ret': 'add_success', 'site': ModelCrawlSite.get_list(by_dict=True)})
 
         elif command == 'custom_script_list':
-            custom_dir = CrawlCustomManager.get_custom_dir()
+            custom_dir = FeederUtil.SITES_DIR
             files = [f for f in os.listdir(custom_dir) if f.endswith('.py') and not f.startswith('__')]
             files.sort()
             return jsonify({'ret': 'success', 'files': files})
 
         elif command == 'custom_script_read':
             filename = os.path.basename(req.form.get('filename', '').strip())
-            custom_dir = CrawlCustomManager.get_custom_dir()
+            custom_dir = FeederUtil.SITES_DIR
             fpath = os.path.join(custom_dir, filename)
             if not filename or not os.path.exists(fpath):
                 return jsonify({'ret': 'not_exist', 'log': '파일이 존재하지 않습니다.'})
@@ -292,13 +290,13 @@ class ModuleCrawl(PluginModuleBase):
             if not filename.endswith('.py'):
                 filename += '.py'
 
-            custom_dir = CrawlCustomManager.get_custom_dir()
+            custom_dir = FeederUtil.SITES_DIR
             fpath = os.path.join(custom_dir, filename)
             try:
                 with open(fpath, 'w', encoding='utf-8') as f:
                     f.write(content)
                 logger.info(f"[{self.name}] 커스텀 스크립트 저장 완료: {filename}")
-                CrawlCustomManager.load_hooks()
+                CrawlUtil.load_hooks()
                 files = [f for f in os.listdir(custom_dir) if f.endswith('.py') and not f.startswith('__')]
                 files.sort()
                 return jsonify({
@@ -313,14 +311,14 @@ class ModuleCrawl(PluginModuleBase):
 
         elif command == 'custom_script_delete':
             filename = os.path.basename(req.form.get('filename', '').strip())
-            custom_dir = CrawlCustomManager.get_custom_dir()
+            custom_dir = FeederUtil.SITES_DIR
             fpath = os.path.join(custom_dir, filename)
             if not filename or not os.path.exists(fpath):
                 return jsonify({'ret': 'not_exist', 'log': '파일이 존재하지 않습니다.'})
             try:
                 os.remove(fpath)
                 logger.info(f"[{self.name}] 커스텀 스크립트 삭제 완료: {filename}")
-                CrawlCustomManager.load_hooks()
+                CrawlUtil.load_hooks()
                 files = [f for f in os.listdir(custom_dir) if f.endswith('.py') and not f.startswith('__')]
                 files.sort()
                 return jsonify({'ret': 'success', 'files': files})
@@ -337,12 +335,12 @@ class ModuleCrawl(PluginModuleBase):
             if not filename.endswith('.py'):
                 return jsonify({'ret': 'invalid_ext', 'log': '.py 파일만 업로드할 수 있습니다.'})
 
-            custom_dir = CrawlCustomManager.get_custom_dir()
+            custom_dir = FeederUtil.SITES_DIR
             fpath = os.path.join(custom_dir, filename)
             try:
                 file_obj.save(fpath)
                 logger.info(f"[{self.name}] 커스텀 스크립트 업로드 완료: {filename}")
-                CrawlCustomManager.load_hooks()
+                CrawlUtil.load_hooks()
                 files = [f for f in os.listdir(custom_dir) if f.endswith('.py') and not f.startswith('__')]
                 files.sort()
                 return jsonify({
@@ -401,15 +399,15 @@ class ModuleCrawl(PluginModuleBase):
                 'use_torrent_info': use_torrent_info,
             }
 
-            ret = CrawlConfigUtil.save_crawler(item_data)
+            ret = FeederUtil.save_crawler(item_data)
             return jsonify({'ret': ret, 'crawlers': self.get_crawler_list()})
 
         elif command == 'remove_crawler':
             target_id = req.form.get('target_id')
-            crawler = CrawlConfigUtil.get_crawler(target_id)
+            crawler = FeederUtil.get_crawler(target_id)
             if crawler:
                 self.delete_crawler_db(crawler)
-                CrawlConfigUtil.delete_crawler(target_id)
+                FeederUtil.delete_crawler(target_id)
                 ret = 'success'
             else:
                 ret = 'fail'
@@ -417,7 +415,7 @@ class ModuleCrawl(PluginModuleBase):
 
         elif command == 'remove_crawler_db':
             target_id = req.form.get('target_id')
-            crawler = CrawlConfigUtil.get_crawler(target_id)
+            crawler = FeederUtil.get_crawler(target_id)
             if crawler:
                 ret = self.delete_crawler_db(crawler)
             else:
@@ -435,7 +433,7 @@ class ModuleCrawl(PluginModuleBase):
 
         elif command == 'torrent_info':
             magnet_hash = req.form.get('hash')
-            info_list = CrawlTorrentInfo.get_torrent_info([magnet_hash])
+            info_list = CrawlUtil.get_torrent_info([magnet_hash])
             result_data = info_list[0] if (info_list and len(info_list) > 0) else None
             return jsonify(result_data)
 
@@ -444,50 +442,14 @@ class ModuleCrawl(PluginModuleBase):
             magnet = req.form.get('magnet', '').strip()
             profile_name = req.form.get('profile_name', '').strip()
             feed_name = req.form.get('feed_name', 'CRAWL_DIRECT')
-
-            if not magnet:
-                return jsonify({'ret': 'fail', 'msg': '마그넷/ed2k 링크가 누락되었습니다.'})
-
-            from .model_download import ModelDownload
-
-            infohash = extract_info_hash(magnet)
-            existing = ModelDownload.get_by_infohash(infohash) if infohash else ModelDownload.get_by_magnet(magnet)
-            if existing:
-                return jsonify({'ret': 'exist', 'msg': f'이미 다운로드 큐에 등록된 작업입니다 (상태: {existing.status}).'})
-
-            dl_item = ModelDownload(
-                feed_name=feed_name,
-                title=title or (infohash or magnet[:30]),
+            res = FeederUtil.add_direct_download(
+                title=title,
                 magnet=magnet,
-                infohash=infohash
+                profile_name=profile_name,
+                feed_name=feed_name,
+                caller_name=self.name
             )
-
-            selected_profile = None
-            if profile_name:
-                yaml_data = CrawlConfigUtil.load_yaml()
-                for p in yaml_data.get('DOWNLOAD_PROFILES', []):
-                    if p.get('name') == profile_name:
-                        selected_profile = p
-                        break
-
-            if selected_profile:
-                dl_item.priority_chain = list(selected_profile.get('priority_chain', []))
-                dest = selected_profile.get('destination', {})
-                dl_item.destination_type = dest.get('type', 'local')
-                dl_item.gdrive_upload_path = dest.get('upload_path', '')
-                dl_item.gdrive_complete_path = dest.get('complete_path', '')
-                dl_item.gdrive_remote_id = dest.get('shared_drive_id', '')
-            else:
-                yaml_data = CrawlConfigUtil.load_yaml()
-                enabled_downloaders = [d['name'] for d in yaml_data.get('DOWNLOADERS', []) if d.get('enabled', True)]
-                dl_item.priority_chain = enabled_downloaders
-                dl_item.destination_type = 'local'
-
-            dl_item.status = 'pending'
-            db.session.add(dl_item)
-            db.session.commit()
-            logger.info(f"[{self.name}] 다운로드 큐 직접 추가: {title} (체인: {' -> '.join(dl_item.priority_chain)})")
-            return jsonify({'ret': 'success', 'msg': '다운로드 큐에 성공적으로 등록되었습니다.'})
+            return jsonify(res)
 
         elif command == 'fix_ed2k_db':
             res = self.fix_database_magnets()
@@ -554,14 +516,14 @@ class ModuleCrawl(PluginModuleBase):
             download_url = target_file[0]
             filename = target_file[1]
 
-            target_crawler = CrawlConfigUtil.get_crawler_by_board(post.site, post.board)
+            target_crawler = FeederUtil.get_crawler_by_board(post.site, post.board)
             target_cfg = SimpleNamespace(
                 use_proxy=target_crawler.get('use_proxy', False) if target_crawler else P.ModelSetting.get_bool(f"{self.name}_use_proxy"),
                 proxy_url=target_crawler.get('proxy_url', '') if target_crawler else P.ModelSetting.get(f"{self.name}_proxy_url"),
                 use_flaresolverr=target_crawler.get('use_flaresolverr', False) if target_crawler else False
             )
 
-            byte_io = CrawlScraper.download_file_stream(download_url, referer=post.url, scheduler_instance=target_cfg)
+            byte_io = CrawlUtil.download_file_stream(download_url, referer=post.url, scheduler_instance=target_cfg)
             mimetype = 'application/x-bittorrent' if filename.lower().endswith('.torrent') else 'application/octet-stream'
 
             try:
@@ -626,24 +588,7 @@ class ModuleCrawl(PluginModuleBase):
         self.start_celery(TaskCrawlBase.start, None, "scheduler", None)
 
     def db_vacuum(self):
-        try:
-            try:
-                engine = db.get_engine(bind=P.package_name)
-            except Exception:
-                engine = db.engine
-
-            if engine.dialect.name == 'sqlite':
-                raw_conn = engine.raw_connection()
-                try:
-                    raw_conn.isolation_level = None
-                    cursor = raw_conn.cursor()
-                    cursor.execute("VACUUM")
-                    cursor.close()
-                    logger.info(f"[{self.name}] SQLite DB VACUUM 정리 완료 ({P.package_name}.db)")
-                finally:
-                    raw_conn.close()
-        except Exception as e:
-            logger.error(f"[{self.name}] db_vacuum 실행 오류: {e}")
+        FeederUtil.db_vacuum()
 
     def delete_crawler_db(self, crawler: dict) -> str:
         try:
@@ -683,7 +628,7 @@ class ModuleCrawl(PluginModuleBase):
                 for row in bbs_rows:
                     if not row.magnet:
                         continue
-                    links = split_magnets(row.magnet)
+                    links = FeederUtil.split_magnets(row.magnet)
                     if not links:
                         continue
                     new_magnet_str = '\n'.join(links)
@@ -704,11 +649,11 @@ class ModuleCrawl(PluginModuleBase):
                             matched_bbs = db.session.query(ModelCrawlItem).filter(ModelCrawlItem.title == dl.title).first()
 
                         if matched_bbs and matched_bbs.magnet:
-                            bbs_links = split_magnets(matched_bbs.magnet)
+                            bbs_links = FeederUtil.split_magnets(matched_bbs.magnet)
                             valid_ed2k = [l for l in bbs_links if l.startswith('ed2k://')]
                             if valid_ed2k:
                                 dl.magnet = valid_ed2k[0]
-                                dl.infohash = extract_info_hash(dl.magnet)
+                                dl.infohash = FeederUtil.extract_info_hash(dl.magnet)
                                 fixed_dl_count += 1
                                 continue
 
@@ -728,7 +673,7 @@ class ModuleCrawl(PluginModuleBase):
 
     def get_crawler_list(self) -> list[dict]:
         ret = []
-        crawlers = CrawlConfigUtil.get_crawlers()
+        crawlers = FeederUtil.get_crawlers()
 
         for c in crawlers:
             info = dict(c)
@@ -761,7 +706,7 @@ class ModuleCrawl(PluginModuleBase):
     def get_search_form_info(self) -> dict:
         ret = {'site': [], 'board': {}}
 
-        for c in CrawlConfigUtil.get_crawlers():
+        for c in FeederUtil.get_crawlers():
             s = c.get('site')
             if not s:
                 continue

@@ -5,19 +5,32 @@ import re
 import sys
 import glob
 import time
-import math
-import yaml
-import json
-import base64
 import requests
 import subprocess
 import importlib.util
-from datetime import datetime, timedelta
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse
 from html import unescape
 from lxml import html
 
+import json
+
 from .setup import *
+from .model_crawl import ModelCrawlSite
+from .util_base import FeederUtil
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    _SELENIUM_AVAILABLE = True
+except ImportError:
+    _SELENIUM_AVAILABLE = False
+
+    webdriver = None
+    By = None
+    WebDriverWait = None
+    EC = None
 
 _CURL_CFFI_AVAILABLE = False
 try:
@@ -34,342 +47,35 @@ except ImportError:
         logger.error(f"[Crawl] curl_cffi 설치 실패: {e}")
         _CURL_CFFI_AVAILABLE = False
 
-CONFIG_FILEPATH = os.path.join(path_data, 'db', 'feeder_settings.yaml')
-CUSTOM_DIR = os.path.join(path_data, 'db', 'feeder_custom')
 
+class CrawlUtil:
+    """크롤링 스크래핑 엔진, 커스텀 훅 및 토렌트 메타데이터 통합 관리자"""
 
-def get_ddns() -> str:
-    try:
-        if hasattr(F, 'SystemModelSetting') and F.SystemModelSetting:
-            return F.SystemModelSetting.get('ddns') or ''
-    except Exception:
-        pass
-    try:
-        if SystemModelSetting:
-            return SystemModelSetting.get('ddns') or ''
-    except Exception:
-        pass
-    try:
-        return F.config.get('ddns', '')
-    except Exception:
-        return ''
+    _hooks = {}
+    _cf_cookies = {}
+    _cf_user_agents = {}
+    CF_COOKIE_EXPIRY = 3600
+    _selenium_driver = None
+    _cffi_sessions = {}
+    _requests_sessions = {}
+    _proxy_index = 0
 
-
-def get_system_apikey() -> str:
-    try:
-        if hasattr(F, 'SystemModelSetting') and F.SystemModelSetting:
-            return F.SystemModelSetting.get('auth_apikey') or F.SystemModelSetting.get('apikey') or ''
-    except Exception:
-        pass
-    try:
-        if SystemModelSetting:
-            return SystemModelSetting.get('auth_apikey') or SystemModelSetting.get('apikey') or ''
-    except Exception:
-        pass
-    return ''
-
-
-def get_tmp_dir(sub_path: str = '') -> str:
-    base_dir = os.path.join(path_data, 'tmp', P.package_name)
-    target_dir = os.path.join(base_dir, sub_path) if sub_path else base_dir
-    os.makedirs(target_dir, exist_ok=True)
-    return target_dir
-
-
-def extract_info_hash(magnet_uri: str) -> str | None:
-    if not magnet_uri:
-        return None
-
-    if magnet_uri.startswith('magnet:'):
-        match = re.search(r'xt=urn:btih:([a-zA-Z0-9]+)', magnet_uri, re.IGNORECASE)
-        if match:
-            raw_hash = match.group(1).lower()
-            if len(raw_hash) == 40:
-                return raw_hash
-            elif len(raw_hash) == 32:
-                try:
-                    decoded = base64.b32decode(raw_hash.upper())
-                    return decoded.hex().lower()
-                except Exception:
-                    return raw_hash
-
-    elif magnet_uri.startswith('ed2k://'):
-        match = re.search(r'ed2k://\|file\|[^|]+\|[0-9]+\|([a-fA-F0-9]{32})', magnet_uri, re.IGNORECASE)
-        if match:
-            return match.group(1).lower()
-
-    return None
-
-
-def extract_info_hash_from_torrent(torrent_bytes: bytes) -> str | None:
-    if not torrent_bytes:
-        return None
-    try:
-        info_idx = torrent_bytes.find(b'4:info')
-        if info_idx == -1:
-            return None
-
-        start = info_idx + 6
-        if start >= len(torrent_bytes) or torrent_bytes[start:start+1] != b'd':
-            return None
-
-        pos = start
-        depth = 0
-        while pos < len(torrent_bytes):
-            char = torrent_bytes[pos:pos+1]
-            if char in (b'd', b'l'):
-                depth += 1
-                pos += 1
-            elif char == b'e':
-                depth -= 1
-                pos += 1
-                if depth == 0:
-                    break
-            elif char == b'i':
-                end_int = torrent_bytes.find(b'e', pos + 1)
-                if end_int == -1:
-                    break
-                pos = end_int + 1
-            elif b'0' <= char <= b'9':
-                colon = torrent_bytes.find(b':', pos)
-                if colon == -1:
-                    break
-                str_len = int(torrent_bytes[pos:colon])
-                pos = colon + 1 + str_len
-            else:
-                pos += 1
-
-        if depth == 0 and pos > start:
-            raw_info = torrent_bytes[start:pos]
-            import hashlib
-            return hashlib.sha1(raw_info).hexdigest().lower()
-    except Exception as ex:
-        logger.debug(f"[CrawlUtil] .torrent 마그넷 해시 추출 예외: {ex}")
-    return None
-
-
-def split_magnets(magnet_str: str) -> list[str]:
-    if not magnet_str:
-        return []
-    raw = str(magnet_str).strip()
-    if not raw:
-        return []
-
-    matches = list(re.finditer(r'(?:magnet:\?|ed2k://)', raw, re.IGNORECASE))
-    if not matches:
-        sep = '\n' if '\n' in raw else '|'
-        return [m.strip() for m in raw.split(sep) if m.strip()]
-
-    result = []
-    for idx, match in enumerate(matches):
-        start = match.start()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(raw)
-        part = raw[start:end].strip().strip('|').strip()
-        if part:
-            result.append(part)
-    return result
-
-
-def clean_xml_string(value: str) -> str:
-    if not value:
-        return ''
-    return (
-        value.replace('&', '&amp;')
-             .replace('<', '&lt;')
-             .replace('>', '&gt;')
-             .replace('"', '&quot;')
-             .replace("'", '&apos;')
-    )
-
-
-def get_paging_info(count, current_page, page_size):
-    total_page = math.ceil(count / page_size) if page_size > 0 else 1
-    if total_page == 0:
-        total_page = 1
-    current_page = max(1, min(int(current_page or 1), total_page))
-
-    page_block = 10
-    start_page = ((current_page - 1) // page_block) * page_block + 1
-    end_page = min(start_page + page_block - 1, total_page)
-    page_list = list(range(start_page, end_page + 1))
-
-    prev_p = start_page - 1 if start_page > 1 else 0
-    next_p = end_page + 1 if end_page < total_page else 0
-
-    return {
-        'page': current_page,
-        'current_page': current_page,
-        'page_size': page_size,
-        'list_step': page_size,
-        'total_page': total_page,
-        'total_count': count,
-        'count': count,
-        'start_page': start_page,
-        'end_page': end_page,
-        'last_page': end_page,
-        'page_list': page_list,
-        'prev_page': prev_p,
-        'next_page': next_p,
+    DEFAULT_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
     }
 
-
-class CrawlConfigUtil:
-
-    @classmethod
-    def get_filepath(cls) -> str:
-        return CONFIG_FILEPATH
-
-    @classmethod
-    def load_yaml(cls) -> dict:
-        if not os.path.exists(CONFIG_FILEPATH):
-            default_data = {
-                'GLOBAL': {},
-                'CRAWLERS': [],
-                'FEEDS': [],
-                'DOWNLOADERS': [],
-                'DOWNLOAD_PROFILES': [],
-                'GDRIVE_ACCOUNTS': []
-            }
-            cls.save_yaml(default_data)
-            return default_data
-
-        try:
-            with open(CONFIG_FILEPATH, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
-
-            if 'CRAWLERS' not in data or not isinstance(data['CRAWLERS'], list):
-                data['CRAWLERS'] = []
-            if 'FEEDS' not in data or not isinstance(data['FEEDS'], list):
-                data['FEEDS'] = []
-            if 'GLOBAL' not in data or not isinstance(data['GLOBAL'], dict):
-                data['GLOBAL'] = {}
-            if 'DOWNLOADERS' not in data or not isinstance(data['DOWNLOADERS'], list):
-                data['DOWNLOADERS'] = []
-            if 'DOWNLOAD_PROFILES' not in data or not isinstance(data['DOWNLOAD_PROFILES'], list):
-                data['DOWNLOAD_PROFILES'] = []
-            if 'GDRIVE_ACCOUNTS' not in data or not isinstance(data['GDRIVE_ACCOUNTS'], list):
-                data['GDRIVE_ACCOUNTS'] = []
-
-            from .task_crawl import TaskCrawl
-            for c in data['CRAWLERS']:
-                if 'boards' not in c or not isinstance(c['boards'], list):
-                    c['boards'] = []
-                for b in c['boards']:
-                    b_val = b.get('board', '')
-                    s_val = b.get('subcat', '')
-                    _, _, f_key = TaskCrawl.parse_board_info(b_val, s_val)
-                    b['full_board_key'] = f_key
-
-            return data
-        except Exception as e:
-            logger.error(f"[CrawlConfig] YAML 로드 실패: {e}")
-            return {'GLOBAL': {}, 'CRAWLERS': [], 'FEEDS': [], 'DOWNLOADERS': [], 'DOWNLOAD_PROFILES': [], 'GDRIVE_ACCOUNTS': []}
-
-    @classmethod
-    def save_yaml(cls, data: dict) -> bool:
-        try:
-            os.makedirs(os.path.dirname(CONFIG_FILEPATH), exist_ok=True)
-            raw_yaml = yaml.dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)
-            formatted_yaml = re.sub(r'\n([A-Z0-9_]+:)', r'\n\n\1', raw_yaml).lstrip('\n')
-            with open(CONFIG_FILEPATH, 'w', encoding='utf-8') as f:
-                f.write(formatted_yaml)
-            return True
-        except Exception as e:
-            logger.error(f"[CrawlConfig] YAML 저장 실패: {e}")
-            return False
-
-    @classmethod
-    def get_crawlers(cls) -> list[dict]:
-        data = cls.load_yaml()
-        return data.get('CRAWLERS', [])
-
-    @classmethod
-    def get_crawler(cls, crawler_id):
-        for c in cls.get_crawlers():
-            if str(c.get('id')) == str(crawler_id):
-                return c
-        return None
-
-    @classmethod
-    def get_crawler_by_board(cls, site_name: str, board_id: str, subcat_id: str = None):
-        from .task_crawl import TaskCrawl
-        _, _, full_key = TaskCrawl.parse_board_info(board_id, subcat_id)
-        for c in cls.get_crawlers():
-            if c.get('site') == site_name:
-                for b in c.get('boards', []):
-                    b_key = b.get('full_board_key') or b.get('board')
-                    if b_key == full_key:
-                        return c
-        return None
-
-    @classmethod
-    def save_crawler(cls, item: dict) -> str:
-        data = cls.load_yaml()
-        crawlers = data.get('CRAWLERS', [])
-        target_id = item.get('id')
-
-        from .task_crawl import TaskCrawl
-        boards = item.get('boards', [])
-        normalized_boards = []
-        for b in boards:
-            b_val = b.get('board', '')
-            s_val = b.get('subcat', '')
-            _, _, f_key = TaskCrawl.parse_board_info(b_val, s_val)
-            normalized_boards.append({
-                'board': str(b_val),
-                'subcat': str(s_val) if s_val else '',
-                'full_board_key': f_key
-            })
-        item['boards'] = normalized_boards
-
-        if target_id is not None and int(target_id) > 0:
-            for idx, c in enumerate(crawlers):
-                if str(c.get('id')) == str(target_id):
-                    crawlers[idx].update(item)
-                    data['CRAWLERS'] = crawlers
-                    cls.save_yaml(data)
-                    logger.info(f"[CrawlConfig] 수집기 수정 완료: ID={target_id}, Site={item.get('site')}")
-                    return 'success_update'
-            return 'not_found'
-
-        for c in crawlers:
-            if c.get('site') == item.get('site'):
-                logger.warning(f"[CrawlConfig] 동일 사이트 수집기 이미 존재: {item.get('site')}")
-                return 'already_exist'
-
-        max_id = max([int(c.get('id', 0)) for c in crawlers], default=0)
-        item['id'] = max_id + 1
-        crawlers.append(item)
-        data['CRAWLERS'] = crawlers
-        cls.save_yaml(data)
-        logger.info(f"[CrawlConfig] 신규 수집기 추가 완료: ID={item['id']}, Site={item.get('site')}")
-        return 'success'
-
-    @classmethod
-    def delete_crawler(cls, target_id) -> bool:
-        data = cls.load_yaml()
-        crawlers = data.get('CRAWLERS', [])
-        data['CRAWLERS'] = [c for c in crawlers if str(c.get('id')) != str(target_id)]
-        cls.save_yaml(data)
-        logger.info(f"[CrawlConfig] 수집기 삭제 완료: ID={target_id}")
-        return True
-
-
-class CrawlCustomManager:
-    _hooks = {}
-
-    @classmethod
-    def get_custom_dir(cls) -> str:
-        sites_dir = os.path.join(CUSTOM_DIR, 'sites')
-        os.makedirs(sites_dir, exist_ok=True)
-        return sites_dir
-
+    # --------------------------------------------------------------------------
+    # 커스텀 훅 스크립트 관리
+    # --------------------------------------------------------------------------
     @classmethod
     def load_hooks(cls):
+        """커스텀 사이트 훅 스크립트 동적 로드"""
         cls._hooks = {}
-        custom_dir = cls.get_custom_dir()
+        custom_dir = FeederUtil.SITES_DIR
         candidate_files = glob.glob(os.path.join(custom_dir, "*.py"))
-        candidate_files.extend(glob.glob(os.path.join(CUSTOM_DIR, "site_*.py")))
+        candidate_files.extend(glob.glob(os.path.join(FeederUtil.CUSTOM_DIR, "site_*.py")))
 
         for fpath in set(candidate_files):
             fname = os.path.basename(fpath)
@@ -385,17 +91,17 @@ class CrawlCustomManager:
                     obj = getattr(mod, attr_name)
                     if isinstance(obj, type) and hasattr(obj, 'SITE_NAME') and obj.SITE_NAME:
                         cls._hooks[obj.SITE_NAME.lower()] = obj
-                        logger.info(f"[CrawlCustom] 커스텀 사이트 훅 등록: '{obj.SITE_NAME}' ({fname})")
+                        logger.info(f"[CrawlUtil] 커스텀 사이트 훅 등록: '{obj.SITE_NAME}' ({fname})")
             except Exception as e:
-                logger.error(f"[CrawlCustom] 커스텀 훅 로드 실패 ({fname}): {e}")
+                logger.error(f"[CrawlUtil] 커스텀 훅 로드 실패 ({fname}): {e}")
 
         cls.sync_default_site_info()
 
     @classmethod
     def sync_default_site_info(cls):
+        """커스텀 훅 기본 템플릿 DB 동기화"""
         try:
             with F.app.app_context():
-                from .model_crawl import ModelCrawlSite
                 for site_key, hook_cls in cls._hooks.items():
                     default_info = getattr(hook_cls, 'DEFAULT_SITE_INFO', None)
                     if default_info and isinstance(default_info, dict):
@@ -408,14 +114,14 @@ class CrawlCustomManager:
                         if not existing:
                             new_site = ModelCrawlSite('custom', default_info, content_str)
                             db.session.add(new_site)
-                            logger.info(f"[CrawlCustom] 사이트 템플릿 신규 등록: '{target_name}'")
+                            logger.info(f"[CrawlUtil] 사이트 템플릿 신규 등록: '{target_name}'")
                         else:
                             existing.info = default_info
                             existing.content = content_str
 
                         db.session.commit()
         except Exception as e:
-            logger.error(f"[CrawlCustom] sync_default_site_info 에러: {e}")
+            logger.error(f"[CrawlUtil] sync_default_site_info 에러: {e}")
             try:
                 db.session.rollback()
             except Exception:
@@ -427,22 +133,9 @@ class CrawlCustomManager:
             cls.load_hooks()
         return cls._hooks.get(site_name.lower()) if site_name else None
 
-
-class CrawlScraper:
-    _cf_cookies = {}
-    _cf_user_agents = {}
-    CF_COOKIE_EXPIRY = 3600
-    _selenium_driver = None
-    _cffi_sessions = {}
-    _requests_sessions = {}
-    _proxy_index = 0
-
-    DEFAULT_HEADERS = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
-
+    # --------------------------------------------------------------------------
+    # 프록시 및 네트워크 관리
+    # --------------------------------------------------------------------------
     @classmethod
     def _get_proxy_list(cls, scheduler_instance=None) -> list[str]:
         if scheduler_instance:
@@ -480,7 +173,7 @@ class CrawlScraper:
         if len(p_list) > 1:
             cls._proxy_index = (cls._proxy_index + 1) % len(p_list)
             active_proxy = p_list[cls._proxy_index]
-            logger.info(f"[CrawlScraper] 프록시 로테이션 ({reason}) -> {active_proxy} ({cls._proxy_index + 1}/{len(p_list)}번)")
+            logger.info(f"[CrawlUtil] 프록시 로테이션 ({reason}) -> {active_proxy} ({cls._proxy_index + 1}/{len(p_list)}번)")
             return active_proxy
         return p_list[0]
 
@@ -521,6 +214,9 @@ class CrawlScraper:
                 if not k.startswith('_'):
                     cffi_sess.cookies.set(k, v, domain=host)
 
+    # --------------------------------------------------------------------------
+    # 웹 스크래핑 엔진
+    # --------------------------------------------------------------------------
     @classmethod
     def get_html(cls, url: str, site_info: dict = None, scheduler_instance=None, referer: str = None, max_retries: int = None, retry_interval: float = None, wait_tag: str = None) -> str | None:
         extra = site_info.get('EXTRA', []) if site_info else []
@@ -562,6 +258,10 @@ class CrawlScraper:
         if 'USE_FLARESOLVERR' in extra or (site_info and site_info.get('USE_FLARESOLVERR')):
             use_fs = True
 
+        if use_selenium and not _SELENIUM_AVAILABLE:
+            logger.warning(f"[CrawlUtil] [{host}] Selenium 사용이 설정되어 있으나 모듈이 없습니다. HTTP 요청으로 자동 폴백합니다.")
+            use_selenium = False
+
         if use_selenium:
             target_wait_tag = wait_tag or (site_info.get('SELENIUM_WAIT_TAG') if site_info else None) or 'body'
             for attempt in range(1, max_retries + 1):
@@ -570,26 +270,26 @@ class CrawlScraper:
                     return res_source
 
                 if cls._selenium_driver is None:
-                    logger.warning(f"[CrawlScraper] 브라우저 세션 초기화 실패로 재시도 중단: {url}")
+                    logger.warning(f"[CrawlUtil] 브라우저 세션 초기화 실패로 재시도 중단: {url}")
                     return None
 
                 if attempt < max_retries:
-                    logger.debug(f"[CrawlScraper] Selenium 재시도 ({attempt}/{max_retries}): {url}")
+                    logger.debug(f"[CrawlUtil] Selenium 재시도 ({attempt}/{max_retries}): {url}")
                     time.sleep(retry_interval)
             return None
 
         if use_fs and not cls._has_valid_clearance(host):
-            logger.info(f"[CrawlScraper] [{host}] Cloudflare 사이트 감지 -> FlareSolverr 최우선 인가 요청: {url}")
+            logger.info(f"[CrawlUtil] [{host}] Cloudflare 사이트 감지 -> FlareSolverr 최우선 인가 요청: {url}")
             for fs_try in range(1, max_retries + 1):
                 tree, fs_html = cls.get_by_flaresolverr(url, proxies=proxies)
                 if fs_html and 'Just a moment...' not in fs_html and 'cf-turnstile' not in fs_html:
-                    logger.info(f"[CrawlScraper] [{host}] FlareSolverr 인가 및 1차 페이지 수신 완료")
+                    logger.info(f"[CrawlUtil] [{host}] FlareSolverr 인가 및 1차 페이지 수신 완료")
                     return fs_html
                 if fs_try < max_retries:
-                    logger.debug(f"[CrawlScraper] [{host}] FlareSolverr 초기 인가 재시도 ({fs_try}/{max_retries})...")
+                    logger.debug(f"[CrawlUtil] [{host}] FlareSolverr 초기 인가 재시도 ({fs_try}/{max_retries})...")
                     time.sleep(retry_interval)
 
-            logger.warning(f"[CrawlScraper] [{host}] FlareSolverr 초기 인가 {max_retries}회 실패, HTTP 세션으로 폴백 시도")
+            logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 초기 인가 {max_retries}회 실패, HTTP 세션으로 폴백 시도")
 
         headers = cls.DEFAULT_HEADERS.copy()
         if host in cls._cf_user_agents:
@@ -616,23 +316,23 @@ class CrawlScraper:
                     if not cffi_session:
                         cffi_session = cffi_requests.Session()
                         cls._cffi_sessions[host] = cffi_session
-                        logger.debug(f"[CrawlScraper] curl_cffi 세션 생성: {host}")
+                        logger.debug(f"[CrawlUtil] curl_cffi 세션 생성: {host}")
 
                     cls._sync_clearance_to_sessions(host)
                     res = cffi_session.get(url, headers=headers, proxies=proxies, impersonate="chrome", timeout=25)
                     if res.status_code == 200:
                         if 'Just a moment...' not in res.text and 'cf-turnstile' not in res.text:
                             return res.text
-                    logger.debug(f"[CrawlScraper] curl_cffi 응답 코드: {res.status_code} ({url})")
+                    logger.debug(f"[CrawlUtil] curl_cffi 응답 코드: {res.status_code} ({url})")
                 except Exception as e:
-                    logger.debug(f"[CrawlScraper] curl_cffi 요청 실패 ({url}): {e}")
+                    logger.debug(f"[CrawlUtil] curl_cffi 요청 실패 ({url}): {e}")
 
             try:
                 req_session = cls._requests_sessions.get(host)
                 if not req_session:
                     req_session = requests.Session()
                     cls._requests_sessions[host] = req_session
-                    logger.debug(f"[CrawlScraper] requests 세션 생성: {host}")
+                    logger.debug(f"[CrawlUtil] requests 세션 생성: {host}")
 
                 cls._sync_clearance_to_sessions(host)
                 res = req_session.get(url, headers=headers, proxies=proxies, timeout=25, verify=False)
@@ -640,12 +340,12 @@ class CrawlScraper:
                     res.encoding = res.apparent_encoding or 'utf-8'
                     if 'Just a moment...' not in res.text and 'cf-turnstile' not in res.text:
                         return res.text
-                logger.debug(f"[CrawlScraper] requests 응답 코드: {res.status_code} ({url})")
+                logger.debug(f"[CrawlUtil] requests 응답 코드: {res.status_code} ({url})")
             except Exception as e:
-                logger.debug(f"[CrawlScraper] requests 요청 실패 ({url}): {e}")
+                logger.debug(f"[CrawlUtil] requests 요청 실패 ({url}): {e}")
 
             if use_fs:
-                logger.warning(f"[CrawlScraper] [{host}] Cloudflare 차단 감지 -> FlareSolverr 재인가: {url}")
+                logger.warning(f"[CrawlUtil] [{host}] Cloudflare 차단 감지 -> FlareSolverr 재인가: {url}")
                 cls._cf_cookies.pop(host, None)
 
                 if host in cls._cffi_sessions:
@@ -664,10 +364,10 @@ class CrawlScraper:
 
                 tree, source = cls.get_by_flaresolverr(url, proxies=proxies)
                 if source and 'Just a moment...' not in source and 'cf-turnstile' not in source:
-                    logger.info(f"[CrawlScraper] [{host}] 세션 복구 및 페이지 수신 성공")
+                    logger.info(f"[CrawlUtil] [{host}] 세션 복구 및 페이지 수신 성공")
                     return source
                 if attempt < max_retries:
-                    logger.debug(f"[CrawlScraper] FlareSolverr 재시도 ({attempt}/{max_retries}): {url}")
+                    logger.debug(f"[CrawlUtil] FlareSolverr 재시도 ({attempt}/{max_retries}): {url}")
                     time.sleep(retry_interval)
             else:
                 if attempt < max_retries:
@@ -694,7 +394,7 @@ class CrawlScraper:
                     create_payload["proxy"] = {"url": proxies['http']}
                 requests.post(f"{fs_url}/v1", json=create_payload, timeout=20)
         except Exception as sess_err:
-            logger.debug(f"[CrawlScraper] FlareSolverr 세션 준비 예외 (무시): {sess_err}")
+            logger.debug(f"[CrawlUtil] FlareSolverr 세션 준비 예외 (무시): {sess_err}")
 
         payload = {
             "cmd": "request.get",
@@ -732,14 +432,14 @@ class CrawlScraper:
                         for c in sol_cookies:
                             cls._cf_cookies[host][c['name']] = c['value']
                         cls._cf_cookies[host]['_timestamp'] = time.time()
-                        logger.info(f"[CrawlScraper] [{host}] FlareSolverr 쿠키 {len(sol_cookies)}개 동기화 완료")
+                        logger.info(f"[CrawlUtil] [{host}] FlareSolverr 쿠키 {len(sol_cookies)}개 동기화 완료")
 
                     cls._sync_clearance_to_sessions(host)
                     return tree, html_source
                 else:
-                    logger.warning(f"[CrawlScraper] FlareSolverr 오류 응답: {data.get('message')}")
+                    logger.warning(f"[CrawlUtil] FlareSolverr 오류 응답: {data.get('message')}")
         except Exception as e:
-            logger.warning(f"[CrawlScraper] FlareSolverr 통신 실패 ({url}): {e}")
+            logger.warning(f"[CrawlUtil] FlareSolverr 통신 실패 ({url}): {e}")
             try:
                 requests.post(f"{fs_url}/v1", json={"cmd": "sessions.destroy", "session": session_name}, timeout=5)
             except Exception:
@@ -794,7 +494,7 @@ class CrawlScraper:
             if proxies and 'http' in proxies:
                 req_payload["proxy"] = {"url": proxies['http']}
 
-            logger.info(f"[CrawlScraper] [{host}] FlareSolverr 인가 요청 ({attempt}/{total_tries}, Proxy: {proxy_str}): {url}")
+            logger.info(f"[CrawlUtil] [{host}] FlareSolverr 인가 요청 ({attempt}/{total_tries}, Proxy: {proxy_str}): {url}")
 
             try:
                 res = requests.post(fs_endpoint, json=req_payload, headers={'Content-Type': 'application/json'}, timeout=55)
@@ -818,14 +518,14 @@ class CrawlScraper:
                                 cls._cf_user_agents[host] = user_agent
 
                             cls._sync_clearance_to_sessions(host)
-                            logger.info(f"[CrawlScraper] [{host}] FlareSolverr 인가 성공 (쿠키 {len(sol_cookies)}개)")
+                            logger.info(f"[CrawlUtil] [{host}] FlareSolverr 인가 성공 (쿠키 {len(sol_cookies)}개)")
                             return sol_cookies, user_agent
 
-                        logger.warning(f"[CrawlScraper] [{host}] 챌린지 미해결 감지 -> 다음 프록시 전환")
+                        logger.warning(f"[CrawlUtil] [{host}] 챌린지 미해결 감지 -> 다음 프록시 전환")
                     else:
-                        logger.warning(f"[CrawlScraper] [{host}] FlareSolverr 응답 오류: {data.get('message')}")
+                        logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 응답 오류: {data.get('message')}")
             except Exception as e:
-                logger.warning(f"[CrawlScraper] [{host}] FlareSolverr 통신 실패: {e}")
+                logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 통신 실패: {e}")
 
             if attempt < total_tries:
                 cls.rotate_proxy(scheduler_instance=scheduler_instance, reason="FlareSolverr 인가 실패 대응")
@@ -835,7 +535,9 @@ class CrawlScraper:
 
     @classmethod
     def solve_turnstile_checkbox(cls, driver, max_wait: int = 6) -> bool:
-        from selenium.webdriver.common.by import By
+        if not _SELENIUM_AVAILABLE or not driver:
+            return False
+
         start_time = time.time()
         while time.time() - start_time < max_wait:
             title = driver.title or ""
@@ -851,7 +553,7 @@ class CrawlScraper:
                             targets = driver.find_elements(By.XPATH, "//input[@type='checkbox'] | //span[contains(@class, 'checkbox')] | //div[@id='challenge-stage']//label | //body")
                             if targets:
                                 driver.execute_script("arguments[0].click();", targets[0])
-                                logger.debug("[CrawlScraper] Turnstile 체크박스 클릭 시도")
+                                logger.debug("[CrawlUtil] Turnstile 체크박스 클릭 시도")
                         finally:
                             driver.switch_to.default_content()
                         break
@@ -870,7 +572,7 @@ class CrawlScraper:
         host = parsed_url.hostname or ''
 
         cls.rotate_proxy(scheduler_instance=scheduler_instance, reason="지속적 차단 대응")
-        logger.warning(f"[CrawlScraper] [{host}] 지속적 차단 감지 -> 브라우저/토큰 캐시 파기 후 재초기화")
+        logger.warning(f"[CrawlUtil] [{host}] 지속적 차단 감지 -> 브라우저/토큰 캐시 파기 후 재초기화")
 
         cls.close_sessions()
         if host in cls._cf_cookies:
@@ -889,13 +591,13 @@ class CrawlScraper:
 
         if site_info:
             try:
-                hook = CrawlCustomManager.get_hook(site_info.get('NAME'))
+                hook = cls.get_hook(site_info.get('NAME'))
                 if hook and hasattr(hook, 'on_init_session'):
                     logger.info(f"[{site_info.get('NAME')}] 세션 재초기화 훅(on_init_session) 실행")
                     hook.on_init_session(site_info, scheduler_instance)
                     driver = cls._selenium_driver
             except Exception as hook_err:
-                logger.debug(f"[CrawlScraper] 재초기화 훅 예외: {hook_err}")
+                logger.debug(f"[CrawlUtil] 재초기화 훅 예외: {hook_err}")
 
         return driver
 
@@ -905,7 +607,7 @@ class CrawlScraper:
         if not any(k in page_title for k in ["Just a moment", "Cloudflare", "Attention Required"]):
             return True
 
-        logger.info(f"[CrawlScraper] Cloudflare 챌린지 화면 감지 ('{page_title}') -> 해결 시도: {url}")
+        logger.info(f"[CrawlUtil] Cloudflare 챌린지 화면 감지 ('{page_title}') -> 해결 시도: {url}")
         if cls.solve_turnstile_checkbox(driver, max_wait=4):
             return True
 
@@ -920,6 +622,10 @@ class CrawlScraper:
 
     @classmethod
     def init_stealth_selenium(cls, site_info: dict, scheduler_instance=None):
+        if not _SELENIUM_AVAILABLE:
+            logger.error("[CrawlUtil] selenium 패키지가 설치되어 있지 않아 원격 브라우저를 구동할 수 없습니다.")
+            return None
+
         site_url = site_info.get('TORRENT_SITE_URL', '').rstrip('/')
         remote_url = site_info.get('SELENIUM_REMOTE_URL') or P.ModelSetting.get('crawl_selenium_remote_url') or 'http://selenium:4444/wd/hub'
         proxies = cls.get_proxies(scheduler_instance)
@@ -948,10 +654,9 @@ class CrawlScraper:
         if use_fs:
             raw_cf_cookies, cf_user_agent = cls.get_flaresolverr_clearance(site_url, scheduler_instance=scheduler_instance)
             if not raw_cf_cookies and not cf_user_agent:
-                logger.error(f"[CrawlScraper] [{host}] FlareSolverr 인가 실패로 Selenium 기동 중단")
+                logger.error(f"[CrawlUtil] [{host}] FlareSolverr 인가 실패로 Selenium 기동 중단")
                 return None
 
-        from selenium import webdriver
         options = webdriver.ChromeOptions()
         options.add_argument('--headless=new')
         options.add_argument('--no-sandbox')
@@ -969,13 +674,13 @@ class CrawlScraper:
 
         if proxies and 'http' in proxies:
             options.add_argument(f'--proxy-server={proxies["http"]}')
-            logger.info(f"[CrawlScraper] Selenium 프록시 적용: {proxies['http']}")
+            logger.info(f"[CrawlUtil] Selenium 프록시 적용: {proxies['http']}")
 
         try:
             driver = webdriver.Remote(command_executor=remote_url, options=options)
             driver.set_page_load_timeout(selenium_timeout)
         except Exception as e:
-            logger.error(f"[CrawlScraper] Remote Selenium 연결 실패 ({remote_url}): {e}")
+            logger.error(f"[CrawlUtil] Remote Selenium 연결 실패 ({remote_url}): {e}")
             return None
 
         try:
@@ -1011,7 +716,7 @@ class CrawlScraper:
                         injected_count += 1
                     except Exception:
                         pass
-            logger.info(f"[CrawlScraper] [{host}] Selenium에 clearance 쿠키 {injected_count}개 주입 완료")
+            logger.info(f"[CrawlUtil] [{host}] Selenium에 clearance 쿠키 {injected_count}개 주입 완료")
 
         if site_info and site_info.get('COOKIE'):
             for part in site_info['COOKIE'].split(';'):
@@ -1030,6 +735,10 @@ class CrawlScraper:
 
     @classmethod
     def get_by_remote_selenium(cls, url: str, wait_tag: str = 'body', scheduler_instance=None, site_info: dict = None) -> str | None:
+        if not _SELENIUM_AVAILABLE:
+            logger.error(f"[CrawlUtil] selenium 모듈 미설치로 원격 렌더링을 수행할 수 없습니다: {url}")
+            return None
+
         driver = cls.init_stealth_selenium(site_info or {}, scheduler_instance=scheduler_instance)
         if not driver:
             return None
@@ -1042,11 +751,7 @@ class CrawlScraper:
             selenium_timeout = 20
 
         try:
-            from selenium.webdriver.common.by import By
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
-
-            logger.debug(f"[CrawlScraper] Selenium 페이지 로드: {url}")
+            logger.debug(f"[CrawlUtil] Selenium 페이지 로드: {url}")
             driver.get(url)
 
             cls.handle_turnstile_challenge(driver, url, site_info=site_info, scheduler_instance=scheduler_instance)
@@ -1054,30 +759,41 @@ class CrawlScraper:
 
             if site_info:
                 try:
-                    hook = CrawlCustomManager.get_hook(site_info.get('NAME'))
+                    hook = cls.get_hook(site_info.get('NAME'))
                     if hook and hasattr(hook, 'on_page_loaded'):
                         hook.on_page_loaded(driver, url)
                 except Exception:
                     pass
 
+            driver = cls._selenium_driver or driver
+            if not driver:
+                return None
+
             effective_wait_tag = wait_tag or 'body'
-            if effective_wait_tag != 'body':
+            if effective_wait_tag != 'body' and WebDriverWait and EC and By:
                 try:
                     WebDriverWait(driver, selenium_timeout).until(EC.presence_of_element_located((By.XPATH, effective_wait_tag)))
                 except Exception as wait_ex:
-                    curr_title = driver.title or ""
+                    curr_title = (driver.title or "") if driver else ""
                     if any(k in curr_title for k in ["Just a moment", "Cloudflare", "Attention Required"]):
-                        logger.warning(f"[CrawlScraper] 태그 대기 중 Cloudflare 재차단 확인 ('{curr_title}') -> 세션 재초기화: {url}")
+                        logger.warning(f"[CrawlUtil] 태그 대기 중 Cloudflare 재차단 확인 ('{curr_title}') -> 세션 재초기화: {url}")
                         driver = cls.reinit_session(site_info or {}, scheduler_instance=scheduler_instance)
+                        driver = cls._selenium_driver or driver
                         if driver:
                             driver.get(url)
-                            WebDriverWait(driver, selenium_timeout).until(EC.presence_of_element_located((By.XPATH, effective_wait_tag)))
+                            try:
+                                WebDriverWait(driver, selenium_timeout).until(EC.presence_of_element_located((By.XPATH, effective_wait_tag)))
+                            except Exception as retry_wait_ex:
+                                logger.warning(f"[CrawlUtil] 세션 재초기화 후 태그 대기 타임아웃 ({effective_wait_tag}): {retry_wait_ex}")
                     else:
-                        logger.warning(f"[CrawlScraper] 태그 대기 타임아웃 ({effective_wait_tag}): {wait_ex}")
+                        logger.warning(f"[CrawlUtil] 태그 대기 타임아웃 ({effective_wait_tag}): {wait_ex}")
+
+            if not driver:
+                return None
 
             return driver.page_source
         except Exception as e:
-            logger.error(f"[CrawlScraper] Remote Selenium 로딩 에러 ({url}): {e}")
+            logger.error(f"[CrawlUtil] Remote Selenium 로딩 에러 ({url}): {e}")
             cls.close_selenium_driver()
             return None
 
@@ -1086,13 +802,14 @@ class CrawlScraper:
         if cls._selenium_driver:
             try:
                 cls._selenium_driver.quit()
-                logger.debug("[CrawlScraper] Selenium 드라이버 정상 종료")
+                logger.debug("[CrawlUtil] Selenium 드라이버 정상 종료")
             except Exception:
                 pass
             cls._selenium_driver = None
 
     @classmethod
     def close_sessions(cls):
+        """활성 브라우저 및 HTTP 세션 정리"""
         cls.close_selenium_driver()
         for host, sess in list(cls._cffi_sessions.items()):
             try:
@@ -1107,10 +824,11 @@ class CrawlScraper:
             except Exception:
                 pass
         cls._requests_sessions.clear()
-        logger.debug("[CrawlScraper] HTTP 활성 세션 정리 완료")
+        logger.debug("[CrawlUtil] HTTP 활성 세션 정리 완료")
 
     @classmethod
     def download_file_stream(cls, download_url: str, referer: str = None, scheduler_instance=None):
+        """첨부파일 스트림 다운로드"""
         proxies = cls.get_proxies(scheduler_instance)
         host = urlparse(download_url).hostname or ''
         headers = cls.DEFAULT_HEADERS.copy()
@@ -1131,7 +849,7 @@ class CrawlScraper:
         if proxies:
             session.proxies.update(proxies)
 
-        logger.debug(f"[CrawlScraper] 파일 스트림 다운로드: {download_url}")
+        logger.debug(f"[CrawlUtil] 파일 스트림 다운로드: {download_url}")
         res = session.get(download_url, stream=True, timeout=60, verify=False)
         res.raise_for_status()
 
@@ -1143,9 +861,9 @@ class CrawlScraper:
         byte_io.seek(0)
         return byte_io
 
-
-class CrawlTorrentInfo:
-
+    # --------------------------------------------------------------------------
+    # 토렌트 메타데이터 취득 (Torrent Info 플러그인 또는 qBittorrent 연동)
+    # --------------------------------------------------------------------------
     @classmethod
     def get_torrent_info(cls, magnet_list: list[str], scheduler_instance=None) -> list[dict] | None:
         if scheduler_instance is not None:
@@ -1163,7 +881,7 @@ class CrawlTorrentInfo:
 
         for magnet in magnet_list:
             if not str(magnet).startswith('magnet:'):
-                logger.debug(f"[CrawlTorrentInfo] 비토렌트 P2P 링크 메타데이터 분석 건너뜀: {magnet[:50]}")
+                logger.debug(f"[CrawlUtil] 비토렌트 P2P 링크 메타데이터 분석 건너뜀: {magnet[:50]}")
                 continue
 
             try:
@@ -1176,19 +894,19 @@ class CrawlTorrentInfo:
                 if info:
                     results.append(info)
             except Exception as e:
-                logger.error(f"[CrawlTorrentInfo] 토렌트 정보 취득 실패 ({magnet}): {e}")
+                logger.error(f"[CrawlUtil] 토렌트 정보 취득 실패 ({magnet}): {e}")
 
         return results if results else None
 
     @classmethod
     def _get_info_via_plugin(cls, magnet_uri: str) -> dict | None:
-        apikey = get_system_apikey()
+        apikey = FeederUtil.get_system_apikey()
         local_port = F.config.get('port', 9999)
         candidate_urls = [
             f"http://127.0.0.1:{local_port}/torrent_info/api/m2i",
             f"http://localhost:{local_port}/torrent_info/api/m2i",
         ]
-        ddns = get_ddns()
+        ddns = FeederUtil.get_ddns()
         if ddns:
             candidate_urls.append(f"{ddns.rstrip('/')}/torrent_info/api/m2i")
 
@@ -1210,7 +928,7 @@ class CrawlTorrentInfo:
             except Exception:
                 continue
 
-        logger.warning(f"[CrawlTorrentInfo] m2i API 응답 실패: {magnet_uri}")
+        logger.warning(f"[CrawlUtil] m2i API 응답 실패: {magnet_uri}")
         return None
 
     @classmethod
@@ -1221,12 +939,12 @@ class CrawlTorrentInfo:
         temp_category = P.ModelSetting.get('crawl_qb_temp_category') or 'feeder_temp'
 
         if not qb_url:
-            logger.error("[CrawlTorrentInfo] qBittorrent URL 미설정")
+            logger.error("[CrawlUtil] qBittorrent URL 미설정")
             return None
 
-        target_hash = extract_info_hash(magnet_uri)
+        target_hash = FeederUtil.extract_info_hash(magnet_uri)
         if not target_hash:
-            logger.warning(f"[CrawlTorrentInfo] 유효하지 않은 마그넷 주소: {magnet_uri}")
+            logger.warning(f"[CrawlUtil] 유효하지 않은 마그넷 주소: {magnet_uri}")
             return None
 
         session = requests.Session()
@@ -1245,7 +963,7 @@ class CrawlTorrentInfo:
 
             is_login_success = (login_res.status_code in [200, 204]) and ('Fails' not in login_res.text)
             if not is_login_success:
-                logger.error(f"[CrawlTorrentInfo] qBittorrent 로그인 실패: HTTP {login_res.status_code}")
+                logger.error(f"[CrawlUtil] qBittorrent 로그인 실패: HTTP {login_res.status_code}")
                 return None
 
             add_data = {
@@ -1282,7 +1000,7 @@ class CrawlTorrentInfo:
             return resolved_info
 
         except Exception as e:
-            logger.error(f"[CrawlTorrentInfo] qBittorrent 연동 예외: {e}")
+            logger.error(f"[CrawlUtil] qBittorrent 연동 예외: {e}")
             try:
                 session.post(f"{qb_url}/api/v2/torrents/delete", data={'hashes': target_hash, 'deleteFiles': 'true'}, timeout=5)
             except Exception:

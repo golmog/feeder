@@ -56,6 +56,7 @@ PLUGIN_ROOT = os.path.dirname(__file__)
 
 try:
     from .model_crawl import ModelCrawlSite, ModelCrawlItem
+    from .model_feed import ModelFeedItem
     from .model_download import ModelDownload, ModelDownloadStat
     from .mod_crawl import ModuleCrawl
     from .mod_feed import ModuleFeed

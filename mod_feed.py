@@ -10,8 +10,9 @@ from sqlalchemy import and_, or_, desc
 from .setup import *
 from .model_crawl import ModelCrawlItem
 from .model_download import ModelDownload
-from .util_crawl import get_ddns, get_system_apikey, clean_xml_string, extract_info_hash, split_magnets
-from .util_feed import FeedConfigUtil, FeedFilter, FeedRssFileWriter
+from .model_feed import ModelFeedItem
+from .util_base import FeederUtil
+from .util_feed import FeedUtil
 from .task_feed import TaskFeedBase
 
 name = 'feed'
@@ -21,10 +22,13 @@ class ModuleFeed(PluginModuleBase):
 
     def __init__(self, P):
         super(ModuleFeed, self).__init__(P, 'setting', name=name, scheduler_desc="Feeder - 피드 관리 및 RSS 발행")
+        self.web_list_model = ModelFeedItem
         self.db_default = {
             f"{self.name}_db_version": "1",
             f"{self.name}_auto_start": "False",
             f"{self.name}_interval": "10",
+            f"{self.name}_db_delete_day": "30",
+            f"{self.name}_db_auto_delete": "False",
             f"{self.name}_feed_count": "100",
             f"{self.name}_make_rss_file": "False",
             f"{self.name}_rss_file_path": "",
@@ -33,7 +37,6 @@ class ModuleFeed(PluginModuleBase):
             f"{self.name}_use_proxy": "False",
             f"{self.name}_proxy_url": "",
         }
-        self.web_list_model = ModelCrawlItem
 
     def process_menu(self, page_name, req):
         try:
@@ -41,13 +44,13 @@ class ModuleFeed(PluginModuleBase):
             arg['package_name'] = P.package_name
             arg['sub'] = self.name
             arg['current_page'] = page_name
-            arg['ddns'] = get_ddns()
-            arg['apikey'] = get_system_apikey()
-            arg['feeds'] = FeedConfigUtil.get_feeds()
-            arg['profiles'] = FeedConfigUtil.get_download_profiles()
+            arg['ddns'] = FeederUtil.get_ddns()
+            arg['apikey'] = FeederUtil.get_system_apikey()
+            arg['feeds'] = FeederUtil.get_feeds()
+            arg['profiles'] = FeederUtil.get_download_profiles()
 
             if page_name == 'setting':
-                arg['yaml_filepath'] = FeedConfigUtil.get_filepath()
+                arg['yaml_filepath'] = FeederUtil.get_filepath()
                 arg['is_include'] = F.scheduler.is_include(self.get_scheduler_name())
                 arg['is_running'] = F.scheduler.is_running(self.get_scheduler_name())
                 return render_template(f'{P.package_name}_{self.name}_setting.html', arg=arg)
@@ -71,11 +74,10 @@ class ModuleFeed(PluginModuleBase):
                     logger.debug(f"[{self.name}] 스케줄러 갱신 예외: {ex}")
                 return ret
 
-            if sub == 'web_list':
-                res_data = self.feed_web_list(req)
-                return jsonify(res_data)
+            command = req.form.get('command') or req.values.get('command') or sub
+            if sub in ['web_list', 'list'] or command in ['web_list', 'list']:
+                return jsonify(self.web_list_model.web_list(req))
 
-            command = req.form.get('command') or sub
             if command:
                 res = self.process_command(command, req.form.get('arg1', ''), req.form.get('arg2', ''), req.form.get('arg3', ''), req)
                 if res is not None:
@@ -87,126 +89,50 @@ class ModuleFeed(PluginModuleBase):
             logger.error(traceback.format_exc())
             return jsonify({'ret': 'error', 'msg': str(e)})
 
-    def feed_web_list(self, req):
-        try:
-            import unicodedata
-            raw_feed_name = req.form.get('feed_select') or req.values.get('feed_select') or ''
-            feed_name = unicodedata.normalize('NFC', raw_feed_name.strip())
-
-            page = int(req.form.get('page', 1))
-            page_size = int(req.form.get('page_size', 25))
-            search_word = req.form.get('search_word', '').strip().lower()
-            status_filter = req.form.get('status_filter', 'all')
-
-            from .util_crawl import get_paging_info
-
-            feed = FeedConfigUtil.get_feed_by_name(feed_name) if feed_name else None
-            if not feed:
-                feeds = FeedConfigUtil.get_feeds()
-                if feeds:
-                    feed = feeds[0]
-                    if feed_name:
-                        logger.warning(f"[{self.name}] 요청된 피드 '{feed_name}'를 찾지 못해 기본 피드 '{feed.get('name')}'로 대체합니다.")
-                else:
-                    feed = None
-
-            if not feed:
-                logger.debug(f"[{self.name}] 등록된 피드가 없어 빈 목록을 반환합니다.")
-                return {'success': True, 'list': [], 'paging': get_paging_info(0, 1, page_size)}
-
-            current_feed_name = feed.get('name')
-            logger.info(f"[{self.name}] 피드 목록 조회 시작: '{current_feed_name}' (화질 요구: {feed.get('quality') or '무관'}, 정규식 필터: {'사용' if feed.get('regexp') else '미사용'})")
-
-            sources = feed.get('sources', [])
-            source_conds = []
-            for src in sources:
-                s_name = src.get('site')
-                b_name = src.get('full_board_key') or src.get('board')
-                if s_name and b_name:
-                    source_conds.append(and_(ModelCrawlItem.site == s_name, ModelCrawlItem.board == b_name))
-
-            if not source_conds:
-                logger.info(f"[{self.name}] 피드 '{current_feed_name}'에 지정된 소스 게시판이 없습니다.")
-                return {'success': True, 'list': [], 'paging': get_paging_info(0, 1, page_size)}
-
-            candidates = db.session.query(ModelCrawlItem).filter(or_(*source_conds)).order_by(ModelCrawlItem.id.desc()).all()
-            global_cfg = FeedConfigUtil.get_global()
-
-            matched_items = []
-            all_hashes = []
-            excluded_count = 0
-
-            for bbs in candidates:
-                b_dict = bbs.as_dict()
-                if not b_dict.get('magnet') and not b_dict.get('files'):
-                    continue
-                if search_word and search_word not in b_dict.get('title', '').lower():
-                    continue
-
-                is_pass, filter_reason = FeedFilter.evaluate(b_dict, feed, global_cfg)
-                if is_pass:
-                    for m_str in b_dict.get('magnet', []):
-                        h = extract_info_hash(m_str)
-                        if h:
-                            all_hashes.append(h)
-                    matched_items.append(b_dict)
-                else:
-                    excluded_count += 1
-                    logger.debug(f"[{self.name}] [{current_feed_name}] 필터 제외: '{bbs.title[:35]}' (사유: {filter_reason})")
-
-            dl_map = {}
-            if all_hashes:
-                records = db.session.query(ModelDownload.infohash, ModelDownload.status, ModelDownload.id).filter(ModelDownload.infohash.in_(all_hashes)).all()
-                for h, st, did in records:
-                    dl_map[h] = {'status': st, 'id': did}
-
-            filtered_by_status = []
-            for item_dict in matched_items:
-                matched_dl = None
-                for m_str in item_dict.get('magnet', []):
-                    h = extract_info_hash(m_str)
-                    if h and h in dl_map:
-                        matched_dl = dl_map[h]
-                        break
-                item_dict['download_info'] = matched_dl
-
-                if status_filter == 'magnet' and not any(m.startswith('magnet:') for m in item_dict.get('magnet', [])):
-                    continue
-                if status_filter == 'ed2k' and not any(m.startswith('ed2k://') for m in item_dict.get('magnet', [])):
-                    continue
-                if status_filter == 'download_completed' and (not matched_dl or matched_dl.get('status') != 'completed'):
-                    continue
-                if status_filter == 'download_active' and (not matched_dl or matched_dl.get('status') not in ['downloading', 'pending', 'local_staging', 'uploading', 'colab_transferring']):
-                    continue
-                if status_filter == 'not_downloaded' and matched_dl:
-                    continue
-
-                filtered_by_status.append(item_dict)
-
-            total_count = len(filtered_by_status)
-            paging = get_paging_info(total_count, page, page_size)
-            actual_page = paging['current_page']
-
-            start_idx = (actual_page - 1) * page_size
-            paged_list = filtered_by_status[start_idx:start_idx + page_size]
-
-            logger.info(f"[{self.name}] 피드 '{current_feed_name}' 필터링 완료: 소스 글 {len(candidates)}건 중 {total_count}건 매칭 (제외: {excluded_count}건, 검색어: '{search_word or '없음'}', 상태: '{status_filter}')")
-
-            return {
-                'success': True,
-                'list': paged_list,
-                'paging': paging
-            }
-        except Exception as e:
-            logger.error(f"[{self.name}] feed_web_list 에러: {e}")
-            logger.error(traceback.format_exc())
-            return {'success': False, 'list': [], 'paging': None}
-
     def process_command(self, command, arg1, arg2, arg3, req):
-        if command == 'load_feeds':
-            feeds = FeedConfigUtil.get_feeds()
-            ddns = get_ddns().rstrip('/')
-            apikey = get_system_apikey()
+        if command == 'clear_feed_db':
+            feed_name = req.form.get('feed_name', '').strip()
+            if not feed_name:
+                return jsonify({'ret': 'fail', 'msg': '피드 이름 누락'})
+            try:
+                deleted = db.session.query(ModelFeedItem).filter_by(feed_name=feed_name).delete()
+                db.session.commit()
+                logger.info(f"[{self.name}] 피드 [{feed_name}] DB 비우기 완료: {deleted}건 삭제됨")
+                return jsonify({'ret': 'success', 'msg': f'[{feed_name}] 피드 DB가 초기화되었습니다 ({deleted}건 삭제).'})
+            except Exception as ex:
+                db.session.rollback()
+                logger.error(f"[{self.name}] clear_feed_db 에러: {ex}")
+                return jsonify({'ret': 'fail', 'msg': str(ex)})
+
+        elif command in ['db_delete', 'reset_db']:
+            try:
+                deleted = db.session.query(ModelFeedItem).delete()
+                db.session.commit()
+                logger.info(f"[{self.name}] 피드 전체 DB 초기화 완료: {deleted}건 삭제")
+                return jsonify(True)
+            except Exception as e:
+                db.session.rollback()
+                logger.error(f"[{self.name}] db_delete 에러: {e}")
+                return jsonify(False)
+
+        elif command == 'db_delete_day':
+            try:
+                day_val = arg1 or P.ModelSetting.get(f"{self.name}_db_delete_day")
+                day = int(day_val)
+                target_date = datetime.now() - timedelta(days=day)
+                deleted = db.session.query(ModelFeedItem).filter(ModelFeedItem.created_time < target_date).delete()
+                db.session.commit()
+                logger.info(f"[{self.name}] {day}일 경과 피드 DB 레코드 삭제 완료: {deleted}건 삭제")
+                return jsonify(True)
+            except Exception as e:
+                db.session.rollback()
+                logger.error(f"[{self.name}] db_delete_day 에러: {e}")
+                return jsonify(False)
+
+        elif command == 'load_feeds':
+            feeds = FeederUtil.get_feeds()
+            ddns = FeederUtil.get_ddns().rstrip('/')
+            apikey = FeederUtil.get_system_apikey()
             feed_list = []
             for f in feeds:
                 info = dict(f)
@@ -284,19 +210,20 @@ class ModuleFeed(PluginModuleBase):
             else:
                 item_data['accept_all'] = False
 
-            ret = FeedConfigUtil.save_feed(item_data)
-            return jsonify({'ret': ret, 'feeds': FeedConfigUtil.get_feeds()})
+            ret = FeederUtil.save_feed(item_data)
+            return jsonify({'ret': ret, 'feeds': FeederUtil.get_feeds()})
 
         elif command == 'remove_feed':
             target_id = req.form.get('target_id')
-            ret = 'success' if FeedConfigUtil.delete_feed(target_id) else 'fail'
-            return jsonify({'ret': ret, 'feeds': FeedConfigUtil.get_feeds()})
+            ret = 'success' if FeederUtil.delete_feed(target_id) else 'fail'
+            return jsonify({'ret': ret, 'feeds': FeederUtil.get_feeds()})
 
         elif command == 'generate_feed_file':
             target_id = req.form.get('target_id')
-            feed = FeedConfigUtil.get_feed(target_id)
+            feed = FeederUtil.get_feed(target_id)
             if feed:
-                ok = FeedRssFileWriter.save_rss_file(feed)
+                FeedUtil.sync_feed(feed)
+                ok = FeedUtil.save_rss_file(feed)
                 return jsonify({'ret': 'success' if ok else 'fail'})
             return jsonify({'ret': 'not_exist'})
 
@@ -305,49 +232,14 @@ class ModuleFeed(PluginModuleBase):
             magnet = req.form.get('magnet', '').strip()
             profile_name = req.form.get('profile_name', '').strip()
             feed_name = req.form.get('feed_name', 'FEED_DIRECT')
-
-            if not magnet:
-                return jsonify({'ret': 'fail', 'msg': '마그넷/ed2k 링크가 누락되었습니다.'})
-
-            infohash = extract_info_hash(magnet)
-            existing = ModelDownload.get_by_infohash(infohash) if infohash else ModelDownload.get_by_magnet(magnet)
-            if existing:
-                return jsonify({'ret': 'exist', 'msg': f'이미 다운로드 큐에 등록된 작업입니다 (상태: {existing.status}).'})
-
-            dl_item = ModelDownload(
-                feed_name=feed_name,
-                title=title or (infohash or magnet[:30]),
+            res = FeederUtil.add_direct_download(
+                title=title,
                 magnet=magnet,
-                infohash=infohash
+                profile_name=profile_name,
+                feed_name=feed_name,
+                caller_name=self.name
             )
-
-            selected_profile = None
-            if profile_name:
-                for p in FeedConfigUtil.get_download_profiles():
-                    if p.get('name') == profile_name:
-                        selected_profile = p
-                        break
-
-            if selected_profile:
-                dl_item.priority_chain = list(selected_profile.get('priority_chain', []))
-                dest = selected_profile.get('destination', {})
-                dl_item.destination_type = dest.get('type', 'local')
-                dl_item.gdrive_upload_path = dest.get('upload_path', '')
-                dl_item.gdrive_complete_path = dest.get('complete_path', '')
-                dl_item.gdrive_remote_id = dest.get('shared_drive_id', '')
-            else:
-                yaml_data = FeedConfigUtil.load_yaml()
-                enabled_downloaders = [d['name'] for d in yaml_data.get('DOWNLOADERS', []) if d.get('enabled', True)]
-                dl_item.priority_chain = enabled_downloaders
-                dl_item.destination_type = 'local'
-
-            dl_item.status = 'pending'
-            db.session.add(dl_item)
-            db.session.commit()
-            logger.info(f"[{self.name}] 다운로드 큐 직접 추가: {title} (체인: {' -> '.join(dl_item.priority_chain)})")
-            return jsonify({'ret': 'success', 'msg': '다운로드 큐에 성공적으로 등록되었습니다.'})
-
-        return super(ModuleFeed, self).process_command(command, arg1, arg2, arg3, req)
+            return jsonify(res)
 
     def process_api(self, sub, req):
         try:
@@ -366,71 +258,41 @@ class ModuleFeed(PluginModuleBase):
 
     def _handle_feed_rss(self, feed_id=None, feed_name=None):
         try:
-            feed = FeedConfigUtil.get_feed(feed_id) if feed_id else FeedConfigUtil.get_feed_by_name(feed_name)
+            feed = FeederUtil.get_feed(feed_id) if feed_id else FeederUtil.get_feed_by_name(feed_name)
             if not feed:
                 return jsonify({'ret': 'not_exist', 'msg': '피드를 찾을 수 없습니다.'}), 404
 
-            sources = feed.get('sources', [])
-            if not sources:
-                xml_empty = self.generate_rss_feed(feed.get('name', 'Feed'), [])
-                return Response(xml_empty, mimetype='application/xml; charset=utf-8')
-
-            source_conditions = []
-            for src in sources:
-                s_name = src.get('site')
-                b_name = src.get('full_board_key') or src.get('board')
-                if s_name and b_name:
-                    source_conditions.append(and_(ModelCrawlItem.site == s_name, ModelCrawlItem.board == b_name))
-
-            if not source_conditions:
-                xml_empty = self.generate_rss_feed(feed.get('name', 'Feed'), [])
-                return Response(xml_empty, mimetype='application/xml; charset=utf-8')
-
+            current_feed_name = feed.get('name')
             feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
-            query_limit = max(feed_count * 4, 400)
-            candidates = db.session.query(ModelCrawlItem).filter(or_(*source_conditions)).order_by(ModelCrawlItem.id.desc()).limit(query_limit).all()
 
-            global_cfg = FeedConfigUtil.get_global()
-            seen_magnets = set()
-            filtered_items = []
-            for bbs in candidates:
-                bbs_dict = bbs.as_dict()
+            feed_records = (
+                db.session.query(ModelFeedItem)
+                .filter_by(feed_name=current_feed_name)
+                .order_by(ModelFeedItem.id.desc())
+                .limit(feed_count)
+                .all()
+            )
 
-                if not bbs_dict.get('magnet') and not bbs_dict.get('files'):
-                    continue
-
-                item_hashes = []
-                for m in bbs_dict.get('magnet', []):
-                    h = extract_info_hash(m) or m
-                    if h:
-                        item_hashes.append(h)
-
-                if item_hashes and any(h in seen_magnets for h in item_hashes):
-                    continue
-
-                is_pass, _ = FeedFilter.evaluate(bbs_dict, feed, global_cfg)
-                if is_pass:
-                    for h in item_hashes:
-                        seen_magnets.add(h)
-                    filtered_items.append(bbs)
-                    if len(filtered_items) >= feed_count:
-                        break
-
-            feed_title = f"FEED: {feed.get('name', 'Feeder')}"
-            xml_content = self.generate_rss_feed(feed_title, filtered_items)
+            feed_title = f"FEED: {current_feed_name}"
+            xml_content = self.generate_rss_feed(feed_title, feed_records)
             return Response(xml_content, mimetype='application/xml; charset=utf-8')
         except Exception as e:
             logger.error(f"[FeedAPI] _handle_feed_rss 에러: {e}")
             return Response('Internal Error', status=500)
+        finally:
+            try:
+                db.session.remove()
+            except Exception:
+                pass
 
     def generate_rss_feed(self, title: str, items: list, include_apikey: bool = True) -> str:
-        ddns = get_ddns().rstrip('/')
-        apikey = get_system_apikey() if include_apikey else ''
+        ddns = FeederUtil.get_ddns().rstrip('/')
+        apikey = FeederUtil.get_system_apikey() if include_apikey else ''
 
         xml = '<?xml version="1.0" encoding="utf-8"?>\n'
         xml += '<rss version="2.0" xmlns:showrss="http://showrss.info/">\n'
         xml += '  <channel>\n'
-        xml += f'    <title>{clean_xml_string(title)}</title>\n'
+        xml += f'    <title>{FeederUtil.clean_xml_string(title)}</title>\n'
         xml += f'    <link>{ddns}</link>\n'
         xml += '    <description>Feeder Generated RSS Feed</description>\n'
 
@@ -447,7 +309,7 @@ class ModuleFeed(PluginModuleBase):
                     magnet_link = f"magnet:?xt=urn:btih:{target_hash}"
 
                     xml += '    <item>\n'
-                    xml += f'      <title>{clean_xml_string(target_name)}</title>\n'
+                    xml += f'      <title>{FeederUtil.clean_xml_string(target_name)}</title>\n'
                     xml += f'      <link>{magnet_link}</link>\n'
                     xml += f'      <pubDate>{date_str}</pubDate>\n'
                     xml += '    </item>\n'
@@ -455,8 +317,8 @@ class ModuleFeed(PluginModuleBase):
                 for mag in bbs_dict['magnet']:
                     has_magnet = True
                     xml += '    <item>\n'
-                    xml += f'      <title>{clean_xml_string(bbs.title)}</title>\n'
-                    xml += f'      <link>{clean_xml_string(mag)}</link>\n'
+                    xml += f'      <title>{FeederUtil.clean_xml_string(bbs.title)}</title>\n'
+                    xml += f'      <link>{FeederUtil.clean_xml_string(mag)}</link>\n'
                     xml += f'      <pubDate>{date_str}</pubDate>\n'
                     xml += '    </item>\n'
 
@@ -470,8 +332,8 @@ class ModuleFeed(PluginModuleBase):
                     download_proxy_url = f"{ddns}/{P.package_name}/api/crawl/download?id={bbs.id}_{f_idx}{apikey_param}"
 
                     xml += '    <item>\n'
-                    xml += f'      <title>{clean_xml_string(filename)}</title>\n'
-                    xml += f'      <link>{clean_xml_string(download_proxy_url)}</link>\n'
+                    xml += f'      <title>{FeederUtil.clean_xml_string(filename)}</title>\n'
+                    xml += f'      <link>{FeederUtil.clean_xml_string(download_proxy_url)}</link>\n'
                     xml += f'      <pubDate>{date_str}</pubDate>\n'
                     xml += '    </item>\n'
 
@@ -480,5 +342,18 @@ class ModuleFeed(PluginModuleBase):
         return xml
 
     def scheduler_function(self):
-        logger.info(f"[{self.name}] 정기 피드 XML 파일 동기화 스케줄러 실행")
+        if P.ModelSetting.get_bool(f"{self.name}_db_auto_delete"):
+            try:
+                day = P.ModelSetting.get_int(f"{self.name}_db_delete_day")
+                if day > 0:
+                    target_date = datetime.now() - timedelta(days=day)
+                    deleted = db.session.query(ModelFeedItem).filter(ModelFeedItem.created_time < target_date).delete()
+                    db.session.commit()
+                    if deleted > 0:
+                        logger.debug(f"[{self.name}] {day}일 경과 피드 DB 자동 정리 완료 (삭제: {deleted}건)")
+            except Exception as e:
+                logger.error(f"[{self.name}] feed db auto delete 에러: {e}")
+                db.session.rollback()
+
+        logger.info(f"[{self.name}] 정기 피드 동기화 및 XML 파일 갱신 스케줄러 실행")
         self.start_celery(TaskFeedBase.start, None, "scheduler")

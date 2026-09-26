@@ -141,7 +141,7 @@ var apikey = "{{ arg['apikey'] }}";
 var is_torrent_info_installed = ("{{ arg.get('is_torrent_info_installed', True) }}" === 'True');
 var server_site_info = {{ arg.get('site_info', {}) | tojson }};
 </script>
-<script src="{{ url_for('.static', filename='feeder_list_base.js') }}"></script>
-<script src="{{ url_for('.static', filename='feeder_crawl_list.js') }}"></script>
+<script src="{{ url_for('.static', filename='feeder_base.js') }}"></script>
+<script src="{{ url_for('.static', filename='feeder_crawl.js') }}"></script>
 
 {% endblock %}

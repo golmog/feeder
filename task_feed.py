@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
+import traceback
+
 from .setup import *
-from .util_feed import FeedRssFileWriter
+from .util_feed import FeedUtil
 
 
 class TaskFeedBase:
@@ -23,9 +25,15 @@ class TaskFeed:
     def sync_all_feeds():
         with F.app.app_context():
             try:
-                logger.info("[TaskFeed] 공유 RSS 피드 XML 파일 일괄 동기화 시작")
-                updated_count = FeedRssFileWriter.save_all_rss_files()
-                logger.info(f"[TaskFeed] 공유 RSS 피드 동기화 완료 (총 {updated_count}개 갱신됨)")
+                logger.info("[TaskFeed] 피드 DB 동기화 및 공유 RSS XML 갱신 작업 시작")
+                new_items_count = FeedUtil.sync_all_feeds()
+                updated_count = FeedUtil.save_all_rss_files()
+                logger.info(f"[TaskFeed] 피드 동기화 완료: 신규 {new_items_count}건 DB 적재, RSS 파일 {updated_count}개 갱신")
             except Exception as e:
                 logger.error(f"[TaskFeed] 피드 동기화 중 오류: {e}")
                 logger.error(traceback.format_exc())
+            finally:
+                try:
+                    db.session.remove()
+                except Exception:
+                    pass

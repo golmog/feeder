@@ -2,6 +2,7 @@
 from datetime import datetime
 from sqlalchemy import and_, or_, func, desc
 from .setup import *
+from .util_base import FeederUtil
 
 PACKAGE_NAME = P.package_name
 
@@ -40,6 +41,7 @@ class ModelCrawlSite(db.Model):
     def as_dict(self):
         ret = {x.name: getattr(self, x.name) for x in self.__table__.columns}
         ret['created_time'] = self.created_time.strftime('%Y-%m-%d %H:%M:%S') if self.created_time else ''
+        ret['magnet'] = FeederUtil.split_magnets(self.magnet) if ret.get('magnet') else []
         ret['options'] = self.get_options()
         return ret
 
@@ -112,8 +114,7 @@ class ModelCrawlItem(ModelBase):
     def as_dict(self):
         ret = {x.name: getattr(self, x.name) for x in self.__table__.columns}
         ret['created_time'] = self.created_time.strftime('%Y-%m-%d %H:%M:%S') if self.created_time else ''
-        from .util_crawl import split_magnets
-        ret['magnet'] = split_magnets(self.magnet) if ret.get('magnet') else []
+        ret['magnet'] = FeederUtil.split_magnets(self.magnet) if ret.get('magnet') else []
         if ret.get('files'):
             ret['files'] = [item.split('|') for item in self.files.split('||') if item]
         else:
@@ -152,9 +153,8 @@ class ModelCrawlItem(ModelBase):
         if not magnet_list:
             return False
         try:
-            from .util_crawl import extract_info_hash
             for mag in magnet_list:
-                info_hash = extract_info_hash(mag)
+                info_hash = FeederUtil.extract_info_hash(mag)
                 if info_hash:
                     exist = db.session.query(cls.id).filter(cls.magnet.like(f"%{info_hash}%")).first()
                     if exist:
@@ -189,14 +189,28 @@ class ModelCrawlItem(ModelBase):
                     query = query.filter(cls.broadcast_status == 'LOGIN_REQUIRED')
                 elif status_filter == 'has_files':
                     query = query.filter(cls.files.isnot(None), cls.files != '')
-                elif status_filter in ['download_completed', 'download_active']:
-                    from .model_download import ModelDownload
-                    target_statuses = ['completed'] if status_filter == 'download_completed' else ['downloading', 'pending', 'local_staging', 'uploading', 'colab_transferring']
-                    dl_hashes = [r[0] for r in db.session.query(ModelDownload.infohash).filter(ModelDownload.status.in_(target_statuses), ModelDownload.infohash.isnot(None)).distinct().all() if r[0]]
-                    if dl_hashes:
-                        query = query.filter(or_(*[cls.magnet.like(f"%{h}%") for h in dl_hashes]))
+                elif status_filter in ['download_completed', 'download_active', 'not_downloaded']:
+                    query = FeederUtil.apply_download_status_filter(query, cls.magnet, status_filter)
+                    if status_filter == 'download_completed':
+                        target_statuses = ['completed']
+                    elif status_filter == 'download_active':
+                        target_statuses = ['downloading', 'pending', 'local_staging', 'uploading', 'colab_transferring']
                     else:
-                        query = query.filter(cls.id == -1)
+                        target_statuses = None
+
+                    if target_statuses:
+                        subq = db.session.query(ModelDownload.id).filter(
+                            ModelDownload.status.in_(target_statuses),
+                            ModelDownload.infohash.isnot(None),
+                            cls.magnet.like(func.concat('%', ModelDownload.infohash, '%'))
+                        ).exists()
+                        query = query.filter(subq)
+                    else:
+                        subq = db.session.query(ModelDownload.id).filter(
+                            ModelDownload.infohash.isnot(None),
+                            cls.magnet.like(func.concat('%', ModelDownload.infohash, '%'))
+                        ).exists()
+                        query = query.filter(~subq)
 
             # 검색 키워드 필터링
             if search:
@@ -256,39 +270,11 @@ class ModelCrawlItem(ModelBase):
             query = query.limit(page_size).offset((page - 1) * page_size)
             lists = query.all()
 
-            from .util_crawl import split_magnets, extract_info_hash, get_paging_info
-            from .model_download import ModelDownload
-
-            all_page_hashes = {}
-            for item_obj in lists:
-                m_list = split_magnets(item_obj.magnet)
-                for m_str in m_list:
-                    h = extract_info_hash(m_str)
-                    if h: all_page_hashes[h] = item_obj.id
-
-            dl_map = {}
-            if all_page_hashes:
-                dl_records = db.session.query(ModelDownload.infohash, ModelDownload.status, ModelDownload.id).filter(ModelDownload.infohash.in_(list(all_page_hashes.keys()))).all()
-                for d_hash, d_status, d_id in dl_records:
-                    dl_map[d_hash] = {'status': d_status, 'id': d_id}
-
-            item_dicts = []
-            for item_obj in lists:
-                d = item_obj.as_dict()
-                d_links = d.get('magnet', [])
-                matched_dl = None
-                for m_str in d_links:
-                    h = extract_info_hash(m_str)
-                    if h and h in dl_map:
-                        matched_dl = dl_map[h]
-                        break
-                d['download_info'] = matched_dl
-                item_dicts.append(d)
+            item_dicts = FeederUtil.attach_download_info(lists)
 
             ret['success'] = True
             ret['list'] = item_dicts
-            # 프레임워크 기본 ModelBase 대신 메타데이터 표준 get_paging_info 사용
-            ret['paging'] = get_paging_info(count, page, page_size)
+            ret['paging'] = FeederUtil.get_paging_info(count, page, page_size)
 
             crawl_mod = P.get_module('crawl')
             if crawl_mod and hasattr(crawl_mod, 'get_search_form_info'):
@@ -300,4 +286,9 @@ class ModelCrawlItem(ModelBase):
         except Exception as e:
             logger.error(f"[ModelCrawlItem] web_list error: {e}")
             logger.error(traceback.format_exc())
-            return {'success': False, 'ret': 'error', 'msg': str(e), 'list': [], 'paging': None}
+            return {'ret': 'error', 'msg': str(e)}
+        finally:
+            try:
+                db.session.remove()
+            except Exception:
+                pass

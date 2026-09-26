@@ -1,13 +1,126 @@
 var cached_download_profiles = [];
 var current_search_xhr = null;
 var current_data = null;
+var feeder_ace_instances = [];
 
+// =============================================================================
+// 플랫폼 공통 유틸리티
+// =============================================================================
+function format_bytes(bytes) {
+  if (!bytes || bytes <= 0) return '0 B';
+  var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  var i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return (bytes / Math.pow(1024, i)).toFixed(2) + ' ' + units[i];
+}
+
+function clean_title_attr(title) {
+  if (!title) return '';
+  return title.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function fallbackCopyText(text, target_name) {
+  var noticeText = target_name || '링크가';
+  var tempInput = $('<textarea>');
+  tempInput.css({ position: 'fixed', left: '-9999px', top: '0' });
+  $('body').append(tempInput);
+  tempInput.val(text).select();
+  try {
+    document.execCommand('copy');
+    notify(noticeText + ' 복사되었습니다.', 'success');
+  } catch (err) {
+    notify('복사에 실패했습니다.', 'warning');
+  }
+  tempInput.remove();
+}
+
+// =============================================================================
+// 상단 내비바 및 탭 상태 유지
+// =============================================================================
+function sync_feeder_header_navbar() {
+  try {
+    var lastCrawl = localStorage.getItem('feeder_last_crawl_page') || 'setting';
+    var lastFeed = localStorage.getItem('feeder_last_feed_page') || 'setting';
+    var lastDl = localStorage.getItem('feeder_last_download_page') || 'setting';
+    $('.navbar a[href*="/' + package_name + '/crawl"]').attr('href', '/' + package_name + '/crawl/' + lastCrawl);
+    $('.navbar a[href*="/' + package_name + '/feed"]').attr('href', '/' + package_name + '/feed/' + lastFeed);
+    $('.navbar a[href*="/' + package_name + '/download"]').attr('href', '/' + package_name + '/download/' + lastDl);
+  } catch (e) {}
+}
+
+function restore_active_subtab(module_name) {
+  try {
+    var targetSub = module_name || sub;
+    var saved_tab = localStorage.getItem(package_name + '_' + targetSub + '_active_tab');
+    if (saved_tab) {
+      var tabElem = $('#nav-tab a[href="' + saved_tab + '"]');
+      if (tabElem.length > 0 && !tabElem.hasClass('active')) {
+        tabElem.tab('show');
+      }
+    }
+  } catch (e) {}
+}
+
+$(document).on('shown.bs.tab', '#nav-tab a[data-toggle="tab"]', function (e) {
+  try {
+    var targetTab = $(e.target).attr('href');
+    if (targetTab && targetTab.startsWith('#')) {
+      localStorage.setItem(package_name + '_' + sub + '_active_tab', targetTab);
+    }
+  } catch (err) {}
+});
+
+$(document).on('click', '.navbar a', function (e) {
+  var href = $(this).attr('href') || '';
+  if (href.indexOf('/' + package_name + '/crawl') !== -1) {
+    var lastCrawl = localStorage.getItem('feeder_last_crawl_page');
+    if (lastCrawl && lastCrawl !== 'setting') {
+      e.preventDefault();
+      window.location.href = '/' + package_name + '/crawl/' + lastCrawl;
+    }
+  } else if (href.indexOf('/' + package_name + '/feed') !== -1) {
+    var lastFeed = localStorage.getItem('feeder_last_feed_page');
+    if (lastFeed && lastFeed !== 'setting') {
+      e.preventDefault();
+      window.location.href = '/' + package_name + '/feed/' + lastFeed;
+    }
+  } else if (href.indexOf('/' + package_name + '/download') !== -1) {
+    var lastDl = localStorage.getItem('feeder_last_download_page');
+    if (lastDl && lastDl !== 'setting') {
+      e.preventDefault();
+      window.location.href = '/' + package_name + '/download/' + lastDl;
+    }
+  }
+});
+
+// =============================================================================
+// Ace Editor 전체화면 버튼 공통 처리
+// =============================================================================
+$(document).on('click', '.modal-fullscreen-btn', function (e) {
+  e.preventDefault();
+  var modalDialog = $(this).closest('.modal-dialog');
+  modalDialog.toggleClass('modal-fullscreen');
+  var icon = $(this).find('i');
+  if (modalDialog.hasClass('modal-fullscreen')) {
+    icon.removeClass('fa-expand').addClass('fa-compress');
+  } else {
+    icon.removeClass('fa-compress').addClass('fa-expand');
+  }
+  setTimeout(function () {
+    for (var i = 0; i < feeder_ace_instances.length; i++) {
+      if (feeder_ace_instances[i]) feeder_ace_instances[i].resize();
+    }
+  }, 150);
+});
+
+// =============================================================================
+// 페이징 생성 및 검색 엔진 공통
+// =============================================================================
 function load_download_profiles() {
   $.ajax({
     url: '/' + package_name + '/ajax/download/load_profiles',
-    type: "POST",
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    dataType: 'json',
+    success: function (data) {
       cached_download_profiles = data.profiles || [];
     }
   });
@@ -27,7 +140,6 @@ function make_page_html(paging) {
 
   var has_prev = false;
   var prev_p = start_p - 1;
-
   if (start_p > 1) {
     has_prev = true;
     if (typeof paging.prev_page === 'object' && paging.prev_page !== null && paging.prev_page.page) {
@@ -39,7 +151,6 @@ function make_page_html(paging) {
 
   var has_next = false;
   var next_p = end_p + 1;
-
   if (end_p < total_page) {
     has_next = true;
     if (typeof paging.next_page === 'object' && paging.next_page !== null && paging.next_page.page) {
@@ -80,16 +191,15 @@ function render_pagination(paging) {
   make_page_html(paging);
 }
 
-window.globalRequestSearch = function(page, preserveScroll) {
+window.globalRequestSearch = function (page, preserveScroll) {
   var storage_pfx = sub + '_';
+  var page_val = (page !== undefined && page !== null && page !== '')
+    ? page.toString()
+    : (localStorage.getItem(storage_pfx + 'current_page') || '1');
 
-  var page_val = (page !== undefined && page !== null && page !== '') 
-      ? page.toString() 
-      : (localStorage.getItem(storage_pfx + 'current_page') || '1');
-
-  var search_word = ($("#search_word").val() || '').trim();
-  var page_size = $("#page_size").val() || '25';
-  var status_filter = $("#status_filter").val() || 'all';
+  var search_word = ($('#search_word').val() || '').trim();
+  var page_size = $('#page_size').val() || '25';
+  var status_filter = $('#status_filter').val() || 'all';
 
   localStorage.setItem(storage_pfx + 'current_page', page_val);
   localStorage.setItem(storage_pfx + 'search_word', search_word);
@@ -104,10 +214,10 @@ window.globalRequestSearch = function(page, preserveScroll) {
   };
 
   if (sub === 'crawl') {
-    var site_select = $("#site_select").val() || localStorage.getItem(storage_pfx + 'site_select') || 'all';
-    var board_select = $("#board_select").val() || localStorage.getItem(storage_pfx + 'board_select') || 'all';
-    var order = $("#order").val() || 'desc';
-    var search_select = $("#search_select").val() || 'title';
+    var site_select = $('#site_select').val() || localStorage.getItem(storage_pfx + 'site_select') || 'all';
+    var board_select = $('#board_select').val() || localStorage.getItem(storage_pfx + 'board_select') || 'all';
+    var order = $('#order').val() || 'desc';
+    var search_select = $('#search_select').val() || 'title';
 
     localStorage.setItem(storage_pfx + 'site_select', site_select);
     localStorage.setItem(storage_pfx + 'board_select', board_select);
@@ -119,7 +229,7 @@ window.globalRequestSearch = function(page, preserveScroll) {
     postData.order = order;
     postData.search_select = search_select;
   } else if (sub === 'feed') {
-    var feed_select = $("#feed_select").val() || localStorage.getItem(storage_pfx + 'feed_select') || '';
+    var feed_select = $('#feed_select').val() || localStorage.getItem(storage_pfx + 'feed_select') || '';
     if (feed_select) {
       localStorage.setItem(storage_pfx + 'feed_select', feed_select);
       postData.feed_select = feed_select;
@@ -127,7 +237,6 @@ window.globalRequestSearch = function(page, preserveScroll) {
   }
 
   var savedScrollTop = (preserveScroll === true) ? window.scrollY : 0;
-
   $('#page1').html('');
   $('#page2').html('');
 
@@ -155,55 +264,47 @@ window.globalRequestSearch = function(page, preserveScroll) {
     current_search_xhr = null;
   }
 
-  var request_url = '/' + package_name + '/ajax/' + sub + '/web_list';
-
   current_search_xhr = $.ajax({
-    url: request_url,
+    url: '/' + package_name + '/ajax/' + sub + '/web_list',
     type: 'POST',
     cache: false,
     data: postData,
     dataType: 'json',
-    success: function(ret) {
+    success: function (ret) {
       current_search_xhr = null;
       if (!ret) {
         notify('서버 응답이 없습니다.', 'warning');
         return;
       }
-
       current_data = ret;
-
       if (ret.info && typeof build_search_form === 'function') {
         build_search_form(ret.info);
       }
-
       var listData = ret.list || ret;
       if (typeof listData === 'string') {
-        try { listData = JSON.parse(listData); } catch(e) { listData = []; }
+        try { listData = JSON.parse(listData); } catch (e) { listData = []; }
       }
-
       try {
         if (typeof make_list === 'function') {
           make_list(listData);
         }
       } catch (renderErr) {
-        console.error("make_list 렌더링 에러:", renderErr);
+        console.error('make_list 렌더링 에러:', renderErr);
         if ($('#list_div').length > 0) {
           $('#list_div').html('<div class="alert alert-danger m-3">렌더링 오류: ' + renderErr.message + '</div>');
         }
         return;
       }
-
       if (ret.paging) {
         make_page_html(ret.paging);
       }
-
       if (preserveScroll && savedScrollTop > 0) {
-        setTimeout(function() {
+        setTimeout(function () {
           window.scrollTo({ top: savedScrollTop, behavior: 'instant' });
         }, 10);
       }
     },
-    error: function(request, status, error) {
+    error: function (request, status, error) {
       if (status === 'abort') return;
       current_search_xhr = null;
       if ($('#list_div').length > 0) {
@@ -215,7 +316,7 @@ window.globalRequestSearch = function(page, preserveScroll) {
   });
 };
 
-$(document).off('click', '.db-page-btn, #page, #gloablSearchPageBtn').on('click', '.db-page-btn, #page, #gloablSearchPageBtn', function(e){
+$(document).off('click', '.db-page-btn, #page, #gloablSearchPageBtn').on('click', '.db-page-btn, #page, #gloablSearchPageBtn', function (e) {
   e.preventDefault();
   e.stopPropagation();
   var targetPage = $(this).attr('data-page') || $(this).data('page') || $(this).text().trim();
@@ -224,36 +325,19 @@ $(document).off('click', '.db-page-btn, #page, #gloablSearchPageBtn').on('click'
   }
 });
 
-function clean_title_attr(title) {
-  if (!title) return '';
-  return title.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
-}
-
-function fallbackCopyText(text, target_name) {
-  var noticeText = target_name || '링크가';
-  var tempInput = $('<textarea>');
-  tempInput.css({position: 'fixed', left: '-9999px', top: '0'});
-  $('body').append(tempInput);
-  tempInput.val(text).select();
-  try {
-    document.execCommand('copy');
-    notify(noticeText + ' 복사되었습니다.', 'success');
-  } catch (err) {
-    notify('복사에 실패했습니다.', 'warning');
-  }
-  tempInput.remove();
-}
-
-$(document).on('click', '.copy_magnet_btn', function(e){
+// =============================================================================
+// 마그넷 복사, 토렌트 정보 및 다운로드 추가 모달 공통
+// =============================================================================
+$(document).on('click', '.copy_magnet_btn', function (e) {
   e.preventDefault();
   var magnet = $(this).data('hash');
   var is_ed2k = String(magnet).toLowerCase().startsWith('ed2k://');
   var target_name = is_ed2k ? 'ed2k 주소가' : '마그넷 주소가';
 
   if (navigator.clipboard && window.isSecureContext) {
-    navigator.clipboard.writeText(magnet).then(function() {
+    navigator.clipboard.writeText(magnet).then(function () {
       notify(target_name + ' 복사되었습니다.', 'success');
-    }).catch(function() {
+    }).catch(function () {
       fallbackCopyText(magnet, target_name);
     });
   } else {
@@ -261,17 +345,17 @@ $(document).on('click', '.copy_magnet_btn', function(e){
   }
 });
 
-$(document).on('click', '.global_torrent_info_btn', function(e){
+$(document).on('click', '.global_torrent_info_btn', function (e) {
   e.preventDefault();
   var magnet_hash = $(this).data('hash');
   notify('토렌트 정보 조회를 요청했습니다...', 'info');
 
   $.ajax({
     url: '/' + package_name + '/ajax/crawl/torrent_info',
-    type: "POST",
-    data: {hash: magnet_hash},
-    dataType: "json",
-    success: function(data) {
+    type: 'POST',
+    data: { hash: magnet_hash },
+    dataType: 'json',
+    success: function (data) {
       if (data) {
         $('#torrent_info_title').text(data.name || '토렌트 정보');
         var html_str = '<p><strong>해시:</strong> <code>' + data.info_hash + '</code></p>';
@@ -294,13 +378,13 @@ $(document).on('click', '.global_torrent_info_btn', function(e){
         notify('토렌트 정보를 획득하지 못했습니다.', 'warning');
       }
     },
-    error: function(xhr, status, error) {
+    error: function (xhr, status, error) {
       notify('정보 조회 실패: ' + error, 'danger');
     }
   });
 });
 
-$(document).on('click', '.direct_download_btn', function(e){
+$(document).on('click', '.direct_download_btn', function (e) {
   e.preventDefault();
   var mag = $(this).data('hash');
   var title = $(this).data('title');
@@ -324,9 +408,9 @@ $(document).on('click', '.direct_download_btn', function(e){
   $('#direct_download_modal').modal('show');
 });
 
-$(document).on('change', '#modal_direct_profile_select', function(){
+$(document).on('change', '#modal_direct_profile_select', function () {
   var pName = $(this).val();
-  var pObj = cached_download_profiles.find(function(p){ return p.name === pName; });
+  var pObj = cached_download_profiles.find(function (p) { return p.name === pName; });
   if (pObj) {
     var chainStr = (pObj.priority_chain || []).join(' -> ') || '(비어있음)';
     var dest = pObj.destination || {};
@@ -342,7 +426,7 @@ $(document).on('change', '#modal_direct_profile_select', function(){
   }
 });
 
-$(document).on('click', '#btn_confirm_direct_download', function(e){
+$(document).on('click', '#btn_confirm_direct_download', function (e) {
   e.preventDefault();
   var mag = $('#modal_direct_magnet').val();
   var title = $('#modal_direct_title').text();
@@ -352,15 +436,15 @@ $(document).on('click', '#btn_confirm_direct_download', function(e){
   notify('다운로드 큐 등록 요청 중...', 'info');
   $.ajax({
     url: '/' + package_name + '/ajax/download/direct_add',
-    type: "POST",
+    type: 'POST',
     data: {
       title: title,
       magnet: mag,
       profile_name: pName,
       feed_name: feed
     },
-    dataType: "json",
-    success: function(data) {
+    dataType: 'json',
+    success: function (data) {
       if (data.ret === 'success') {
         notify('다운로드 큐에 성공적으로 등록되었습니다.', 'success');
         $('#direct_download_modal').modal('hide');
@@ -370,38 +454,4 @@ $(document).on('click', '#btn_confirm_direct_download', function(e){
       }
     }
   });
-});
-
-function sync_feeder_header_navbar() {
-  try {
-    var lastCrawl = localStorage.getItem('feeder_last_crawl_page') || 'setting';
-    var lastFeed = localStorage.getItem('feeder_last_feed_page') || 'setting';
-    var lastDl = localStorage.getItem('feeder_last_download_page') || 'setting';
-    $('.navbar a[href*="/' + package_name + '/crawl"]').attr('href', '/' + package_name + '/crawl/' + lastCrawl);
-    $('.navbar a[href*="/' + package_name + '/feed"]').attr('href', '/' + package_name + '/feed/' + lastFeed);
-    $('.navbar a[href*="/' + package_name + '/download"]').attr('href', '/' + package_name + '/download/' + lastDl);
-  } catch(e) {}
-}
-
-$(document).on('click', '.navbar a', function(e){
-  var href = $(this).attr('href') || '';
-  if (href.indexOf('/' + package_name + '/crawl') !== -1) {
-    var lastCrawl = localStorage.getItem('feeder_last_crawl_page');
-    if (lastCrawl && lastCrawl !== 'setting') {
-      e.preventDefault();
-      window.location.href = '/' + package_name + '/crawl/' + lastCrawl;
-    }
-  } else if (href.indexOf('/' + package_name + '/feed') !== -1) {
-    var lastFeed = localStorage.getItem('feeder_last_feed_page');
-    if (lastFeed && lastFeed !== 'setting') {
-      e.preventDefault();
-      window.location.href = '/' + package_name + '/feed/' + lastFeed;
-    }
-  } else if (href.indexOf('/' + package_name + '/download') !== -1) {
-    var lastDl = localStorage.getItem('feeder_last_download_page');
-    if (lastDl && lastDl !== 'setting') {
-      e.preventDefault();
-      window.location.href = '/' + package_name + '/download/' + lastDl;
-    }
-  }
 });

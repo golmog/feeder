@@ -8,10 +8,8 @@ from lxml import html
 
 from .setup import *
 from .model_crawl import ModelCrawlSite, ModelCrawlItem
-from .util_crawl import (
-    CrawlConfigUtil, CrawlCustomManager, CrawlScraper, CrawlTorrentInfo,
-    extract_info_hash, extract_info_hash_from_torrent
-)
+from .util_base import FeederUtil
+from .util_crawl import CrawlUtil
 
 
 class TaskCrawlBase:
@@ -45,22 +43,7 @@ class TaskCrawl:
 
     @staticmethod
     def parse_board_info(board: str, subcat: str = None) -> tuple[str, str, str]:
-        board_str = str(board).strip() if board else ''
-        subcat_str = str(subcat).strip() if subcat else ''
-
-        if 'fid=' in board_str and 'typeid=' in board_str:
-            m_fid = re.search(r'fid=(?P<fid>\d+)', board_str)
-            m_type = re.search(r'typeid=(?P<typeid>\d+)', board_str)
-            if m_fid:
-                board_str = m_fid.group('fid')
-            if m_type:
-                subcat_str = m_type.group('typeid')
-        elif not subcat_str and ':' in board_str:
-            parts = board_str.split(':', 1)
-            board_str, subcat_str = parts[0].strip(), parts[1].strip()
-
-        full_key = f"{board_str}:{subcat_str}" if subcat_str else board_str
-        return board_str, subcat_str, full_key
+        return FeederUtil.parse_board_info(board, subcat)
 
     @staticmethod
     def build_board_url(site_info: dict, board: str, page: int, subcat: str = None) -> str:
@@ -104,7 +87,7 @@ class TaskCrawl:
                 target_desc = f"개별 수집기(ID: {target_crawler_id})" if target_crawler_id else "전체 수집기"
                 logger.info(f"[TaskCrawl] [{mode_label}] 크롤링 수집 작업 시작 ({target_desc}, 항상 최대 페이지 탐색: {'ON' if always_max_page else 'OFF'})")
 
-                crawlers = CrawlConfigUtil.get_crawlers()
+                crawlers = FeederUtil.get_crawlers()
                 if not crawlers:
                     logger.info("[TaskCrawl] 등록된 수집기(CRAWLERS)가 없습니다.")
                     return
@@ -168,7 +151,7 @@ class TaskCrawl:
 
                     for b_idx, b in enumerate(boards):
                         if b_idx > 0:
-                            CrawlScraper.rotate_proxy(scheduler_instance=target_cfg, reason="게시판 전환 부하 분산")
+                            CrawlUtil.rotate_proxy(scheduler_instance=target_cfg, reason="게시판 전환 부하 분산")
 
                         board_id = b.get('board')
                         subcat_id = str(b.get('subcat', '')).strip()
@@ -210,7 +193,7 @@ class TaskCrawl:
                             logger.error(f"[TaskCrawl] [{site_name}] {full_board_key} 수집 중 오류: {board_err}")
                             logger.error(traceback.format_exc())
                         finally:
-                            CrawlScraper.close_sessions()
+                            CrawlUtil.close_sessions()
                             crawl_delay = TaskCrawl.get_crawl_delay(site_entity.info, target_cfg=target_cfg)
                             if crawl_delay > 0:
                                 time.sleep(crawl_delay)
@@ -222,7 +205,7 @@ class TaskCrawl:
                 logger.error(traceback.format_exc())
             finally:
                 P.ModelSetting.set('crawl_is_running', 'False')
-                CrawlScraper.close_sessions()
+                CrawlUtil.close_sessions()
 
     @staticmethod
     def get_crawl_delay(site_info: dict = None, target_cfg=None) -> float:
@@ -298,14 +281,14 @@ class TaskCrawl:
             site_info['PROXY_URL'] = getattr(target_cfg, 'proxy_url', '')
 
         try:
-            hook = CrawlCustomManager.get_hook(site_name)
+            hook = CrawlUtil.get_hook(site_name)
             if hook:
                 logger.info(f"[{site_name}] 커스텀 사이트 훅 감지: {hook.__name__}")
                 if hasattr(hook, 'on_init_session'):
                     logger.info(f"[{site_name}] 커스텀 훅 세션 초기화(on_init_session) 실행")
                     hook.on_init_session(site_info, target_cfg)
 
-            if getattr(target_cfg, 'use_selenium', False) and CrawlScraper._selenium_driver is None:
+            if getattr(target_cfg, 'use_selenium', False) and CrawlUtil._selenium_driver is None:
                 logger.error(f"[TaskCrawl] [{site_name}] 세션 생성 실패로 게시판({full_board_key}) 수집을 시작할 수 없습니다.")
                 return None
 
@@ -317,7 +300,7 @@ class TaskCrawl:
                 logger.info(f"[TaskCrawl] [{cur_page}/{target_pages}p] 게시판 목록 URL 요청 시작: {board_url}")
 
                 list_wait_tag = site_info.get('SELENIUM_WAIT_TAG', 'body')
-                html_source = CrawlScraper.get_html(board_url, site_info=site_info, scheduler_instance=target_cfg, wait_tag=list_wait_tag)
+                html_source = CrawlUtil.get_html(board_url, site_info=site_info, scheduler_instance=target_cfg, wait_tag=list_wait_tag)
 
                 if not html_source:
                     logger.warning(f"[TaskCrawl] 게시판 HTML 수신 실패: {board_url}")
@@ -406,7 +389,7 @@ class TaskCrawl:
 
                     logger.info(f"[TaskCrawl] [{cur_page}p - {idx+1}/{total_targets}] 상세 수집: ID={item['id']} / {item['title'][:35]}...")
                     detail_wait_tag = site_info.get('SELENIUM_DETAIL_WAIT_TAG', 'body')
-                    detail_html = CrawlScraper.get_html(item['url'], site_info=site_info, scheduler_instance=target_cfg, referer=board_url, wait_tag=detail_wait_tag)
+                    detail_html = CrawlUtil.get_html(item['url'], site_info=site_info, scheduler_instance=target_cfg, referer=board_url, wait_tag=detail_wait_tag)
 
                     if detail_html:
                         detail_tree = html.fromstring(detail_html)
@@ -425,9 +408,9 @@ class TaskCrawl:
                                 f_name = d_item.get('filename', '').lower()
                                 if f_name.endswith('.torrent') and f_link:
                                     try:
-                                        t_io = CrawlScraper.download_file_stream(f_link, referer=item['url'], scheduler_instance=target_cfg)
+                                        t_io = CrawlUtil.download_file_stream(f_link, referer=item['url'], scheduler_instance=target_cfg)
                                         if t_io:
-                                            info_hash = extract_info_hash_from_torrent(t_io.getvalue())
+                                            info_hash = FeederUtil.extract_info_hash_from_torrent(t_io.getvalue())
                                             if info_hash:
                                                 extracted_mag = f"magnet:?xt=urn:btih:{info_hash}"
                                                 item['magnet'].append(extracted_mag)
@@ -436,7 +419,7 @@ class TaskCrawl:
                                     except Exception as ex:
                                         logger.debug(f"[TaskCrawl] [{site_name}] 첨부 토렌트 분석 실패 ({f_name}): {ex}")
 
-                        item['torrent_info'] = CrawlTorrentInfo.get_torrent_info(item['magnet'], target_cfg)
+                        item['torrent_info'] = CrawlUtil.get_torrent_info(item['magnet'], target_cfg)
                     else:
                         item['magnet'] = []
                         item['download'] = []
@@ -461,7 +444,7 @@ class TaskCrawl:
                 if stop_crawl:
                     break
         finally:
-            CrawlScraper.close_sessions()
+            CrawlUtil.close_sessions()
 
         return bbs_list
 
@@ -480,7 +463,7 @@ class TaskCrawl:
                     href = elem.attrib.get('href', '').strip()
                     if not href:
                         continue
-                    info_hash = extract_info_hash(href)
+                    info_hash = FeederUtil.extract_info_hash(href)
                     if info_hash:
                         if info_hash in seen_hashes:
                             continue
@@ -494,7 +477,7 @@ class TaskCrawl:
             if page_html:
                 text_magnets = re.findall(r'magnet:\?xt=urn:btih:[a-zA-Z0-9]+', page_html, re.IGNORECASE)
                 for raw_mag in text_magnets:
-                    info_hash = extract_info_hash(raw_mag)
+                    info_hash = FeederUtil.extract_info_hash(raw_mag)
                     if info_hash:
                         if info_hash in seen_hashes:
                             continue
@@ -507,7 +490,7 @@ class TaskCrawl:
 
                 text_ed2k = re.findall(r'ed2k://\|file\|[^|]+\|[0-9]+\|[a-fA-F0-9]{32}(?:\|[^|]*)?\|/', page_html, re.IGNORECASE)
                 for raw_ed2k in text_ed2k:
-                    ed2k_hash = extract_info_hash(raw_ed2k)
+                    ed2k_hash = FeederUtil.extract_info_hash(raw_ed2k)
                     if ed2k_hash:
                         if ed2k_hash in seen_hashes:
                             continue
@@ -526,7 +509,7 @@ class TaskCrawl:
             for m in re.findall(pattern, page_html):
                 extracted_str = m[0] if isinstance(m, tuple) else m
                 formatted = (template % extracted_str).lower() if '%s' in template else extracted_str.lower()
-                info_hash = extract_info_hash(formatted)
+                info_hash = FeederUtil.extract_info_hash(formatted)
                 if info_hash:
                     if info_hash in seen_hashes:
                         continue

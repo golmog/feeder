@@ -121,6 +121,7 @@ var sub = "{{ arg['sub'] }}";
 var apikey = "{{ arg['apikey'] }}";
 var enable_sse = ("{{ arg.get('download_enable_sse', 'True') }}" === 'True');
 </script>
-<script src="{{ url_for('.static', filename='feeder_download_queue.js') }}"></script>
+<script src="{{ url_for('.static', filename='feeder_base.js') }}"></script>
+<script src="{{ url_for('.static', filename='feeder_download.js') }}"></script>
 
 {% endblock %}

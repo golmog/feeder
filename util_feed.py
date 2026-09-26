@@ -4,265 +4,21 @@ import os
 import re
 import sys
 import time
-import math
-import yaml
 import json
-import base64
 from datetime import datetime, timedelta
 
+from xml.etree import ElementTree as ET
+import requests
+from sqlalchemy import and_, or_
+
 from .setup import *
-from .util_crawl import (
-    get_ddns, get_system_apikey, clean_xml_string,
-    extract_info_hash, split_magnets, get_paging_info,
-    get_tmp_dir
-)
-
-CONFIG_FILEPATH = os.path.join(path_data, 'db', 'feeder_settings.yaml')
+from .model_crawl import ModelCrawlItem
+from .model_feed import ModelFeedItem
+from .util_base import FeederUtil
 
 
-class FeedConfigUtil:
-
-    @classmethod
-    def get_filepath(cls) -> str:
-        return CONFIG_FILEPATH
-
-    @classmethod
-    def load_yaml(cls) -> dict:
-        if not os.path.exists(CONFIG_FILEPATH):
-            default_data = {
-                'GLOBAL': {},
-                'CRAWLERS': [],
-                'FEEDS': [],
-                'DOWNLOADERS': [],
-                'DOWNLOAD_PROFILES': [],
-                'GDRIVE_ACCOUNTS': []
-            }
-            cls.save_yaml(default_data)
-            return default_data
-
-        try:
-            with open(CONFIG_FILEPATH, 'r', encoding='utf-8') as f:
-                data = yaml.safe_load(f) or {}
-
-            if 'FEEDS' not in data or not isinstance(data['FEEDS'], list):
-                data['FEEDS'] = []
-            if 'GLOBAL' not in data or not isinstance(data['GLOBAL'], dict):
-                data['GLOBAL'] = {}
-            if 'CRAWLERS' not in data or not isinstance(data['CRAWLERS'], list):
-                data['CRAWLERS'] = []
-            if 'DOWNLOADERS' not in data or not isinstance(data['DOWNLOADERS'], list):
-                data['DOWNLOADERS'] = []
-            if 'DOWNLOAD_PROFILES' not in data or not isinstance(data['DOWNLOAD_PROFILES'], list):
-                data['DOWNLOAD_PROFILES'] = []
-            if 'GDRIVE_ACCOUNTS' not in data or not isinstance(data['GDRIVE_ACCOUNTS'], list):
-                data['GDRIVE_ACCOUNTS'] = []
-
-            from .task_crawl import TaskCrawl
-            for f in data['FEEDS']:
-                if 'sources' not in f or not isinstance(f['sources'], list):
-                    f['sources'] = []
-                for src in f['sources']:
-                    b_val = src.get('board', '')
-                    s_val = src.get('subcat', '')
-                    _, _, f_key = TaskCrawl.parse_board_info(b_val, s_val)
-                    src['full_board_key'] = f_key
-
-            return data
-        except Exception as e:
-            logger.error(f"[FeedConfig] YAML 로드 실패: {e}")
-            return {'GLOBAL': {}, 'CRAWLERS': [], 'FEEDS': [], 'DOWNLOADERS': [], 'DOWNLOAD_PROFILES': [], 'GDRIVE_ACCOUNTS': []}
-
-    @classmethod
-    def save_yaml(cls, data: dict) -> bool:
-        try:
-            os.makedirs(os.path.dirname(CONFIG_FILEPATH), exist_ok=True)
-            raw_yaml = yaml.dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)
-            formatted_yaml = re.sub(r'\n([A-Z0-9_]+:)', r'\n\n\1', raw_yaml).lstrip('\n')
-            with open(CONFIG_FILEPATH, 'w', encoding='utf-8') as f:
-                f.write(formatted_yaml)
-            return True
-        except Exception as e:
-            logger.error(f"[FeedConfig] YAML 저장 실패: {e}")
-            return False
-
-    @classmethod
-    def get_feeds(cls) -> list[dict]:
-        data = cls.load_yaml()
-        return data.get('FEEDS', [])
-
-    @classmethod
-    def get_feed(cls, feed_id):
-        for f in cls.get_feeds():
-            if str(f.get('id')) == str(feed_id):
-                return f
-        return None
-
-    @classmethod
-    def get_feed_by_name(cls, feed_name: str):
-        import unicodedata
-        target_name = unicodedata.normalize('NFC', str(feed_name).strip()).lower()
-        for f in cls.get_feeds():
-            current_name = unicodedata.normalize('NFC', str(f.get('name', '')).strip()).lower()
-            if current_name == target_name:
-                return f
-        return None
-
-    @classmethod
-    def save_feed(cls, item: dict) -> str:
-        data = cls.load_yaml()
-        feeds = data.get('FEEDS', [])
-        target_id = item.get('id')
-
-        from .task_crawl import TaskCrawl
-        sources = item.get('sources', [])
-        normalized_sources = []
-        for src in sources:
-            b_val = src.get('board', '')
-            s_val = src.get('subcat', '')
-            _, _, f_key = TaskCrawl.parse_board_info(b_val, s_val)
-            normalized_sources.append({
-                'site': src.get('site', ''),
-                'board': str(b_val),
-                'subcat': str(s_val) if s_val else '',
-                'full_board_key': f_key
-            })
-        item['sources'] = normalized_sources
-
-        if target_id is not None and int(target_id) > 0:
-            for idx, f in enumerate(feeds):
-                if str(f.get('id')) == str(target_id):
-                    feeds[idx].update(item)
-                    data['FEEDS'] = feeds
-                    cls.save_yaml(data)
-                    logger.info(f"[FeedConfig] 피드 수정 완료: ID={target_id}, Name={item.get('name')}")
-                    return 'success_update'
-            return 'not_found'
-
-        target_name = str(item.get('name', '')).strip().lower()
-        for f in feeds:
-            if str(f.get('name', '')).strip().lower() == target_name:
-                logger.warning(f"[FeedConfig] 동일 이름의 피드 중복: {item.get('name')}")
-                return 'already_exist'
-
-        max_id = max([int(f.get('id', 0)) for f in feeds], default=0)
-        item['id'] = max_id + 1
-        feeds.append(item)
-        data['FEEDS'] = feeds
-        cls.save_yaml(data)
-        logger.info(f"[FeedConfig] 신규 피드 추가 완료: ID={item['id']}, Name={item.get('name')}")
-        return 'success'
-
-    @classmethod
-    def delete_feed(cls, target_id) -> bool:
-        data = cls.load_yaml()
-        feeds = data.get('FEEDS', [])
-        data['FEEDS'] = [f for f in feeds if str(f.get('id')) != str(target_id)]
-        cls.save_yaml(data)
-        logger.info(f"[FeedConfig] 피드 삭제 완료: ID={target_id}")
-        return True
-
-    @classmethod
-    def get_global(cls) -> dict:
-        data = cls.load_yaml()
-        return data.get('GLOBAL', {})
-
-    # 다운로더 엔진 (DOWNLOADERS) 설정 관리
-    @classmethod
-    def get_downloaders(cls) -> list[dict]:
-        data = cls.load_yaml()
-        return data.get('DOWNLOADERS', [])
-
-    @classmethod
-    def get_downloader_by_name(cls, name: str) -> dict | None:
-        target = str(name).strip().lower()
-        for d in cls.get_downloaders():
-            if str(d.get('name', '')).strip().lower() == target:
-                return d
-        return None
-
-    @classmethod
-    def save_downloader(cls, item: dict) -> str:
-        data = cls.load_yaml()
-        items = data.get('DOWNLOADERS', [])
-        target_name = item.get('name', '').strip()
-        if not target_name:
-            return 'empty_name'
-
-        for idx, d in enumerate(items):
-            if str(d.get('name', '')).strip().lower() == target_name.lower():
-                items[idx].update(item)
-                data['DOWNLOADERS'] = items
-                cls.save_yaml(data)
-                logger.info(f"[FeedConfig] 다운로더 설정 갱신: {target_name}")
-                return 'success_update'
-
-        items.append(item)
-        data['DOWNLOADERS'] = items
-        cls.save_yaml(data)
-        logger.info(f"[FeedConfig] 신규 다운로더 추가: {target_name}")
-        return 'success'
-
-    @classmethod
-    def delete_downloader(cls, name: str) -> bool:
-        data = cls.load_yaml()
-        items = data.get('DOWNLOADERS', [])
-        target = str(name).strip().lower()
-        data['DOWNLOADERS'] = [d for d in items if str(d.get('name', '')).strip().lower() != target]
-        cls.save_yaml(data)
-        logger.info(f"[FeedConfig] 다운로더 삭제: {name}")
-        return True
-
-    # 다운로드 라우팅 프로필 (DOWNLOAD_PROFILES) 설정 관리
-    @classmethod
-    def get_download_profiles(cls) -> list[dict]:
-        data = cls.load_yaml()
-        return data.get('DOWNLOAD_PROFILES', [])
-
-    @classmethod
-    def get_download_profile_by_feed(cls, feed_name: str) -> dict | None:
-        target = str(feed_name).strip().lower()
-        for p in cls.get_download_profiles():
-            feeds = [str(f).strip().lower() for f in p.get('feeds', [])]
-            if target in feeds or '*' in feeds:
-                return p
-        return None
-
-    @classmethod
-    def save_download_profile(cls, item: dict) -> str:
-        data = cls.load_yaml()
-        profiles = data.get('DOWNLOAD_PROFILES', [])
-        name = item.get('name', '').strip()
-        if not name:
-            return 'empty_name'
-
-        for idx, p in enumerate(profiles):
-            if str(p.get('name', '')).strip().lower() == name.lower():
-                profiles[idx].update(item)
-                data['DOWNLOAD_PROFILES'] = profiles
-                cls.save_yaml(data)
-                logger.info(f"[FeedConfig] 다운로드 프로필 갱신: {name}")
-                return 'success_update'
-
-        profiles.append(item)
-        data['DOWNLOAD_PROFILES'] = profiles
-        cls.save_yaml(data)
-        logger.info(f"[FeedConfig] 신규 다운로드 프로필 추가: {name}")
-        return 'success'
-
-    # 구글 드라이브 계정 풀 (GDRIVE_ACCOUNTS) 설정 관리
-    @classmethod
-    def get_gdrive_accounts(cls) -> list[dict]:
-        data = cls.load_yaml()
-        return data.get('GDRIVE_ACCOUNTS', [])
-
-    @classmethod
-    def save_gdrive_accounts(cls, accounts: list[dict]) -> bool:
-        data = cls.load_yaml()
-        data['GDRIVE_ACCOUNTS'] = accounts
-        return cls.save_yaml(data)
-
-
-class FeedFilter:
+class FeedUtil:
+    """피드 필터링(Flexget 규격), 외부/내부 소스 동기화 및 공유 RSS XML 파일 생성 통합 관리자"""
 
     RESOLUTION_MAP = {
         '4320p': 4320, '8k': 4320,
@@ -273,8 +29,12 @@ class FeedFilter:
         '360p': 360,
     }
 
+    # --------------------------------------------------------------------------
+    # 화질 및 정규식 필터링 엔진
+    # --------------------------------------------------------------------------
     @classmethod
     def detect_resolution(cls, item: dict) -> int | None:
+        """게시글 제목 및 첨부 파일명 기반 해상도 숫자(p) 감지"""
         texts = [item.get('title', '')]
         if item.get('files'):
             for f in item['files']:
@@ -328,6 +88,7 @@ class FeedFilter:
 
     @classmethod
     def matches_quality(cls, item_res: int | None, requirement: str) -> bool:
+        """화질 조건식(1080p+, >=720p, 720p-1080p 등) 부합 여부 판정"""
         if item_res is None:
             return False
 
@@ -363,6 +124,7 @@ class FeedFilter:
 
     @classmethod
     def parse_rule(cls, rule_item) -> tuple[re.Pattern | None, list[str]]:
+        """정규식 필터 룰 파싱"""
         pattern = None
         raw_from = 'title'
 
@@ -388,11 +150,12 @@ class FeedFilter:
             compiled = re.compile(str(pattern), re.IGNORECASE)
             return compiled, fields
         except re.error as e:
-            logger.warning(f"[FeedFilter] 올바르지 않은 정규식 패턴 '{pattern}': {e}")
+            logger.warning(f"[FeedUtil] 올바르지 않은 정규식 패턴 '{pattern}': {e}")
             return None, []
 
     @classmethod
     def get_field_values(cls, item: dict, field_name: str) -> list[str]:
+        """필터 검사용 필드별 값 추출"""
         values = []
         target = field_name.lower()
 
@@ -444,8 +207,9 @@ class FeedFilter:
 
     @classmethod
     def evaluate(cls, item: dict, feed_cfg: dict = None, global_cfg: dict = None) -> tuple[bool, str]:
+        """아이템이 피드 및 전역 필터 조건을 통과하는지 평가"""
         feed_dict = feed_cfg if isinstance(feed_cfg, dict) else (vars(feed_cfg) if feed_cfg else {})
-        glob_dict = global_cfg if global_cfg is not None else FeedConfigUtil.get_global()
+        glob_dict = global_cfg if global_cfg is not None else FeederUtil.get_global()
 
         glob_regexp = glob_dict.get('regexp', {}) if isinstance(glob_dict, dict) else {}
         for r in (glob_regexp.get('reject') or []):
@@ -516,11 +280,162 @@ class FeedFilter:
 
         return True, "기본 허용 (미거부 항목)"
 
+    # --------------------------------------------------------------------------
+    # 소스 동기화 (크롤러 DB 및 외부 RSS)
+    # --------------------------------------------------------------------------
+    @classmethod
+    def fetch_remote_rss_items(cls, rss_url: str) -> list[dict]:
+        """외부 원격 RSS 피드 파싱"""
+        items = []
+        try:
+            res = requests.get(rss_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20, verify=False)
+            if res.status_code != 200 or not res.text:
+                logger.warning(f"[FeedUtil] 외부 RSS 응답 실패 ({res.status_code}): {rss_url}")
+                return items
 
-class FeedRssFileWriter:
+            root = ET.fromstring(res.text)
+            for item_elem in root.findall('.//item'):
+                title = (item_elem.findtext('title') or '').strip()
+                link = (item_elem.findtext('link') or '').strip()
+                guid = (item_elem.findtext('guid') or '').strip()
+
+                target_url = link or guid
+                magnets = []
+                if target_url.startswith(('magnet:', 'ed2k://')):
+                    magnets.append(target_url)
+
+                enclosure = item_elem.find('enclosure')
+                files = []
+                if enclosure is not None:
+                    enc_url = enclosure.attrib.get('url', '')
+                    if enc_url.startswith(('magnet:', 'ed2k://')):
+                        magnets.append(enc_url)
+                    elif enc_url:
+                        enc_name = target_url.split('/')[-1] if target_url else 'attachment'
+                        files.append([enc_url, enc_name, 'NONE'])
+
+                if title and (magnets or target_url or files):
+                    items.append({
+                        'title': title,
+                        'url': target_url,
+                        'magnet': magnets,
+                        'files': files,
+                        'torrent_info': None
+                    })
+        except Exception as e:
+            logger.error(f"[FeedUtil] 외부 RSS 파싱 에러 ({rss_url}): {e}")
+        return items
 
     @classmethod
+    def sync_feed(cls, feed: dict) -> int:
+        """개별 피드에 소속된 크롤러 및 외부 RSS 데이터 동기화"""
+        feed_name = feed.get('name')
+        if not feed_name:
+            return 0
+
+        global_cfg = FeederUtil.get_global()
+        sources = feed.get('sources', [])
+        added_count = 0
+
+
+        try:
+            # 내부 크롤러 게시판 소스 동기화
+            internal_conds = []
+            for src in sources:
+                s_type = src.get('type') or 'crawl'
+                if s_type == 'crawl':
+                    s_name = src.get('site')
+                    b_name = src.get('full_board_key') or src.get('board')
+                    if s_name and b_name:
+                        internal_conds.append(and_(ModelCrawlItem.site == s_name, ModelCrawlItem.board == b_name))
+
+            if internal_conds:
+                crawl_candidates = db.session.query(ModelCrawlItem).filter(or_(*internal_conds)).order_by(ModelCrawlItem.id.desc()).limit(300).all()
+                for bbs in crawl_candidates:
+                    b_dict = bbs.as_dict()
+                    if not b_dict.get('magnet') and not b_dict.get('files'):
+                        continue
+
+                    exists = db.session.query(ModelFeedItem.id).filter_by(feed_name=feed_name, url=bbs.url).first()
+                    if exists:
+                        continue
+
+                    is_pass, reason = cls.evaluate(b_dict, feed, global_cfg)
+                    if is_pass:
+                        new_feed_item = ModelFeedItem(
+                            feed_name=feed_name,
+                            source_type='crawl',
+                            source_name=f"{bbs.site}:{bbs.board}"
+                        )
+                        new_feed_item.title = bbs.title
+                        new_feed_item.url = bbs.url
+                        new_feed_item.magnet_count = bbs.magnet_count
+                        new_feed_item.file_count = bbs.file_count
+                        new_feed_item.magnet = bbs.magnet
+                        new_feed_item.files = bbs.files
+                        new_feed_item.torrent_info = bbs.torrent_info
+                        new_feed_item.broadcast_status = bbs.broadcast_status
+                        db.session.add(new_feed_item)
+                        added_count += 1
+                        logger.debug(f"[FeedUtil] [{feed_name}] 크롤러 아이템 적재: '{bbs.title[:35]}'")
+
+            # 외부 RSS 피드 소스 동기화
+            for src in sources:
+                s_type = src.get('type') or ('rss' if src.get('url') and not src.get('site') else 'crawl')
+                if s_type == 'rss' and src.get('url'):
+                    rss_url = src.get('url')
+                    remote_items = cls.fetch_remote_rss_items(rss_url)
+                    for r_item in remote_items:
+                        exists = db.session.query(ModelFeedItem.id).filter_by(feed_name=feed_name, url=r_item['url']).first()
+                        if exists:
+                            continue
+
+                        is_pass, reason = cls.evaluate(r_item, feed, global_cfg)
+                        if is_pass:
+                            new_feed_item = ModelFeedItem(
+                                feed_name=feed_name,
+                                source_type='rss',
+                                source_name=rss_url
+                            )
+                            new_feed_item.title = r_item['title']
+                            new_feed_item.url = r_item['url']
+                            new_feed_item.magnet_count = len(r_item.get('magnet', []))
+                            new_feed_item.file_count = len(r_item.get('files', []))
+                            new_feed_item.magnet = '\n'.join(r_item.get('magnet', []))
+                            if r_item.get('files'):
+                                new_feed_item.files = '||'.join(f"{x[0]}|{x[1]}|NONE" for x in r_item['files'])
+                            db.session.add(new_feed_item)
+                            added_count += 1
+                            logger.debug(f"[FeedUtil] [{feed_name}] 외부 RSS 아이템 적재: '{r_item['title'][:35]}'")
+
+            if added_count > 0:
+                db.session.commit()
+                logger.info(f"[FeedUtil] 피드 [{feed_name}] 동기화 완료: 신규 {added_count}건 DB 적재")
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"[FeedUtil] 피드 [{feed_name}] 동기화 중 오류: {e}")
+        finally:
+            try:
+                db.session.remove()
+            except Exception:
+                pass
+
+        return added_count
+
+    @classmethod
+    def sync_all_feeds(cls) -> int:
+        """모든 활성 피드 동기화 수행"""
+        total_added = 0
+        for f in FeederUtil.get_feeds():
+            total_added += cls.sync_feed(f)
+        return total_added
+
+    # --------------------------------------------------------------------------
+    # 공유용 RSS XML 파일 생성 및 보관주기(Retention) 관리
+    # --------------------------------------------------------------------------
+    @classmethod
     def save_rss_file(cls, feed_cfg: dict) -> bool:
+        """피드 전용 정적 RSS XML 파일 생성"""
         try:
             feed = feed_cfg if isinstance(feed_cfg, dict) else (vars(feed_cfg) if feed_cfg else {})
 
@@ -529,13 +444,20 @@ class FeedRssFileWriter:
             if not (global_make and feed_use):
                 return False
 
+            feed_name = feed.get('name')
+            if not feed_name:
+                return False
+
+            # 파일 저장 전 최신 DB 데이터 동기화 선행 실행
+            cls.sync_feed(feed)
+
             save_dir = feed.get('rss_file_path') or (P.ModelSetting.get('feed_rss_file_path') if P.ModelSetting else '')
             save_dir = save_dir.strip() if save_dir else ''
             if not save_dir:
-                logger.warning(f"[FeedRssFile] [{feed.get('name')}] RSS 파일 저장 경로 미설정")
+                logger.warning(f"[FeedUtil] [{feed_name}] RSS 파일 저장 경로 미설정")
                 return False
 
-            default_filename = f"{feed.get('name', 'feed')}.xml"
+            default_filename = f"{feed_name}.xml"
             filename = (feed.get('rss_file') or default_filename).strip()
             if not filename.lower().endswith('.xml'):
                 filename += '.xml'
@@ -550,78 +472,41 @@ class FeedRssFileWriter:
             except Exception:
                 items_val = 100
 
-            sources = feed.get('sources', [])
-            if not sources:
-                return False
-
-            from .model_crawl import ModelCrawlItem
-            from sqlalchemy import and_, or_
-            source_conditions = []
-            for src in sources:
-                s_name = src.get('site')
-                b_name = src.get('full_board_key') or src.get('board')
-                if s_name and b_name:
-                    source_conditions.append(and_(ModelCrawlItem.site == s_name, ModelCrawlItem.board == b_name))
-
-            if not source_conditions:
-                return False
-
-            query = db.session.query(ModelCrawlItem).filter(or_(*source_conditions))
+            query = db.session.query(ModelFeedItem).filter_by(feed_name=feed_name)
             if days_val > 0:
                 limit_date = datetime.now() - timedelta(days=days_val)
-                query = query.filter(ModelCrawlItem.created_time >= limit_date)
+                query = query.filter(ModelFeedItem.created_time >= limit_date)
 
-            query_limit = max(items_val * 4, 400)
-            candidates = query.order_by(ModelCrawlItem.id.desc()).limit(query_limit).all()
-
-            global_cfg = FeedConfigUtil.get_global()
-            seen_magnets = set()
-            filtered_records = []
-            for bbs in candidates:
-                bbs_dict = bbs.as_dict()
-
-                if not bbs_dict.get('magnet') and not bbs_dict.get('files'):
-                    continue
-
-                item_hashes = []
-                for m in bbs_dict.get('magnet', []):
-                    h = extract_info_hash(m) or m
-                    if h:
-                        item_hashes.append(h)
-
-                if item_hashes and any(h in seen_magnets for h in item_hashes):
-                    continue
-
-                is_pass, _ = FeedFilter.evaluate(bbs_dict, feed, global_cfg)
-                if is_pass:
-                    for h in item_hashes:
-                        seen_magnets.add(h)
-                    filtered_records.append(bbs)
-                    if len(filtered_records) >= items_val:
-                        break
+            feed_records = query.order_by(ModelFeedItem.id.desc()).limit(items_val).all()
 
             feed_mod = P.get_module('feed')
             if not feed_mod:
                 return False
 
-            feed_title = f"{feed.get('name', 'Feeder')} (Shared Feed)"
-            xml_content = feed_mod.generate_rss_feed(feed_title, filtered_records, include_apikey=False)
+            feed_title = f"{feed_name} (Shared Feed)"
+            xml_content = feed_mod.generate_rss_feed(feed_title, feed_records, include_apikey=False)
 
             os.makedirs(save_dir, exist_ok=True)
             target_filepath = os.path.join(save_dir, filename)
             with open(target_filepath, 'w', encoding='utf-8') as f:
                 f.write(xml_content)
 
-            logger.info(f"[FeedRssFile] 공유 RSS 파일 생성 완료: {target_filepath} ({len(filtered_records)}개 항목)")
+            logger.info(f"[FeedUtil] 공유 RSS 파일 생성 완료: {target_filepath} ({len(feed_records)}개 항목)")
             return True
         except Exception as e:
-            logger.error(f"[FeedRssFile] 피드 RSS 파일 생성 실패 ({feed_cfg.get('name')}): {e}")
+            logger.error(f"[FeedUtil] 피드 RSS 파일 생성 실패 ({feed_cfg.get('name')}): {e}")
             return False
+        finally:
+            try:
+                db.session.remove()
+            except Exception:
+                pass
 
     @classmethod
     def save_all_rss_files(cls) -> int:
+        """설정된 모든 피드의 RSS 파일 일괄 갱신"""
         count = 0
-        for f in FeedConfigUtil.get_feeds():
+        for f in FeederUtil.get_feeds():
             if str(f.get('use_rss_file', False)).lower() in ['true', 'on', '1']:
                 if cls.save_rss_file(f):
                     count += 1

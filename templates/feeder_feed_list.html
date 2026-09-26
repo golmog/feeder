@@ -6,14 +6,11 @@
 <form id="form_search" class="mb-3" style="text-align:left">
   <div class="d-flex justify-content-between align-items-center flex-wrap">
     <div class="form-inline mb-2">
-      <label class="mr-2 font-weight-bold">발행 피드:</label>
       <select id="feed_select" name="feed_select" class="form-control form-control-sm mr-2" style="min-width: 180px;">
+        <option value="all">전체 피드</option>
         {% for f in arg['feeds'] %}
         <option value="{{ f['name'] }}">{{ f['name'] }}</option>
         {% endfor %}
-        {% if not arg['feeds'] %}
-        <option value="">-- 등록된 피드 없음 --</option>
-        {% endif %}
       </select>
       <select id="status_filter" name="status_filter" class="form-control form-control-sm mr-2">
         <option value="all">전체 상태</option>
@@ -46,7 +43,7 @@
 {{ macros.m_hr_head_top() }}
 {{ macros.m_row_start('0') }}
 {{ macros.m_col(1, macros.m_strong('ID')) }}
-{{ macros.m_col(2, macros.m_strong('소스 게시판')) }}
+{{ macros.m_col(2, macros.m_strong('소속 피드')) }}
 {{ macros.m_col(9, macros.m_strong('콘텐츠 정보 / 다운로드')) }}
 {{ macros.m_row_end() }}
 {{ macros.m_hr_head_bottom() }}
@@ -100,7 +97,7 @@
 var package_name = "{{ arg['package_name'] }}";
 var sub = "{{ arg['sub'] }}";
 </script>
-<script src="{{ url_for('.static', filename='feeder_list_base.js') }}"></script>
-<script src="{{ url_for('.static', filename='feeder_feed_list.js') }}"></script>
+<script src="{{ url_for('.static', filename='feeder_base.js') }}"></script>
+<script src="{{ url_for('.static', filename='feeder_feed.js') }}"></script>
 
 {% endblock %}

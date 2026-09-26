@@ -3,6 +3,7 @@ from datetime import datetime
 from sqlalchemy import desc, or_
 
 from .setup import *
+from .util_base import FeederUtil
 
 PACKAGE_NAME = P.package_name
 
@@ -121,11 +122,10 @@ class ModelDownload(ModelBase):
             total_count = query.count()
             items = query.order_by(desc(cls.id)).limit(page_size).offset((page - 1) * page_size).all()
 
-            from .util_crawl import get_paging_info
             return {
                 'success': True,
                 'list': [it.as_dict() for it in items],
-                'paging': get_paging_info(total_count, page, page_size)
+                'paging': FeederUtil.get_paging_info(total_count, page, page_size)
             }
         except Exception as e:
             logger.error(f"[ModelDownload] web_list 쿼리 오류: {e}")
