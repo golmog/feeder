@@ -254,11 +254,12 @@ class RcloneSimpleTransporter(BaseTransporter):
         cmd = [
             "rclone", "copy", source_path, dest_full,
             "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE",
-            "--drive-chunk-size", chunk_size,
-            "--retries", "2"
+            "--drive-chunk-size", chunk_size
         ]
         if rclone_conf:
             cmd.extend(["--config", rclone_conf])
+
+        cmd.extend(FeederUtil.get_rclone_extra_options())
 
         logger.info(f"[RcloneTransporter] 업로드 시작: {folder_name} -> {dest_full}")
         try:

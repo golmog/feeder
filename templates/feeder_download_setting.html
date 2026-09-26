@@ -46,6 +46,7 @@
       {{ macros.setting_input_text('download_shared_drive_id', '기본 목적지 공유 드라이브 ID', value=arg['download_shared_drive_id'], placeholder='예: 0ABCDE12345678') }}
       {{ macros.setting_input_text('download_rclone_bind_ip', 'Rclone 바인드 IP', value=arg['download_rclone_bind_ip'], placeholder='예: 192.168.1.100 (특정 네트워크 인터페이스 고정 시 입력)') }}
       {{ macros.setting_input_text('download_rclone_chunk_size', 'Rclone 청크 사이즈', value=arg['download_rclone_chunk_size'], placeholder='256M', desc=['구글 드라이브 업로드 청크 크기 (기본값: 256M)']) }}
+      {{ macros.setting_input_text('download_rclone_extra_options', 'Rclone 추가 옵션', value=arg['download_rclone_extra_options'], placeholder='--timeout 30m', desc=['Rclone 실행 시 추가로 적용할 확장 옵션 문자열 (공백 구분, 기본값: --timeout 30m)']) }}
       {{ macros.m_hr() }}
       {{ macros.setting_input_text('download_mydrive_upload_threshold', '내 드라이브 바이패스 임계 용량', value=arg['download_mydrive_upload_threshold'], placeholder='14GB', desc=['이 용량 이하의 파일만 15GB MyDrive로 1차 업로드 후 공유 드라이브로 서버사이드 이동합니다. (기본값: 14GB)']) }}
       {{ macros.setting_input_text('download_gdrive_upload_limit', '개인 계정 일일 업로드 한도', value=arg['download_gdrive_upload_limit'], placeholder='700GB', desc=['개인 SA 계정당 24시간 안전 업로드 제한량 (기본값: 700GB)']) }}

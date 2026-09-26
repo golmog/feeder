@@ -69,7 +69,9 @@ class TaskDownload:
 
     @staticmethod
     def sync_feed_items(profiles: list[dict]):
-        global_cfg = FeederUtil.get_global()
+        """피드(FEEDS) 테이블에 적재된 최신 아이템을 다운로드 큐(ModelDownload)에 동기화"""
+        from .model_feed import ModelFeedItem
+
         all_feeds = FeederUtil.get_feeds()
         new_items_count = 0
 
@@ -87,73 +89,59 @@ class TaskDownload:
                 if '*' not in target_feed_names and f_name not in target_feed_names:
                     continue
 
-                sources = feed.get('sources', [])
-                if not sources:
-                    continue
+                sync_days = profile.get('sync_days')
+                if sync_days is None:
+                    sync_days = P.ModelSetting.get_int('download_feed_sync_days', 3)
+                else:
+                    sync_days = int(sync_days)
 
-                for src in sources:
-                    site_name = src.get('site')
-                    board_key = src.get('full_board_key') or src.get('board')
-                    if not site_name or not board_key:
+                query = db.session.query(ModelFeedItem).filter_by(feed_name=f_name)
+                if sync_days > 0:
+                    limit_date = datetime.now() - timedelta(days=sync_days)
+                    query = query.filter(ModelFeedItem.created_time >= limit_date)
+
+                candidates = query.order_by(ModelFeedItem.id.desc()).all()
+
+                for feed_item in candidates:
+                    feed_dict = feed_item.as_dict()
+                    magnets = feed_dict.get('magnet', [])
+                    if not magnets:
                         continue
 
-                    sync_days = profile.get('sync_days')
-                    if sync_days is None:
-                        sync_days = P.ModelSetting.get_int('download_feed_sync_days', 3)
-                    else:
-                        sync_days = int(sync_days)
+                    # 마그넷(BTIH) 우선 선별, 부재 시 ed2k 채택
+                    target_mag = None
+                    for m in magnets:
+                        if str(m).lower().startswith('magnet:'):
+                            target_mag = m
+                            break
+                    if not target_mag:
+                        target_mag = magnets[0]
 
-                    query = db.session.query(ModelCrawlItem).filter_by(site=site_name, board=board_key)
-                    if sync_days > 0:
-                        limit_date = datetime.now() - timedelta(days=sync_days)
-                        query = query.filter(ModelCrawlItem.created_time >= limit_date)
+                    infohash = FeederUtil.extract_info_hash(target_mag)
 
-                    candidates = query.order_by(ModelCrawlItem.id.desc()).all()
+                    existing = None
+                    if infohash:
+                        existing = ModelDownload.get_by_infohash(infohash)
+                    if not existing:
+                        existing = ModelDownload.get_by_magnet(target_mag)
+                    if existing:
+                        continue
 
-                    for bbs in candidates:
-                        bbs_dict = bbs.as_dict()
-                        magnets = bbs_dict.get('magnet', [])
-                        if not magnets:
-                            continue
+                    dl_item = ModelDownload(
+                        feed_name=f_name,
+                        title=feed_item.title,
+                        magnet=target_mag,
+                        infohash=infohash
+                    )
+                    dl_item.priority_chain = priority_chain
+                    dl_item.current_engine_index = 0
+                    dl_item.destination_type = dest_type
+                    dl_item.gdrive_upload_path = destination_cfg.get('upload_path', '')
+                    dl_item.gdrive_complete_path = destination_cfg.get('complete_path', '')
+                    dl_item.gdrive_remote_id = destination_cfg.get('shared_drive_id', '')
 
-                        # 마그넷(BTIH) 우선 선별, 없을 경우 ed2k 채택 (범용 다운로더 호환성 보장)
-                        target_mag = None
-                        for m in magnets:
-                            if str(m).lower().startswith('magnet:'):
-                                target_mag = m
-                                break
-                        if not target_mag:
-                            target_mag = magnets[0]
-
-                        infohash = FeederUtil.extract_info_hash(target_mag)
-
-                        existing = None
-                        if infohash:
-                            existing = ModelDownload.get_by_infohash(infohash)
-                        if not existing:
-                            existing = ModelDownload.get_by_magnet(target_mag)
-                        if existing:
-                            continue
-
-                        is_pass, _ = FeedUtil.evaluate(bbs_dict, feed, global_cfg)
-                        if not is_pass:
-                            continue
-
-                        dl_item = ModelDownload(
-                            feed_name=f_name,
-                            title=bbs.title,
-                            magnet=target_mag,
-                            infohash=infohash
-                        )
-                        dl_item.priority_chain = priority_chain
-                        dl_item.current_engine_index = 0
-                        dl_item.destination_type = dest_type
-                        dl_item.gdrive_upload_path = destination_cfg.get('upload_path', '')
-                        dl_item.gdrive_complete_path = destination_cfg.get('complete_path', '')
-                        dl_item.gdrive_remote_id = destination_cfg.get('shared_drive_id', '')
-
-                        db.session.add(dl_item)
-                        new_items_count += 1
+                    db.session.add(dl_item)
+                    new_items_count += 1
 
         if new_items_count > 0:
             db.session.commit()
@@ -292,16 +280,13 @@ class TaskDownload:
                     dest_cfg = profile.get('destination', {})
                     dest_type = it.destination_type or dest_cfg.get('type', 'local')
 
-                    if dest_type == 'colab_gdrive':
-                        transporter = DownloadUtil.get_transporter('colab_gdrive')
-                        if transporter:
-                            transporter.transport(it, source_path, dest_cfg)
-                        else:
-                            it.status = 'pending_colab'
-                        logger.info(f"[DownloadPoll] [{engine_name}] 완료 확인 -> Colab 릴레이 대기열 인계: {it.title}")
-                    elif source_path.startswith(('ad:', 'http://', 'https://')):
+                    transporter = DownloadUtil.get_transporter(dest_type)
+                    if transporter and getattr(transporter, 'IS_RELAY_HANDLER', False):
+                        transporter.transport(it, source_path, dest_cfg)
+                        logger.info(f"[DownloadPoll] [{engine_name}] 완료 확인 -> 원격 릴레이 대기열({it.status}) 인계: {it.title}")
+                    elif not os.path.exists(source_path) and (':' in source_path or source_path.startswith(('http://', 'https://'))):
                         it.status = 'pending_local_staging'
-                        logger.info(f"[DownloadPoll] [{engine_name}] 완료 확인 -> 로컬 스테이징 대기열 인계: {it.title}")
+                        logger.info(f"[DownloadPoll] [{engine_name}] 원격 완료 확인 -> 로컬 스테이징 대기열 인계: {it.title}")
                     else:
                         it.status = 'downloaded'
                         logger.info(f"[DownloadPoll] [{engine_name}] 다운로드 완료 확인 (이송 대기): {it.title}")
@@ -375,19 +360,22 @@ class TaskDownload:
                 shutil.rmtree(item_staging_dir, ignore_errors=True)
             os.makedirs(item_staging_dir, exist_ok=True)
 
-            dest_download_path = os.path.join(item_staging_dir, raw_name) if is_single_file else item_staging_dir
+            is_remote_cloud = not os.path.exists(src_path) and (':' in src_path or src_path.startswith(('http://', 'https://')))
+            rclone_cmd_type = "copy" if is_remote_cloud else ("copyto" if is_single_file else "copy")
+            dest_download_path = item_staging_dir if (is_remote_cloud or not is_single_file) else os.path.join(item_staging_dir, raw_name)
 
-            logger.info(f"[LocalStaging] 로컬 스테이징 다운로드 시작: {target_folder_name}")
+            logger.info(f"[LocalStaging] 로컬 스테이징 다운로드 시작: {target_folder_name} (명령: {rclone_cmd_type})")
 
-            rclone_cmd_type = "copyto" if is_single_file else "copy"
             rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or FeederUtil.load_yaml().get('rclone', {}).get('conf_path', '')
             cmd = [
                 "rclone", rclone_cmd_type, src_path, dest_download_path,
-                "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE",
-                "--retries", "1", "--timeout", "15m"
+                "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE"
             ]
             if rclone_conf:
                 cmd.extend(["--config", rclone_conf])
+
+            # 유저 설정 Rclone 확장 옵션 결합
+            cmd.extend(FeederUtil.get_rclone_extra_options())
 
             success = False
             try:

@@ -369,13 +369,16 @@ class UploadUtil:
         logger.info(f"[UploadUtil] 업로드 시작: {folder_name} [{cls.format_bytes(fsize)}] -> {mode} ({acc_name}, 리모트: {effective_remote})")
         manager.add_usage(usage_key, fsize)
 
+        chunk_size = P.ModelSetting.get('download_rclone_chunk_size') or '256M'
         cmd = [
             "rclone", "copy", local_path, dest_incoming,
             "--config", rclone_conf,
             "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE",
-            "--drive-chunk-size", "256M",
-            "--retries", "1", "--timeout", "30m", "--contimeout", "30s"
+            "--drive-chunk-size", chunk_size
         ] + impersonate_arg
+
+        # 유저 설정 Rclone 확장 옵션 결합
+        cmd.extend(FeederUtil.get_rclone_extra_options())
 
         success, out = cls.run_rclone(cmd, f"업로드 {folder_name}")
 

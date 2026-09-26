@@ -415,7 +415,7 @@ $(document).on('change', '#modal_direct_profile_select', function () {
     var chainStr = (pObj.priority_chain || []).join(' -> ') || '(비어있음)';
     var dest = pObj.destination || {};
     var destStr = dest.type || 'local';
-    if (dest.type === 'colab_gdrive') destStr += ' (Colab 무트래픽)';
+    if (dest.type === 'relay_worker' || dest.type === 'remote_relay') destStr += ' (원격 릴레이 워커)';
     else if (dest.type === 'gdrive_rotation') destStr += ' (SA 15GB 우회)';
 
     $('#modal_direct_chain_preview').text(chainStr);

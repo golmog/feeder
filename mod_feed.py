@@ -130,16 +130,7 @@ class ModuleFeed(PluginModuleBase):
                 return jsonify(False)
 
         elif command == 'load_feeds':
-            feeds = FeederUtil.get_feeds()
-            ddns = FeederUtil.get_ddns().rstrip('/')
-            apikey = FeederUtil.get_system_apikey()
-            feed_list = []
-            for f in feeds:
-                info = dict(f)
-                info['api'] = f"{ddns}/{P.package_name}/api/feed/rss?name={f.get('name')}&apikey={apikey}"
-                info['use_rss_file'] = str(f.get('use_rss_file', False)).lower() in ['true', 'on', '1']
-                feed_list.append(info)
-            return jsonify({'feeds': feed_list})
+            return jsonify({'feeds': self.get_feed_list()})
 
         elif command == 'add_feed':
             feed_id = req.form.get('modal_feed_id', '-1').strip()
@@ -208,16 +199,14 @@ class ModuleFeed(PluginModuleBase):
                     regexp_data['reject_excluding'] = rex
                 if regexp_data:
                     item_data['regexp'] = regexp_data
-            else:
-                item_data['accept_all'] = False
 
             ret = FeederUtil.save_feed(item_data)
-            return jsonify({'ret': ret, 'feeds': FeederUtil.get_feeds()})
+            return jsonify({'ret': ret, 'feeds': self.get_feed_list()})
 
         elif command == 'remove_feed':
             target_id = req.form.get('target_id')
             ret = 'success' if FeederUtil.delete_feed(target_id) else 'fail'
-            return jsonify({'ret': ret, 'feeds': FeederUtil.get_feeds()})
+            return jsonify({'ret': ret, 'feeds': self.get_feed_list()})
 
         elif command == 'generate_feed_file':
             target_id = req.form.get('target_id')
@@ -241,6 +230,19 @@ class ModuleFeed(PluginModuleBase):
                 caller_name=self.name
             )
             return jsonify(res)
+
+    def get_feed_list(self) -> list[dict]:
+        """웹 UI 렌더링에 필요한 API URL 등이 포함된 피드 목록 반환"""
+        feeds = FeederUtil.get_feeds()
+        ddns = FeederUtil.get_ddns().rstrip('/')
+        apikey = FeederUtil.get_system_apikey()
+        feed_list = []
+        for f in feeds:
+            info = dict(f)
+            info['api'] = f"{ddns}/{P.package_name}/api/feed/rss?name={f.get('name')}&apikey={apikey}"
+            info['use_rss_file'] = str(f.get('use_rss_file', False)).lower() in ['true', 'on', '1']
+            feed_list.append(info)
+        return feed_list
 
     def process_api(self, sub, req):
         try:

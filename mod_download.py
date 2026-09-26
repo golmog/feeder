@@ -45,6 +45,7 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_gdrive_upload_limit": "700GB",
             f"{self.name}_shared_drive_upload_limit": "3TB",
             f"{self.name}_shared_drive_quota_reset_time": "16:00",
+            f"{self.name}_rclone_extra_options": "--timeout 30m",
         }
 
     def process_menu(self, page_name, req):
@@ -429,10 +430,10 @@ class ModuleDownload(PluginModuleBase):
                     stream_with_context(self.generate_sse_stream()),
                     mimetype='text/event-stream'
                 )
-            elif sub == 'colab_claim':
-                return self._handle_colab_claim(req)
-            elif sub == 'colab_report':
-                return self._handle_colab_report(req)
+            elif sub == 'relay_claim':
+                return self._handle_relay_claim(req)
+            elif sub == 'relay_report':
+                return self._handle_relay_report(req)
             return jsonify({'ret': 'fail', 'msg': f'알 수 없는 API 명령: {sub}'}), 404
         except Exception as e:
             logger.error(f"[{self.name}] process_api 에러 ({sub}): {e}")
@@ -444,20 +445,21 @@ class ModuleDownload(PluginModuleBase):
             client_key = (req.get_json(silent=True) or {}).get('apikey')
         return bool(client_key and client_key == FeederUtil.get_system_apikey())
 
-    def _handle_colab_claim(self, req):
+    def _handle_relay_claim(self, req):
+        """원격 릴레이 워커(VPS, 외부 서버 등)의 대기 작업 선점 API"""
         if not self._verify_api_auth(req):
             return jsonify({'ret': 'fail', 'msg': 'API 인증 실패'}), 401
 
         item = (
             db.session.query(ModelDownload)
-            .filter_by(status='pending_colab')
+            .filter_by(status='pending_relay')
             .order_by(ModelDownload.id.asc())
             .first()
         )
         if not item:
-            return jsonify({'ret': 'success', 'has_task': False, 'msg': '대기 중인 Colab 전송 작업이 없습니다.'})
+            return jsonify({'ret': 'success', 'has_task': False, 'msg': '대기 중인 원격 릴레이 전송 작업이 없습니다.'})
 
-        item.status = 'colab_transferring'
+        item.status = 'relay_transferring'
         db.session.commit()
 
         rclone_conf_path = P.ModelSetting.get('download_rclone_conf_path') or FeederUtil.load_yaml().get('rclone', {}).get('conf_path', '')
@@ -493,10 +495,10 @@ class ModuleDownload(PluginModuleBase):
 
                     if found_content:
                         sa_files[sa_fname] = found_content
-                        colab_sa_path = f"/root/.config/rclone/sa/{sa_fname}"
+                        remote_sa_path = f"/root/.config/rclone/sa/{sa_fname}"
                         rclone_conf_text = re.sub(
                             rf'service_account_file\s*=\s*{re.escape(raw_sa_path)}',
-                            f'service_account_file = {colab_sa_path}',
+                            f'service_account_file = {remote_sa_path}',
                             rclone_conf_text
                         )
             except Exception as e:
@@ -514,7 +516,10 @@ class ModuleDownload(PluginModuleBase):
         else:
             dest_full_path = f"{remote_name}:{complete_path}/{folder_name}"
 
-        src_full_path = item.local_path or f"ad:magnets/{folder_name}"
+        downloader_cfg = FeederUtil.get_downloader_by_name(item.current_engine_name) or {}
+        engine_remote = downloader_cfg.get('remote_name', 'ad')
+        engine_base = downloader_cfg.get('rclone_base_path', 'magnets')
+        src_full_path = item.local_path or f"{engine_remote}:{engine_base}/{folder_name}"
         buffer_limit_gb = dest_cfg.get('buffer_limit_gb', 50)
 
         task_data = {
@@ -527,7 +532,7 @@ class ModuleDownload(PluginModuleBase):
             'buffer_limit_bytes': int(buffer_limit_gb) * 1024 * 1024 * 1024
         }
 
-        logger.info(f"[{self.name}] [Colab API] 작업 선점 완료: {item.title} (ID: {item.id})")
+        logger.info(f"[{self.name}] [Relay API] 원격 릴레이 작업 선점 완료: {item.title} (ID: {item.id})")
         return jsonify({
             'ret': 'success',
             'has_task': True,
@@ -536,7 +541,8 @@ class ModuleDownload(PluginModuleBase):
             'sa_files': sa_files
         })
 
-    def _handle_colab_report(self, req):
+    def _handle_relay_report(self, req):
+        """원격 릴레이 워커의 작업 완료/실패 결과 수신 API"""
         if not self._verify_api_auth(req):
             return jsonify({'ret': 'fail', 'msg': 'API 인증 실패'}), 401
 
@@ -566,11 +572,11 @@ class ModuleDownload(PluginModuleBase):
                 except Exception as ex:
                     logger.debug(f"[{self.name}] 원본 마그넷 삭제 실패 (무시): {ex}")
 
-            logger.info(f"[{self.name}] [Colab API] 전송 최종 완료 확정: {item.title} (ID: {item.id})")
+            logger.info(f"[{self.name}] [Relay API] 원격 릴레이 전송 완료 확정: {item.title} (ID: {item.id})")
         else:
             item.status = 'failed'
-            item.error_message = f"Colab 전송 실패: {error_msg}"
-            logger.warning(f"[{self.name}] [Colab API] 전송 실패 보고: {item.title} ({error_msg})")
+            item.error_message = f"릴레이 전송 실패: {error_msg}"
+            logger.warning(f"[{self.name}] [Relay API] 원격 릴레이 전송 실패 보고: {item.title} ({error_msg})")
 
         db.session.commit()
         return jsonify({'ret': 'success'})
@@ -580,10 +586,10 @@ class ModuleDownload(PluginModuleBase):
             try:
                 with F.app.app_context():
                     counts = {
-                        'pending': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending', 'pending_colab'])).count(),
+                        'pending': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending', 'pending_relay'])).count(),
                         'downloading': db.session.query(ModelDownload).filter_by(status='downloading').count(),
                         'staging': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_local_staging', 'local_staging'])).count(),
-                        'uploading': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_upload', 'uploading', 'colab_transferring'])).count(),
+                        'uploading': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_upload', 'uploading', 'relay_transferring'])).count(),
                         'completed': db.session.query(ModelDownload).filter_by(status='completed').count(),
                         'failed': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['failed', 'move_failed'])).count(),
                     }

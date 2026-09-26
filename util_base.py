@@ -269,6 +269,19 @@ class FeederUtil:
             logger.error(f"[FeederUtil] DB VACUUM 실행 오류: {e}")
 
     @classmethod
+    def get_rclone_extra_options(cls) -> list[str]:
+        """설정된 Rclone 확장 옵션 문자열을 안전하게 분리하여 리스트로 반환"""
+        import shlex
+        raw_opt = P.ModelSetting.get('download_rclone_extra_options') if P.ModelSetting else ''
+        if not raw_opt:
+            raw_opt = '--timeout 30m'
+        try:
+            return shlex.split(raw_opt.strip())
+        except Exception as ex:
+            logger.debug(f"[FeederUtil] Rclone 옵션 shlex 파싱 예외 (단순 분리 사용): {ex}")
+            return [x.strip() for x in raw_opt.split() if x.strip()]
+
+    @classmethod
     def apply_download_status_filter(cls, query, magnet_column, status_filter: str):
         """마그넷 컬럼과 ModelDownload 상태 간의 서브쿼리 필터 공통 적용"""
         if status_filter not in ['download_completed', 'download_active', 'not_downloaded']:
