@@ -72,9 +72,9 @@
   <div id='page2'></div>
 </div>
 
-<!-- 모달: 리스트에서 직접 다운로드 큐 등록 -->
+<!-- 모달: 리스트에서 직접 다운로드 큐 등록 (프리셋 & 커스텀 옵션) -->
 <div class="modal fade" id="direct_download_modal" tabindex="-1" role="dialog" aria-hidden="true">
-  <div class="modal-dialog modal-md">
+  <div class="modal-dialog modal-lg">
     <div class="modal-content">
       <div class="modal-header d-flex align-items-center justify-content-between">
         <h5 class="modal-title font-weight-bold">
@@ -84,26 +84,63 @@
       </div>
       <div class="modal-body">
         <input type="hidden" id="modal_direct_feed_name" value="">
+
+        <!-- 대상 콘텐츠 정보 -->
         <div class="form-group mb-2">
           <label class="small text-muted font-weight-bold mb-1">콘텐츠 제목</label>
           <div id="modal_direct_title" class="p-2 border rounded font-weight-bold small text-light" style="background: rgba(255, 255, 255, 0.05); word-break: break-all;"></div>
         </div>
 
-        <div class="form-group mb-2">
+        <div class="form-group mb-3">
           <label class="small text-muted font-weight-bold mb-1">대상 링크 (마그넷 / ed2k)</label>
           <input type="text" id="modal_direct_magnet" class="form-control form-control-sm font-weight-bold" readonly>
         </div>
 
-        <div class="form-group mb-3">
-          <label class="small font-weight-bold mb-1">적용할 다운로드 프로필</label>
-          <select id="modal_direct_profile_select" class="form-control form-control-sm"></select>
-          <small class="form-text text-muted">선택한 프로필의 우선순위 체인과 목적지 설정이 적용됩니다.</small>
+        <!-- 다운로드 프로필 프리셋 -->
+        <div class="form-group row mb-3 p-2 rounded" style="background: rgba(23, 162, 184, 0.08); border: 1px solid rgba(23, 162, 184, 0.2);">
+          <label class="col-sm-3 col-form-label font-weight-bold text-info"><i class="fa fa-bookmark mr-1"></i>설정 프리셋</label>
+          <div class="col-sm-9">
+            <select id="modal_direct_preset_select" class="form-control form-control-sm font-weight-bold"></select>
+            <small class="form-text text-muted">프로필을 선택하면 아래의 엔진 체인과 목적지 설정이 자동으로 채워집니다. 불러온 후 원하는 대로 수정 가능합니다.</small>
+          </div>
         </div>
 
-        <div class="card border-0 p-2 small mb-1" style="background: rgba(255, 255, 255, 0.05); border: 1px solid rgba(255, 255, 255, 0.1);">
-          <div class="mb-1 text-light"><strong>우선순위 체인:</strong> <span id="modal_direct_chain_preview" class="text-warning font-weight-bold ml-1">-</span></div>
-          <div class="text-light"><strong>목적지 유형:</strong> <span id="modal_direct_dest_preview" class="text-info font-weight-bold ml-1">-</span></div>
+        <!-- 우선순위 체인 편집기 -->
+        <div class="form-group row mb-2">
+          <label class="col-sm-3 col-form-label text-right font-weight-bold">우선순위 체인</label>
+          <div class="col-sm-9">
+            <div class="input-group input-group-sm mb-2">
+              <select id="modal_direct_engine_select" class="form-control mr-1"></select>
+              <div class="input-group-append">
+                <button type="button" id="btn_add_direct_chain_engine" class="btn btn-primary text-white px-3">엔진 추가</button>
+              </div>
+            </div>
+            <div class="table-responsive rounded border" style="max-height: 140px; overflow-y: auto;">
+              <table class="table table-sm table-hover mb-0 text-center">
+                <thead class="thead-light">
+                  <tr>
+                    <th style="width: 20%;">우선순위</th>
+                    <th style="width: 50%;">다운로더 식별명</th>
+                    <th style="width: 30%;">순서 조정 / 제외</th>
+                  </tr>
+                </thead>
+                <tbody id="modal_direct_chain_tbody">
+                  <tr><td colspan="3" class="text-muted py-2">등록된 다운로더 엔진이 없습니다.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </div>
+
+        <!-- 목적지 유형 선택 및 동적 세부 폼 -->
+        <div class="form-group row mb-2">
+          <label class="col-sm-3 col-form-label text-right font-weight-bold">목적지 유형</label>
+          <div class="col-sm-9">
+            <select id="modal_direct_dest_type" class="form-control form-control-sm font-weight-bold"></select>
+          </div>
+        </div>
+
+        <div id="modal_direct_dynamic_dest_fields" class="mt-2"></div>
       </div>
       <div class="modal-footer">
         <button type="button" id="btn_confirm_direct_download" class="btn btn-sm btn-primary font-weight-bold">
