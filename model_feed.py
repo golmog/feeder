@@ -26,13 +26,14 @@ class ModelFeedItem(ModelBase):
     source_name = db.Column(db.String, index=True)
 
     title = db.Column(db.String, index=True)
-    url = db.Column(db.String)
+    url = db.Column(db.String, index=True)
     magnet_count = db.Column(db.Integer, default=0)
     file_count = db.Column(db.Integer, default=0)
+    infohash = db.Column(db.String(40), index=True, nullable=True)
     magnet = db.Column(db.String, index=True)
     files = db.Column(db.String)
     torrent_info = db.Column(db.JSON, nullable=True)
-    broadcast_status = db.Column(db.String, default='')
+    broadcast_status = db.Column(db.String, default='', index=True)
 
     def __init__(self, feed_name, source_type='crawl', source_name=''):
         self.created_time = datetime.now()
@@ -74,7 +75,7 @@ class ModelFeedItem(ModelBase):
             elif status_filter == 'has_files':
                 query = query.filter(cls.files.isnot(None), cls.files != '')
             elif status_filter in ['download_completed', 'download_active', 'not_downloaded']:
-                query = FeederUtil.apply_download_status_filter(query, cls.magnet, status_filter)
+                query = FeederUtil.apply_download_status_filter(cls, query, status_filter)
 
         if search:
             query = query.filter(or_(

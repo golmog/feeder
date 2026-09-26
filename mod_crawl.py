@@ -61,6 +61,7 @@ class ModuleCrawl(PluginModuleBase):
             P.ModelSetting.set(f"{self.name}_is_running", "False")
             P.ModelSetting.set(f"{self.name}_test_running", "False")
             P.ModelSetting.set(f"{self.name}_running_start_time", "0")
+            FeederUtil.migrate_db()
             # logger.info(f"[{self.name}] 플러그인 로드: 수집 런타임 락 플래그 초기화 완료")
         except Exception as e:
             logger.debug(f"[{self.name}] plugin_load 초기화 예외: {e}")

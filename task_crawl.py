@@ -573,6 +573,9 @@ class TaskCrawl:
             bbs.torrent_info = item.get('torrent_info')
             bbs.broadcast_status = item.get('broadcast_status', '')
 
+            primary_mag = item['magnet'][0] if item.get('magnet') else ''
+            bbs.infohash = FeederUtil.extract_info_hash(primary_mag) if primary_mag else None
+
             if bbs.file_count > 0:
                 bbs.files = '||'.join(f"{x['link']}|{x['filename']}|NONE" for x in item['download'])
             else:

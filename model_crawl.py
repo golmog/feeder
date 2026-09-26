@@ -91,7 +91,7 @@ class ModelCrawlItem(ModelBase):
     __bind_key__ = PACKAGE_NAME
 
     id = db.Column(db.Integer, primary_key=True)
-    created_time = db.Column(db.DateTime, default=datetime.now)
+    created_time = db.Column(db.DateTime, default=datetime.now, index=True)
     site = db.Column(db.String, index=True)
     board = db.Column(db.String, index=True)
     post_id = db.Column(db.Integer, index=True, nullable=True)
@@ -100,10 +100,11 @@ class ModelCrawlItem(ModelBase):
     url = db.Column(db.String)
     magnet_count = db.Column(db.Integer, default=0)
     file_count = db.Column(db.Integer, default=0)
+    infohash = db.Column(db.String(40), index=True, nullable=True)
     magnet = db.Column(db.String, index=True)
     files = db.Column(db.String)
     torrent_info = db.Column(db.JSON, nullable=True)
-    broadcast_status = db.Column(db.String, default='')
+    broadcast_status = db.Column(db.String, default='', index=True)
 
     def __init__(self, site_name, board_name):
         self.created_time = datetime.now()
@@ -156,7 +157,7 @@ class ModelCrawlItem(ModelBase):
             for mag in magnet_list:
                 info_hash = FeederUtil.extract_info_hash(mag)
                 if info_hash:
-                    exist = db.session.query(cls.id).filter(cls.magnet.like(f"%{info_hash}%")).first()
+                    exist = db.session.query(cls.id).filter(cls.infohash == info_hash.lower()).first()
                     if exist:
                         return True
                 else:
@@ -190,7 +191,7 @@ class ModelCrawlItem(ModelBase):
                 elif status_filter == 'has_files':
                     query = query.filter(cls.files.isnot(None), cls.files != '')
                 elif status_filter in ['download_completed', 'download_active', 'not_downloaded']:
-                    query = FeederUtil.apply_download_status_filter(query, cls.magnet, status_filter)
+                    query = FeederUtil.apply_download_status_filter(cls, query, status_filter)
                     if status_filter == 'download_completed':
                         target_statuses = ['completed']
                     elif status_filter == 'download_active':

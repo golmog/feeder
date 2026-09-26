@@ -17,13 +17,13 @@ class ModelDownload(ModelBase):
     id = db.Column(db.Integer, primary_key=True)
     created_time = db.Column(db.DateTime, default=datetime.now)
     updated_time = db.Column(db.DateTime, default=datetime.now, onupdate=datetime.now)
-    completed_time = db.Column(db.DateTime, nullable=True)
+    completed_time = db.Column(db.DateTime, nullable=True, index=True)
 
     feed_name = db.Column(db.String, index=True)
     title = db.Column(db.String, index=True)
     magnet = db.Column(db.String, index=True)
     infohash = db.Column(db.String, index=True, nullable=True)
-    file_name = db.Column(db.String, nullable=True)
+    file_name = db.Column(db.String, nullable=True, index=True)
     file_size = db.Column(db.BigInteger, default=0)
 
     status = db.Column(db.String, index=True, default='pending')

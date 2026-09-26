@@ -244,9 +244,7 @@ function render_feeds(data) {
     str += '        <button type="button" class="btn btn-primary text-white feed_edit_btn" data-id="' + item.id + '" data-index="' + i + '">수정</button>';
     str += '        <button type="button" class="btn btn-danger text-white remove_feed_btn" data-id="' + item.id + '">삭제</button>';
     str += '        <button type="button" class="btn btn-secondary text-white clear_feed_db_btn" data-name="' + item.name + '" title="해당 피드의 적재 DB만 초기화">DB 비우기</button>';
-    if (isRssFile) {
-      str += '        <button type="button" class="btn btn-outline-success generate_feed_file_btn" data-id="' + item.id + '" title="XML 파일 즉시 생성">XML 갱신</button>';
-    }
+    str += '        <button type="button" class="btn btn-outline-success generate_feed_file_btn" data-id="' + item.id + '" title="XML 파일 즉시 생성">XML 갱신</button>';
     str += '      </div>';
     str += '      <a href="' + item.api + '" target="_blank" class="btn btn-sm text-white" style="background-color: #f26522; font-weight: 500;"><i class="fa fa-rss"></i> RSS 피드</a>';
     str += '    </div>';

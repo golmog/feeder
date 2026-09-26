@@ -372,6 +372,7 @@ class FeedUtil:
                         new_feed_item.magnet_count = bbs.magnet_count
                         new_feed_item.file_count = bbs.file_count
                         new_feed_item.magnet = bbs.magnet
+                        new_feed_item.infohash = bbs.infohash or FeederUtil.extract_info_hash(bbs.magnet)
                         new_feed_item.files = bbs.files
                         new_feed_item.torrent_info = bbs.torrent_info
                         new_feed_item.broadcast_status = bbs.broadcast_status
@@ -402,6 +403,8 @@ class FeedUtil:
                             new_feed_item.magnet_count = len(r_item.get('magnet', []))
                             new_feed_item.file_count = len(r_item.get('files', []))
                             new_feed_item.magnet = '\n'.join(r_item.get('magnet', []))
+                            r_primary_mag = r_item['magnet'][0] if r_item.get('magnet') else ''
+                            new_feed_item.infohash = FeederUtil.extract_info_hash(r_primary_mag) if r_primary_mag else None
                             if r_item.get('files'):
                                 new_feed_item.files = '||'.join(f"{x[0]}|{x[1]}|NONE" for x in r_item['files'])
                             db.session.add(new_feed_item)
@@ -434,14 +437,14 @@ class FeedUtil:
     # 공유용 RSS XML 파일 생성 및 보관주기(Retention) 관리
     # --------------------------------------------------------------------------
     @classmethod
-    def save_rss_file(cls, feed_cfg: dict) -> bool:
-        """피드 전용 정적 RSS XML 파일 생성"""
+    def save_rss_file(cls, feed_cfg: dict, force: bool = False) -> bool:
+        """피드 전용 정적 RSS XML 파일 생성 (force=True 시 설정 무관 강제 생성)"""
         try:
             feed = feed_cfg if isinstance(feed_cfg, dict) else (vars(feed_cfg) if feed_cfg else {})
 
             global_make = P.ModelSetting.get_bool('feed_make_rss_file') if P.ModelSetting else False
             feed_use = str(feed.get('use_rss_file', False)).lower() in ['true', 'on', '1']
-            if not (global_make and feed_use):
+            if not force and not (global_make and feed_use):
                 return False
 
             feed_name = feed.get('name')

@@ -213,7 +213,7 @@ class ModuleFeed(PluginModuleBase):
             feed = FeederUtil.get_feed(target_id)
             if feed:
                 FeedUtil.sync_feed(feed)
-                ok = FeedUtil.save_rss_file(feed)
+                ok = FeedUtil.save_rss_file(feed, force=True)
                 return jsonify({'ret': 'success' if ok else 'fail'})
             return jsonify({'ret': 'not_exist'})
 
