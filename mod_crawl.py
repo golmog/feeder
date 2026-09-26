@@ -12,6 +12,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from .setup import *
 from .model_crawl import ModelCrawlSite, ModelCrawlItem
+from .model_download import ModelDownload
 from .util_base import FeederUtil
 from .util_crawl import CrawlUtil
 from .task_crawl import TaskCrawlBase, TaskCrawl
@@ -621,8 +622,6 @@ class ModuleCrawl(PluginModuleBase):
     def fix_database_magnets(self):
         with F.app.app_context():
             try:
-                from .model_download import ModelDownload
-
                 fixed_bbs_count = 0
                 bbs_rows = db.session.query(ModelCrawlItem).filter(ModelCrawlItem.magnet.isnot(None)).all()
                 for row in bbs_rows:

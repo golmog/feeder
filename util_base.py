@@ -17,6 +17,8 @@ import requests
 import subprocess
 import unicodedata
 from datetime import datetime, timedelta
+from sqlalchemy import func
+
 
 from .setup import *
 
@@ -273,7 +275,6 @@ class FeederUtil:
             return query
 
         from .model_download import ModelDownload
-        from sqlalchemy import func
 
         if status_filter == 'download_completed':
             target_statuses = ['completed']
