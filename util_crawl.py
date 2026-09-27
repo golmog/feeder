@@ -114,12 +114,11 @@ class CrawlUtil:
                         if not existing:
                             new_site = ModelCrawlSite('custom', default_info, content_str)
                             db.session.add(new_site)
-                            logger.info(f"[CrawlUtil] 사이트 템플릿 신규 등록: '{target_name}'")
+                            db.session.commit()
+                            logger.info(f"[CrawlUtil] 사이트 템플릿 최초 신규 등록: '{target_name}'")
                         else:
-                            existing.info = default_info
-                            existing.content = content_str
+                            pass
 
-                        db.session.commit()
         except Exception as e:
             logger.error(f"[CrawlUtil] sync_default_site_info 에러: {e}")
             try:
