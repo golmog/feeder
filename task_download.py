@@ -46,7 +46,7 @@ class TaskDownload:
                 mode_str = "수동 실행" if manual else "스케쥴러 자동 실행"
                 logger.info(f"[DownloadPipeline] 다운로드 파이프라인 가동 ({mode_str})")
 
-                # 현재 큐 현황 집계 및 요약 출력
+                # 현재 큐 현황 집계 및 요약 최우선 출력
                 q_counts = {
                     'pending': db.session.query(ModelDownload).filter(ModelDownload.status == 'pending').count(),
                     'downloading': db.session.query(ModelDownload).filter(ModelDownload.status == 'downloading').count(),
@@ -64,13 +64,10 @@ class TaskDownload:
                     logger.debug("[DownloadPipeline] 등록된 다운로드 프로필(DOWNLOAD_PROFILES)이 없습니다.")
                     return
 
-                # SA 내 드라이브 고아 파일 사전 정리
-                UploadUtil.drain_all_sa_mydrives()
-
-                # 피드 최신 데이터 동기화
+                # 피드 최신 데이터 동기화 및 큐 등록
                 TaskDownload.sync_feed_items(profiles)
 
-                # 활성 큐 작업들에 대해 현재 설정된 최신 프로필(목적지 및 체인) 동적 동기화 및 리라우팅
+                # 활성 큐 작업들에 대해 현재 설정된 최신 프로필 동적 동기화
                 TaskDownload.sync_active_items_with_profiles()
 
                 # 단일 스케줄 내 논스톱 연쇄 관통 루프 (최대 3회 패스)
@@ -105,6 +102,9 @@ class TaskDownload:
 
                     if (pending_after + staging_after + downloaded_after + uploading_after) == 0:
                         break
+
+                # SA 내 드라이브 고아 파일 사전 정리 (파이프라인 실행 방해 없도록 후반 배치)
+                UploadUtil.drain_all_sa_mydrives()
 
                 # 이전 실패 항목 재시도
                 TaskDownload.retry_move_failed()
@@ -545,14 +545,14 @@ class TaskDownload:
             # 유저 설정 Rclone 확장 옵션 결합
             cmd.extend(FeederUtil.get_rclone_extra_options())
 
-            success = False
-            try:
-                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=1800)
-                success = (res.returncode == 0)
-                if not success:
-                    logger.error(f"[LocalStaging] Rclone 다운로드 실패: {res.stderr.strip()}")
-            except Exception as ex:
-                logger.error(f"[LocalStaging] Rclone 실행 예외: {ex}")
+            success, out = UploadUtil.run_rclone(
+                cmd,
+                f"로컬 스테이징 {target_folder_name}",
+                item_id=item.id,
+                file_size=item.file_size
+            )
+            if not success:
+                logger.error(f"[LocalStaging] Rclone 다운로드 실패: {out.strip()[:200]}")
 
             if success and os.path.exists(item_staging_dir):
                 downloader_cfg = FeederUtil.get_downloader_by_name(item.current_engine_name)

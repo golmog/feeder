@@ -309,68 +309,54 @@ class CrawlUtil:
                 headers['Cookie'] = f"{current_cookie_str}; {injected}".strip('; ')
 
         for attempt in range(1, max_retries + 1):
+            proxies = cls.get_proxies(scheduler_instance)
+            proxy_display = proxies.get('http') if (proxies and 'http' in proxies) else 'Direct'
+
             if _CURL_CFFI_AVAILABLE:
                 try:
                     cffi_session = cls._cffi_sessions.get(host)
                     if not cffi_session:
                         cffi_session = cffi_requests.Session()
                         cls._cffi_sessions[host] = cffi_session
-                        logger.debug(f"[CrawlUtil] curl_cffi 세션 생성: {host}")
+                        logger.debug(f"[CrawlUtil] curl_cffi 세션 생성 ({proxy_display}): {host}")
 
                     cls._sync_clearance_to_sessions(host)
                     res = cffi_session.get(url, headers=headers, proxies=proxies, impersonate="chrome", timeout=25)
                     if res.status_code == 200:
                         if 'Just a moment...' not in res.text and 'cf-turnstile' not in res.text:
                             return res.text
-                    logger.debug(f"[CrawlUtil] curl_cffi 응답 코드: {res.status_code} ({url})")
+                        logger.warning(f"[CrawlUtil] [{host}] Cloudflare 챌린지 감지 (HTTP 200 Turnstile) -> 인가 갱신 시도")
+                    else:
+                        logger.debug(f"[CrawlUtil] curl_cffi 응답 코드: {res.status_code} ({url})")
+
                 except Exception as e:
-                    logger.debug(f"[CrawlUtil] curl_cffi 요청 실패 ({url}): {e}")
+                    err_msg = str(e)
+                    logger.debug(f"[CrawlUtil] curl_cffi 요청 실패 ({proxy_display} / {url}): {err_msg}")
 
-            try:
-                req_session = cls._requests_sessions.get(host)
-                if not req_session:
-                    req_session = requests.Session()
-                    cls._requests_sessions[host] = req_session
-                    logger.debug(f"[CrawlUtil] requests 세션 생성: {host}")
+            # 차단(403, 429), 서버오류(503), SSL/TLS 연결 단절 감지 시 즉시 세션 파기 및 프록시 로테이션
+            if host in cls._cffi_sessions:
+                try:
+                    cls._cffi_sessions[host].close()
+                except Exception:
+                    pass
+                cls._cffi_sessions.pop(host, None)
 
-                cls._sync_clearance_to_sessions(host)
-                res = req_session.get(url, headers=headers, proxies=proxies, timeout=25, verify=False)
-                if res.status_code == 200:
-                    res.encoding = res.apparent_encoding or 'utf-8'
-                    if 'Just a moment...' not in res.text and 'cf-turnstile' not in res.text:
-                        return res.text
-                logger.debug(f"[CrawlUtil] requests 응답 코드: {res.status_code} ({url})")
-            except Exception as e:
-                logger.debug(f"[CrawlUtil] requests 요청 실패 ({url}): {e}")
+            # 등록된 프록시가 있을 경우 즉시 다음 프록시로 전환하여 차단 우회
+            rotated_proxy = cls.rotate_proxy(scheduler_instance=scheduler_instance, reason=f"차단/응답불가 대응 ({attempt}/{max_retries})")
+            if rotated_proxy:
+                proxies = cls.get_proxies(scheduler_instance)
 
+            # Cloudflare 사이트의 경우 FlareSolverr 재인가 수행
             if use_fs:
-                logger.warning(f"[CrawlUtil] [{host}] Cloudflare 차단 감지 -> FlareSolverr 재인가: {url}")
                 cls._cf_cookies.pop(host, None)
-
-                if host in cls._cffi_sessions:
-                    try:
-                        cls._cffi_sessions[host].close()
-                    except Exception:
-                        pass
-                    cls._cffi_sessions.pop(host, None)
-
-                if host in cls._requests_sessions:
-                    try:
-                        cls._requests_sessions[host].close()
-                    except Exception:
-                        pass
-                    cls._requests_sessions.pop(host, None)
-
+                logger.warning(f"[CrawlUtil] [{host}] Cloudflare 재인가 시도 (새 프록시: {proxies.get('http') if proxies else 'Direct'}): {url}")
                 tree, source = cls.get_by_flaresolverr(url, proxies=proxies)
                 if source and 'Just a moment...' not in source and 'cf-turnstile' not in source:
-                    logger.info(f"[CrawlUtil] [{host}] 세션 복구 및 페이지 수신 성공")
+                    logger.info(f"[CrawlUtil] [{host}] 새 프록시로 FlareSolverr 인가 및 페이지 수신 성공")
                     return source
-                if attempt < max_retries:
-                    logger.debug(f"[CrawlUtil] FlareSolverr 재시도 ({attempt}/{max_retries}): {url}")
-                    time.sleep(retry_interval)
-            else:
-                if attempt < max_retries:
-                    time.sleep(retry_interval)
+
+            if attempt < max_retries:
+                time.sleep(retry_interval)
 
         return None
 

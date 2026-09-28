@@ -160,7 +160,7 @@ function render_queue_rows(list) {
     else if (it.status === 'pending_local_staging' || it.status === 'local_staging') statusBadge = '<span class="badge badge-info">로컬 스테이징</span>';
     else if (it.status === 'pending_relay') statusBadge = '<span class="badge badge-warning">원격 릴레이 대기</span>';
     else if (it.status === 'relay_transferring') statusBadge = '<span class="badge badge-primary">원격 릴레이 전송 중</span>';
-    else if (it.status === 'downloaded') statusBadge = '<span class="badge badge-success">다운로드 완료</span>';
+    else if (it.status === 'downloaded') statusBadge = '<span class="badge badge-success">다운로드 완료 (업로드 대기)</span>';
     else if (it.status === 'pending_upload' || it.status === 'uploading') statusBadge = '<span class="badge badge-primary">업로드 중</span>';
     else if (it.status === 'completed') statusBadge = '<span class="badge badge-success">최종 완료</span>';
     else if (it.status === 'failed') statusBadge = '<span class="badge badge-danger">실패</span>';
@@ -193,26 +193,62 @@ function render_queue_rows(list) {
     detailHtml += '  <span class="text-muted ml-auto"><i class="fa fa-clock-o mr-1"></i>' + timeStr + '</span>';
     detailHtml += '</div>';
 
-    // 3행: 진행 상태별 컴팩트 게이지 바 (다운로드 중일 때만 밀착 노출)
+    // 3행: 진행 상태별 게이지 바 (다운로드 중 / 로컬 스테이징 / 업로드 실시간 노출)
     if (it.status === 'downloading') {
       var progVal = (it.progress !== undefined && it.progress !== null) ? it.progress : 0;
-      var speedStr = it.download_speed ? format_bytes(it.download_speed) + '/s' : '0 B/s';
+      var speedStr = it.download_speed ? format_bytes(it.download_speed) + '/s' : (it.speed_str || '0 B/s');
       var dlBytesStr = it.downloaded_bytes ? format_bytes(it.downloaded_bytes) : '0 B';
       var totalBytesStr = it.file_size ? format_bytes(it.file_size) : '확인 중';
 
       detailHtml += '<div class="mt-1 p-1 px-2 rounded" style="background: rgba(0, 123, 255, 0.06); border: 1px solid rgba(0, 123, 255, 0.15);">';
       detailHtml += '  <div class="d-flex justify-content-between align-items-center mb-1 small font-weight-bold">';
-      detailHtml += '    <span class="text-primary" style="font-size: 0.82rem;"><i class="fa fa-arrow-circle-o-down mr-1"></i>다운로드 진행: ' + progVal + '% (' + dlBytesStr + ' / ' + totalBytesStr + ')</span>';
+      detailHtml += '    <span class="text-primary" style="font-size: 0.82rem;"><i class="fa fa-arrow-circle-o-down mr-1"></i>엔진 다운로드 진행: ' + progVal + '% (' + dlBytesStr + ' / ' + totalBytesStr + ')</span>';
       detailHtml += '    <span class="badge badge-info"><i class="fa fa-tachometer mr-1"></i>' + speedStr + '</span>';
       detailHtml += '  </div>';
       detailHtml += '  <div class="progress" style="height: 12px; background-color: rgba(255, 255, 255, 0.15); border-radius: 3px;">';
       detailHtml += '    <div class="progress-bar progress-bar-striped progress-bar-animated bg-primary" role="progressbar" style="width: ' + progVal + '%; font-size: 0.72rem; line-height: 12px;" aria-valuenow="' + progVal + '" aria-valuemin="0" aria-valuemax="100">' + (progVal > 8 ? progVal + '%' : '') + '</div>';
       detailHtml += '  </div>';
       detailHtml += '</div>';
-    } else if (it.status === 'pending_local_staging' || it.status === 'local_staging') {
-      detailHtml += '<div class="mt-1 small text-info font-weight-bold"><i class="fa fa-cog fa-spin mr-1"></i>원격 클라우드 다운로드 완료 ➔ 로컬 스테이징 전송 중...</div>';
-    } else if (it.status === 'uploading' || it.status === 'relay_transferring') {
-      detailHtml += '<div class="mt-1 small text-primary font-weight-bold"><i class="fa fa-cloud-upload fa-spin mr-1"></i>Google Drive 업로드 / 원격 릴레이 전송 진행 중...</div>';
+    } else if (it.status === 'local_staging') {
+      var progVal = (it.progress !== undefined && it.progress !== null) ? it.progress : 0;
+      var speedStr = it.speed_str || (it.download_speed ? format_bytes(it.download_speed) + '/s' : '전송 준비중');
+      var dlBytesStr = it.downloaded_bytes ? format_bytes(it.downloaded_bytes) : '0 B';
+      var totalBytesStr = it.file_size ? format_bytes(it.file_size) : '확인 중';
+      var etaStr = it.eta ? ' (ETA: ' + it.eta + ')' : '';
+
+      detailHtml += '<div class="mt-1 p-1 px-2 rounded" style="background: rgba(23, 162, 184, 0.08); border: 1px solid rgba(23, 162, 184, 0.25);">';
+      detailHtml += '  <div class="d-flex justify-content-between align-items-center mb-1 small font-weight-bold">';
+      detailHtml += '    <span class="text-info" style="font-size: 0.82rem;"><i class="fa fa-hdd-o fa-spin mr-1"></i>로컬 스테이징 수신: ' + progVal + '% (' + dlBytesStr + ' / ' + totalBytesStr + ')' + etaStr + '</span>';
+      detailHtml += '    <span class="badge badge-info"><i class="fa fa-tachometer mr-1"></i>' + speedStr + '</span>';
+      detailHtml += '  </div>';
+      detailHtml += '  <div class="progress" style="height: 12px; background-color: rgba(255, 255, 255, 0.15); border-radius: 3px;">';
+      detailHtml += '    <div class="progress-bar progress-bar-striped progress-bar-animated bg-info" role="progressbar" style="width: ' + progVal + '%; font-size: 0.72rem; line-height: 12px;" aria-valuenow="' + progVal + '" aria-valuemin="0" aria-valuemax="100">' + (progVal > 8 ? progVal + '%' : '') + '</div>';
+      detailHtml += '  </div>';
+      detailHtml += '</div>';
+    } else if (it.status === 'uploading') {
+      var progVal = (it.progress !== undefined && it.progress !== null) ? it.progress : 0;
+      var speedStr = it.speed_str || (it.download_speed ? format_bytes(it.download_speed) + '/s' : '전송 준비중');
+      var dlBytesStr = it.downloaded_bytes ? format_bytes(it.downloaded_bytes) : '0 B';
+      var totalBytesStr = it.file_size ? format_bytes(it.file_size) : '확인 중';
+      var etaStr = it.eta ? ' (ETA: ' + it.eta + ')' : '';
+
+      detailHtml += '<div class="mt-1 p-1 px-2 rounded" style="background: rgba(40, 167, 69, 0.08); border: 1px solid rgba(40, 167, 69, 0.25);">';
+      detailHtml += '  <div class="d-flex justify-content-between align-items-center mb-1 small font-weight-bold">';
+      detailHtml += '    <span class="text-success" style="font-size: 0.82rem;"><i class="fa fa-cloud-upload fa-spin mr-1"></i>Google Drive 업로드: ' + progVal + '% (' + dlBytesStr + ' / ' + totalBytesStr + ')' + etaStr + '</span>';
+      detailHtml += '    <span class="badge badge-success"><i class="fa fa-tachometer mr-1"></i>' + speedStr + '</span>';
+      detailHtml += '  </div>';
+      detailHtml += '  <div class="progress" style="height: 12px; background-color: rgba(255, 255, 255, 0.15); border-radius: 3px;">';
+      detailHtml += '    <div class="progress-bar progress-bar-striped progress-bar-animated bg-success" role="progressbar" style="width: ' + progVal + '%; font-size: 0.72rem; line-height: 12px;" aria-valuenow="' + progVal + '" aria-valuemin="0" aria-valuemax="100">' + (progVal > 8 ? progVal + '%' : '') + '</div>';
+      detailHtml += '  </div>';
+      detailHtml += '</div>';
+    } else if (it.status === 'pending_local_staging') {
+      detailHtml += '<div class="mt-1 small text-info font-weight-bold"><i class="fa fa-clock-o mr-1"></i>로컬 스테이징 대기 중...</div>';
+    } else if (it.status === 'downloaded') {
+      detailHtml += '<div class="mt-1 small text-success font-weight-bold"><i class="fa fa-check-circle-o mr-1"></i>로컬 다운로드 완료 (Google Drive 업로드 대기 중...)</div>';
+    } else if (it.status === 'pending_upload') {
+      detailHtml += '<div class="mt-1 small text-primary font-weight-bold"><i class="fa fa-clock-o mr-1"></i>Google Drive 업로드 대기 중...</div>';
+    } else if (it.status === 'relay_transferring') {
+      detailHtml += '<div class="mt-1 small text-primary font-weight-bold"><i class="fa fa-cloud-upload fa-spin mr-1"></i>원격 릴레이 전송 진행 중...</div>';
     }
 
     detailHtml += errorMsg;
@@ -925,7 +961,7 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
 
     if (f.type === 'checkbox') {
       var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
-      html += '    <input type="checkbox" id="dest_field_' + f.name + '" class="mt-2" ' + isChk + '>';
+      html += '    <div><input type="checkbox" id="dest_field_' + f.name + '" data-toggle="toggle" data-on="On" data-off="Off" data-size="small" ' + isChk + '></div>';
     } else if (f.type === 'number') {
       html += '    <input type="number" id="dest_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
     } else if (f.type === 'password') {
@@ -939,10 +975,27 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
     html += '</div>';
   }
   container.html(html);
+
+  try {
+    container.find('input[data-toggle="toggle"]').bootstrapToggle();
+  } catch (err) {}
 }
 
 $('#profile_dest_type').change(function () {
   render_dynamic_dest_fields($(this).val(), null);
+});
+
+$(document).on('input change', '#profile_name', function () {
+  if ($('#profile_mode').val() !== 'add') return;
+  var pName = $(this).val().trim() || 'default';
+  var upField = $('#dest_field_upload_path');
+  var compField = $('#dest_field_complete_path');
+  if (upField.length && (!upField.val() || upField.val().startsWith('incoming/'))) {
+    upField.val('incoming/' + pName);
+  }
+  if (compField.length && (!compField.val() || compField.val().startsWith('uploads/'))) {
+    compField.val('uploads/' + pName);
+  }
 });
 
 function render_profiles(data) {
@@ -1128,6 +1181,11 @@ $(document).on('click', '#profile_add_btn', function (e) {
   var default_trans = available_transporter_schemas.length > 0 ? available_transporter_schemas[0].transporter_id : '';
   update_profile_dest_type_dropdown(default_trans);
   render_dynamic_dest_fields(default_trans, null);
+
+  var upField = $('#dest_field_upload_path');
+  var compField = $('#dest_field_complete_path');
+  if (upField.length) upField.val('incoming/default');
+  if (compField.length) compField.val('uploads/default');
 
   modal_profile_feeds = ['*'];
   modal_profile_chain = [];

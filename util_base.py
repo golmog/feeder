@@ -16,9 +16,9 @@ import unicodedata
 import requests
 import subprocess
 import unicodedata
+import threading
 from datetime import datetime, timedelta
 from sqlalchemy import func
-
 
 from .setup import *
 
@@ -280,6 +280,33 @@ class FeederUtil:
         except Exception as ex:
             logger.debug(f"[FeederUtil] Rclone 옵션 shlex 파싱 예외 (단순 분리 사용): {ex}")
             return [x.strip() for x in raw_opt.split() if x.strip()]
+
+    _rclone_live_stats = {}
+    _rclone_stats_lock = threading.Lock()
+
+    @classmethod
+    def set_rclone_progress(cls, item_id, progress_dict: dict):
+        """Rclone 실시간 전송률/속도 캐시 저장"""
+        if not item_id:
+            return
+        with cls._rclone_stats_lock:
+            cls._rclone_live_stats[str(item_id)] = progress_dict
+
+    @classmethod
+    def get_rclone_progress(cls, item_id) -> dict:
+        """Rclone 실시간 전송률/속도 캐시 조회"""
+        if not item_id:
+            return {}
+        with cls._rclone_stats_lock:
+            return dict(cls._rclone_live_stats.get(str(item_id), {}))
+
+    @classmethod
+    def clear_rclone_progress(cls, item_id):
+        """Rclone 전송 완료/종료 시 캐시 제거"""
+        if not item_id:
+            return
+        with cls._rclone_stats_lock:
+            cls._rclone_live_stats.pop(str(item_id), None)
 
     @classmethod
     def apply_download_status_filter(cls, model_cls, query, status_filter: str):

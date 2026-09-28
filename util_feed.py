@@ -377,35 +377,84 @@ class FeedUtil:
                         internal_conds.append(and_(ModelCrawlItem.site == s_name, ModelCrawlItem.board == b_name))
 
             if internal_conds:
-                crawl_candidates = db.session.query(ModelCrawlItem).filter(or_(*internal_conds)).order_by(ModelCrawlItem.id.desc()).limit(300).all()
-                for bbs in crawl_candidates:
-                    b_dict = bbs.as_dict()
-                    if not b_dict.get('magnet') and not b_dict.get('files'):
-                        continue
+                def _safe_int(val, fallback=0):
+                    try:
+                        if val is not None and str(val).strip() != '':
+                            return int(val)
+                    except Exception:
+                        pass
+                    return fallback
 
-                    exists = db.session.query(ModelFeedItem.id).filter_by(feed_name=feed_name, url=bbs.url).first()
-                    if exists:
-                        continue
+                # 목표 아이템 수 산출 (설정값이 있으면 우선 적용, 미설정 시 기본 100)
+                f_items = _safe_int(feed.get('rss_file_items'), _safe_int(P.ModelSetting.get('feed_rss_file_items'), 0))
+                f_count = _safe_int(feed.get('feed_count'), _safe_int(P.ModelSetting.get('feed_feed_count'), 0))
+                target_item_count = max(f_items, f_count) if (f_items > 0 or f_count > 0) else 100
 
-                    is_pass, reason = cls.evaluate(b_dict, feed, global_cfg)
-                    if is_pass:
-                        new_feed_item = ModelFeedItem(
-                            feed_name=feed_name,
-                            source_type='crawl',
-                            source_name=f"{bbs.site}:{bbs.board}"
-                        )
-                        new_feed_item.title = bbs.title
-                        new_feed_item.url = bbs.url
-                        new_feed_item.magnet_count = bbs.magnet_count
-                        new_feed_item.file_count = bbs.file_count
-                        new_feed_item.magnet = bbs.magnet
-                        new_feed_item.files = bbs.files
-                        new_feed_item.torrent_info = bbs.torrent_info
-                        new_feed_item.broadcast_status = bbs.broadcast_status
-                        new_feed_item.infohash = bbs.infohash or FeederUtil.extract_info_hash(bbs.magnet)
-                        db.session.add(new_feed_item)
-                        added_count += 1
-                        logger.debug(f"[FeedUtil] [{feed_name}] 크롤러 아이템 적재: '{bbs.title[:35]}'")
+                # 보관 기간 산출 (일 단위, 0 이하면 기간 무제한)
+                days_val = _safe_int(feed.get('rss_file_days'), _safe_int(P.ModelSetting.get('feed_rss_file_days'), 14))
+                cutoff_date = (datetime.now() - timedelta(days=days_val)) if days_val > 0 else None
+
+                # 현재 피드 DB에 이미 적재되어 있는 유효(기간 내) 항목 수 확인
+                valid_count_query = db.session.query(ModelFeedItem).filter_by(feed_name=feed_name)
+                if cutoff_date:
+                    valid_count_query = valid_count_query.filter(ModelFeedItem.created_time >= cutoff_date)
+                current_valid_count = valid_count_query.count()
+
+                batch_size = 100
+                last_seen_id = None
+                scanned_total = 0
+
+                # 원본 개수 제한 없이 (기간 AND 최대 개수) 조건을 충족할 때까지 커서 페이징 탐색
+                while current_valid_count < target_item_count:
+                    query = db.session.query(ModelCrawlItem).filter(or_(*internal_conds))
+                    if cutoff_date:
+                        query = query.filter(ModelCrawlItem.created_time >= cutoff_date)
+                    if last_seen_id is not None:
+                        query = query.filter(ModelCrawlItem.id < last_seen_id)
+
+                    candidates = query.order_by(ModelCrawlItem.id.desc()).limit(batch_size).all()
+                    if not candidates:
+                        break
+
+                    scanned_total += len(candidates)
+                    for bbs in candidates:
+                        last_seen_id = bbs.id
+
+                        b_dict = bbs.as_dict()
+                        if not b_dict.get('magnet') and not b_dict.get('files'):
+                            continue
+
+                        exists = db.session.query(ModelFeedItem.id).filter_by(feed_name=feed_name, url=bbs.url).first()
+                        if exists:
+                            continue
+
+                        is_pass, reason = cls.evaluate(b_dict, feed, global_cfg)
+                        if is_pass:
+                            new_feed_item = ModelFeedItem(
+                                feed_name=feed_name,
+                                source_type='crawl',
+                                source_name=f"{bbs.site}:{bbs.board}"
+                            )
+                            new_feed_item.created_time = bbs.created_time or datetime.now()
+                            new_feed_item.title = bbs.title
+                            new_feed_item.url = bbs.url
+                            new_feed_item.magnet_count = bbs.magnet_count
+                            new_feed_item.file_count = bbs.file_count
+                            new_feed_item.magnet = bbs.magnet
+                            new_feed_item.files = bbs.files
+                            new_feed_item.torrent_info = bbs.torrent_info
+                            new_feed_item.broadcast_status = bbs.broadcast_status
+                            new_feed_item.infohash = bbs.infohash or FeederUtil.extract_info_hash(bbs.magnet)
+                            db.session.add(new_feed_item)
+                            added_count += 1
+                            current_valid_count += 1
+                            logger.debug(f"[FeedUtil] [{feed_name}] 크롤러 아이템 적재: '{bbs.title[:35]}'")
+
+                            if current_valid_count >= target_item_count:
+                                break
+
+                if scanned_total > 0:
+                    logger.debug(f"[FeedUtil] [{feed_name}] 원본 {scanned_total}건 탐색 완료 -> 유효 피드 {current_valid_count}/{target_item_count}건 충족 (신규 적재: {added_count}건)")
 
             # 외부 RSS 피드 소스 동기화
             for src in sources:

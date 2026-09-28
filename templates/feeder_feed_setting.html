@@ -150,8 +150,8 @@
           </div>
           {{ macros.m_hr() }}
 
-          {{ macros.setting_input_text('feed_count', '실시간 RSS 피드 최대 수', col='8', placeholder='미입력 시 기본 설정값 (100개) 사용', desc=['/api/feed/rss 요청 시 반환될 최대 피드 항목 수']) }}
-          {{ macros.setting_input_text('rss_file_days', '피드 보관 기간 (일)', col='8', placeholder='미입력 시 기본 설정 (14일) 사용', desc=['XML 파일 생성 및 피드 보관 기간(일)']) }}
+          {{ macros.setting_input_text('feed_count', '실시간 RSS 피드 최대 수', col='8', placeholder='미입력 시 기본 설정값 사용', desc=['/api/feed/rss 요청 시 반환될 최대 피드 항목 수']) }}
+          {{ macros.setting_input_text('rss_file_days', '피드 보관 기간 (일)', col='8', placeholder='미입력 시 기본 설정값 사용', desc=['XML 파일 생성 및 피드 보관 기간(일)']) }}
           {{ macros.setting_input_text('rss_file_items', '피드 보관 최대 항목 수', col='8', placeholder='미입력 시 기본 설정값 사용', desc=['XML 파일 생성 및 보관 최대 항목 수']) }}
           {{ macros.m_hr() }}
 
@@ -165,7 +165,7 @@
           <div id="modal_use_feed_rss_file_div" class="collapse">
             {{ macros.setting_input_text('rss_file', 'XML 파일명', col='8', placeholder='예: offkab_cen.xml') }}
             {{ macros.setting_input_text('rss_file_path', '개별 저장 경로', col='8', value='', placeholder='미입력 시 기본 설정 경로 사용') }}
-            {{ macros.setting_input_text('rss_file_days', '개별 유지 기간 (일)', col='8', value='', placeholder='미입력 시 기본 설정 (14일) 사용') }}
+            {{ macros.setting_input_text('rss_file_days', '개별 유지 기간 (일)', col='8', value='', placeholder='미입력 시 기본 설정값 사용') }}
             {{ macros.setting_input_text('rss_file_items', '개별 최대 항목 수', col='8', value='', placeholder='미입력 시 기본 설정값 사용') }}
           </div>
         </form>

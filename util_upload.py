@@ -47,15 +47,16 @@ class UploadUtil:
         return f"{size:.2f} {unit}"
 
     @staticmethod
-    def run_rclone(cmd: list[str], description: str = "", log_output: bool = True) -> tuple[bool, str]:
-        """Rclone 서브프로세스 실행 및 실시간 출력 캡처"""
+    def run_rclone(cmd: list[str], description: str = "", log_output: bool = True, item_id=None, file_size=None) -> tuple[bool, str]:
+        """Rclone 서브프로세스 실행 및 실시간 출력/전송률 캡처"""
         rclone_cfg = FeederUtil.load_yaml().get('rclone', {})
         env = os.environ.copy()
         if rclone_cfg.get('bind_ip'):
             env['RCLONE_BIND_ADDR'] = rclone_cfg['bind_ip']
 
         if log_output and description:
-            logger.info(f"[Rclone] 시작: {description}")
+            size_text = f" ({UploadUtil.format_bytes(file_size)})" if file_size else ""
+            logger.info(f"[Rclone] 시작: {description}{size_text}")
 
         try:
             proc = subprocess.Popen(
@@ -72,8 +73,27 @@ class UploadUtil:
                 if not line:
                     continue
                 output_lines.append(line)
-                if "Transferred:" in line or "ETA" in line or "%" in line:
-                    logger.debug(f"[Rclone Progress] {line}")
+
+                # Rclone --stats-one-line 실시간 전송률 정밀 파싱
+                # 지원 포맷: "1.23 GiB / 4.49 GiB, 27%, 25.12 MiB/s, ETA 2m12s" 또는 "1.23G / 4.49G, 27%..."
+                if "%" in line:
+                    m = re.search(r'([0-9.]+\s*[a-zA-Z]+)\s*/\s*([0-9.]+\s*[a-zA-Z]+),\s*([0-9.]+)%,\s*([0-9.]+\s*[a-zA-Z/]+)(?:,\s*ETA\s*([^\s,]+))?', line)
+                    if m:
+                        trans_str = m.group(1).strip()
+                        total_str = m.group(2).strip()
+                        pct_val = float(m.group(3))
+                        speed_val = m.group(4).strip()
+                        eta_val = m.group(5) or ''
+
+                        if item_id:
+                            FeederUtil.set_rclone_progress(item_id, {
+                                'progress': pct_val,
+                                'speed_str': speed_val,
+                                'downloaded_bytes': UploadUtil.parse_size_bytes(trans_str),
+                                'total_bytes': UploadUtil.parse_size_bytes(total_str) if total_str else (file_size or 0),
+                                'eta': eta_val
+                            })
+                        logger.debug(f"[Rclone Progress] {description}: {pct_val}% ({trans_str} / {total_str}) @ {speed_val} ETA {eta_val}")
 
             proc.stdout.close()
             proc.wait()
@@ -92,6 +112,9 @@ class UploadUtil:
         except Exception as ex:
             logger.error(f"[Rclone] 실행 예외 ({description}): {ex}")
             return False, str(ex)
+        finally:
+            if item_id:
+                FeederUtil.clear_rclone_progress(item_id)
 
     @classmethod
     def get_remote_size(cls, remote_path: str, rclone_conf: str, impersonate_email: str = None) -> int:
@@ -272,16 +295,26 @@ class UploadUtil:
             logger.debug("[UploadUtil] Rclone 설정 파일 경로 또는 공유 드라이브 ID가 설정되지 않아 SA 정리 건너뜀")
             return
 
-        target_root = f"{base_remote}:{{{dst_drive_id}}}/"
         accounts = FeederUtil.get_gdrive_accounts()
-        use_impersonate = P.ModelSetting.get_bool('download_gdrive_use_impersonate')
+        if not accounts:
+            logger.debug("[UploadUtil] 등록된 SA 계정이 없어 내 드라이브 정리 건너뜀")
+            return
 
+        target_root = f"{base_remote}:{{{dst_drive_id}}}/"
+        use_impersonate = P.ModelSetting.get_bool('download_gdrive_use_impersonate')
+        start_time = time.time()
+
+        logger.info(f"[UploadUtil] Google Drive SA 내 드라이브 고아 파일 정리 시작 (대상: {len(accounts)}개 계정, 목적지: {target_root})")
+
+        processed_count = 0
         for acc in accounts:
             email = acc.get('username')
             if not email:
                 continue
 
             current_remote = base_remote if use_impersonate else (acc.get('remote_name') or base_remote)
+            logger.debug(f"[UploadUtil] SA 계정 잔여 파일 정리 중: {email} (리모트: {current_remote})")
+
             try:
                 cmd_move = [
                     "rclone", "move", f"{current_remote}:", target_root,
@@ -303,8 +336,12 @@ class UploadUtil:
                 if use_impersonate:
                     cmd_cleanup.extend(["--drive-impersonate", email])
                 cls.run_rclone(cmd_cleanup, log_output=False)
+                processed_count += 1
             except Exception as ex:
                 logger.debug(f"[UploadUtil] {email} 내 드라이브 정리 중 예외 (무시): {ex}")
+
+        elapsed_time = time.time() - start_time
+        logger.info(f"[UploadUtil] Google Drive SA 내 드라이브 고아 파일 정리 완료 (처리: {processed_count}/{len(accounts)}개 계정, 소요시간: {elapsed_time:.1f}초)")
 
     @classmethod
     def execute_upload(cls, item: ModelDownload, manager: AccountManager) -> bool:
@@ -391,7 +428,7 @@ class UploadUtil:
         # 유저 설정 Rclone 확장 옵션 결합
         cmd.extend(FeederUtil.get_rclone_extra_options())
 
-        success, out = cls.run_rclone(cmd, f"업로드 {folder_name}")
+        success, out = cls.run_rclone(cmd, f"업로드 {folder_name}", item_id=item.id, file_size=fsize)
 
         if not success:
             logger.error(f"[UploadUtil] 업로드 실패: {folder_name} -> incoming 불완전 찌꺼기 즉시 파기")

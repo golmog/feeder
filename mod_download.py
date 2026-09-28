@@ -656,7 +656,7 @@ class ModuleDownload(PluginModuleBase):
 
                     active_statuses = [
                         'pending', 'downloading', 'pending_local_staging', 'local_staging',
-                        'pending_upload', 'uploading', 'pending_relay', 'relay_transferring'
+                        'downloaded', 'pending_upload', 'uploading', 'pending_relay', 'relay_transferring'
                     ]
                     active_rows = (
                         db.session.query(ModelDownload)
@@ -719,6 +719,17 @@ class ModuleDownload(PluginModuleBase):
                                 d['downloaded_bytes'] = dl_bytes
                                 d['download_speed'] = dl_speed
                                 d['progress'] = min(prog, 100.0)
+
+                        # 로컬 스테이징 및 Google Drive 업로드 중일 때는 Rclone 실시간 캐시 데이터 병합
+                        elif it.status in ['local_staging', 'uploading']:
+                            rclone_stat = FeederUtil.get_rclone_progress(it.id)
+                            if rclone_stat:
+                                d['progress'] = rclone_stat.get('progress', 0.0)
+                                d['download_speed'] = rclone_stat.get('download_speed', 0)
+                                d['speed_str'] = rclone_stat.get('speed_str', '')
+                                d['downloaded_bytes'] = rclone_stat.get('downloaded_bytes', 0)
+                                d['file_size'] = rclone_stat.get('total_bytes') or d.get('file_size') or 0
+                                d['eta'] = rclone_stat.get('eta', '')
 
                         # 로컬 스테이징, 업로드 중, 릴레이 등 단계 전환 상태는 항상 DB에 저장된 상태를 최우선 유지
                         d['status'] = it.status

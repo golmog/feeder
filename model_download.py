@@ -107,7 +107,7 @@ class ModelDownload(ModelBase):
                 if status_filter == 'active':
                     query = query.filter(cls.status.in_([
                         'pending', 'downloading', 'pending_local_staging',
-                        'local_staging', 'pending_upload', 'uploading',
+                        'local_staging', 'downloaded', 'pending_upload', 'uploading',
                         'pending_relay', 'relay_transferring'
                     ]))
                 else:
