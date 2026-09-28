@@ -61,6 +61,8 @@ $(document).ready(function () {
     var saved_word = localStorage.getItem(sub + '_search_word') || '';
     var saved_page = localStorage.getItem(sub + '_current_page') || '1';
 
+    var saved_board = localStorage.getItem(sub + '_board_select') || 'all';
+
     if ($('#site_select').length > 0) $('#site_select').val(saved_site);
     $('#status_filter').val(saved_status);
     $('#order').val(saved_order);
@@ -70,7 +72,13 @@ $(document).ready(function () {
 
     if (typeof server_site_info !== 'undefined' && server_site_info && server_site_info.site) {
       build_search_form(server_site_info);
+      if (saved_site !== 'all') {
+        $('#site_select').val(saved_site);
+        update_board_select(saved_site);
+        $('#board_select').val(saved_board);
+      }
     }
+
     load_download_profiles();
     window.globalRequestSearch(saved_page);
   }
@@ -201,12 +209,6 @@ function update_board_select(selected_site) {
 
 function make_list(data) {
   try {
-    if (data && data.info) {
-      build_search_form(data.info);
-    } else if (current_data && current_data.info) {
-      build_search_form(current_data.info);
-    }
-
     var list_items = Array.isArray(data) ? data : (data && data.list ? data.list : []);
     if (!list_items || list_items.length === 0) {
       document.getElementById('list_div').innerHTML = '<div class="text-center py-4 text-muted">수집된 콘텐츠가 없습니다.</div>';

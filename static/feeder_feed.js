@@ -72,8 +72,7 @@ $('#search_word').keydown(function (e) {
 });
 
 $('#feed_select').change(function () {
-  var selectedFeed = $(this).val();
-  localStorage.setItem(sub + '_feed_select', selectedFeed);
+  localStorage.setItem(sub + '_feed_select', $(this).val());
   localStorage.setItem(sub + '_current_page', '1');
   window.globalRequestSearch('1', false);
 });
@@ -84,10 +83,10 @@ $('#status_filter').change(function () {
   window.globalRequestSearch('1', false);
 });
 
-$('#feed_select, #status_filter, #page_size').change(function () {
-  if ($('#list_div').length > 0 && $('#feed_select').length > 0) {
-    window.globalRequestSearch('1', false);
-  }
+$('#page_size').change(function () {
+  localStorage.setItem(sub + '_page_size', $(this).val());
+  localStorage.setItem(sub + '_current_page', '1');
+  window.globalRequestSearch('1', false);
 });
 
 $('#reset_btn').click(function (e) {

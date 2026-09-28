@@ -421,6 +421,20 @@ $('#reset_btn').click(function (e) {
   window.globalRequestSearch('1', false);
 });
 
+$('#search').click(function (e) {
+  e.preventDefault();
+  if ($('#download_list_tbody').length === 0) return;
+  window.globalRequestSearch('1', false);
+});
+
+$('#search_word').keydown(function (e) {
+  if (e.which === 13) {
+    e.preventDefault();
+    if ($('#download_list_tbody').length === 0) return;
+    window.globalRequestSearch('1', false);
+  }
+});
+
 $('#modal_retry_profile_select').change(function () {
   var pName = $(this).val();
   var pObj = cached_download_profiles.find(function (p) { return p.name === pName; });

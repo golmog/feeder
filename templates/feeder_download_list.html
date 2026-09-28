@@ -3,7 +3,7 @@
 
 <link rel="stylesheet" href="{{ url_for('.static', filename='feeder.css') }}">
 
-<form id="form_search" class="form-inline mb-3 justify-content-between">
+<form id="form_search" class="form-inline mb-3 justify-content-between" onsubmit="return false;">
   <div class="form-inline">
     <select id="status_filter" name="status_filter" class="form-control form-control-sm mr-2">
       <option value="all">전체 상태</option>

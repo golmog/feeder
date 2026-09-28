@@ -202,9 +202,9 @@ window.globalRequestSearch = function (page, preserveScroll) {
     ? page.toString()
     : (localStorage.getItem(storage_pfx + 'current_page') || '1');
 
-  var search_word = ($('#search_word').val() || '').trim();
-  var page_size = $('#page_size').val() || '25';
-  var status_filter = $('#status_filter').val() || 'all';
+  var search_word = ($('#search_word').length > 0) ? ($('#search_word').val() || '').trim() : (localStorage.getItem(storage_pfx + 'search_word') || '');
+  var page_size = ($('#page_size').length > 0) ? ($('#page_size').val() || '25') : (localStorage.getItem(storage_pfx + 'page_size') || '25');
+  var status_filter = ($('#status_filter').length > 0) ? ($('#status_filter').val() || 'all') : (localStorage.getItem(storage_pfx + 'status_filter') || 'all');
 
   localStorage.setItem(storage_pfx + 'current_page', page_val);
   localStorage.setItem(storage_pfx + 'search_word', search_word);
@@ -219,10 +219,10 @@ window.globalRequestSearch = function (page, preserveScroll) {
   };
 
   if (sub === 'crawl') {
-    var site_select = $('#site_select').val() || localStorage.getItem(storage_pfx + 'site_select') || 'all';
-    var board_select = $('#board_select').val() || localStorage.getItem(storage_pfx + 'board_select') || 'all';
-    var order = $('#order').val() || 'desc';
-    var search_select = $('#search_select').val() || 'title';
+    var site_select = ($('#site_select').length > 0) ? ($('#site_select').val() || 'all') : (localStorage.getItem(storage_pfx + 'site_select') || 'all');
+    var board_select = ($('#board_select').length > 0) ? ($('#board_select').val() || 'all') : (localStorage.getItem(storage_pfx + 'board_select') || 'all');
+    var order = ($('#order').length > 0) ? ($('#order').val() || 'desc') : (localStorage.getItem(storage_pfx + 'order') || 'desc');
+    var search_select = ($('#search_select').length > 0) ? ($('#search_select').val() || 'title') : (localStorage.getItem(storage_pfx + 'search_select') || 'title');
 
     localStorage.setItem(storage_pfx + 'site_select', site_select);
     localStorage.setItem(storage_pfx + 'board_select', board_select);
@@ -234,11 +234,9 @@ window.globalRequestSearch = function (page, preserveScroll) {
     postData.order = order;
     postData.search_select = search_select;
   } else if (sub === 'feed') {
-    var feed_select = $('#feed_select').val() || localStorage.getItem(storage_pfx + 'feed_select') || '';
-    if (feed_select) {
-      localStorage.setItem(storage_pfx + 'feed_select', feed_select);
-      postData.feed_select = feed_select;
-    }
+    var feed_select = ($('#feed_select').length > 0) ? ($('#feed_select').val() || 'all') : (localStorage.getItem(storage_pfx + 'feed_select') || 'all');
+    localStorage.setItem(storage_pfx + 'feed_select', feed_select);
+    postData.feed_select = feed_select;
   }
 
   var savedScrollTop = (preserveScroll === true) ? window.scrollY : 0;
@@ -327,6 +325,20 @@ $(document).off('click', '.db-page-btn, #page, #gloablSearchPageBtn').on('click'
   var targetPage = $(this).attr('data-page') || $(this).data('page') || $(this).text().trim();
   if (targetPage && !isNaN(targetPage)) {
     window.globalRequestSearch(targetPage.toString(), false);
+  }
+});
+
+$(document).on('submit', '#form_search', function (e) {
+  e.preventDefault();
+  $('#search').trigger('click');
+  return false;
+});
+
+$(document).on('keydown', '#search_word', function (e) {
+  if (e.which === 13) {
+    e.preventDefault();
+    e.stopPropagation();
+    $('#search').trigger('click');
   }
 });
 
