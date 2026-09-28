@@ -36,6 +36,10 @@ class ModuleFeed(PluginModuleBase):
             f"{self.name}_rss_file_items": "100",
             f"{self.name}_use_proxy": "False",
             f"{self.name}_proxy_url": "",
+            f"{self.name}_use_global_filter": "False",
+            f"{self.name}_filter_reject": "",
+            f"{self.name}_filter_accept": "",
+            f"{self.name}_filter_reject_excluding": "",
         }
 
     def process_menu(self, page_name, req):

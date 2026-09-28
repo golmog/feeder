@@ -206,10 +206,57 @@ class FeedUtil:
         return False
 
     @classmethod
+    def parse_filter_lines(cls, text: str) -> list:
+        """줄바꿈 구분된 정규식 텍스트를 파싱하여 규칙 리스트로 변환"""
+        res = []
+        if not text:
+            return res
+        import yaml
+        for raw_line in text.splitlines():
+            line = raw_line.strip().lstrip('-').strip()
+            if not line or line.startswith('#'):
+                continue
+            try:
+                loaded = yaml.safe_load(line)
+                if isinstance(loaded, (str, dict)):
+                    res.append(loaded)
+                else:
+                    res.append(line)
+            except Exception:
+                res.append(line)
+        return res
+
+    @classmethod
+    def get_global_config(cls) -> dict:
+        """YAML 설정과 FEED 기본 설정(ModelSetting)에 정의된 전역 필터링 통합 조회"""
+        glob_cfg = FeederUtil.get_global()
+        glob_dict = dict(glob_cfg) if isinstance(glob_cfg, dict) else {}
+        glob_regexp = dict(glob_dict.get('regexp', {})) if isinstance(glob_dict.get('regexp'), dict) else {}
+
+        # FEED 기본 설정의 공통 정규식 필터가 활성화되어 있으면 병합 적용
+        if P and hasattr(P, 'ModelSetting') and P.ModelSetting.get_bool('feed_use_global_filter'):
+            ui_reject = cls.parse_filter_lines(P.ModelSetting.get('feed_filter_reject') or '')
+            ui_accept = cls.parse_filter_lines(P.ModelSetting.get('feed_filter_accept') or '')
+            ui_reject_ex = cls.parse_filter_lines(P.ModelSetting.get('feed_filter_reject_excluding') or '')
+
+            if ui_reject:
+                exist_rej = glob_regexp.get('reject', [])
+                glob_regexp['reject'] = exist_rej + [r for r in ui_reject if r not in exist_rej]
+            if ui_accept:
+                exist_acc = glob_regexp.get('accept', [])
+                glob_regexp['accept'] = exist_acc + [r for r in ui_accept if r not in exist_acc]
+            if ui_reject_ex:
+                exist_rex = glob_regexp.get('reject_excluding', [])
+                glob_regexp['reject_excluding'] = exist_rex + [r for r in ui_reject_ex if r not in exist_rex]
+
+        glob_dict['regexp'] = glob_regexp
+        return glob_dict
+
+    @classmethod
     def evaluate(cls, item: dict, feed_cfg: dict = None, global_cfg: dict = None) -> tuple[bool, str]:
         """아이템이 피드 및 전역 필터 조건을 통과하는지 평가"""
         feed_dict = feed_cfg if isinstance(feed_cfg, dict) else (vars(feed_cfg) if feed_cfg else {})
-        glob_dict = global_cfg if global_cfg is not None else FeederUtil.get_global()
+        glob_dict = global_cfg if global_cfg is not None else cls.get_global_config()
 
         glob_regexp = glob_dict.get('regexp', {}) if isinstance(glob_dict, dict) else {}
         for r in (glob_regexp.get('reject') or []):
@@ -360,7 +407,7 @@ class FeedUtil:
         if not feed_name:
             return 0
 
-        global_cfg = FeederUtil.get_global()
+        global_cfg = cls.get_global_config()
         sources = feed.get('sources', [])
         added_count = 0
 

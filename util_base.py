@@ -286,7 +286,7 @@ class FeederUtil:
 
     @classmethod
     def set_rclone_progress(cls, item_id, progress_dict: dict):
-        """Rclone 실시간 전송률/속도 캐시 저장"""
+        """웹 프로세스 메모리에 실시간 전송률 저장"""
         if not item_id:
             return
         with cls._rclone_stats_lock:
@@ -294,7 +294,7 @@ class FeederUtil:
 
     @classmethod
     def get_rclone_progress(cls, item_id) -> dict:
-        """Rclone 실시간 전송률/속도 캐시 조회"""
+        """웹 프로세스 메모리에서 실시간 전송률 조회"""
         if not item_id:
             return {}
         with cls._rclone_stats_lock:
@@ -302,11 +302,30 @@ class FeederUtil:
 
     @classmethod
     def clear_rclone_progress(cls, item_id):
-        """Rclone 전송 완료/종료 시 캐시 제거"""
+        """전송 완료 시 웹 프로세스 메모리에서 제거"""
         if not item_id:
             return
         with cls._rclone_stats_lock:
             cls._rclone_live_stats.pop(str(item_id), None)
+
+    @classmethod
+    def report_rclone_progress(cls, item_id, progress_dict: dict, action: str = 'update'):
+        """Celery 워커에서 Web API(progress_update)로 실시간 전송률을 HTTP POST 발송"""
+        if not item_id:
+            return
+        try:
+            port = F.config.get('port', 9999) if (hasattr(F, 'config') and F.config) else 9999
+            api_url = f"http://127.0.0.1:{port}/{P.package_name}/api/download/progress_update"
+            apikey = cls.get_system_apikey()
+            payload = {
+                'item_id': str(item_id),
+                'data': progress_dict,
+                'action': action,
+                'apikey': apikey
+            }
+            requests.post(api_url, json=payload, timeout=1.5)
+        except Exception:
+            pass
 
     @classmethod
     def apply_download_status_filter(cls, model_cls, query, status_filter: str):

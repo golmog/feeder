@@ -47,6 +47,7 @@ $(document).ready(function () {
 
     use_collapse('feed_make_rss_file');
     use_collapse('feed_use_proxy');
+    use_collapse('feed_use_global_filter');
     load_all_feed_data();
     restore_active_subtab('feed');
     setTimeout(function () { restore_active_subtab('feed'); }, 80);
@@ -174,6 +175,7 @@ function make_list(data) {
 // -----------------------------------------------------------------------------
 $('#feed_make_rss_file').change(function () { use_collapse('feed_make_rss_file'); });
 $('#feed_use_proxy').change(function () { use_collapse('feed_use_proxy'); });
+$('#feed_use_global_filter').change(function () { use_collapse('feed_use_global_filter'); });
 
 $(document).on('change', '#modal_feed_use_proxy', function () {
   if ($(this).is(':checked')) $('#modal_feed_use_proxy_div').collapse('show');

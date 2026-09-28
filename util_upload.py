@@ -86,14 +86,13 @@ class UploadUtil:
                         eta_val = m.group(5) or ''
 
                         if item_id:
-                            FeederUtil.set_rclone_progress(item_id, {
+                            FeederUtil.report_rclone_progress(item_id, {
                                 'progress': pct_val,
                                 'speed_str': speed_val,
                                 'downloaded_bytes': UploadUtil.parse_size_bytes(trans_str),
                                 'total_bytes': UploadUtil.parse_size_bytes(total_str) if total_str else (file_size or 0),
                                 'eta': eta_val
-                            })
-                        logger.debug(f"[Rclone Progress] {description}: {pct_val}% ({trans_str} / {total_str}) @ {speed_val} ETA {eta_val}")
+                            }, action='update')
 
             proc.stdout.close()
             proc.wait()
@@ -114,7 +113,7 @@ class UploadUtil:
             return False, str(ex)
         finally:
             if item_id:
-                FeederUtil.clear_rclone_progress(item_id)
+                FeederUtil.report_rclone_progress(item_id, {}, action='clear')
 
     @classmethod
     def get_remote_size(cls, remote_path: str, rclone_conf: str, impersonate_email: str = None) -> int:

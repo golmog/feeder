@@ -244,6 +244,8 @@ class CloudDrive2Engine(BaseDownloadEngine):
         {"name": "cd2_virtual_path", "label": "CD2 가상 다운로드 경로", "type": "text", "default": "115open/云下载", "desc": "오프라인 다운로드가 저장될 CD2 내부 가상 경로"},
         {"name": "cd2_mount_path", "label": "CD2 로컬 마운트 경로", "type": "text", "placeholder": "예: /mnt/cd2/115open/云下载", "desc": "로컬 파일시스템에 마운트된 실제 디렉터리 경로"},
         {"name": "cd2_completed_path", "label": "CD2 내부 완료 이동 경로", "type": "text", "placeholder": "예: /mnt/cd2/115open/uploads", "desc": "다운로드 완료 후 정리할 대상 폴더 경로"},
+        {"name": "cd2_max_pages", "label": "작업 목록 최대 탐색 페이지 수", "type": "number", "default": 1, "desc": "오프라인 작업 목록 조회 시 최대 탐색할 페이지 수 (기본값: 1페이지)"},
+        {"name": "cd2_timeout", "label": "gRPC 타임아웃 (초)", "type": "number", "default": 30, "desc": "gRPC 요청 제한 시간(초) (기본값: 30초)"},
         {"name": "stalled_timeout_hours", "label": "지연 타임아웃 (시간)", "type": "number", "default": 24, "desc": "해당 시간 동안 미완료 시 다음 엔진으로 자동 폴백 (0 입력 시 무제한 대기)"}
     ]
 
@@ -256,6 +258,16 @@ class CloudDrive2Engine(BaseDownloadEngine):
         self.mount_path = self.config.get('cd2_mount_path', '').strip()
         self.comp_path = self.config.get('cd2_completed_path', '').strip()
 
+        try:
+            self.max_pages = int(self.config.get('cd2_max_pages') or 1)
+        except Exception:
+            self.max_pages = 1
+        try:
+            self.grpc_timeout = int(self.config.get('cd2_timeout') or 30)
+        except Exception:
+            self.grpc_timeout = 30
+        self._last_refresh_time = 0
+
     def _get_grpc_stub(self):
         """gRPC 채널 및 스텁 생성"""
         if not CD2_GRPC_AVAILABLE or not CloudDrive_pb2_grpc:
@@ -265,17 +277,24 @@ class CloudDrive2Engine(BaseDownloadEngine):
         metadata = [('authorization', f"Bearer {self.token}")] if self.token else []
         return stub, metadata
 
-    def refresh_cache(self):
-        """클라우드 새 파일 반영을 위한 CD2 가상경로 캐시 강제 갱신"""
+    def refresh_cache(self, min_interval_sec: int = 300):
+        """클라우드 새 파일 반영을 위한 CD2 가상경로 캐시 갱신 (지나친 반복 방지를 위해 최소 5분 쿨다운 적용)"""
+        now = time.time()
+        if now - self._last_refresh_time < min_interval_sec:
+            return
+
         stub, metadata = self._get_grpc_stub()
         if not stub:
             return
+
         try:
+            self._last_refresh_time = now
             req = CloudDrive_pb2.ListSubFileRequest(path=self.vpath, forceRefresh=True)
-            for _ in stub.GetSubFiles(req, metadata=metadata, timeout=10):
+            for _ in stub.GetSubFiles(req, metadata=metadata, timeout=self.grpc_timeout):
                 pass
+            logger.debug(f"[CloudDrive2Engine] CD2 가상 경로 캐시 강제 갱신 완료: {self.vpath}")
         except Exception as e:
-            logger.debug(f"[CloudDrive2Engine] CD2 캐시 갱신 예외: {e}")
+            logger.debug(f"[CloudDrive2Engine] CD2 캐시 갱신 예외 ({self.grpc_timeout}s 타임아웃): {e}")
 
     def add_magnet(self, link: str, title: str = None) -> tuple[bool, str, str]:
         """CD2 gRPC를 통한 오프라인 다운로드 추가"""
@@ -320,48 +339,48 @@ class CloudDrive2Engine(BaseDownloadEngine):
         if not stub:
             return [], "CD2 gRPC 모듈 미로드"
 
-        self.refresh_cache()
-
         try:
             ret = []
-            max_pages = 5
+            max_pages = max(1, self.max_pages)
             for page_num in range(1, max_pages + 1):
-                req = CloudDrive_pb2.OfflineFileListAllRequest(path=self.vpath, page=page_num)
-                res = stub.ListAllOfflineFiles(req, metadata=metadata, timeout=30)
-                if not res.offlineFiles:
-                    break
+                try:
+                    req = CloudDrive_pb2.OfflineFileListAllRequest(path=self.vpath, page=page_num)
+                    res = stub.ListAllOfflineFiles(req, metadata=metadata, timeout=self.grpc_timeout)
+                    if not res.offlineFiles:
+                        break
 
-                for t in res.offlineFiles:
-                    infohash = getattr(t, 'infoHash', '').lower()
-                    original_url = getattr(t, 'url', '')
-                    if not infohash and original_url:
-                        infohash = FeederUtil.extract_info_hash(original_url) or ''
+                    for t in res.offlineFiles:
+                        infohash = getattr(t, 'infoHash', '').lower()
+                        original_url = getattr(t, 'url', '')
+                        if not infohash and original_url:
+                            infohash = FeederUtil.extract_info_hash(original_url) or ''
 
-                    fname = getattr(t, 'name', '') or ''
-                    fsize = getattr(t, 'size', 0) or 0
-                    status_code = getattr(t, 'status', 0)
+                        fname = getattr(t, 'name', '') or ''
+                        fsize = getattr(t, 'size', 0) or 0
+                        status_code = getattr(t, 'status', 0)
 
-                    # CD2 작업 상태 코드: 2 완료(FINISHED), 3 에러(ERROR), 그 외 다운로드 중
-                    if status_code == 2:
-                        std_status = 'completed'
-                    elif status_code == 3:
-                        std_status = 'error'
-                    else:
-                        std_status = 'downloading'
+                        # CD2 작업 상태 코드: 2 완료(FINISHED), 3 에러(ERROR), 그 외 다운로드 중
+                        if status_code == 2:
+                            std_status = 'completed'
+                        elif status_code == 3:
+                            std_status = 'error'
+                        else:
+                            std_status = 'downloading'
 
-                    src_path = os.path.join(self.mount_path, fname) if self.mount_path and fname else fname
+                        ret.append({
+                            'task_id': infohash or original_url[:40],
+                            'hash': infohash,
+                            'status': std_status,
+                            'filename': fname,
+                            'file_size': fsize,
+                            'source_path': ''
+                        })
 
-                    ret.append({
-                        'task_id': infohash or original_url[:40],
-                        'hash': infohash,
-                        'status': std_status,
-                        'filename': fname,
-                        'file_size': fsize,
-                        'source_path': src_path
-                    })
-
-                page_count = getattr(res, 'pageCount', 0)
-                if page_count > 0 and page_num >= page_count:
+                    page_count = getattr(res, 'pageCount', 0)
+                    if page_count > 0 and page_num >= page_count:
+                        break
+                except Exception as page_err:
+                    logger.debug(f"[CloudDrive2Engine] 오프라인 작업 목록 조회 예외 ({page_num}p): {page_err}")
                     break
 
             return ret, ""
@@ -429,6 +448,8 @@ class LocalTransporter(BaseTransporter):
 
         item.local_path = final_path
         return True, "completed", f"로컬 보존 완료 ({final_path})"
+
+
 class RcloneSimpleTransporter(BaseTransporter):
     TRANSPORTER_ID = "rclone_simple"
     TRANSPORTER_NAME = "일반 Rclone 리모트 단순 업로드"
@@ -499,10 +520,10 @@ class GDrivePoolTransporter(BaseTransporter):
     TRANSPORTER_NAME = "Google Drive 계정 풀 로테이션 (MyDrive 경유용)"
 
     CONFIG_SCHEMA = [
-        {"name": "use_local_staging", "label": "로컬 스테이징 사용", "type": "checkbox", "default": True, "desc": "On: 로컬 디스크에 임시 다운로드 후 전송, Off: 다이렉트(on-the-fly) 메모리 스트리밍 전송"},
-        {"name": "upload_path", "label": "임시 수신 경로 (Incoming)", "type": "text", "default": "incoming/default"},
-        {"name": "complete_path", "label": "최종 라이브러리 경로 (Complete)", "type": "text", "default": "uploads/default"},
-        {"name": "shared_drive_id", "label": "공유 드라이브 ID (Shared Drive ID)", "type": "text", "placeholder": "미입력 시 기본 설정값 사용"}
+        {"name": "use_local_staging", "label": "로컬 스테이징 사용", "type": "checkbox", "default": True, "desc": "On: 로컬 임시 디스크 다운로드 후 전송, Off: 다이렉트(on-the-fly) 스트리밍 전송"},
+        {"name": "upload_path", "label": "임시 수신 경로", "type": "text", "placeholder": "예: incoming/프로필명", "desc": "로컬 스테이징 루트 및 구글 드라이브 임시 수신 디렉터리 경로"},
+        {"name": "shared_drive_id", "label": "공유 드라이브 ID", "type": "text", "placeholder": "미입력 시 기본 설정값 사용", "desc": "최종 라이브러리가 위치할 대상 공유 드라이브 ID"},
+        {"name": "complete_path", "label": "최종 라이브러리 경로", "type": "text", "placeholder": "예: uploads/프로필명", "desc": "지정한 공유 드라이브 내 최종 보관 폴더 경로"}
     ]
 
     def transport(self, item, source_path: str, dest_config: dict) -> tuple[bool, str, str]:

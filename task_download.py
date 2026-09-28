@@ -64,6 +64,9 @@ class TaskDownload:
                     logger.debug("[DownloadPipeline] 등록된 다운로드 프로필(DOWNLOAD_PROFILES)이 없습니다.")
                     return
 
+                # SA 내 드라이브 고아 파일 사전 정리 및 용량 확보
+                UploadUtil.drain_all_sa_mydrives()
+
                 # 피드 최신 데이터 동기화 및 큐 등록
                 TaskDownload.sync_feed_items(profiles)
 
@@ -102,9 +105,6 @@ class TaskDownload:
 
                     if (pending_after + staging_after + downloaded_after + uploading_after) == 0:
                         break
-
-                # SA 내 드라이브 고아 파일 사전 정리 (파이프라인 실행 방해 없도록 후반 배치)
-                UploadUtil.drain_all_sa_mydrives()
 
                 # 이전 실패 항목 재시도
                 TaskDownload.retry_move_failed()
@@ -360,17 +360,16 @@ class TaskDownload:
             if not engine:
                 continue
 
-            if hasattr(engine, 'refresh_cache'):
-                engine.refresh_cache()
-
-            task_ids = [it.engine_task_id for it in engine_items if it.engine_task_id]
-            status_list, err = engine.get_status(task_ids=task_ids)
+            status_list, err = engine.get_status()
             if err:
                 logger.warning(f"[DownloadPoll] [{engine_name}] 상태 조회 실패: {err}")
                 continue
 
             status_map_by_tid = {str(s.get('task_id')): s for s in status_list if s.get('task_id')}
             status_map_by_hash = {str(s.get('hash')).lower(): s for s in status_list if s.get('hash')}
+
+            matched_count = sum(1 for it in engine_items if (str(it.engine_task_id) in status_map_by_tid or (it.infohash and str(it.infohash).lower() in status_map_by_hash)))
+            logger.debug(f"[DownloadPoll] [{engine_name}] 전체 토렌트 {len(status_list)}건 수신 (큐 매칭: {matched_count}건, 미등록 잔여: {len(status_list) - matched_count}건)")
 
             try:
                 stalled_hours = int(downloader_cfg.get('stalled_timeout_hours', 24))
@@ -466,6 +465,13 @@ class TaskDownload:
 
     @staticmethod
     def process_local_staging():
+        stuck_staging = db.session.query(ModelDownload).filter_by(status='local_staging').all()
+        if stuck_staging:
+            for s_it in stuck_staging:
+                s_it.status = 'pending_local_staging'
+            db.session.commit()
+            logger.info(f"[LocalStaging] 멈춰있던 스테이징 작업 {len(stuck_staging)}건을 대기열(pending_local_staging)로 자동 복구했습니다.")
+
         try:
             batch_limit = P.ModelSetting.get_int('download_batch_limit')
         except Exception:
@@ -474,7 +480,7 @@ class TaskDownload:
         if not items:
             return
 
-        staging_root = FeederUtil.get_global().get('local_staging_path') or os.path.join(FeederUtil.get_tmp_dir(), 'staging')
+        staging_root = P.ModelSetting.get('download_local_staging_path') or FeederUtil.get_global().get('local_staging_path') or os.path.join(FeederUtil.get_tmp_dir(), 'staging')
         os.makedirs(staging_root, exist_ok=True)
 
         for item in items:
@@ -515,9 +521,14 @@ class TaskDownload:
             else:
                 target_folder_name = folder_base_name
 
-            # 경로 구조: 로컬 스테이징 경로 / 다운로드 프로필명 / 서브폴더(target_folder_name) / 파일
-            profile_name = (profile.get('name') if profile else None) or 'default'
-            item_staging_dir = os.path.join(staging_root, profile_name, target_folder_name)
+            # 경로 구조: 로컬 스테이징 임시 경로 루트 / 프로필 임시 수신 경로(upload_path) / 서브폴더(target_folder_name) / 파일
+            dest_cfg = profile.get('destination', {}) if profile else {}
+            upload_path = (item.gdrive_upload_path or dest_cfg.get('upload_path') or '').strip('/')
+            if not upload_path:
+                profile_name = (profile.get('name') if profile else None) or 'default'
+                upload_path = profile_name
+
+            item_staging_dir = os.path.join(staging_root, upload_path, target_folder_name)
             if os.path.exists(item_staging_dir):
                 shutil.rmtree(item_staging_dir, ignore_errors=True)
             os.makedirs(item_staging_dir, exist_ok=True)
@@ -530,29 +541,34 @@ class TaskDownload:
                 rclone_cmd_type = "copy"
                 dest_download_path = item_staging_dir
 
-            logger.info(f"[LocalStaging] 로컬 스테이징 다운로드 시작: {profile_name}/{target_folder_name} (명령: {rclone_cmd_type})")
+            logger.info(f"[LocalStaging] 로컬 스테이징 다운로드 시작: {upload_path}/{target_folder_name} (명령: {rclone_cmd_type})")
 
             rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or FeederUtil.load_yaml().get('rclone', {}).get('conf_path', '')
             cmd = [
                 "rclone", rclone_cmd_type, src_path, dest_download_path,
-                "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE",
+                "--stats", "1s", "--stats-one-line", "--log-level", "INFO",
                 "--multi-thread-streams", "0",
                 "--retries", "3"
             ]
             if rclone_conf:
                 cmd.extend(["--config", rclone_conf])
 
-            # 유저 설정 Rclone 확장 옵션 결합
             cmd.extend(FeederUtil.get_rclone_extra_options())
 
-            success, out = UploadUtil.run_rclone(
-                cmd,
-                f"로컬 스테이징 {target_folder_name}",
-                item_id=item.id,
-                file_size=item.file_size
-            )
-            if not success:
-                logger.error(f"[LocalStaging] Rclone 다운로드 실패: {out.strip()[:200]}")
+            success = False
+            out = ""
+            try:
+                success, out = UploadUtil.run_rclone(
+                    cmd,
+                    f"로컬 스테이징 {target_folder_name}",
+                    item_id=item.id,
+                    file_size=item.file_size
+                )
+                if not success:
+                    logger.error(f"[LocalStaging] Rclone 다운로드 실패: {out.strip()[:200]}")
+            except Exception as ex:
+                logger.error(f"[LocalStaging] Rclone 실행 예외 ({target_folder_name}): {ex}")
+                success = False
 
             if success and os.path.exists(item_staging_dir):
                 downloader_cfg = FeederUtil.get_downloader_by_name(item.current_engine_name)
@@ -564,6 +580,7 @@ class TaskDownload:
                 item.local_path = item_staging_dir
                 item.file_name = target_folder_name
                 item.status = 'downloaded'
+                item.error_message = None
                 logger.info(f"[LocalStaging] 폴더 스테이징 완료: {target_folder_name} -> downloaded 전환")
             else:
                 if os.path.exists(item_staging_dir):
@@ -634,10 +651,19 @@ class TaskDownload:
 
     @staticmethod
     def process_uploads():
+        # 이전 비정상 종료로 멈춘 uploading 작업을 pending_upload로 자동 복구
+        stuck_uploads = db.session.query(ModelDownload).filter_by(status='uploading').all()
+        if stuck_uploads:
+            for u_it in stuck_uploads:
+                u_it.status = 'pending_upload'
+            db.session.commit()
+            logger.info(f"[UploadUtil] 멈춰있던 업로드 작업 {len(stuck_uploads)}건을 대기열(pending_upload)로 자동 복구했습니다.")
+
         try:
             batch_limit = P.ModelSetting.get_int('download_batch_limit')
         except Exception:
             batch_limit = 50
+
         items = ModelDownload.get_list_by_status(['pending_upload'], limit=batch_limit)
         if not items:
             return

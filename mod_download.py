@@ -444,10 +444,28 @@ class ModuleDownload(PluginModuleBase):
                 return self._handle_relay_claim(req)
             elif sub == 'relay_report':
                 return self._handle_relay_report(req)
+            elif sub == 'progress_update':
+                return self._handle_progress_update(req)
             return jsonify({'ret': 'fail', 'msg': f'알 수 없는 API 명령: {sub}'}), 404
         except Exception as e:
             logger.error(f"[{self.name}] process_api 에러 ({sub}): {e}")
             return jsonify({'ret': 'error', 'msg': str(e)}), 500
+
+    def _handle_progress_update(self, req):
+        """Celery 워커로부터 실시간 Rclone 전송률 수신 및 웹 메모리 갱신"""
+        data = req.get_json(silent=True) or req.form or {}
+        item_id = data.get('item_id')
+        action = data.get('action', 'update')
+        if not item_id:
+            return jsonify({'ret': 'fail', 'msg': 'item_id 누락'}), 400
+
+        if action == 'clear':
+            FeederUtil.clear_rclone_progress(item_id)
+        else:
+            prog_data = data.get('data') or {}
+            FeederUtil.set_rclone_progress(item_id, prog_data)
+
+        return jsonify({'ret': 'success'})
 
     def _verify_api_auth(self, req) -> bool:
         client_key = req.args.get('apikey') or req.form.get('apikey')
@@ -666,37 +684,29 @@ class ModuleDownload(PluginModuleBase):
                         .all()
                     )
 
-                    # downloading 상태인 항목들에 대해 다운로더 엔진 실시간 진행 데이터 수집
-                    downloading_items = [it for it in active_rows if it.status == 'downloading']
-                    engine_live_data = {}
+                    # 활성화된 다운로더 엔진(AllDebrid 등)에서 전체 마그넷 목록 수집
+                    cloud_tasks = []
+                    for dl in FeederUtil.get_downloaders():
+                        if dl.get('enabled', True):
+                            engine = DownloadUtil.create_engine(dl)
+                            if engine and hasattr(engine, 'get_status'):
+                                try:
+                                    s_list, _ = engine.get_status()
+                                    if s_list:
+                                        for c_item in s_list:
+                                            c_item['engine_name'] = dl.get('name', 'alldebrid')
+                                        cloud_tasks.extend(s_list)
+                                except Exception:
+                                    pass
 
-                    if downloading_items:
-                        items_by_engine = {}
-                        for it in downloading_items:
-                            e_name = it.current_engine_name
-                            if e_name:
-                                items_by_engine.setdefault(e_name, []).append(it)
+                    engine_live_data = {str(s.get('task_id')): s for s in cloud_tasks if s.get('task_id')}
+                    engine_live_data.update({str(s.get('hash')).lower(): s for s in cloud_tasks if s.get('hash')})
 
-                        for e_name, e_items in items_by_engine.items():
-                            dl_cfg = FeederUtil.get_downloader_by_name(e_name)
-                            if not dl_cfg:
-                                continue
-                            engine = DownloadUtil.create_engine(dl_cfg)
-                            if not engine:
-                                continue
+                    # DB의 활성 작업 ID 및 해시 세트
+                    db_tids = {str(it.engine_task_id) for it in active_rows if it.engine_task_id}
+                    db_hashes = {str(it.infohash).lower() for it in active_rows if it.infohash}
 
-                            task_ids = [it.engine_task_id for it in e_items if it.engine_task_id]
-                            status_list, _ = engine.get_status(task_ids=task_ids)
-                            if status_list:
-                                for s in status_list:
-                                    tid = str(s.get('task_id', ''))
-                                    thash = str(s.get('hash', '')).lower()
-                                    if tid:
-                                        engine_live_data[tid] = s
-                                    if thash:
-                                        engine_live_data[thash] = s
-
-                    # 각 아이템 딕셔너리에 실시간 속도, 진행률 병합 (진행 중일 때만 동적 반영, 단계 상태는 DB 우선)
+                    # 각 아이템 딕셔너리에 실시간 속도, 진행률 병합
                     active_list = []
                     for it in active_rows:
                         d = it.as_dict()
@@ -720,7 +730,7 @@ class ModuleDownload(PluginModuleBase):
                                 d['download_speed'] = dl_speed
                                 d['progress'] = min(prog, 100.0)
 
-                        # 로컬 스테이징 및 Google Drive 업로드 중일 때는 Rclone 실시간 캐시 데이터 병합
+                        # 로컬 스테이징 및 Google Drive 업로드 중일 때는 Rclone 실시간 IPC 데이터 병합
                         elif it.status in ['local_staging', 'uploading']:
                             rclone_stat = FeederUtil.get_rclone_progress(it.id)
                             if rclone_stat:
@@ -731,9 +741,34 @@ class ModuleDownload(PluginModuleBase):
                                 d['file_size'] = rclone_stat.get('total_bytes') or d.get('file_size') or 0
                                 d['eta'] = rclone_stat.get('eta', '')
 
-                        # 로컬 스테이징, 업로드 중, 릴레이 등 단계 전환 상태는 항상 DB에 저장된 상태를 최우선 유지
+                        # 단계 상태는 항상 DB에 저장된 실제 상태(it.status)를 최우선 유지
                         d['status'] = it.status
                         active_list.append(d)
+
+                    # DB에 등록되지 않은 다운로더 엔진(AllDebrid, PikPak 등) 잔여 항목들을 동적 엔진명으로 큐에 노출
+                    for c_task in cloud_tasks:
+                        tid = str(c_task.get('task_id', ''))
+                        thash = str(c_task.get('hash', '')).lower()
+                        if tid and tid in db_tids:
+                            continue
+                        if thash and thash in db_hashes:
+                            continue
+
+                        eng_name = c_task.get('engine_name') or 'Engine'
+                        raw_id = tid or thash or '0'
+                        display_id = raw_id[:10] if len(raw_id) > 10 else raw_id
+
+                        active_list.append({
+                            'id': display_id,
+                            'feed_name': eng_name,
+                            'title': c_task.get('filename') or f"{eng_name} Task {display_id}",
+                            'file_name': c_task.get('filename') or '',
+                            'file_size': c_task.get('file_size', 0),
+                            'status': 'engine_unmanaged',
+                            'current_engine_name': eng_name,
+                            'local_path': '',
+                            'created_time': f"{eng_name} 보관중"
+                        })
 
                     data_str = json.dumps({
                         'timestamp': int(time.time()),

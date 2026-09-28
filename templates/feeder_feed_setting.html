@@ -36,6 +36,13 @@
       <div id="feed_use_proxy_div" class="collapse">
         {{ macros.setting_input_text('feed_proxy_url', 'Proxy URL', value=arg['feed_proxy_url'], placeholder='예: http://gluetun:8888') }}
       </div>
+      {{ macros.m_hr() }}
+      {{ macros.setting_checkbox('feed_use_global_filter', '공통 정규식 필터 사용', value=arg['feed_use_global_filter'], desc=['On: 모든 피드에 공통으로 적용할 전역 정규식 필터링을 활성화합니다.']) }}
+      <div id="feed_use_global_filter_div" class="collapse">
+        {{ macros.setting_input_textarea('feed_filter_reject', '공통 거부 패턴 (reject)', value=arg['feed_filter_reject'], row='3', desc=['모든 피드에서 공통으로 제외할 정규식 목록 (줄바꿈 구분)', '예시: FC2-PPV 또는 \\btrailer\\b: {from: title}']) }}
+        {{ macros.setting_input_textarea('feed_filter_accept', '공통 허용 패턴 (accept)', value=arg['feed_filter_accept'], row='3', desc=['모든 피드에서 공통으로 우선 허용할 정규식 목록 (줄바꿈 구분)', '예시: 1080p 또는 \\bKOR\\b: {from: [title, link]}']) }}
+        {{ macros.setting_input_textarea('feed_filter_reject_excluding', '공통 필수 포함 (reject_excluding)', value=arg['feed_filter_reject_excluding'], row='2', desc=['모든 피드에서 반드시 포함되어야 하는 필수 정규식 목록 (줄바꿈 구분)', '예시: \\[FHD\\]']) }}
+      </div>
     {{ macros.m_tab_content_end() }}
 
     {{ macros.m_tab_content_start('feeds', false) }}

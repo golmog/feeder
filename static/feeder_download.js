@@ -161,6 +161,7 @@ function render_queue_rows(list) {
     else if (it.status === 'pending_relay') statusBadge = '<span class="badge badge-warning">원격 릴레이 대기</span>';
     else if (it.status === 'relay_transferring') statusBadge = '<span class="badge badge-primary">원격 릴레이 전송 중</span>';
     else if (it.status === 'downloaded') statusBadge = '<span class="badge badge-success">다운로드 완료 (업로드 대기)</span>';
+    else if (it.status === 'ad_unmanaged') statusBadge = '<span class="badge badge-secondary">AD 미등록 (잔여)</span>';
     else if (it.status === 'pending_upload' || it.status === 'uploading') statusBadge = '<span class="badge badge-primary">업로드 중</span>';
     else if (it.status === 'completed') statusBadge = '<span class="badge badge-success">최종 완료</span>';
     else if (it.status === 'failed') statusBadge = '<span class="badge badge-danger">실패</span>';
@@ -169,7 +170,14 @@ function render_queue_rows(list) {
     var engineInfo = it.current_engine_name ? '<br><small class="text-muted">엔진: ' + it.current_engine_name + '</small>' : '';
     var errorMsg = it.error_message ? '<div class="mt-1 small text-danger font-weight-bold"><i class="fa fa-exclamation-triangle mr-1"></i>' + it.error_message + '</div>' : '';
     var timeStr = it.updated_time || it.created_time || '';
-    var pathDisplay = it.local_path ? '<code>' + it.local_path + '</code>' : '<span class="text-muted">경로 확인 중...</span>';
+    var pathDisplay = '';
+    if (it.status === 'engine_unmanaged' || it.status === 'ad_unmanaged') {
+      pathDisplay = '<span class="text-muted"><i class="fa fa-cloud mr-1"></i>원격 클라우드 보관</span>';
+    } else if (it.local_path) {
+      pathDisplay = '<code>' + it.local_path + '</code>';
+    } else {
+      pathDisplay = '<span class="text-muted">-</span>';
+    }
 
     var detailHtml = '';
 
@@ -249,6 +257,9 @@ function render_queue_rows(list) {
       detailHtml += '<div class="mt-1 small text-primary font-weight-bold"><i class="fa fa-clock-o mr-1"></i>Google Drive 업로드 대기 중...</div>';
     } else if (it.status === 'relay_transferring') {
       detailHtml += '<div class="mt-1 small text-primary font-weight-bold"><i class="fa fa-cloud-upload fa-spin mr-1"></i>원격 릴레이 전송 진행 중...</div>';
+    } else if (it.status === 'engine_unmanaged' || it.status === 'ad_unmanaged') {
+      var engLabelName = it.current_engine_name || it.feed_name || '다운로더';
+      detailHtml += '<div class="mt-1 small text-muted"><i class="fa fa-cloud mr-1"></i>' + engLabelName + ' 계정 내 보관 중 (DB 미등록 잔여 항목)</div>';
     }
 
     detailHtml += errorMsg;
@@ -258,11 +269,15 @@ function render_queue_rows(list) {
     str += '  <td>' + statusBadge + engineInfo + '</td>';
     str += '  <td class="text-left">' + detailHtml + '</td>';
     str += '  <td>';
-    str += '    <div class="btn-group btn-group-sm">';
-    str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold queue_action_btn" data-action="retry" data-id="' + it.id + '">재시도</button>';
-    str += '      <button type="button" class="btn btn-success text-white queue_action_btn" data-action="force_complete" data-id="' + it.id + '">완료</button>';
-    str += '      <button type="button" class="btn btn-danger text-white queue_action_btn" data-action="delete" data-id="' + it.id + '">삭제</button>';
-    str += '    </div>';
+    if (it.status === 'engine_unmanaged' || it.status === 'ad_unmanaged' || String(it.id).startsWith('EXT-') || String(it.id).startsWith('AD-')) {
+      str += '    <span class="text-muted small">-</span>';
+    } else {
+      str += '    <div class="btn-group btn-group-sm">';
+      str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold queue_action_btn" data-action="retry" data-id="' + it.id + '">재시도</button>';
+      str += '      <button type="button" class="btn btn-success text-white queue_action_btn" data-action="force_complete" data-id="' + it.id + '">완료</button>';
+      str += '      <button type="button" class="btn btn-danger text-white queue_action_btn" data-action="delete" data-id="' + it.id + '">삭제</button>';
+      str += '    </div>';
+    }
     str += '  </td>';
     str += '</tr>';
   }
@@ -330,6 +345,10 @@ function make_list(list) {
     else if (it.status === 'pending_relay') statusBadge = '<span class="badge badge-warning">원격 릴레이 대기</span>';
     else if (it.status === 'relay_transferring') statusBadge = '<span class="badge badge-primary">원격 릴레이 전송 중</span>';
     else if (it.status === 'downloaded') statusBadge = '<span class="badge badge-success">다운로드 완료</span>';
+    else if (it.status === 'engine_unmanaged' || it.status === 'ad_unmanaged') {
+      var engBadgeName = it.current_engine_name || it.feed_name || '엔진';
+      statusBadge = '<span class="badge badge-secondary">' + engBadgeName + ' 미등록 (잔여)</span>';
+    }
     else if (it.status === 'pending_upload' || it.status === 'uploading') statusBadge = '<span class="badge badge-primary">업로드 중</span>';
     else if (it.status === 'move_failed') statusBadge = '<span class="badge badge-warning">이동 실패</span>';
     else if (it.status === 'failed') statusBadge = '<span class="badge badge-danger">실패</span>';
@@ -955,7 +974,7 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
     var ph = f.placeholder || '';
     var descHtml = f.desc ? '<small class="form-text text-muted">' + f.desc + '</small>' : '';
 
-    html += '<div class="form-group row mb-2">';
+    html += '<div class="form-group row mb-2 dest-field-row-' + f.name + '">';
     html += '  <label class="col-sm-3 col-form-label text-right font-weight-bold">' + f.label + '</label>';
     html += '  <div class="col-sm-9">';
 
@@ -979,10 +998,35 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
   try {
     container.find('input[data-toggle="toggle"]').bootstrapToggle();
   } catch (err) {}
+
+  function toggleUploadPathField() {
+    var stagingChk = $('#dest_field_use_local_staging');
+    if (stagingChk.length > 0) {
+      if (stagingChk.is(':checked')) {
+        $('.dest-field-row-upload_path').show();
+      } else {
+        $('.dest-field-row-upload_path').hide();
+      }
+    }
+  }
+
+  toggleUploadPathField();
+  $('#dest_field_use_local_staging').change(function () {
+    toggleUploadPathField();
+  });
 }
 
 $('#profile_dest_type').change(function () {
   render_dynamic_dest_fields($(this).val(), null);
+  var pName = $('#profile_name').val().trim() || 'default';
+  var upField = $('#dest_field_upload_path');
+  var compField = $('#dest_field_complete_path');
+  if (upField.length && (!upField.val() || upField.val() === 'default' || upField.val().startsWith('incoming/'))) {
+    upField.val(pName);
+  }
+  if (compField.length && (!compField.val() || compField.val() === 'default' || compField.val().startsWith('uploads/'))) {
+    compField.val('uploads/' + pName);
+  }
 });
 
 $(document).on('input change', '#profile_name', function () {
@@ -990,10 +1034,10 @@ $(document).on('input change', '#profile_name', function () {
   var pName = $(this).val().trim() || 'default';
   var upField = $('#dest_field_upload_path');
   var compField = $('#dest_field_complete_path');
-  if (upField.length && (!upField.val() || upField.val().startsWith('incoming/'))) {
-    upField.val('incoming/' + pName);
+  if (upField.length && (!upField.val() || upField.val() === 'default' || upField.val().startsWith('incoming/'))) {
+    upField.val(pName);
   }
-  if (compField.length && (!compField.val() || compField.val().startsWith('uploads/'))) {
+  if (compField.length && (!compField.val() || compField.val() === 'default' || compField.val().startsWith('uploads/'))) {
     compField.val('uploads/' + pName);
   }
 });
