@@ -169,7 +169,7 @@
       <div class="modal-body">
         <form id="downloader_form">
           <input type="hidden" id="downloader_mode" value="add">
-          {{ macros.setting_input_text('dl_name', '식별명', col='9', placeholder='예: ad_main, 115_vip, qbit_local', desc=['프로필 체인에서 참조할 고유 식별 영문명']) }}
+          {{ macros.setting_input_text('dl_name', '식별명', col='9', placeholder='예: qbit_main, cd2_main, local_downloader', desc=['프로필 체인에서 참조할 고유 식별 영문명']) }}
           <div class="form-group row mb-2">
             <label class="col-sm-3 col-form-label text-right font-weight-bold">엔진 타입</label>
             <div class="col-sm-9">
@@ -247,7 +247,7 @@
       <div class="modal-body">
         <form id="profile_form">
           <input type="hidden" id="profile_mode" value="add">
-          {{ macros.setting_input_text('profile_name', '프로필명', col='9', placeholder='예: default_profile, movies_direct_115') }}
+          {{ macros.setting_input_text('profile_name', '프로필명', col='9', placeholder='예: default_profile, media_direct') }}
           <!-- 적용 피드 선택 영역 -->
           <div class="form-group row mb-2">
             <label class="col-sm-3 col-form-label text-right font-weight-bold">적용 피드</label>

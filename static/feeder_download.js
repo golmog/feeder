@@ -91,11 +91,22 @@ $(document).ready(function () {
 // -----------------------------------------------------------------------------
 function init_sse_listener() {
   if (window.EventSource) {
+    if (sse_source) {
+      try { sse_source.close(); } catch (e) {}
+    }
     var sseUrl = '/' + package_name + '/api/' + sub + '/sse' + (apikey ? '?apikey=' + apikey : '');
     sse_source = new EventSource(sseUrl);
+
+    sse_source.onopen = function () {
+      $('#sse_status_badge').removeClass('badge-secondary badge-danger')
+        .addClass('badge-success')
+        .html('<i class="fa fa-bolt mr-1"></i>실시간 라이브');
+    };
+
     sse_source.onmessage = function (event) {
       try {
         var data = JSON.parse(event.data);
+        // 상단 통계 카드 수치 실시간 업데이트
         if (data && data.counts) {
           $('#stat_pending').text(data.counts.pending || 0);
           $('#stat_downloading').text(data.counts.downloading || 0);
@@ -104,7 +115,18 @@ function init_sse_listener() {
           $('#stat_completed').text(data.counts.completed || 0);
           $('#stat_failed').text(data.counts.failed || 0);
         }
+
+        // 활성 큐 테이블 실시간 자동 렌더링 (새로고침 없이 테이블 행 자동 동기화)
+        if (data && Array.isArray(data.active_list) && $('#active_queue_tbody').length > 0) {
+          render_queue_rows(data.active_list);
+        }
       } catch (err) {}
+    };
+
+    sse_source.onerror = function () {
+      $('#sse_status_badge').removeClass('badge-success badge-secondary')
+        .addClass('badge-danger')
+        .html('<i class="fa fa-exclamation-circle mr-1"></i>연결 끊김 (재연결 시도중)');
     };
   }
 }
@@ -125,7 +147,7 @@ function render_queue_rows(list) {
   var tbody = $('#active_queue_tbody');
   if (!tbody.length) return;
   if (!list || list.length === 0) {
-    tbody.html('<tr><td colspan="6" class="py-4 text-muted">현재 진행 중인 활성 작업이 없습니다.</td></tr>');
+    tbody.html('<tr><td colspan="4" class="py-4 text-muted">현재 진행 중인 활성 작업이 없습니다.</td></tr>');
     return;
   }
 
@@ -145,19 +167,60 @@ function render_queue_rows(list) {
     else statusBadge = '<span class="badge badge-secondary">' + it.status + '</span>';
 
     var engineInfo = it.current_engine_name ? '<br><small class="text-muted">엔진: ' + it.current_engine_name + '</small>' : '';
-    var errorMsg = it.error_message ? '<br><small class="text-danger">오류: ' + it.error_message + '</small>' : '';
-    var pathDisplay = it.local_path ? '<div class="text-truncate small text-muted" style="max-width: 220px;" title="' + it.local_path + '">' + it.local_path + '</div>' : '<span class="text-muted">-</span>';
+    var errorMsg = it.error_message ? '<div class="mt-1 small text-danger font-weight-bold"><i class="fa fa-exclamation-triangle mr-1"></i>' + it.error_message + '</div>' : '';
+    var timeStr = it.updated_time || it.created_time || '';
+    var pathDisplay = it.local_path ? '<code>' + it.local_path + '</code>' : '<span class="text-muted">경로 확인 중...</span>';
+
+    var detailHtml = '';
+
+    // 1행: 피드명 + 제목
+    detailHtml += '<div class="mb-1">';
+    detailHtml += '  <span class="badge badge-dark mr-1">' + (it.feed_name || 'Feed') + '</span>';
+    detailHtml += '  <strong style="font-size: 0.95rem;">' + it.title + '</strong>';
+    detailHtml += '</div>';
+
+    // 2행: 파일명 (용량) + 저장 경로 + [우측: 시각] (한 줄 통합 배치)
+    var fsizeText = it.file_size ? ' (' + format_bytes(it.file_size) + ')' : '';
+    var nameAndSize = it.file_name
+      ? '<span class="font-weight-bold text-info mr-2"><i class="fa fa-folder-open-o mr-1"></i>' + it.file_name + fsizeText + '</span>'
+      : (fsizeText ? '<span class="badge badge-secondary mr-2"><i class="fa fa-database mr-1"></i>' + format_bytes(it.file_size) + '</span>' : '');
+
+    detailHtml += '<div class="small text-muted d-flex justify-content-between align-items-center flex-wrap" style="line-height: 1.5;">';
+    detailHtml += '  <div class="d-inline-flex align-items-center flex-wrap mr-2">';
+    detailHtml +=      nameAndSize;
+    detailHtml += '    <span class="mr-2"><i class="fa fa-hdd-o mr-1"></i>' + pathDisplay + '</span>';
+    detailHtml += '  </div>';
+    detailHtml += '  <span class="text-muted ml-auto"><i class="fa fa-clock-o mr-1"></i>' + timeStr + '</span>';
+    detailHtml += '</div>';
+
+    // 3행: 진행 상태별 컴팩트 게이지 바 (다운로드 중일 때만 밀착 노출)
+    if (it.status === 'downloading') {
+      var progVal = (it.progress !== undefined && it.progress !== null) ? it.progress : 0;
+      var speedStr = it.download_speed ? format_bytes(it.download_speed) + '/s' : '0 B/s';
+      var dlBytesStr = it.downloaded_bytes ? format_bytes(it.downloaded_bytes) : '0 B';
+      var totalBytesStr = it.file_size ? format_bytes(it.file_size) : '확인 중';
+
+      detailHtml += '<div class="mt-1 p-1 px-2 rounded" style="background: rgba(0, 123, 255, 0.06); border: 1px solid rgba(0, 123, 255, 0.15);">';
+      detailHtml += '  <div class="d-flex justify-content-between align-items-center mb-1 small font-weight-bold">';
+      detailHtml += '    <span class="text-primary" style="font-size: 0.82rem;"><i class="fa fa-arrow-circle-o-down mr-1"></i>다운로드 진행: ' + progVal + '% (' + dlBytesStr + ' / ' + totalBytesStr + ')</span>';
+      detailHtml += '    <span class="badge badge-info"><i class="fa fa-tachometer mr-1"></i>' + speedStr + '</span>';
+      detailHtml += '  </div>';
+      detailHtml += '  <div class="progress" style="height: 12px; background-color: rgba(255, 255, 255, 0.15); border-radius: 3px;">';
+      detailHtml += '    <div class="progress-bar progress-bar-striped progress-bar-animated bg-primary" role="progressbar" style="width: ' + progVal + '%; font-size: 0.72rem; line-height: 12px;" aria-valuenow="' + progVal + '" aria-valuemin="0" aria-valuemax="100">' + (progVal > 8 ? progVal + '%' : '') + '</div>';
+      detailHtml += '  </div>';
+      detailHtml += '</div>';
+    } else if (it.status === 'pending_local_staging' || it.status === 'local_staging') {
+      detailHtml += '<div class="mt-1 small text-info font-weight-bold"><i class="fa fa-cog fa-spin mr-1"></i>원격 클라우드 다운로드 완료 ➔ 로컬 스테이징 전송 중...</div>';
+    } else if (it.status === 'uploading' || it.status === 'relay_transferring') {
+      detailHtml += '<div class="mt-1 small text-primary font-weight-bold"><i class="fa fa-cloud-upload fa-spin mr-1"></i>Google Drive 업로드 / 원격 릴레이 전송 진행 중...</div>';
+    }
+
+    detailHtml += errorMsg;
 
     str += '<tr>';
     str += '  <td class="font-weight-bold">' + it.id + '</td>';
     str += '  <td>' + statusBadge + engineInfo + '</td>';
-    str += '  <td class="text-left">';
-    str += '    <span class="badge badge-dark mr-1">' + (it.feed_name || 'Feed') + '</span>';
-    str += '    <strong>' + it.title + '</strong>' + errorMsg;
-    if (it.file_name) str += '<br><small class="text-info font-weight-bold">폴더/파일: ' + it.file_name + '</small>';
-    str += '  </td>';
-    str += '  <td>' + format_bytes(it.file_size) + '<br>' + pathDisplay + '</td>';
-    str += '  <td class="small text-muted">' + (it.updated_time || it.created_time || '') + '</td>';
+    str += '  <td class="text-left">' + detailHtml + '</td>';
     str += '  <td>';
     str += '    <div class="btn-group btn-group-sm">';
     str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold queue_action_btn" data-action="retry" data-id="' + it.id + '">재시도</button>';
@@ -216,7 +279,7 @@ function make_list(list) {
   var tbody = $('#download_list_tbody');
   if (!tbody.length) return;
   if (!list || list.length === 0) {
-    tbody.html('<tr><td colspan="6" class="py-4 text-muted">검색 조건에 일치하는 다운로드 이력이 없습니다.</td></tr>');
+    tbody.html('<tr><td colspan="4" class="py-4 text-muted">검색 조건에 일치하는 다운로드 이력이 없습니다.</td></tr>');
     return;
   }
 
@@ -228,8 +291,8 @@ function make_list(list) {
     else if (it.status === 'downloading') statusBadge = '<span class="badge badge-primary">다운로드 중</span>';
     else if (it.status === 'pending') statusBadge = '<span class="badge badge-warning">대기 (Pending)</span>';
     else if (it.status === 'pending_local_staging' || it.status === 'local_staging') statusBadge = '<span class="badge badge-info">로컬 스테이징</span>';
-    else if (it.status === 'pending_colab') statusBadge = '<span class="badge badge-warning">Colab 대기</span>';
-    else if (it.status === 'colab_transferring') statusBadge = '<span class="badge badge-primary">Colab 전송 중</span>';
+    else if (it.status === 'pending_relay') statusBadge = '<span class="badge badge-warning">원격 릴레이 대기</span>';
+    else if (it.status === 'relay_transferring') statusBadge = '<span class="badge badge-primary">원격 릴레이 전송 중</span>';
     else if (it.status === 'downloaded') statusBadge = '<span class="badge badge-success">다운로드 완료</span>';
     else if (it.status === 'pending_upload' || it.status === 'uploading') statusBadge = '<span class="badge badge-primary">업로드 중</span>';
     else if (it.status === 'move_failed') statusBadge = '<span class="badge badge-warning">이동 실패</span>';
@@ -237,20 +300,38 @@ function make_list(list) {
     else statusBadge = '<span class="badge badge-secondary">' + it.status + '</span>';
 
     var engineInfo = it.current_engine_name ? '<br><small class="text-muted">엔진: ' + it.current_engine_name + '</small>' : '';
-    var errorMsg = it.error_message ? '<br><small class="text-danger">오류: ' + it.error_message + '</small>' : '';
-    var pathDisplay = it.local_path ? '<div class="text-truncate small text-muted" style="max-width: 220px;" title="' + it.local_path + '">' + it.local_path + '</div>' : '<span class="text-muted">-</span>';
+    var errorMsg = it.error_message ? '<div class="mt-1 small text-danger font-weight-bold"><i class="fa fa-exclamation-triangle mr-1"></i>' + it.error_message + '</div>' : '';
     var timeStr = it.completed_time || it.updated_time || it.created_time || '';
+    var pathDisplay = it.local_path ? '<code>' + it.local_path + '</code>' : '<span class="text-muted">-</span>';
+
+    var detailHtml = '';
+
+    // 1행: 피드명 + 제목
+    detailHtml += '<div class="mb-1">';
+    detailHtml += '  <span class="badge badge-dark mr-1">' + (it.feed_name || 'Feed') + '</span>';
+    detailHtml += '  <strong style="font-size: 0.95rem;">' + it.title + '</strong>';
+    detailHtml += '</div>';
+
+    // 2행: 파일명 (용량) + 저장 경로 + [우측: 완료시각] (한 줄 통합 배치)
+    var fsizeText = it.file_size ? ' (' + format_bytes(it.file_size) + ')' : '';
+    var nameAndSize = it.file_name
+      ? '<span class="font-weight-bold text-info mr-2"><i class="fa fa-folder-open-o mr-1"></i>' + it.file_name + fsizeText + '</span>'
+      : (fsizeText ? '<span class="badge badge-secondary mr-2"><i class="fa fa-database mr-1"></i>' + format_bytes(it.file_size) + '</span>' : '');
+
+    detailHtml += '<div class="small text-muted d-flex justify-content-between align-items-center flex-wrap" style="line-height: 1.5;">';
+    detailHtml += '  <div class="d-inline-flex align-items-center flex-wrap mr-2">';
+    detailHtml +=      nameAndSize;
+    detailHtml += '    <span class="mr-2"><i class="fa fa-hdd-o mr-1"></i>' + pathDisplay + '</span>';
+    detailHtml += '  </div>';
+    detailHtml += '  <span class="text-muted ml-auto"><i class="fa fa-clock-o mr-1"></i>' + timeStr + '</span>';
+    detailHtml += '</div>';
+
+    detailHtml += errorMsg;
 
     str += '<tr>';
     str += '  <td class="font-weight-bold">' + it.id + '</td>';
     str += '  <td>' + statusBadge + engineInfo + '</td>';
-    str += '  <td class="text-left">';
-    str += '    <span class="badge badge-dark mr-1">' + (it.feed_name || 'Feed') + '</span>';
-    str += '    <strong>' + it.title + '</strong>' + errorMsg;
-    if (it.file_name) str += '<br><small class="text-info font-weight-bold">폴더/파일: ' + it.file_name + '</small>';
-    str += '  </td>';
-    str += '  <td>' + format_bytes(it.file_size) + '<br>' + pathDisplay + '</td>';
-    str += '  <td class="small text-muted">' + timeStr + '</td>';
+    str += '  <td class="text-left">' + detailHtml + '</td>';
     str += '  <td>';
     str += '    <div class="btn-group btn-group-sm">';
     str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold btn_list_action" data-action="retry" data-id="' + it.id + '">재시도</button>';
@@ -485,15 +566,20 @@ function render_downloaders(data) {
     var timeoutStr = (rawTimeout <= 0) ? '<span class="text-info font-weight-bold">타임아웃 무제한</span>' : rawTimeout + '시간 타임아웃';
 
     var connDetail = '';
-    if (item.engine_type === 'alldebrid') {
-      connDetail = '리모트: <code>' + (item.remote_name || 'ad') + ':' + (item.rclone_base_path || 'magnets') + '</code>';
-    } else if (item.engine_type === '115') {
-      connDetail = 'CD2: ' + (item.cd2_addr || '127.0.0.1') + ':' + (item.cd2_port || 19798) + ' | 마운트: ' + (item.cd2_mount_path || '-');
-    } else if (item.engine_type === 'qbittorrent') {
+    if (item.engine_type === 'qbittorrent') {
       connDetail = 'URL: ' + (item.url || '-') + ' | 저장: ' + (item.save_path || '-');
+    } else if (item.engine_type === 'cd2') {
+      connDetail = 'CD2: ' + (item.cd2_addr || '127.0.0.1') + ':' + (item.cd2_port || 19798) + ' | 마운트: ' + (item.cd2_mount_path || '-');
     } else {
-      var keys = Object.keys(item).filter(function (k) { return ['name', 'engine_type', 'enabled', 'stalled_timeout_hours'].indexOf(k) === -1; });
-      connDetail = keys.slice(0, 3).map(function (k) { return k + ': ' + item[k]; }).join(' | ') || '-';
+      // 커스텀 엔진(AllDebrid, PikPak 등): 식별용 주요 설정값 동적 표시
+      var keys = Object.keys(item).filter(function (k) {
+        return ['name', 'engine_type', 'enabled', 'stalled_timeout_hours'].indexOf(k) === -1;
+      });
+      connDetail = keys.slice(0, 3).map(function (k) {
+        var val = item[k];
+        if (typeof val === 'string' && val.length > 20) val = val.substring(0, 20) + '...';
+        return k + ': ' + val;
+      }).join(' | ') || '-';
     }
 
     str += '<tr>';
@@ -881,9 +967,12 @@ function render_profiles(data) {
     } else if (dest.type === 'gdrive_rotation') {
       destInfo = '<span class="badge badge-success">GDrive 계정 풀</span>';
       if (dest.complete_path) destInfo += '<br><small class="text-muted">' + dest.complete_path + '</small>';
-    } else if (dest.type === 'colab_gdrive') {
-      destInfo = '<span class="badge badge-primary">Colab GDrive</span>';
+    } else if (dest.type && dest.type.indexOf('relay') !== -1) {
+      destInfo = '<span class="badge badge-primary">원격 릴레이</span>';
       if (dest.remote_name) destInfo += '<br><small class="text-muted">' + dest.remote_name + ' (' + (dest.buffer_limit_gb || 50) + 'GB 버퍼)</small>';
+    } else {
+      // 커스텀 트랜스포터 기본 표기
+      if (dest.type) destInfo = '<span class="badge badge-info">' + dest.type + '</span>';
     }
 
     str += '<tr>';

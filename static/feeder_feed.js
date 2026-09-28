@@ -175,6 +175,11 @@ function make_list(data) {
 $('#feed_make_rss_file').change(function () { use_collapse('feed_make_rss_file'); });
 $('#feed_use_proxy').change(function () { use_collapse('feed_use_proxy'); });
 
+$(document).on('change', '#modal_feed_use_proxy', function () {
+  if ($(this).is(':checked')) $('#modal_feed_use_proxy_div').collapse('show');
+  else $('#modal_feed_use_proxy_div').collapse('hide');
+});
+
 function load_all_feed_data() {
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/load_feeds',
@@ -452,6 +457,13 @@ $(document).on('click', '#feed_add_btn', function (e) {
   $('#filter_reject').val('');
   $('#filter_accept').val('');
   $('#filter_reject_excluding').val('');
+  $('#feed_count').val('');
+  $('#rss_file_days').val('');
+  $('#rss_file_items').val('');
+
+  set_modal_checkbox('modal_feed_use_proxy', false);
+  $('#modal_feed_proxy_url').val('');
+  $('#modal_feed_use_proxy_div').collapse('hide');
   $('#rss_file').val('');
   $('#rss_file_path').val('');
   $('#rss_file_days').val('');
@@ -491,6 +503,16 @@ $(document).on('click', '.feed_edit_btn', function (e) {
   $('#filter_reject').val(reject_str);
   $('#filter_accept').val(accept_str);
   $('#filter_reject_excluding').val(reject_ex_str);
+
+  $('#feed_count').val(item.feed_count || '');
+  $('#rss_file_days').val(item.rss_file_days || '');
+  $('#rss_file_items').val(item.rss_file_items || '');
+
+  var isProxy = (item.use_proxy === true || item.use_proxy === 'True' || item.use_proxy === 'true' || item.use_proxy === 'on');
+  set_modal_checkbox('modal_feed_use_proxy', isProxy);
+  $('#modal_feed_proxy_url').val(item.proxy_url || '');
+  if (isProxy) $('#modal_feed_use_proxy_div').collapse('show');
+  else $('#modal_feed_use_proxy_div').collapse('hide');
 
   $('#rss_file').val(item.rss_file || '');
   $('#rss_file_path').val(item.rss_file_path || '');

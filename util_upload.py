@@ -117,10 +117,10 @@ class UploadUtil:
             self.accounts = FeederUtil.get_gdrive_accounts()
             self.busy_accounts = set()
 
-            self.limit_user = UploadUtil.parse_size_bytes(P.ModelSetting.get('download_gdrive_upload_limit', '700GB'))
-            self.limit_shared = UploadUtil.parse_size_bytes(P.ModelSetting.get('download_shared_drive_upload_limit', '3TB'))
-            self.threshold = UploadUtil.parse_size_bytes(P.ModelSetting.get('download_mydrive_upload_threshold', '14GB'))
-            self.reset_time_str = P.ModelSetting.get('download_shared_drive_quota_reset_time', '16:00')
+            self.limit_user = UploadUtil.parse_size_bytes(P.ModelSetting.get('download_gdrive_upload_limit') or '700GB')
+            self.limit_shared = UploadUtil.parse_size_bytes(P.ModelSetting.get('download_shared_drive_upload_limit') or '3TB')
+            self.threshold = UploadUtil.parse_size_bytes(P.ModelSetting.get('download_mydrive_upload_threshold') or '14GB')
+            self.reset_time_str = P.ModelSetting.get('download_shared_drive_quota_reset_time') or '16:00'
 
             self.usage_map = self._get_24h_usage_summary()
             self.shared_usage = self.usage_map.get('SHARED_DRIVE_UPLOAD', 0)
@@ -310,15 +310,26 @@ class UploadUtil:
     def execute_upload(cls, item: ModelDownload, manager: AccountManager) -> bool:
         """구글 드라이브 업로드 및 2단계 서버사이드 원자적 이동 실행"""
         local_path = item.local_path
-        if not local_path or not os.path.exists(local_path):
-            logger.error(f"[UploadUtil] 업로드할 로컬 폴더가 존재하지 않습니다: {local_path}")
+        # 원격 소스(AllDebrid 등) 다이렉트 스트리밍 여부 판별
+        is_remote_source = bool(local_path and not os.path.exists(local_path) and (':' in local_path or local_path.startswith(('http://', 'https://'))))
+
+        if not local_path or (not is_remote_source and not os.path.exists(local_path)):
+            logger.error(f"[UploadUtil] 업로드할 소스 경로가 존재하지 않습니다: {local_path}")
             item.status = 'failed'
-            item.error_message = "로컬 소스 폴더 없음"
+            item.error_message = "소스 경로 없음"
             db.session.commit()
             return False
 
-        folder_name = item.file_name or os.path.basename(local_path)
-        fsize = item.file_size or sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(local_path) for f in fs)
+        raw_name = item.file_name or os.path.basename(local_path)
+        base_name, ext = os.path.splitext(raw_name)
+        # 단일 파일일 때도 확장자를 제외한 폴더명을 생성하여 항상 폴더 단위로 수신 및 chpar 처리
+        folder_name = base_name if (ext and not raw_name.endswith(('/', '\\'))) else raw_name
+        item.file_name = folder_name
+
+        if is_remote_source:
+            fsize = item.file_size or 0
+        else:
+            fsize = item.file_size or sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(local_path) for f in fs)
         item.file_size = fsize
 
         rclone_cfg = FeederUtil.load_yaml().get('rclone', {})
@@ -428,11 +439,23 @@ class UploadUtil:
             move_success, _ = cls.run_rclone(chpar_cmd, f"원자적 부모폴더 변경(chpar) {folder_name}")
 
         if move_success:
-            try:
-                shutil.rmtree(local_path, ignore_errors=True)
-                logger.info(f"[UploadUtil] 로컬 작업 완료 폴더 정리 완료: {folder_name}")
-            except Exception:
-                pass
+            if is_remote_source:
+                # 다이렉트 원격 스트리밍 완료 시 다운로더 엔진의 원본 작업 정리
+                downloader_cfg = FeederUtil.get_downloader_by_name(item.current_engine_name)
+                if downloader_cfg and item.engine_task_id:
+                    try:
+                        engine = DownloadUtil.create_engine(downloader_cfg)
+                        if engine:
+                            engine.delete_task(item.engine_task_id)
+                            logger.info(f"[UploadUtil] 원격 소스 원본 작업 삭제 완료: {item.engine_task_id}")
+                    except Exception as del_ex:
+                        logger.debug(f"[UploadUtil] 원격 원본 삭제 실패 (무시): {del_ex}")
+            else:
+                try:
+                    shutil.rmtree(local_path, ignore_errors=True)
+                    logger.info(f"[UploadUtil] 로컬 작업 완료 폴더 정리 완료: {folder_name}")
+                except Exception:
+                    pass
 
         if mode == 'mydrive':
             cleanup_cmd = ["rclone", "cleanup", f"{effective_remote}:", "--config", rclone_conf, "--log-level", "NOTICE"] + impersonate_arg

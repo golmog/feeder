@@ -296,13 +296,13 @@ class FeederUtil:
             target_statuses = [
                 'downloading', 'pending', 'local_staging', 'uploading',
                 'pending_local_staging', 'pending_upload', 'pending_relay',
-                'relay_transferring', 'colab_transferring', 'pending_colab'
+                'relay_transferring'
             ]
         else:
             target_statuses = [
                 'completed', 'downloading', 'pending', 'local_staging', 'uploading',
                 'pending_local_staging', 'pending_upload', 'pending_relay',
-                'relay_transferring', 'colab_transferring', 'pending_colab'
+                'relay_transferring'
             ]
 
         subq = (
@@ -590,9 +590,15 @@ class FeederUtil:
             b_val = src.get('board', '')
             s_val = src.get('subcat', '')
             _, _, f_key = cls.parse_board_info(b_val, s_val)
+
+            src_type = src.get('type') or ('rss' if str(b_val).startswith(('http://', 'https://')) else 'crawl')
+            src_url = src.get('url') or (str(b_val) if src_type == 'rss' else '')
+
             normalized_sources.append({
-                'site': src.get('site', ''),
+                'type': src_type,
+                'site': src.get('site', '외부RSS' if src_type == 'rss' else ''),
                 'board': str(b_val),
+                'url': src_url,
                 'subcat': str(s_val) if s_val else '',
                 'full_board_key': f_key
             })

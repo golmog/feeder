@@ -46,22 +46,73 @@ class TaskDownload:
                 mode_str = "수동 실행" if manual else "스케쥴러 자동 실행"
                 logger.info(f"[DownloadPipeline] 다운로드 파이프라인 가동 ({mode_str})")
 
+                # 현재 큐 현황 집계 및 요약 출력
+                q_counts = {
+                    'pending': db.session.query(ModelDownload).filter(ModelDownload.status == 'pending').count(),
+                    'downloading': db.session.query(ModelDownload).filter(ModelDownload.status == 'downloading').count(),
+                    'staging': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_local_staging', 'local_staging'])).count(),
+                    'downloaded': db.session.query(ModelDownload).filter(ModelDownload.status == 'downloaded').count(),
+                    'relay': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_relay', 'relay_transferring'])).count(),
+                    'uploading': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_upload', 'uploading'])).count(),
+                    'failed': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['failed', 'move_failed'])).count(),
+                }
+                total_active = q_counts['pending'] + q_counts['downloading'] + q_counts['staging'] + q_counts['downloaded'] + q_counts['relay'] + q_counts['uploading']
+                logger.info(f"[DownloadPipeline] 현재 큐 요약 (활성 {total_active}건) | 대기:{q_counts['pending']} | 진행:{q_counts['downloading']} | 스테이징:{q_counts['staging']} | 다운완료:{q_counts['downloaded']} | 릴레이:{q_counts['relay']} | 업로드:{q_counts['uploading']} | 실패:{q_counts['failed']}")
+
                 profiles = FeederUtil.get_download_profiles()
                 if not profiles:
                     logger.debug("[DownloadPipeline] 등록된 다운로드 프로필(DOWNLOAD_PROFILES)이 없습니다.")
                     return
 
+                # SA 내 드라이브 고아 파일 사전 정리
                 UploadUtil.drain_all_sa_mydrives()
 
+                # 피드 최신 데이터 동기화
                 TaskDownload.sync_feed_items(profiles)
-                TaskDownload.dispatch_pending_downloads()
-                TaskDownload.poll_active_downloads()
-                TaskDownload.process_local_staging()
-                TaskDownload.route_completed_downloads()
-                TaskDownload.process_uploads()
+
+                # 활성 큐 작업들에 대해 현재 설정된 최신 프로필(목적지 및 체인) 동적 동기화 및 리라우팅
+                TaskDownload.sync_active_items_with_profiles()
+
+                # 단일 스케줄 내 논스톱 연쇄 관통 루프 (최대 3회 패스)
+                # 이전 단계에서 상태가 바뀐 항목을 즉시 다음 단계로 밀어붙여 한 주기 내 최종 완료 유도
+                max_cascade_passes = 3
+                for cascade_pass in range(1, max_cascade_passes + 1):
+                    # 활성 대기/진행 큐 집계
+                    pending_cnt = db.session.query(ModelDownload).filter(ModelDownload.status == 'pending').count()
+                    downloading_cnt = db.session.query(ModelDownload).filter(ModelDownload.status == 'downloading').count()
+                    staging_cnt = db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_local_staging', 'local_staging'])).count()
+                    downloaded_cnt = db.session.query(ModelDownload).filter(ModelDownload.status == 'downloaded').count()
+                    uploading_cnt = db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_upload', 'uploading'])).count()
+
+                    total_active_before = pending_cnt + downloading_cnt + staging_cnt + downloaded_cnt + uploading_cnt
+                    if total_active_before == 0 and cascade_pass > 1:
+                        break
+
+                    logger.debug(f"[DownloadPipeline] 연쇄 파이프라인 패스 {cascade_pass}/{max_cascade_passes} 실행 (활성 작업: {total_active_before}개)")
+
+                    # 순차 실행: 디스패치 -> 상태조회 -> 스테이징 -> 이송 라우팅 -> 업로드
+                    TaskDownload.dispatch_pending_downloads()
+                    TaskDownload.poll_active_downloads()
+                    TaskDownload.process_local_staging()
+                    TaskDownload.route_completed_downloads()
+                    TaskDownload.process_uploads()
+
+                    # 방금 패스에서 추가 전이가 발생하지 않았으면 조기 종료
+                    pending_after = db.session.query(ModelDownload).filter(ModelDownload.status == 'pending').count()
+                    staging_after = db.session.query(ModelDownload).filter(ModelDownload.status == 'pending_local_staging').count()
+                    downloaded_after = db.session.query(ModelDownload).filter(ModelDownload.status == 'downloaded').count()
+                    uploading_after = db.session.query(ModelDownload).filter(ModelDownload.status == 'pending_upload').count()
+
+                    if (pending_after + staging_after + downloaded_after + uploading_after) == 0:
+                        break
+
+                # 이전 실패 항목 재시도
                 TaskDownload.retry_move_failed()
 
-                logger.info("[DownloadPipeline] 다운로드 파이프라인 주기 완료")
+                # 대기 중인 원격 릴레이(Colab 등) 작업 점검 및 워커 트리거
+                TaskDownload.check_pending_relays()
+
+                logger.info(f"[DownloadPipeline] 다운로드 파이프라인 주기 완료 ({mode_str})")
 
             except Exception as e:
                 logger.error(f"[DownloadPipeline] 파이프라인 처리 중 오류: {e}")
@@ -91,7 +142,10 @@ class TaskDownload:
 
                 sync_days = profile.get('sync_days')
                 if sync_days is None:
-                    sync_days = P.ModelSetting.get_int('download_feed_sync_days', 3)
+                    try:
+                        sync_days = P.ModelSetting.get_int('download_feed_sync_days')
+                    except Exception:
+                        sync_days = 3
                 else:
                     sync_days = int(sync_days)
 
@@ -148,8 +202,89 @@ class TaskDownload:
             logger.info(f"[DownloadPipeline] 신규 다운로드 작업 {new_items_count}건 등록 완료")
 
     @staticmethod
+    def sync_active_items_with_profiles():
+        """활성 큐 작업들에 대해 현재 설정된 최신 프로필(목적지, 경로, 우선순위체인)을 동적으로 반영하고 상태를 리라우팅"""
+        active_statuses = [
+            'pending', 'downloading', 'pending_local_staging', 'local_staging',
+            'downloaded', 'pending_upload', 'uploading', 'pending_relay', 'relay_transferring'
+        ]
+        items = db.session.query(ModelDownload).filter(ModelDownload.status.in_(active_statuses)).all()
+        if not items:
+            return
+
+        updated_count = 0
+        for item in items:
+            profile = FeederUtil.get_download_profile_by_feed(item.feed_name)
+            if not profile:
+                continue
+
+            dest_cfg = profile.get('destination', {})
+            current_dest_type = dest_cfg.get('type', 'local')
+            current_chain = profile.get('priority_chain', [])
+
+            # 우선순위 체인 동적 동기화 (아직 시작 전인 pending 상태일 때)
+            if item.status == 'pending' and current_chain and item.priority_chain != current_chain:
+                item.priority_chain = current_chain
+
+            # 목적지 세부 설정 동적 동기화
+            dest_changed = (item.destination_type != current_dest_type)
+            item.destination_type = current_dest_type
+            item.gdrive_upload_path = dest_cfg.get('upload_path', '')
+            item.gdrive_complete_path = dest_cfg.get('complete_path', '')
+            item.gdrive_remote_id = dest_cfg.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
+
+            transporter = DownloadUtil.get_transporter(current_dest_type)
+            is_relay_dest = bool(transporter and getattr(transporter, 'IS_RELAY_HANDLER', False))
+
+            src_path = item.local_path or ''
+            is_remote_src = not os.path.exists(src_path) and (':' in src_path or src_path.startswith(('http://', 'https://')))
+
+            # 로컬 스테이징 사용 여부 동적 판별
+            use_local_staging = dest_cfg.get('use_local_staging')
+            if use_local_staging is None:
+                use_local_staging = profile.get('use_local_staging', True)
+            use_local_staging = str(use_local_staging).lower() in ['true', 'on', '1']
+
+            # 목적지 변경 또는 스테이징 옵션(On/Off) 변경에 따른 동적 상태 리라우팅
+            if not is_relay_dest and item.status in ['pending_relay', 'relay_transferring']:
+                if is_remote_src and use_local_staging:
+                    item.status = 'pending_local_staging'
+                    logger.info(f"[DownloadPipeline] 프로필 변경 감지: 최신 목적지({current_dest_type}, 로컬스테이징)에 맞춰 로컬 스테이징(pending_local_staging)으로 리라우팅 -> {item.title}")
+                else:
+                    item.status = 'downloaded'
+                    logger.info(f"[DownloadPipeline] 프로필 변경 감지: 최신 목적지({current_dest_type}, 다이렉트)에 맞춰 전송 대기(downloaded)로 리라우팅 -> {item.title}")
+                updated_count += 1
+
+            elif not is_relay_dest and is_remote_src and not use_local_staging and item.status in ['pending_local_staging', 'local_staging']:
+                # 로컬 스테이징 옵션이 꺼진 경우 즉시 다이렉트 전송 대기열로 인계
+                item.status = 'downloaded'
+                logger.info(f"[DownloadPipeline] 설정 변경 감지: 로컬 스테이징 해제 -> 다이렉트(on-the-fly) 전송 대기(downloaded)로 리라우팅 -> {item.title}")
+                updated_count += 1
+
+            elif not is_relay_dest and is_remote_src and use_local_staging and item.status == 'downloaded' and not os.path.exists(item.local_path or ''):
+                # 로컬 스테이징 옵션이 켜졌는데 소스가 원격인 채로 대기 중인 경우 스테이징 대기열로 복귀
+                item.status = 'pending_local_staging'
+                logger.info(f"[DownloadPipeline] 설정 변경 감지: 로컬 스테이징 적용 -> 로컬 스테이징(pending_local_staging)으로 리라우팅 -> {item.title}")
+                updated_count += 1
+
+            elif is_relay_dest and item.status in ['pending_local_staging', 'downloaded', 'pending_upload']:
+                item.status = 'pending_relay'
+                logger.info(f"[DownloadPipeline] 프로필 변경 감지: 최신 목적지({current_dest_type})에 맞춰 원격 릴레이 대기(pending_relay)로 리라우팅 -> {item.title}")
+                updated_count += 1
+
+            elif dest_changed:
+                updated_count += 1
+
+        if updated_count > 0:
+            db.session.commit()
+            logger.info(f"[DownloadPipeline] 활성 큐 {updated_count}건에 대해 현재 최신 프로필 설정 동적 동기화 완료")
+
+    @staticmethod
     def dispatch_pending_downloads():
-        batch_limit = P.ModelSetting.get_int('download_batch_limit', 50)
+        try:
+            batch_limit = P.ModelSetting.get_int('download_batch_limit')
+        except Exception:
+            batch_limit = 50
         items = ModelDownload.get_list_by_status(['pending'], limit=batch_limit)
         if not items:
             return
@@ -254,10 +389,14 @@ class TaskDownload:
                 std_status = matched_status.get('status')
                 fname = matched_status.get('filename') or it.file_name
                 fsize = matched_status.get('file_size') or it.file_size
+                src_path = matched_status.get('source_path')
+
                 if fname:
                     it.file_name = fname
                 if fsize:
                     it.file_size = fsize
+                if src_path and not it.local_path:
+                    it.local_path = src_path
 
                 if std_status == 'completed':
                     source_path = matched_status.get('source_path', '')
@@ -278,13 +417,31 @@ class TaskDownload:
 
                     profile = FeederUtil.get_download_profile_by_feed(it.feed_name) or {}
                     dest_cfg = profile.get('destination', {})
-                    dest_type = it.destination_type or dest_cfg.get('type', 'local')
+                    dest_type = dest_cfg.get('type') or it.destination_type or 'local'
+                    it.destination_type = dest_type
+                    it.gdrive_upload_path = dest_cfg.get('upload_path', '')
+                    it.gdrive_complete_path = dest_cfg.get('complete_path', '')
+                    it.gdrive_remote_id = dest_cfg.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
 
                     transporter = DownloadUtil.get_transporter(dest_type)
-                    if transporter and getattr(transporter, 'IS_RELAY_HANDLER', False):
+                    is_relay_dest = bool(transporter and getattr(transporter, 'IS_RELAY_HANDLER', False))
+                    is_remote_src = not os.path.exists(source_path) and (':' in source_path or source_path.startswith(('http://', 'https://')))
+
+                    # 목적지 설정의 로컬 스테이징(임시 다운로드) 사용 여부 판별 (기본값: True)
+                    use_local_staging = dest_cfg.get('use_local_staging')
+                    if use_local_staging is None:
+                        use_local_staging = profile.get('use_local_staging', True)
+                    use_local_staging = str(use_local_staging).lower() in ['true', 'on', '1']
+
+                    if is_relay_dest:
+                        it.status = 'pending_relay'
                         transporter.transport(it, source_path, dest_cfg)
                         logger.info(f"[DownloadPoll] [{engine_name}] 완료 확인 -> 원격 릴레이 대기열({it.status}) 인계: {it.title}")
-                    elif not os.path.exists(source_path) and (':' in source_path or source_path.startswith(('http://', 'https://'))):
+                    elif is_remote_src and not use_local_staging:
+                        # 다이렉트(on-the-fly) 모드: 로컬 디스크 스테이징을 건너뛰고 곧바로 전송 대기열 인계
+                        it.status = 'downloaded'
+                        logger.info(f"[DownloadPoll] [{engine_name}] 완료 확인 -> 다이렉트(on-the-fly) 전송 대기열 인계: {it.title}")
+                    elif is_remote_src and use_local_staging:
                         it.status = 'pending_local_staging'
                         logger.info(f"[DownloadPoll] [{engine_name}] 원격 완료 확인 -> 로컬 스테이징 대기열 인계: {it.title}")
                     else:
@@ -309,7 +466,10 @@ class TaskDownload:
 
     @staticmethod
     def process_local_staging():
-        batch_limit = P.ModelSetting.get_int('download_batch_limit', 50)
+        try:
+            batch_limit = P.ModelSetting.get_int('download_batch_limit')
+        except Exception:
+            batch_limit = 50
         items = ModelDownload.get_list_by_status(['pending_local_staging'], limit=batch_limit)
         if not items:
             return
@@ -355,21 +515,29 @@ class TaskDownload:
             else:
                 target_folder_name = folder_base_name
 
-            item_staging_dir = os.path.join(staging_root, target_folder_name)
+            # 경로 구조: 로컬 스테이징 경로 / 다운로드 프로필명 / 서브폴더(target_folder_name) / 파일
+            profile_name = (profile.get('name') if profile else None) or 'default'
+            item_staging_dir = os.path.join(staging_root, profile_name, target_folder_name)
             if os.path.exists(item_staging_dir):
                 shutil.rmtree(item_staging_dir, ignore_errors=True)
             os.makedirs(item_staging_dir, exist_ok=True)
 
             is_remote_cloud = not os.path.exists(src_path) and (':' in src_path or src_path.startswith(('http://', 'https://')))
-            rclone_cmd_type = "copy" if is_remote_cloud else ("copyto" if is_single_file else "copy")
-            dest_download_path = item_staging_dir if (is_remote_cloud or not is_single_file) else os.path.join(item_staging_dir, raw_name)
+            if is_single_file:
+                rclone_cmd_type = "copyto"
+                dest_download_path = os.path.join(item_staging_dir, raw_name)
+            else:
+                rclone_cmd_type = "copy"
+                dest_download_path = item_staging_dir
 
-            logger.info(f"[LocalStaging] 로컬 스테이징 다운로드 시작: {target_folder_name} (명령: {rclone_cmd_type})")
+            logger.info(f"[LocalStaging] 로컬 스테이징 다운로드 시작: {profile_name}/{target_folder_name} (명령: {rclone_cmd_type})")
 
             rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or FeederUtil.load_yaml().get('rclone', {}).get('conf_path', '')
             cmd = [
                 "rclone", rclone_cmd_type, src_path, dest_download_path,
-                "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE"
+                "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE",
+                "--multi-thread-streams", "0",
+                "--retries", "3"
             ]
             if rclone_conf:
                 cmd.extend(["--config", rclone_conf])
@@ -423,13 +591,23 @@ class TaskDownload:
         for item in items:
             profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
             dest_cfg = profile.get('destination', {})
-            dest_type = item.destination_type or dest_cfg.get('type', 'local')
+            dest_type = dest_cfg.get('type') or item.destination_type or 'local'
+            item.destination_type = dest_type
+            item.gdrive_upload_path = dest_cfg.get('upload_path', '')
+            item.gdrive_complete_path = dest_cfg.get('complete_path', '')
+            item.gdrive_remote_id = dest_cfg.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
 
             transporter = DownloadUtil.get_transporter(dest_type)
             if not transporter:
                 logger.warning(f"[RouteComplete] 등록되지 않은 이송 핸들러({dest_type}) -> 로컬 완료 대체: {item.title}")
                 item.status = 'completed'
                 item.completed_time = now
+                continue
+
+            # 구글 드라이브 계정 풀의 경우 멀티스레드 업로드 큐(pending_upload)로 넘겨 process_uploads에서 전담 처리
+            if dest_type == 'gdrive_rotation':
+                item.status = 'pending_upload'
+                logger.info(f"[RouteComplete] Google Drive SA 계정 풀 업로드 큐(pending_upload) 인계: {item.title}")
                 continue
 
             logger.info(f"[RouteComplete] 이송 핸들러 [{dest_type}] 호출 시작: {item.title}")
@@ -456,7 +634,10 @@ class TaskDownload:
 
     @staticmethod
     def process_uploads():
-        batch_limit = P.ModelSetting.get_int('download_batch_limit', 50)
+        try:
+            batch_limit = P.ModelSetting.get_int('download_batch_limit')
+        except Exception:
+            batch_limit = 50
         items = ModelDownload.get_list_by_status(['pending_upload'], limit=batch_limit)
         if not items:
             return
@@ -467,7 +648,10 @@ class TaskDownload:
 
     @staticmethod
     def retry_move_failed():
-        batch_limit = P.ModelSetting.get_int('download_batch_limit', 50)
+        try:
+            batch_limit = P.ModelSetting.get_int('download_batch_limit')
+        except Exception:
+            batch_limit = 50
         one_hour_ago = datetime.now() - timedelta(hours=1)
         items = (
             db.session.query(ModelDownload)
@@ -486,3 +670,36 @@ class TaskDownload:
             item.last_move_attempt_time = datetime.now()
             db.session.commit()
             UploadUtil.execute_upload(item, manager)
+
+    @staticmethod
+    def check_pending_relays():
+        """큐에 방치된 pending_relay 항목이 있고 현재 가동 중인 워커가 없다면 자동 재기동"""
+        try:
+            busy_count = db.session.query(ModelDownload).filter_by(status='relay_transferring').count()
+            pending_items = db.session.query(ModelDownload).filter_by(status='pending_relay').all()
+
+            if not pending_items and busy_count == 0:
+                return
+
+            if busy_count > 0:
+                logger.info(f"[DownloadPipeline] 현재 릴레이 전송 진행 중인 작업({busy_count}건)이 있어 대기합니다. (대기열: {len(pending_items)}건)")
+                return
+
+            logger.info(f"[DownloadPipeline] 미완료 릴레이 대기 작업 {len(pending_items)}건 감지 ➔ 워커 자동 기동 호출")
+
+            triggered_dest_types = set()
+            for it in pending_items:
+                dest_type = it.destination_type
+                if not dest_type or dest_type in triggered_dest_types:
+                    continue
+
+                profile = FeederUtil.get_download_profile_by_feed(it.feed_name) or {}
+                dest_cfg = profile.get('destination', {})
+                transporter = DownloadUtil.get_transporter(dest_type)
+
+                if transporter and hasattr(transporter, 'resume_relay'):
+                    transporter.resume_relay(dest_cfg)
+                    triggered_dest_types.add(dest_type)
+
+        except Exception as ex:
+            logger.error(f"[DownloadPipeline] 잔여 릴레이 점검 중 예외: {ex}")

@@ -455,8 +455,19 @@ class ModuleDownload(PluginModuleBase):
             client_key = (req.get_json(silent=True) or {}).get('apikey')
         return bool(client_key and client_key == FeederUtil.get_system_apikey())
 
+    @staticmethod
+    def _obscure_rclone_password(password: str) -> str:
+        """rclone obscure 호출로 암호화된 Rclone 비밀번호 생성"""
+        try:
+            res = subprocess.run(["rclone", "obscure", password], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+        except Exception:
+            pass
+        return password
+
     def _handle_relay_claim(self, req):
-        """원격 릴레이 워커(VPS, 외부 서버 등)의 대기 작업 선점 API"""
+        """원격 릴레이 워커(VPS, 외부 서버, Colab 등)의 대기 작업 선점 API"""
         if not self._verify_api_auth(req):
             return jsonify({'ret': 'fail', 'msg': 'API 인증 실패'}), 401
 
@@ -514,6 +525,27 @@ class ModuleDownload(PluginModuleBase):
             except Exception as e:
                 logger.error(f"[{self.name}] rclone.conf 분석 실패: {e}")
 
+        # 다운로더 설정 조회 및 AllDebrid WebDAV 리모트 자동 주입
+        downloader_cfg = FeederUtil.get_downloader_by_name(item.current_engine_name) or {}
+        engine_type = downloader_cfg.get('engine_type', '').lower()
+        engine_remote = downloader_cfg.get('remote_name', '').strip() or 'ad'
+        engine_base = downloader_cfg.get('rclone_base_path', '').strip('/')
+
+        if engine_type == 'alldebrid':
+            apikey = downloader_cfg.get('apikey', '').strip()
+            if apikey and f"[{engine_remote}]" not in rclone_conf_text:
+                obscured_pass = self._obscure_rclone_password(apikey)
+                ad_section = (
+                    f"\n[{engine_remote}]\n"
+                    f"type = webdav\n"
+                    f"url = https://webdav.alldebrid.com\n"
+                    f"vendor = other\n"
+                    f"user = {apikey}\n"
+                    f"pass = {obscured_pass}\n"
+                )
+                rclone_conf_text += ad_section
+                logger.info(f"[{self.name}] [Relay API] AllDebrid WebDAV Rclone 설정([{engine_remote}]) 동적 주입 완료")
+
         profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
         dest_cfg = profile.get('destination', {})
         remote_name = dest_cfg.get('remote_name') or P.ModelSetting.get('download_rclone_shared_remote_name') or 'gdrive_shared'
@@ -521,28 +553,40 @@ class ModuleDownload(PluginModuleBase):
         complete_path = (item.gdrive_complete_path or dest_cfg.get('complete_path') or 'uploads/default').strip('/')
         folder_name = item.file_name or f"item_{item.id}"
 
-        if shared_drive_id:
-            dest_full_path = f"{remote_name}:{{{shared_drive_id}}}/{complete_path}/{folder_name}"
-        else:
-            dest_full_path = f"{remote_name}:{complete_path}/{folder_name}"
+        # 단일 파일 여부 판별 (확장자가 있고 끝이 슬래시가 아닌 경우)
+        _, ext = os.path.splitext(folder_name)
+        is_single_file = bool(ext and not folder_name.endswith(('/', '\\')))
 
-        downloader_cfg = FeederUtil.get_downloader_by_name(item.current_engine_name) or {}
-        engine_remote = downloader_cfg.get('remote_name', 'ad')
-        engine_base = downloader_cfg.get('rclone_base_path', 'magnets')
-        src_full_path = item.local_path or f"{engine_remote}:{engine_base}/{folder_name}"
+        if shared_drive_id:
+            dest_base_path = f"{remote_name}:{{{shared_drive_id}}}/{complete_path}"
+        else:
+            dest_base_path = f"{remote_name}:{complete_path}"
+
+        dest_full_path = f"{dest_base_path}/{folder_name}"
+        dest_dir_path = dest_base_path if is_single_file else dest_full_path
+
+        if engine_remote and engine_base:
+            src_full_path = item.local_path or f"{engine_remote}:{engine_base}/{folder_name}"
+        elif engine_remote:
+            src_full_path = item.local_path or f"{engine_remote}:{folder_name}"
+        else:
+            src_full_path = item.local_path or folder_name
+
         buffer_limit_gb = dest_cfg.get('buffer_limit_gb', 50)
 
         task_data = {
             'id': item.id,
             'title': item.title,
             'file_name': folder_name,
+            'is_single_file': is_single_file,
             'file_size': item.file_size or 0,
             'remote_source_path': src_full_path,
             'dest_path': dest_full_path,
+            'dest_dir_path': dest_dir_path,
             'buffer_limit_bytes': int(buffer_limit_gb) * 1024 * 1024 * 1024
         }
 
-        logger.info(f"[{self.name}] [Relay API] 원격 릴레이 작업 선점 완료: {item.title} (ID: {item.id})")
+        logger.info(f"[{self.name}] [Relay API] 원격 릴레이 작업 선점 완료: {item.title} (ID: {item.id}, 단일파일={is_single_file})")
         return jsonify({
             'ret': 'success',
             'has_task': True,
@@ -592,6 +636,7 @@ class ModuleDownload(PluginModuleBase):
         return jsonify({'ret': 'success'})
 
     def generate_sse_stream(self):
+        """실시간 대시보드용 SSE 스트림 (통계 카운트 + 활성 작업 목록 동시 전송)"""
         while True:
             try:
                 with F.app.app_context():
@@ -603,10 +648,91 @@ class ModuleDownload(PluginModuleBase):
                         'completed': db.session.query(ModelDownload).filter_by(status='completed').count(),
                         'failed': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['failed', 'move_failed'])).count(),
                     }
-                    data_str = json.dumps({'timestamp': int(time.time()), 'counts': counts})
+
+                    try:
+                        batch_limit = P.ModelSetting.get_int('download_batch_limit')
+                    except Exception:
+                        batch_limit = 50
+
+                    active_statuses = [
+                        'pending', 'downloading', 'pending_local_staging', 'local_staging',
+                        'pending_upload', 'uploading', 'pending_relay', 'relay_transferring'
+                    ]
+                    active_rows = (
+                        db.session.query(ModelDownload)
+                        .filter(ModelDownload.status.in_(active_statuses))
+                        .order_by(desc(ModelDownload.id))
+                        .limit(batch_limit)
+                        .all()
+                    )
+
+                    # downloading 상태인 항목들에 대해 다운로더 엔진 실시간 진행 데이터 수집
+                    downloading_items = [it for it in active_rows if it.status == 'downloading']
+                    engine_live_data = {}
+
+                    if downloading_items:
+                        items_by_engine = {}
+                        for it in downloading_items:
+                            e_name = it.current_engine_name
+                            if e_name:
+                                items_by_engine.setdefault(e_name, []).append(it)
+
+                        for e_name, e_items in items_by_engine.items():
+                            dl_cfg = FeederUtil.get_downloader_by_name(e_name)
+                            if not dl_cfg:
+                                continue
+                            engine = DownloadUtil.create_engine(dl_cfg)
+                            if not engine:
+                                continue
+
+                            task_ids = [it.engine_task_id for it in e_items if it.engine_task_id]
+                            status_list, _ = engine.get_status(task_ids=task_ids)
+                            if status_list:
+                                for s in status_list:
+                                    tid = str(s.get('task_id', ''))
+                                    thash = str(s.get('hash', '')).lower()
+                                    if tid:
+                                        engine_live_data[tid] = s
+                                    if thash:
+                                        engine_live_data[thash] = s
+
+                    # 각 아이템 딕셔너리에 실시간 속도, 진행률 병합 (진행 중일 때만 동적 반영, 단계 상태는 DB 우선)
+                    active_list = []
+                    for it in active_rows:
+                        d = it.as_dict()
+
+                        # 엔진 라이브 진행 정보는 DB 상태가 실제 다운로드 중(downloading)일 때만 반영
+                        if it.status == 'downloading':
+                            live_info = engine_live_data.get(str(it.engine_task_id)) or engine_live_data.get(str(it.infohash or '').lower())
+                            if live_info:
+                                dl_bytes = live_info.get('downloaded_bytes', 0)
+                                dl_speed = live_info.get('download_speed', 0)
+                                total_sz = live_info.get('file_size') or it.file_size or 0
+
+                                if 'progress' in live_info:
+                                    prog = float(live_info['progress'])
+                                elif total_sz > 0 and dl_bytes > 0:
+                                    prog = round((dl_bytes / total_sz) * 100, 1)
+                                else:
+                                    prog = 0.0
+
+                                d['downloaded_bytes'] = dl_bytes
+                                d['download_speed'] = dl_speed
+                                d['progress'] = min(prog, 100.0)
+
+                        # 로컬 스테이징, 업로드 중, 릴레이 등 단계 전환 상태는 항상 DB에 저장된 상태를 최우선 유지
+                        d['status'] = it.status
+                        active_list.append(d)
+
+                    data_str = json.dumps({
+                        'timestamp': int(time.time()),
+                        'counts': counts,
+                        'active_list': active_list
+                    })
                     yield f"data: {data_str}\n\n"
+
             except Exception as e:
-                logger.debug(f"[{self.name}] SSE 스트림 예외: {e}")
+                logger.debug(f"[{self.name}] SSE 스트림 전송 예외: {e}")
             finally:
                 try:
                     db.session.remove()

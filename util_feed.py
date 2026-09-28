@@ -284,16 +284,34 @@ class FeedUtil:
     # 소스 동기화 (크롤러 DB 및 외부 RSS)
     # --------------------------------------------------------------------------
     @classmethod
-    def fetch_remote_rss_items(cls, rss_url: str) -> list[dict]:
-        """외부 원격 RSS 피드 파싱"""
+    def fetch_remote_rss_items(cls, rss_url: str, feed_cfg: dict = None) -> list[dict]:
+        """외부 원격 RSS 피드 파싱 (개별 피드 프록시 설정 최우선 적용)"""
         items = []
         try:
-            res = requests.get(rss_url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=20, verify=False)
-            if res.status_code != 200 or not res.text:
+            proxies = None
+            feed = feed_cfg or {}
+
+            # 개별 피드 프록시 설정이 명시되어 있으면 우선 적용, 없으면 전역 기본 프록시 적용
+            feed_use_proxy = feed.get('use_proxy')
+            if feed_use_proxy is not None:
+                use_proxy = bool(feed_use_proxy)
+            else:
+                use_proxy = P.ModelSetting.get_bool('feed_use_proxy') if P.ModelSetting else False
+
+            if use_proxy:
+                p_url = (feed.get('proxy_url') or '').strip()
+                if not p_url and P.ModelSetting:
+                    p_url = (P.ModelSetting.get('feed_proxy_url') or '').strip()
+                if p_url:
+                    proxies = {'http': p_url, 'https': p_url}
+
+            res = requests.get(rss_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}, proxies=proxies, timeout=25, verify=False)
+            if res.status_code != 200 or not res.content:
                 logger.warning(f"[FeedUtil] 외부 RSS 응답 실패 ({res.status_code}): {rss_url}")
                 return items
 
-            root = ET.fromstring(res.text)
+            # encoding 선언이 포함된 XML 파싱 시 반드시 bytes(res.content) 전달
+            root = ET.fromstring(res.content)
             for item_elem in root.findall('.//item'):
                 title = (item_elem.findtext('title') or '').strip()
                 link = (item_elem.findtext('link') or '').strip()
@@ -301,8 +319,10 @@ class FeedUtil:
 
                 target_url = link or guid
                 magnets = []
-                if target_url.startswith(('magnet:', 'ed2k://')):
-                    magnets.append(target_url)
+                if link and str(link).startswith(('magnet:', 'ed2k://')):
+                    magnets.append(link)
+                elif guid and str(guid).startswith(('magnet:', 'ed2k://')):
+                    magnets.append(guid)
 
                 enclosure = item_elem.find('enclosure')
                 files = []
@@ -314,14 +334,21 @@ class FeedUtil:
                         enc_name = target_url.split('/')[-1] if target_url else 'attachment'
                         files.append([enc_url, enc_name, 'NONE'])
 
-                if title and (magnets or target_url or files):
+                # 중복 링크 제거
+                unique_magnets = []
+                for m in magnets:
+                    if m not in unique_magnets:
+                        unique_magnets.append(m)
+
+                if title and (unique_magnets or target_url or files):
                     items.append({
                         'title': title,
                         'url': target_url,
-                        'magnet': magnets,
+                        'magnet': unique_magnets,
                         'files': files,
                         'torrent_info': None
                     })
+
         except Exception as e:
             logger.error(f"[FeedUtil] 외부 RSS 파싱 에러 ({rss_url}): {e}")
         return items
@@ -372,20 +399,22 @@ class FeedUtil:
                         new_feed_item.magnet_count = bbs.magnet_count
                         new_feed_item.file_count = bbs.file_count
                         new_feed_item.magnet = bbs.magnet
-                        new_feed_item.infohash = bbs.infohash or FeederUtil.extract_info_hash(bbs.magnet)
                         new_feed_item.files = bbs.files
                         new_feed_item.torrent_info = bbs.torrent_info
                         new_feed_item.broadcast_status = bbs.broadcast_status
+                        new_feed_item.infohash = bbs.infohash or FeederUtil.extract_info_hash(bbs.magnet)
                         db.session.add(new_feed_item)
                         added_count += 1
                         logger.debug(f"[FeedUtil] [{feed_name}] 크롤러 아이템 적재: '{bbs.title[:35]}'")
 
             # 외부 RSS 피드 소스 동기화
             for src in sources:
-                s_type = src.get('type') or ('rss' if src.get('url') and not src.get('site') else 'crawl')
-                if s_type == 'rss' and src.get('url'):
-                    rss_url = src.get('url')
-                    remote_items = cls.fetch_remote_rss_items(rss_url)
+                src_board = str(src.get('board', '')).strip()
+                src_url = (src.get('url') or src_board).strip()
+                is_rss_source = (src.get('type') == 'rss') or src_board.startswith(('http://', 'https://'))
+
+                if is_rss_source and src_url:
+                    remote_items = cls.fetch_remote_rss_items(src_url, feed_cfg=feed)
                     for r_item in remote_items:
                         exists = db.session.query(ModelFeedItem.id).filter_by(feed_name=feed_name, url=r_item['url']).first()
                         if exists:
@@ -396,20 +425,23 @@ class FeedUtil:
                             new_feed_item = ModelFeedItem(
                                 feed_name=feed_name,
                                 source_type='rss',
-                                source_name=rss_url
+                                source_name=src_url
                             )
                             new_feed_item.title = r_item['title']
                             new_feed_item.url = r_item['url']
                             new_feed_item.magnet_count = len(r_item.get('magnet', []))
                             new_feed_item.file_count = len(r_item.get('files', []))
                             new_feed_item.magnet = '\n'.join(r_item.get('magnet', []))
+
                             r_primary_mag = r_item['magnet'][0] if r_item.get('magnet') else ''
                             new_feed_item.infohash = FeederUtil.extract_info_hash(r_primary_mag) if r_primary_mag else None
+
                             if r_item.get('files'):
                                 new_feed_item.files = '||'.join(f"{x[0]}|{x[1]}|NONE" for x in r_item['files'])
+
                             db.session.add(new_feed_item)
                             added_count += 1
-                            logger.debug(f"[FeedUtil] [{feed_name}] 외부 RSS 아이템 적재: '{r_item['title'][:35]}'")
+                            logger.info(f"[FeedUtil] [{feed_name}] 외부 RSS 아이템 적재 성공: '{r_item['title'][:35]}'")
 
             if added_count > 0:
                 db.session.commit()

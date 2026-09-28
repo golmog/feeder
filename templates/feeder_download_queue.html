@@ -55,8 +55,13 @@
 </div>
 
 <div class="d-flex justify-content-between align-items-center mb-3">
-  <h5 class="mb-0 font-weight-bold"><i class="fa fa-tasks mr-1"></i>실시간 활성 작업 큐 (Active Queue)</h5>
-  <button id="queue_refresh_btn" class="btn btn-sm btn-outline-secondary"><i class="fa fa-refresh mr-1"></i>새로고침</button>
+  <div class="d-flex align-items-center">
+    <h5 class="mb-0 font-weight-bold mr-2"><i class="fa fa-tasks mr-1"></i>실시간 활성 작업 큐 (Active Queue)</h5>
+    <span id="sse_status_badge" class="badge badge-secondary"><i class="fa fa-circle-o-notch fa-spin mr-1"></i>연결 대기중</span>
+  </div>
+  <div>
+    <button id="queue_refresh_btn" class="btn btn-sm btn-outline-secondary"><i class="fa fa-refresh mr-1"></i>수동 새로고침</button>
+  </div>
 </div>
 
 <div class="table-responsive">
@@ -65,14 +70,12 @@
       <tr>
         <th style="width: 5%;">ID</th>
         <th style="width: 14%;">상태 / 엔진</th>
-        <th style="width: 36%;">피드명 / 콘텐츠 정보</th>
-        <th style="width: 15%;">용량 / 저장 경로</th>
-        <th style="width: 14%;">시간</th>
-        <th style="width: 16%;">제어</th>
+        <th style="width: 66%;">콘텐츠 정보 및 저장 / 용량 상세</th>
+        <th style="width: 15%;">제어</th>
       </tr>
     </thead>
     <tbody id="active_queue_tbody">
-      <tr><td colspan="6" class="py-4 text-muted">활성 작업 큐를 불러오는 중입니다...</td></tr>
+      <tr><td colspan="4" class="py-4 text-muted">활성 작업 큐를 불러오는 중입니다...</td></tr>
     </tbody>
   </table>
 </div>

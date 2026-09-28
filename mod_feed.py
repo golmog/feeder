@@ -148,11 +148,15 @@ class ModuleFeed(PluginModuleBase):
             filter_accept = req.form.get('filter_accept', '').strip()
             filter_reject_excluding = req.form.get('filter_reject_excluding', '').strip()
 
+            feed_count = req.form.get('feed_count', '').strip()
+            rss_file_days = req.form.get('rss_file_days', '').strip()
+            rss_file_items = req.form.get('rss_file_items', '').strip()
+            use_proxy = req.form.get('modal_feed_use_proxy') in ['True', 'on', 'true', True]
+            proxy_url = req.form.get('modal_feed_proxy_url', '').strip()
+
             use_rss_file = req.form.get('use_rss_file') in ['True', 'on', 'true', True]
             rss_file = req.form.get('rss_file', '').strip()
             rss_file_path = req.form.get('rss_file_path', '').strip()
-            rss_file_days = req.form.get('rss_file_days', '').strip()
-            rss_file_items = req.form.get('rss_file_items', '').strip()
 
             def parse_filter_lines(text: str) -> list:
                 res = []
@@ -177,11 +181,14 @@ class ModuleFeed(PluginModuleBase):
                 'name': name_val or f"feed_{feed_id}",
                 'sources': sources,
                 'quality': quality,
+                'feed_count': feed_count,
+                'rss_file_days': rss_file_days,
+                'rss_file_items': rss_file_items,
+                'use_proxy': use_proxy,
+                'proxy_url': proxy_url,
                 'use_rss_file': use_rss_file,
                 'rss_file': rss_file,
                 'rss_file_path': rss_file_path,
-                'rss_file_days': rss_file_days,
-                'rss_file_items': rss_file_items,
             }
 
             item_data['accept_all'] = accept_all
@@ -266,7 +273,11 @@ class ModuleFeed(PluginModuleBase):
                 return jsonify({'ret': 'not_exist', 'msg': '피드를 찾을 수 없습니다.'}), 404
 
             current_feed_name = feed.get('name')
-            feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
+            raw_feed_count = feed.get('feed_count')
+            if raw_feed_count and str(raw_feed_count).isdigit() and int(raw_feed_count) > 0:
+                feed_count = int(raw_feed_count)
+            else:
+                feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
 
             feed_records = (
                 db.session.query(ModelFeedItem)
