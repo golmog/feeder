@@ -47,12 +47,9 @@ class UploadUtil:
         return f"{size:.2f} {unit}"
 
     @staticmethod
-    def run_rclone(cmd: list[str], description: str = "", log_output: bool = True, item_id=None, file_size=None) -> tuple[bool, str]:
+    def run_rclone(cmd: list[str], description: str = "", log_output: bool = True, item_id=None, file_size=None, watchdog_timeout: int = None) -> tuple[bool, str]:
         """Rclone 서브프로세스 실행 및 실시간 출력/전송률 캡처"""
-        rclone_cfg = FeederUtil.load_yaml().get('rclone', {})
         env = os.environ.copy()
-        if rclone_cfg.get('bind_ip'):
-            env['RCLONE_BIND_ADDR'] = rclone_cfg['bind_ip']
 
         if log_output and description:
             size_text = f" ({UploadUtil.format_bytes(file_size)})" if file_size else ""
@@ -67,6 +64,26 @@ class UploadUtil:
                 encoding='utf-8',
                 env=env
             )
+
+            # 무전송 감시 타이머 (로컬 스테이징 등 지정된 경우에만 가동, 대용량 업로드 해싱 지연 보호)
+            transfer_started = threading.Event()
+            killed_by_watchdog = [False]
+
+            if watchdog_timeout and watchdog_timeout > 0:
+                def _watchdog():
+                    if not transfer_started.wait(timeout=watchdog_timeout):
+                        if proc.poll() is None:
+                            logger.warning(f"[Rclone] {description}: {watchdog_timeout}초간 데이터 전송 시작이 감지되지 않아 프로세스를 강제 종료합니다.")
+                            killed_by_watchdog[0] = True
+                            try:
+                                proc.kill()
+                                proc.wait(timeout=3)
+                            except Exception:
+                                pass
+
+                watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+                watchdog_thread.start()
+
             output_lines = []
             for line in iter(proc.stdout.readline, ''):
                 line = line.strip()
@@ -74,8 +91,21 @@ class UploadUtil:
                     continue
                 output_lines.append(line)
 
+                # 실제 전송용 실행 시에만 에러/경고 출력 (lsjson 등 단순 검사 시 오탐 차단)
+                if log_output:
+                    line_lower = line.lower()
+                    has_error_level = bool(re.match(r'^\s*(?:error|fatal)\s*:', line_lower))
+                    has_failure_phrase = any(phrase in line_lower for phrase in (
+                        'failed to', 'permission denied', 'quota exceeded',
+                        'rate limit', 'authentication failed', '403 forbidden'
+                    ))
+                    is_progress_line = bool(re.search(r'\d+(?:\.\d+)?\s*[kmgt]?ib\s*/', line_lower))
+                    if (has_error_level or has_failure_phrase) and not is_progress_line and 'directory not found' not in line_lower:
+                        logger.error(f"[Rclone Error] {description}: {line}")
+                    elif re.match(r'^\s*(?:warning|notice)\s*:', line_lower):
+                        logger.info(f"[Rclone Log] {description}: {line}")
+
                 # Rclone --stats-one-line 실시간 전송률 정밀 파싱
-                # 지원 포맷: "1.23 GiB / 4.49 GiB, 27%, 25.12 MiB/s, ETA 2m12s" 또는 "1.23G / 4.49G, 27%..."
                 if "%" in line:
                     m = re.search(r'([0-9.]+\s*[a-zA-Z]+)\s*/\s*([0-9.]+\s*[a-zA-Z]+),\s*([0-9.]+)%,\s*([0-9.]+\s*[a-zA-Z/]+)(?:,\s*ETA\s*([^\s,]+))?', line)
                     if m:
@@ -85,18 +115,33 @@ class UploadUtil:
                         speed_val = m.group(4).strip()
                         eta_val = m.group(5) or ''
 
+                        speed_clean = speed_val.lower().replace('/s', '').strip()
+                        speed_bytes = UploadUtil.parse_size_bytes(speed_clean)
+                        trans_bytes = UploadUtil.parse_size_bytes(trans_str)
+
+                        if (pct_val > 0 or trans_bytes > 0) and not transfer_started.is_set():
+                            transfer_started.set()
+
                         if item_id:
                             FeederUtil.report_rclone_progress(item_id, {
                                 'progress': pct_val,
                                 'speed_str': speed_val,
-                                'downloaded_bytes': UploadUtil.parse_size_bytes(trans_str),
+                                'download_speed': speed_bytes,
+                                'downloaded_bytes': trans_bytes,
                                 'total_bytes': UploadUtil.parse_size_bytes(total_str) if total_str else (file_size or 0),
                                 'eta': eta_val
                             }, action='update')
 
+            transfer_started.set()
             proc.stdout.close()
             proc.wait()
             full_output = '\n'.join(output_lines)
+
+            if killed_by_watchdog[0]:
+                err_msg = f"{watchdog_timeout}초간 데이터 전송 시작 불가 (무반응 타임아웃 강제 종료)"
+                if log_output:
+                    logger.error(f"[Rclone] 실패 ({description}): {err_msg}")
+                return False, err_msg
 
             if proc.returncode == 0:
                 if log_output and description:
@@ -139,10 +184,12 @@ class UploadUtil:
             self.accounts = FeederUtil.get_gdrive_accounts()
             self.busy_accounts = set()
 
-            self.limit_user = UploadUtil.parse_size_bytes(P.ModelSetting.get('download_gdrive_upload_limit') or '700GB')
-            self.limit_shared = UploadUtil.parse_size_bytes(P.ModelSetting.get('download_shared_drive_upload_limit') or '3TB')
-            self.threshold = UploadUtil.parse_size_bytes(P.ModelSetting.get('download_mydrive_upload_threshold') or '14GB')
-            self.reset_time_str = P.ModelSetting.get('download_shared_drive_quota_reset_time') or '16:00'
+            # 쿼터 및 임계 수치 계층 판별: 전역 DB 설정 -> YAML default 설정 -> 시스템 기본값
+            default_yaml = config_data.get('default', {})
+            self.limit_user = UploadUtil.parse_size_bytes(P.ModelSetting.get('download_gdrive_upload_limit') or default_yaml.get('gdrive_upload_limit') or '700GB')
+            self.limit_shared = UploadUtil.parse_size_bytes(P.ModelSetting.get('download_shared_drive_upload_limit') or default_yaml.get('shared_drive_upload_limit') or '3TB')
+            self.threshold = UploadUtil.parse_size_bytes(P.ModelSetting.get('download_mydrive_upload_threshold') or default_yaml.get('mydrive_upload_threshold') or '14GB')
+            self.reset_time_str = P.ModelSetting.get('download_shared_drive_quota_reset_time') or default_yaml.get('shared_drive_quota_reset_time') or '16:00'
 
             self.usage_map = self._get_24h_usage_summary()
             self.shared_usage = self.usage_map.get('SHARED_DRIVE_UPLOAD', 0)
@@ -287,7 +334,12 @@ class UploadUtil:
         config_data = FeederUtil.load_yaml()
         rclone_cfg = config_data.get('rclone', {})
         rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or rclone_cfg.get('conf_path', '')
-        base_remote = P.ModelSetting.get('download_rclone_remote_name') or rclone_cfg.get('remote_name', 'gdrive_sa')
+        base_remote = (
+            P.ModelSetting.get('download_gdrive_mydrive_remote_name')
+            or P.ModelSetting.get('download_rclone_remote_name')
+            or rclone_cfg.get('mydrive_remote_name')
+            or rclone_cfg.get('remote_name', 'gdrive_sa')
+        )
         dst_drive_id = P.ModelSetting.get('download_shared_drive_id') or rclone_cfg.get('shared_drive_id', '')
 
         if not rclone_conf or not dst_drive_id:
@@ -301,7 +353,6 @@ class UploadUtil:
 
         target_root = f"{base_remote}:{{{dst_drive_id}}}/"
         use_impersonate = P.ModelSetting.get_bool('download_gdrive_use_impersonate')
-        start_time = time.time()
 
         logger.info(f"[UploadUtil] Google Drive SA 내 드라이브 고아 파일 정리 시작 (대상: {len(accounts)}개 계정, 목적지: {target_root})")
 
@@ -339,13 +390,13 @@ class UploadUtil:
             except Exception as ex:
                 logger.debug(f"[UploadUtil] {email} 내 드라이브 정리 중 예외 (무시): {ex}")
 
-        elapsed_time = time.time() - start_time
-        logger.info(f"[UploadUtil] Google Drive SA 내 드라이브 고아 파일 정리 완료 (처리: {processed_count}/{len(accounts)}개 계정, 소요시간: {elapsed_time:.1f}초)")
+        logger.info(f"[UploadUtil] Google Drive SA 내 드라이브 고아 파일 정리 완료 (처리: {processed_count}/{len(accounts)}개 계정)")
 
     @classmethod
     def execute_upload(cls, item: ModelDownload, manager: AccountManager) -> bool:
-        """구글 드라이브 업로드 및 2단계 서버사이드 원자적 이동 실행"""
+        """구글 드라이브 업로드 및 2단계 서버사이드 원자적 이동 실행 (Zero-Lock Rclone 전송)"""
         local_path = item.local_path
+
         # 원격 소스(AllDebrid 등) 다이렉트 스트리밍 여부 판별
         is_remote_source = bool(local_path and not os.path.exists(local_path) and (':' in local_path or local_path.startswith(('http://', 'https://'))))
 
@@ -370,16 +421,37 @@ class UploadUtil:
 
         rclone_cfg = FeederUtil.load_yaml().get('rclone', {})
         rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or rclone_cfg.get('conf_path', '')
-        remote_net = P.ModelSetting.get('download_rclone_remote_name') or rclone_cfg.get('remote_name', 'gdrive_sa')
-        remote_shared = P.ModelSetting.get('download_rclone_shared_remote_name') or rclone_cfg.get('shared_remote_name', 'gdrive_shared')
 
-        target_drive_id = item.gdrive_remote_id or P.ModelSetting.get('download_shared_drive_id') or rclone_cfg.get('shared_drive_id', '')
+        # 프로필의 최신 목적지 설정 동적 조회 (과거 DB 고정값 오버라이드)
+        profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
+        dest_cfg = FeederUtil.get_profile_destination(profile, item.current_engine_name)
+
+        # 리모트명 계층 판별: 프로필 목적지 리모트 -> 전역 DB 설정 -> YAML rclone -> 기본값
+        remote_net = (
+            dest_cfg.get('mydrive_remote_name')
+            or P.ModelSetting.get('download_gdrive_mydrive_remote_name')
+            or P.ModelSetting.get('download_rclone_remote_name')
+            or rclone_cfg.get('mydrive_remote_name')
+            or rclone_cfg.get('remote_name', 'gdrive_sa')
+        )
+        remote_shared = (
+            dest_cfg.get('shared_remote_name')
+            or P.ModelSetting.get('download_rclone_shared_remote_name')
+            or rclone_cfg.get('shared_remote_name', 'gdrive_shared')
+        )
+
+        # 공유 드라이브 ID 계층 판별: 프로필 설정 -> DB 기본 설정 -> YAML 설정
+        target_drive_id = dest_cfg.get('shared_drive_id') or item.gdrive_remote_id or P.ModelSetting.get('download_shared_drive_id') or rclone_cfg.get('shared_drive_id', '')
         if not target_drive_id:
             logger.error("[UploadUtil] 목적지 공유 드라이브 ID(shared_drive_id)가 설정되지 않았습니다.")
             item.status = 'failed'
             item.error_message = "공유 드라이브 ID 누락"
             db.session.commit()
             return False
+
+        # 최신 목적지 서브 경로 동적 갱신
+        comp_path = (dest_cfg.get('complete_path') or item.gdrive_complete_path or 'uploads/default').strip('/')
+        up_path = (dest_cfg.get('upload_path') or item.gdrive_upload_path or 'incoming/default').strip('/')
 
         mode, acc, reason = manager.allocate_account(fsize)
         if mode in ['wait', 'skip']:
@@ -388,126 +460,177 @@ class UploadUtil:
 
         acc_name = acc.get('username') if acc else 'Default_Shared'
         usage_key = acc_name if mode == 'mydrive' else 'SHARED_DRIVE_UPLOAD'
+        use_impersonate = FeederUtil.resolve_setting(
+            'use_impersonate',
+            dest_cfg,
+            {},
+            P.ModelSetting.get_bool('download_gdrive_use_impersonate'),
+            False
+        )
+        use_impersonate = str(use_impersonate).lower() in ('true', 'on', '1')
 
-        comp_path = (item.gdrive_complete_path or 'uploads/default').strip('/')
-        up_path = (item.gdrive_upload_path or 'incoming/default').strip('/')
-        use_impersonate = P.ModelSetting.get_bool('download_gdrive_use_impersonate')
-
-        if mode == 'mydrive':
-            effective_remote = remote_net if use_impersonate else (acc.get('remote_name') or remote_net)
-            impersonate_arg = ["--drive-impersonate", acc_name] if use_impersonate else []
-            dest_incoming = f"{effective_remote}:{{{acc.get('mydrive_rclone_id')}}}/{comp_path}/{folder_name}"
-        else:
-            effective_remote = remote_shared
-            impersonate_arg = []
-            dest_incoming = f"{remote_shared}:{{{target_drive_id}}}/{up_path}/{folder_name}"
-
-        clean_chk = ["rclone", "lsjson", dest_incoming, "--stat", "--config", rclone_conf] + impersonate_arg
-        csuc, cout = cls.run_rclone(clean_chk, log_output=False)
-        if csuc and cout.strip() and cout.strip() not in ["{}", "[]"]:
-            logger.warning(f"[UploadUtil] 이전 세션 비정상 중단 찌꺼기 발견 -> incoming 폴더 즉시 초기화: {dest_incoming}")
-            clean_cmd = ["rclone", "purge", dest_incoming, "--config", rclone_conf] + impersonate_arg
-            cls.run_rclone(clean_cmd, log_output=False)
-
-        item.status = 'uploading'
-        item.gdrive_account = acc_name
-        db.session.commit()
-
-        logger.info(f"[UploadUtil] 업로드 시작: {folder_name} [{cls.format_bytes(fsize)}] -> {mode} ({acc_name}, 리모트: {effective_remote})")
-        manager.add_usage(usage_key, fsize)
-
-        chunk_size = P.ModelSetting.get('download_rclone_chunk_size') or '256M'
-        cmd = [
-            "rclone", "copy", local_path, dest_incoming,
-            "--config", rclone_conf,
-            "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE",
-            "--drive-chunk-size", chunk_size
-        ] + impersonate_arg
-
-        # 유저 설정 Rclone 확장 옵션 결합
-        cmd.extend(FeederUtil.get_rclone_extra_options())
-
-        success, out = cls.run_rclone(cmd, f"업로드 {folder_name}", item_id=item.id, file_size=fsize)
-
-        if not success:
-            logger.error(f"[UploadUtil] 업로드 실패: {folder_name} -> incoming 불완전 찌꺼기 즉시 파기")
-            purge_cmd = ["rclone", "purge", dest_incoming, "--config", rclone_conf]
+        # 계정 락 영구 누수 방지를 위한 try-finally 보장 블록
+        try:
             if mode == 'mydrive':
-                purge_cmd.extend(["--drive-impersonate", acc_name])
-            cls.run_rclone(purge_cmd, log_output=False)
+                effective_remote = remote_net if use_impersonate else (acc.get('remote_name') or remote_net)
+                impersonate_arg = ["--drive-impersonate", acc_name] if use_impersonate else []
+                dest_incoming = f"{effective_remote}:{{{acc.get('mydrive_rclone_id')}}}/{up_path}/{folder_name}"
+            else:
+                effective_remote = remote_shared
+                impersonate_arg = []
+                dest_incoming = f"{remote_shared}:{{{target_drive_id}}}/{up_path}/{folder_name}"
 
-            out_lower = out.lower()
-            is_quota = "storagequotaexceeded" in out_lower or "upload limit" in out_lower
-            is_rate = "userratelimitexceeded" in out_lower or "rate limit" in out_lower or "403" in out_lower
+            clean_chk = ["rclone", "lsjson", dest_incoming, "--stat", "--config", rclone_conf] + impersonate_arg
+            csuc, cout = cls.run_rclone(clean_chk, log_output=False, watchdog_timeout=None)
+            if csuc and cout.strip() and cout.strip() not in ["{}", "[]"]:
+                logger.warning(f"[UploadUtil] 이전 세션 비정상 중단 찌꺼기 발견 -> incoming 폴더 즉시 초기화: {dest_incoming}")
+                clean_cmd = ["rclone", "purge", dest_incoming, "--config", rclone_conf] + impersonate_arg
+                cls.run_rclone(clean_cmd, log_output=False, watchdog_timeout=None)
 
-            if is_quota:
-                if mode == 'mydrive':
-                    manager.block_account(acc_name, is_rate_limit=False)
-                else:
-                    manager.block_shared_drive()
-            elif is_rate and mode == 'mydrive':
-                manager.block_account(acc_name, is_rate_limit=True)
-
-            if mode == 'mydrive':
-                manager.release_account(acc_name)
-
-            item.status = 'pending_upload'
-            item.error_message = f"업로드 실패 (찌꺼기 파기 완료: {out[:100]})"
+            item.status = 'uploading'
+            item.gdrive_account = acc_name
             db.session.commit()
-            return False
 
-        move_success = False
-        base_move_opts = [
-            "--config", rclone_conf,
-            "--drive-server-side-across-configs",
-            "--drive-use-trash=false",
-            "--stats-one-line", "--log-level", "NOTICE"
-        ]
+            logger.info(f"[UploadUtil] 업로드 시작: {folder_name} [{cls.format_bytes(fsize)}] -> {mode} ({acc_name}, 리모트: {effective_remote})")
+            manager.add_usage(usage_key, fsize)
 
-        if mode == 'mydrive':
-            src_m = f"{effective_remote}:{{{acc.get('mydrive_rclone_id')}}}/{comp_path}/{folder_name}"
-            dst_m = f"{remote_net}:{{{target_drive_id}}}/{comp_path}/{folder_name}"
-            move_cmd = ["rclone", "move", src_m, dst_m, "--delete-empty-src-dirs"] + impersonate_arg + base_move_opts
-            move_success, _ = cls.run_rclone(move_cmd, f"서버사이드 폴더 이동(Across) {folder_name}")
-        else:
-            dst_parent = f"{remote_shared}:{{{target_drive_id}}}/{comp_path}"
-            chpar_cmd = ["rclone", "backend", "chpar", dest_incoming, dst_parent, "--config", rclone_conf, "--log-level", "NOTICE"]
-            move_success, _ = cls.run_rclone(chpar_cmd, f"원자적 부모폴더 변경(chpar) {folder_name}")
+            chunk_size = P.ModelSetting.get('download_rclone_chunk_size') or '256M'
+            cmd = [
+                "rclone", "copy", local_path, dest_incoming,
+                "--config", rclone_conf,
+                "--stats", "1s", "--stats-one-line", "--log-level", "INFO",
+                "--drive-chunk-size", chunk_size
+            ] + impersonate_arg
 
-        if move_success:
-            if is_remote_source:
-                # 다이렉트 원격 스트리밍 완료 시 다운로더 엔진의 원본 작업 정리
-                downloader_cfg = FeederUtil.get_downloader_by_name(item.current_engine_name)
-                if downloader_cfg and item.engine_task_id:
+            cmd.extend(FeederUtil.get_rclone_exclude_options())
+            cmd.extend(FeederUtil.get_rclone_extra_options())
+
+            item_id = item.id
+            current_engine_name = item.current_engine_name
+            engine_task_id = item.engine_task_id
+
+            # 대용량 Rclone 업로드 중 DB 락을 원천 차단하기 위해 세션을 완전히 반환
+            db.session.remove()
+
+            success, out = cls.run_rclone(cmd, f"업로드 {folder_name}", item_id=item_id, file_size=fsize, watchdog_timeout=300)
+
+            # Rclone 전송 종료 후 다시 세션을 열어 최종 상태 갱신
+            item = db.session.query(ModelDownload).filter_by(id=item_id).first()
+            if not item:
+                return False
+
+            if not success:
+                logger.error(f"[UploadUtil] 업로드 실패: {folder_name} -> incoming 불완전 찌꺼기 즉시 파기")
+                purge_cmd = ["rclone", "purge", dest_incoming, "--config", rclone_conf]
+                if mode == 'mydrive':
+                    purge_cmd.extend(["--drive-impersonate", acc_name])
+                cls.run_rclone(purge_cmd, log_output=False, watchdog_timeout=None)
+
+                out_lower = out.lower()
+                is_quota = "storagequotaexceeded" in out_lower or "upload limit" in out_lower
+                is_rate = "userratelimitexceeded" in out_lower or "rate limit" in out_lower or "403" in out_lower
+
+                if is_quota:
+                    if mode == 'mydrive':
+                        manager.block_account(acc_name, is_rate_limit=False)
+                    else:
+                        manager.block_shared_drive()
+                elif is_rate and mode == 'mydrive':
+                    manager.block_account(acc_name, is_rate_limit=True)
+
+                # 실패 시에도 완료된 로컬 파일은 보존하고 pending_upload 상태 유지
+                err_summary = out.strip()[:150] if out else "5분간 전송 시작 불가 또는 네트워크 오류"
+                item.status = 'pending_upload'
+                item.error_message = f"업로드 실패 (다음 주기에 재시도): {err_summary}"
+                item.last_status_time = datetime.now()
+                db.session.commit()
+                db.session.remove()
+                return False
+
+            is_dir = os.path.isdir(local_path)
+            move_success = False
+            base_move_opts = [
+                "--config", rclone_conf,
+                "--drive-server-side-across-configs",
+                "--drive-use-trash=false",
+                "--stats-one-line", "--log-level", "NOTICE"
+            ]
+
+            if mode == 'mydrive':
+                src_m = f"{effective_remote}:{{{acc.get('mydrive_rclone_id')}}}/{comp_path}/{folder_name}"
+                dst_m = f"{remote_shared}:{{{target_drive_id}}}/{comp_path}/{folder_name}"
+                cmd_action = "move" if (is_dir or is_remote_source) else "moveto"
+                move_cmd = ["rclone", cmd_action, src_m, dst_m] + impersonate_arg + base_move_opts
+                if is_dir or is_remote_source:
+                    move_cmd.append("--delete-empty-src-dirs")
+                move_success, _ = cls.run_rclone(move_cmd, f"서버사이드 이동(Across/{cmd_action}) {folder_name}", log_output=True, watchdog_timeout=None)
+            else:
+                dst_parent = f"{remote_shared}:{{{target_drive_id}}}/{comp_path}"
+                move_cmd = ["rclone", "backend", "chpar", dest_incoming, dst_parent, "--config", rclone_conf, "--log-level", "NOTICE"]
+                move_success, _ = cls.run_rclone(move_cmd, f"원자적 부모폴더 변경(chpar) {folder_name}", log_output=True, watchdog_timeout=None)
+
+            if move_success:
+                downloader_cfg = FeederUtil.get_downloader_by_name(current_engine_name)
+                is_cd2_source = bool(
+                    downloader_cfg and
+                    str(downloader_cfg.get('engine_type', '')).lower() == 'cd2'
+                )
+
+                # CD2 -> Google Drive는 복사가 아니라 이동이므로 마운트 원본도 제거
+                if is_cd2_source and local_path and os.path.exists(local_path):
                     try:
+                        if os.path.isdir(local_path):
+                            shutil.rmtree(local_path)
+                        else:
+                            os.remove(local_path)
+                        logger.info(f"[UploadUtil] CD2 마운트 원본 삭제 완료: {local_path}")
+                    except Exception as cleanup_ex:
+                        item.status = 'move_failed'
+                        item.last_move_attempt_time = datetime.now()
+                        item.error_message = f"CD2 마운트 원본 삭제 실패: {cleanup_ex}"
+                        db.session.commit()
+                        logger.error(f"[UploadUtil] CD2 마운트 원본 삭제 실패: {local_path} ({cleanup_ex})")
+                        db.session.remove()
+                        return False
+
+                # 최종 업로드 완료 시 다운로더 엔진의 원본 작업 히스토리 자동 삭제
+                if downloader_cfg and engine_task_id:
+                    try:
+                        from .util_download import DownloadUtil
                         engine = DownloadUtil.create_engine(downloader_cfg)
                         if engine:
-                            engine.delete_task(item.engine_task_id)
-                            logger.info(f"[UploadUtil] 원격 소스 원본 작업 삭제 완료: {item.engine_task_id}")
+                            engine.delete_task(engine_task_id)
+                            logger.info(f"[UploadUtil] 다운로더 작업 히스토리 정리 완료: [{current_engine_name}] {engine_task_id}")
                     except Exception as del_ex:
-                        logger.debug(f"[UploadUtil] 원격 원본 삭제 실패 (무시): {del_ex}")
+                        logger.debug(f"[UploadUtil] 다운로더 작업 삭제 실패 (무시): {del_ex}")
+
+                # 로컬 임시 스테이징 폴더인 경우 정리 (CD2 마운트 원본은 위에서 별도 처리)
+                if not is_remote_source and not is_cd2_source:
+                    try:
+                        if os.path.exists(local_path):
+                            shutil.rmtree(local_path, ignore_errors=True)
+                            logger.info(f"[UploadUtil] 로컬 작업 완료 폴더 정리 완료: {folder_name}")
+                    except Exception:
+                        pass
+
+            if mode == 'mydrive':
+                cleanup_cmd = ["rclone", "cleanup", f"{effective_remote}:", "--config", rclone_conf, "--log-level", "NOTICE"] + impersonate_arg
+                cls.run_rclone(cleanup_cmd, log_output=False, watchdog_timeout=None)
+
+            if move_success:
+                item.status = 'completed'
+                item.completed_time = datetime.now()
+                item.error_message = None
+                logger.info(f"[UploadUtil] 구글 드라이브 최종 완료(completed): {folder_name}")
             else:
-                try:
-                    shutil.rmtree(local_path, ignore_errors=True)
-                    logger.info(f"[UploadUtil] 로컬 작업 완료 폴더 정리 완료: {folder_name}")
-                except Exception:
-                    pass
+                item.status = 'move_failed'
+                item.last_move_attempt_time = datetime.now()
+                item.error_message = "서버사이드 chpar/move 실패"
+                logger.warning(f"[UploadUtil] 최종 이동 실패 (move_failed로 보존): {folder_name}")
 
-        if mode == 'mydrive':
-            cleanup_cmd = ["rclone", "cleanup", f"{effective_remote}:", "--config", rclone_conf, "--log-level", "NOTICE"] + impersonate_arg
-            cls.run_rclone(cleanup_cmd, log_output=False)
-            manager.release_account(acc_name)
-
-        if move_success:
-            item.status = 'completed'
-            item.completed_time = datetime.now()
-            item.error_message = None
-            logger.info(f"[UploadUtil] 구글 드라이브 최종 완료(completed): {folder_name}")
-        else:
-            item.status = 'move_failed'
-            item.last_move_attempt_time = datetime.now()
-            item.error_message = "서버사이드 chpar/move 실패"
-            logger.warning(f"[UploadUtil] 최종 이동 실패 (move_failed로 보존): {folder_name}")
-
-        db.session.commit()
-        return True
+            db.session.commit()
+            db.session.remove()
+            return move_success
+        finally:
+            if mode == 'mydrive' and acc_name:
+                manager.release_account(acc_name)

@@ -30,6 +30,7 @@ class ModuleFeed(PluginModuleBase):
             f"{self.name}_db_delete_day": "30",
             f"{self.name}_db_auto_delete": "False",
             f"{self.name}_feed_count": "100",
+            f"{self.name}_global_quality": "",
             f"{self.name}_make_rss_file": "False",
             f"{self.name}_rss_file_path": "",
             f"{self.name}_rss_file_days": "14",

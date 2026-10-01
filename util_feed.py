@@ -274,6 +274,9 @@ class FeedUtil:
         if target_quality is None and isinstance(glob_dict, dict):
             target_quality = glob_dict.get('quality')
 
+        if not target_quality and P and hasattr(P, 'ModelSetting'):
+            target_quality = (P.ModelSetting.get('feed_global_quality') or '').strip()
+
         if target_quality:
             req_list = target_quality if isinstance(target_quality, list) else [target_quality]
             item_res = cls.detect_resolution(item)
@@ -492,7 +495,9 @@ class FeedUtil:
                             new_feed_item.torrent_info = bbs.torrent_info
                             new_feed_item.broadcast_status = bbs.broadcast_status
                             new_feed_item.infohash = bbs.infohash or FeederUtil.extract_info_hash(bbs.magnet)
+
                             db.session.add(new_feed_item)
+                            db.session.commit()
                             added_count += 1
                             current_valid_count += 1
                             logger.debug(f"[FeedUtil] [{feed_name}] 크롤러 아이템 적재: '{bbs.title[:35]}'")
@@ -536,12 +541,13 @@ class FeedUtil:
                                 new_feed_item.files = '||'.join(f"{x[0]}|{x[1]}|NONE" for x in r_item['files'])
 
                             db.session.add(new_feed_item)
+                            db.session.commit()
                             added_count += 1
                             logger.info(f"[FeedUtil] [{feed_name}] 외부 RSS 아이템 적재 성공: '{r_item['title'][:35]}'")
 
             if added_count > 0:
-                db.session.commit()
                 logger.info(f"[FeedUtil] 피드 [{feed_name}] 동기화 완료: 신규 {added_count}건 DB 적재")
+
         except Exception as e:
             db.session.rollback()
             logger.error(f"[FeedUtil] 피드 [{feed_name}] 동기화 중 오류: {e}")

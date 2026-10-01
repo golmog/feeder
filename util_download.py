@@ -5,6 +5,7 @@ import shutil
 import requests
 import subprocess
 import importlib.util
+import inspect
 
 import sys
 
@@ -61,7 +62,7 @@ class BaseDownloadEngine:
         self.name = self.config.get('name', self.ENGINE_ID)
         self.enabled = bool(self.config.get('enabled', True))
 
-    def add_magnet(self, link: str, title: str = None) -> tuple[bool, str, str]:
+    def add_magnet(self, link: str, title: str = None, upload_path: str = None) -> tuple[bool, str, str]:
         raise NotImplementedError
 
     def get_status(self, task_ids: list[str] = None) -> tuple[list[dict], str]:
@@ -241,9 +242,11 @@ class CloudDrive2Engine(BaseDownloadEngine):
         {"name": "cd2_addr", "label": "CD2 주소", "type": "text", "default": "127.0.0.1", "required": True},
         {"name": "cd2_port", "label": "CD2 포트 (gRPC)", "type": "number", "default": 19798},
         {"name": "cd2_token", "label": "CD2 인증 토큰", "type": "password", "placeholder": "CloudDrive2 JWT 토큰"},
-        {"name": "cd2_virtual_path", "label": "CD2 가상 다운로드 경로", "type": "text", "default": "115open/云下载", "desc": "오프라인 다운로드가 저장될 CD2 내부 가상 경로"},
-        {"name": "cd2_mount_path", "label": "CD2 로컬 마운트 경로", "type": "text", "placeholder": "예: /mnt/cd2/115open/云下载", "desc": "로컬 파일시스템에 마운트된 실제 디렉터리 경로"},
-        {"name": "cd2_completed_path", "label": "CD2 내부 완료 이동 경로", "type": "text", "placeholder": "예: /mnt/cd2/115open/uploads", "desc": "다운로드 완료 후 정리할 대상 폴더 경로"},
+# [추가/수정 코드 시작]
+        {"name": "cd2_virtual_path", "label": "마그넷 저장 기본 경로 루트", "type": "text", "default": "115open/云下载", "desc": "오프라인 다운로드가 저장될 CD2 내부 가상 기본 경로 루트"},
+        {"name": "cd2_mount_path", "label": "CD2 로컬 마운트 경로 루트", "type": "text", "placeholder": "예: /mnt/cd2/115open/云下载", "desc": "로컬 파일시스템에 마운트된 실제 기본 디렉터리 경로 루트"},
+# [추가/수정 코드 끝]
+        {"name": "use_local_staging", "label": "로컬 스테이징 기본 사용", "type": "checkbox", "default": False, "desc": "CD2 마운트는 기본적으로 직접 전송합니다. 다운로드 프로필에서 명시하면 프로필 설정이 우선합니다."},
         {"name": "cd2_max_pages", "label": "작업 목록 최대 탐색 페이지 수", "type": "number", "default": 1, "desc": "오프라인 작업 목록 조회 시 최대 탐색할 페이지 수 (기본값: 1페이지)"},
         {"name": "cd2_timeout", "label": "gRPC 타임아웃 (초)", "type": "number", "default": 30, "desc": "gRPC 요청 제한 시간(초) (기본값: 30초)"},
         {"name": "stalled_timeout_hours", "label": "지연 타임아웃 (시간)", "type": "number", "default": 24, "desc": "해당 시간 동안 미완료 시 다음 엔진으로 자동 폴백 (0 입력 시 무제한 대기)"}
@@ -256,7 +259,6 @@ class CloudDrive2Engine(BaseDownloadEngine):
         self.token = self.config.get('cd2_token', '').strip()
         self.vpath = "/" + self.config.get('cd2_virtual_path', '115open/云下载').strip("/")
         self.mount_path = self.config.get('cd2_mount_path', '').strip()
-        self.comp_path = self.config.get('cd2_completed_path', '').strip()
 
         try:
             self.max_pages = int(self.config.get('cd2_max_pages') or 1)
@@ -296,22 +298,27 @@ class CloudDrive2Engine(BaseDownloadEngine):
         except Exception as e:
             logger.debug(f"[CloudDrive2Engine] CD2 캐시 갱신 예외 ({self.grpc_timeout}s 타임아웃): {e}")
 
-    def add_magnet(self, link: str, title: str = None) -> tuple[bool, str, str]:
-        """CD2 gRPC를 통한 오프라인 다운로드 추가"""
+    def add_magnet(self, link: str, title: str = None, upload_path: str = None) -> tuple[bool, str, str]:
+        """CD2 gRPC를 통한 오프라인 다운로드 추가 (수신 경로 하위 폴더 자동 생성 및 결합)"""
         stub, metadata = self._get_grpc_stub()
         if not stub:
             return False, "", "CD2 gRPC 모듈(clouddrive_pb2)이 준비되지 않았습니다."
 
         try:
+            target_vpath = self.vpath
+            if upload_path and str(upload_path).strip():
+                clean_sub = str(upload_path).strip().strip('/')
+                target_vpath = f"{self.vpath}/{clean_sub}"
+
             try:
-                parent_dir = os.path.dirname(self.vpath)
-                folder_name = os.path.basename(self.vpath)
+                parent_dir = os.path.dirname(target_vpath)
+                folder_name = os.path.basename(target_vpath)
                 req_cf = CloudDrive_pb2.CreateFolderRequest(parentPath=parent_dir, folderName=folder_name)
                 stub.CreateFolder(req_cf, metadata=metadata, timeout=5)
             except Exception:
                 pass
 
-            req = CloudDrive_pb2.AddOfflineFileRequest(urls=link, toFolder=self.vpath)
+            req = CloudDrive_pb2.AddOfflineFileRequest(urls=link, toFolder=target_vpath)
             res = stub.AddOfflineFiles(req, metadata=metadata, timeout=20)
 
             if hasattr(res, 'success') and not res.success:
@@ -389,7 +396,74 @@ class CloudDrive2Engine(BaseDownloadEngine):
             return [], f"CD2 gRPC 상태 조회 예외: {str(e)}"
 
     def delete_task(self, task_id: str) -> bool:
-        return True
+        """CD2 오프라인 다운로드 히스토리에서 해당 작업 삭제"""
+        return self.delete_tasks([task_id])
+
+    def delete_tasks(self, task_ids: list[str]) -> bool:
+        """CD2 오프라인 다운로드 히스토리에서 작업들 일괄 삭제 (115 실물 파일은 안전하게 보존)"""
+        if not task_ids:
+            return True
+        stub, metadata = self._get_grpc_stub()
+        if not stub:
+            return False
+
+        # stub에서 오프라인 삭제 RPC 메서드 탐색
+        method_name = None
+        for name in ['DeleteOfflineFiles', 'RemoveOfflineFiles', 'DeleteOfflineFile', 'RemoveOfflineFile', 'CancelOfflineFiles']:
+            if hasattr(stub, name):
+                method_name = name
+                break
+
+        if not method_name:
+            logger.debug(f"[CloudDrive2Engine] CD2 gRPC 삭제 메서드 부재: {[m for m in dir(stub) if 'offline' in m.lower()]}")
+            return False
+
+        # CloudDrive_pb2에서 요청 메시지 클래스 탐색
+        req_cls = None
+        for name in [f"{method_name}Request", 'DeleteOfflineFilesRequest', 'RemoveOfflineFilesRequest', 'DeleteOfflineFileRequest']:
+            if hasattr(CloudDrive_pb2, name):
+                req_cls = getattr(CloudDrive_pb2, name)
+                break
+
+        if not req_cls:
+            logger.debug("[CloudDrive2Engine] CD2 gRPC 삭제 요청 클래스 부재")
+            return False
+
+        # 요청 파라미터 동적 구성 (115 원본 파일 삭제 방지를 위해 deleteFiles는 무조건 False 지정)
+        field_names = req_cls.DESCRIPTOR.fields_by_name.keys()
+        kwargs = {}
+        if 'path' in field_names:
+            kwargs['path'] = self.vpath
+        if 'deleteFiles' in field_names:
+            kwargs['deleteFiles'] = False
+        elif 'delete_files' in field_names:
+            kwargs['delete_files'] = False
+
+        # 40자리 infoHash 및 식별자 추출
+        hashes = [tid.lower() for tid in task_ids if len(tid) == 40]
+        if not hashes:
+            hashes = task_ids
+
+        if 'infoHashes' in field_names:
+            kwargs['infoHashes'] = hashes
+        elif 'info_hashes' in field_names:
+            kwargs['info_hashes'] = hashes
+        elif 'infoHash' in field_names and len(hashes) == 1:
+            kwargs['infoHash'] = hashes[0]
+        elif 'taskIds' in field_names:
+            kwargs['taskIds'] = task_ids
+        elif 'urls' in field_names:
+            kwargs['urls'] = task_ids
+
+        try:
+            req = req_cls(**kwargs)
+            method = getattr(stub, method_name)
+            method(req, metadata=metadata, timeout=15)
+            logger.info(f"[CloudDrive2Engine] CD2 오프라인 히스토리 레코드 삭제 완료: {len(task_ids)}건")
+            return True
+        except Exception as ex:
+            logger.warning(f"[CloudDrive2Engine] CD2 오프라인 히스토리 삭제 실패 ({len(task_ids)}건): {ex}")
+            return False
 
     def test_connection(self) -> tuple[bool, str]:
         """CloudDrive2 gRPC 통신 및 토큰 유효성 검증"""
@@ -415,14 +489,14 @@ class CloudDrive2Engine(BaseDownloadEngine):
 
 class LocalTransporter(BaseTransporter):
     TRANSPORTER_ID = "local"
-    TRANSPORTER_NAME = "로컬 디스크 보존 (단순 완료)"
+    TRANSPORTER_NAME = "단순 경로 이동"
 
     CONFIG_SCHEMA = [
-        {"name": "target_folder", "label": "최종 이동 경로", "type": "text", "placeholder": "비워두면 수득 완료 위치 그대로 보존", "desc": "로컬 디스크 내 완료 파일이 이동될 최종 디렉터리 경로"}
+        {"name": "complete_path", "label": "최종 완료 이동 경로", "type": "text", "placeholder": "예: uploads/프로필명 (엔진 루트 하위)", "desc": "로컬 출력 엔진의 설정 루트 하위 경로입니다. 엔진 루트(cd2_mount_path, save_path 등)와 조합하며, /로 시작해도 절대 경로가 아닌 루트 하위 상대 경로로 처리합니다."}
     ]
 
     def transport(self, item, source_path: str, dest_config: dict) -> tuple[bool, str, str]:
-        target_folder = (dest_config.get('target_folder') or '').strip()
+        target_folder = (dest_config.get('complete_path') or dest_config.get('target_folder') or '').strip()
         folder_name = item.file_name or os.path.basename(source_path)
 
         if not source_path or not os.path.exists(source_path):
@@ -430,17 +504,36 @@ class LocalTransporter(BaseTransporter):
             return False, "failed", f"로컬 파일 없음: {source_path}"
 
         final_path = source_path
-        if target_folder and os.path.abspath(source_path) != os.path.abspath(target_folder):
+        if target_folder:
             try:
                 os.makedirs(target_folder, exist_ok=True)
                 dest_file = os.path.join(target_folder, folder_name)
                 if os.path.exists(dest_file):
-                    short_hash = (item.infohash[:6] if item.infohash else "dup")
-                    n, e = os.path.splitext(folder_name)
-                    dest_file = os.path.join(target_folder, f"{n}_{short_hash}{e}" if e else f"{folder_name}_{short_hash}")
+                    short_hash = (item.infohash[:6] if item.infohash else f"id_{item.id}")
+                    if os.path.isdir(source_path):
+                        candidate_name = f"{folder_name}_[{short_hash}]"
+                    else:
+                        n, e = os.path.splitext(folder_name)
+                        candidate_name = f"{n}_{short_hash}{e}"
+                    dest_file = os.path.join(target_folder, candidate_name)
 
-                shutil.move(source_path, dest_file)
-                final_path = dest_file
+                    # 동일 hash의 기존 항목까지 있으면 추가 suffix를 붙여 덮어쓰기를 방지한다.
+                    suffix = 2
+                    while os.path.exists(dest_file):
+                        if os.path.isdir(source_path):
+                            candidate_name = f"{folder_name}_[{short_hash}]_{suffix}"
+                        else:
+                            n, e = os.path.splitext(folder_name)
+                            candidate_name = f"{n}_{short_hash}_{suffix}{e}"
+                        dest_file = os.path.join(target_folder, candidate_name)
+                        suffix += 1
+
+                if os.path.abspath(source_path) == os.path.abspath(dest_file):
+                    final_path = dest_file
+                else:
+                    shutil.move(source_path, dest_file)
+                    final_path = dest_file
+
                 logger.info(f"[LocalTransporter] 로컬 최종 경로 이동 완료: {final_path}")
             except Exception as e:
                 logger.error(f"[LocalTransporter] 로컬 파일 이동 실패: {e}")
@@ -455,29 +548,44 @@ class RcloneSimpleTransporter(BaseTransporter):
     TRANSPORTER_NAME = "일반 Rclone 리모트 단순 업로드"
 
     CONFIG_SCHEMA = [
-        {"name": "use_local_staging", "label": "로컬 스테이징 사용", "type": "checkbox", "default": True, "desc": "On: 로컬 디스크에 임시 다운로드 후 전송, Off: 다이렉트(on-the-fly) 메모리 스트리밍 전송"},
-        {"name": "remote_path", "label": "Rclone 목적지 경로", "type": "text", "required": True, "placeholder": "예: onedrive:media/movies 또는 my_gdrive:incoming"},
-        {"name": "chunk_size", "label": "업로드 청크 크기", "type": "text", "default": "128M"}
+        {"name": "use_local_staging", "label": "로컬 스테이징 사용", "type": "checkbox", "default": True, "desc": "On: 다운로더 원격 소스를 로컬 임시 경로에 먼저 수신합니다. Off: 로컬 파일시스템을 거치지 않고 원격 임시 업로드 경로로 직접 전송합니다."},
+        {"name": "staging_path", "label": "임시 수신 경로", "type": "text", "placeholder": "예: profile-name", "desc": "전역 로컬 스테이징 루트 아래에 생성할 작업별 임시 수신 경로입니다."},
+        {"name": "upload_path", "label": "임시 업로드 경로", "type": "text", "placeholder": "예: incoming/프로필명", "desc": "Rclone 리모트 안에서 업로드가 먼저 완료되는 임시 경로입니다."},
+        {"name": "complete_path", "label": "최종 완료 이동 경로", "type": "text", "placeholder": "예: uploads/프로필명", "desc": "임시 업로드가 성공한 뒤 최종적으로 이동할 Rclone 리모트 경로입니다."},
+        {"name": "remote_name", "label": "일반 업로드 리모트명", "type": "text", "placeholder": "미입력 시 기본 설정값 사용", "desc": "비워두면 기본 설정의 일반 업로드 리모트를 사용합니다."}
     ]
 
     def transport(self, item, source_path: str, dest_config: dict) -> tuple[bool, str, str]:
-        remote_dest = (dest_config.get('remote_path') or '').strip()
-        if not remote_dest:
-            return False, "failed", "Rclone 목적지 경로(remote_path) 미설정"
+        upload_path = (dest_config.get('upload_path') or '').strip().strip('/')
+        complete_path = (dest_config.get('complete_path') or '').strip().strip('/')
+        if not upload_path or not complete_path:
+            return False, "failed", "Rclone 임시 업로드 경로(upload_path)와 최종 완료 이동 경로(complete_path)가 모두 필요합니다."
 
         is_remote_source = bool(source_path and not os.path.exists(source_path) and (':' in source_path or source_path.startswith(('http://', 'https://'))))
         if not source_path or (not is_remote_source and not os.path.exists(source_path)):
             return False, "failed", f"업로드 대상 소스 파일 없음: {source_path}"
 
         rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or FeederUtil.load_yaml().get('rclone', {}).get('conf_path', '')
+        rclone_cfg = FeederUtil.load_yaml().get('rclone', {})
+        remote_name = (
+            dest_config.get('remote_name')
+            or P.ModelSetting.get('download_rclone_upload_remote_name')
+            or P.ModelSetting.get('download_rclone_remote_name')
+            or rclone_cfg.get('upload_remote_name')
+            or rclone_cfg.get('remote_name')
+            or ''
+        ).strip()
+        if not remote_name:
+            return False, "failed", "일반 업로드 Rclone 리모트명이 설정되지 않았습니다."
         raw_name = item.file_name or os.path.basename(source_path)
         base_name, ext = os.path.splitext(raw_name)
         folder_name = base_name if (ext and not raw_name.endswith(('/', '\\'))) else raw_name
-        dest_full = f"{remote_dest.rstrip('/')}/{folder_name}"
-        chunk_size = dest_config.get('chunk_size', '128M')
+        temp_full = f"{remote_name}:{upload_path}/{folder_name}"
+        final_full = f"{remote_name}:{complete_path}/{folder_name}"
+        chunk_size = P.ModelSetting.get('download_rclone_chunk_size') or '256M'
 
         cmd = [
-            "rclone", "copy", source_path, dest_full,
+            "rclone", "copy", source_path, temp_full,
             "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE",
             "--drive-chunk-size", chunk_size
         ]
@@ -486,11 +594,21 @@ class RcloneSimpleTransporter(BaseTransporter):
 
         cmd.extend(FeederUtil.get_rclone_extra_options())
 
-        logger.info(f"[RcloneTransporter] 업로드 시작 ({'원격 다이렉트' if is_remote_source else '로컬'}): {folder_name} -> {dest_full}")
+        logger.info(f"[RcloneTransporter] 임시 업로드 시작 ({'원격 다이렉트' if is_remote_source else '로컬'}): {folder_name} -> {temp_full}")
         try:
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3600)
             if res.returncode == 0:
-                logger.info(f"[RcloneTransporter] 업로드 완료: {dest_full}")
+                move_cmd = ["rclone", "move", temp_full, final_full, "--delete-empty-src-dirs"]
+                if rclone_conf:
+                    move_cmd.extend(["--config", rclone_conf])
+                move_cmd.extend(FeederUtil.get_rclone_extra_options())
+                move_res = subprocess.run(move_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3600)
+                if move_res.returncode != 0:
+                    err = move_res.stderr.strip() or "최종 완료 경로 이동 실패"
+                    logger.error(f"[RcloneTransporter] 최종 이동 오류: {err}")
+                    return False, "failed", f"Rclone 최종 이동 실패: {err[:120]}"
+
+                logger.info(f"[RcloneTransporter] 최종 이동 완료: {final_full}")
                 if is_remote_source:
                     downloader_cfg = FeederUtil.get_downloader_by_name(item.current_engine_name)
                     if downloader_cfg and item.engine_task_id:
@@ -505,7 +623,7 @@ class RcloneSimpleTransporter(BaseTransporter):
                         shutil.rmtree(source_path, ignore_errors=True)
                     elif os.path.isfile(source_path):
                         os.remove(source_path)
-                return True, "completed", f"Rclone 업로드 완료 ({dest_full})"
+                return True, "completed", f"Rclone 업로드 및 최종 이동 완료 ({final_full})"
             else:
                 err = res.stderr.strip() or "알 수 없는 Rclone 오류"
                 logger.error(f"[RcloneTransporter] Rclone 오류: {err}")
@@ -520,10 +638,14 @@ class GDrivePoolTransporter(BaseTransporter):
     TRANSPORTER_NAME = "Google Drive 계정 풀 로테이션 (MyDrive 경유용)"
 
     CONFIG_SCHEMA = [
-        {"name": "use_local_staging", "label": "로컬 스테이징 사용", "type": "checkbox", "default": True, "desc": "On: 로컬 임시 디스크 다운로드 후 전송, Off: 다이렉트(on-the-fly) 스트리밍 전송"},
-        {"name": "upload_path", "label": "임시 수신 경로", "type": "text", "placeholder": "예: incoming/프로필명", "desc": "로컬 스테이징 루트 및 구글 드라이브 임시 수신 디렉터리 경로"},
+        {"name": "use_impersonate", "label": "Impersonate 사용", "type": "checkbox", "desc": "On: 기본 MyDrive SA 리모트에 계정 이메일을 impersonate 대상으로 적용합니다. Off: 계정별 독립 Rclone 리모트를 사용합니다."},
+        {"name": "use_local_staging", "label": "로컬 스테이징 사용", "type": "checkbox", "default": True, "desc": "On: 다운로더 원격 소스를 로컬 임시 경로에 먼저 수신합니다. Off: 로컬 파일시스템을 거치지 않고 원격 임시 업로드 경로로 직접 전송합니다."},
+        {"name": "staging_path", "label": "임시 수신 경로", "type": "text", "placeholder": "예: profile-name", "desc": "전역 로컬 스테이징 루트 아래에 생성할 작업별 임시 수신 경로입니다."},
+        {"name": "upload_path", "label": "임시 업로드 경로", "type": "text", "placeholder": "예: incoming/프로필명", "desc": "Google Drive에서 업로드가 먼저 완료되는 임시 경로입니다."},
+        {"name": "mydrive_remote_name", "label": "내 드라이브 SA 리모트명", "type": "text", "placeholder": "미입력 시 기본 설정값 사용"},
+        {"name": "shared_remote_name", "label": "목적지 공유 드라이브 리모트명", "type": "text", "placeholder": "미입력 시 기본 설정값 사용"},
         {"name": "shared_drive_id", "label": "공유 드라이브 ID", "type": "text", "placeholder": "미입력 시 기본 설정값 사용", "desc": "최종 라이브러리가 위치할 대상 공유 드라이브 ID"},
-        {"name": "complete_path", "label": "최종 라이브러리 경로", "type": "text", "placeholder": "예: uploads/프로필명", "desc": "지정한 공유 드라이브 내 최종 보관 폴더 경로"}
+        {"name": "complete_path", "label": "최종 완료 이동 경로", "type": "text", "placeholder": "예: uploads/프로필명", "desc": "지정한 공유 드라이브 내 최종 보관 폴더 경로"}
     ]
 
     def transport(self, item, source_path: str, dest_config: dict) -> tuple[bool, str, str]:
@@ -540,6 +662,28 @@ class GDrivePoolTransporter(BaseTransporter):
 # 단일 통합 관리자: DownloadUtil
 # ==============================================================================
 class DownloadUtil:
+    @staticmethod
+    def get_local_root(config: dict | None) -> str:
+        """Return the configured filesystem root for an engine's local output."""
+        config = config or {}
+        for key in ('local_root', 'cd2_mount_path', 'save_path', 'download_path', 'output_path'):
+            value = str(config.get(key) or '').strip()
+            if value:
+                return value
+        return ''
+
+    @staticmethod
+    def add_magnet(engine, link: str, title: str = None, upload_path: str = None):
+        """Call engines with the optional upload_path argument only when supported."""
+        signature = inspect.signature(engine.add_magnet)
+        accepts_upload_path = (
+            'upload_path' in signature.parameters
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in signature.parameters.values())
+        )
+        if accepts_upload_path:
+            return engine.add_magnet(link, title=title, upload_path=upload_path)
+        return engine.add_magnet(link, title=title)
+
     """다운로더 엔진 및 이송 핸들러 통합 관리자"""
 
     _engine_classes = {}

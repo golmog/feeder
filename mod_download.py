@@ -6,7 +6,7 @@ import time
 import traceback
 from datetime import datetime, timedelta
 from flask import render_template, request, jsonify, Response, stream_with_context
-from sqlalchemy import desc, func
+from sqlalchemy import desc, func, case
 import sqlite3
 
 from .setup import *
@@ -29,17 +29,23 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_interval": "5",
             f"{self.name}_db_delete_day": "30",
             f"{self.name}_db_auto_delete": "False",
-            f"{self.name}_feed_sync_days": "3",
-            f"{self.name}_batch_limit": "50",
+            f"{self.name}_is_running": "False",
+            f"{self.name}_running_start_time": "0",
+            f"{self.name}_feed_sync_hours": "72",
+            f"{self.name}_use_local_staging": "True",
             f"{self.name}_local_staging_path": "",
+            f"{self.name}_max_staging_items": "10",
+            f"{self.name}_staging_workers": "2",
+            f"{self.name}_upload_workers": "2",
             f"{self.name}_exclude_pattern": "",
             f"{self.name}_enable_sse": "True",
             f"{self.name}_rclone_conf_path": "",
             f"{self.name}_rclone_remote_name": "net",
+            f"{self.name}_rclone_upload_remote_name": "",
             f"{self.name}_gdrive_use_impersonate": "False",
+            f"{self.name}_gdrive_mydrive_remote_name": "gdrive_sa",
             f"{self.name}_rclone_shared_remote_name": "gf",
             f"{self.name}_shared_drive_id": "",
-            f"{self.name}_rclone_bind_ip": "",
             f"{self.name}_rclone_chunk_size": "256M",
             f"{self.name}_mydrive_upload_threshold": "14GB",
             f"{self.name}_gdrive_upload_limit": "700GB",
@@ -47,6 +53,49 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_shared_drive_quota_reset_time": "16:00",
             f"{self.name}_rclone_extra_options": "--timeout 30m",
         }
+
+    def plugin_load(self):
+        """플러그인 로드 시 이전 비정상 종료된 전송 중 작업을 직전 대기 상태로 일괄 초기화"""
+        try:
+            with F.app.app_context():
+                # FF 재시작 후 남아 있을 수 있는 다운로드 파이프라인 런타임 락 초기화
+                FeederUtil.init_runtime_locks()
+                FeederUtil.reset_runtime_lock('download_pipeline')
+                P.ModelSetting.set(f"{self.name}_is_running", "False")
+                P.ModelSetting.set(f"{self.name}_running_start_time", "0")
+                FeederUtil.init_sqlite_concurrency()
+
+                stg_cnt = db.session.query(ModelDownload).filter_by(status='local_staging').update({'status': 'pending_local_staging'})
+                up_cnt = db.session.query(ModelDownload).filter_by(status='uploading').update({'status': 'pending_upload'})
+                rel_cnt = db.session.query(ModelDownload).filter_by(status='relay_transferring').update({'status': 'pending_relay'})
+                db.session.commit()
+
+                total_reset = stg_cnt + up_cnt + rel_cnt
+                if total_reset > 0:
+                    logger.info(f"[{self.name}] 플러그인 로드: 비정상 종료된 전송 작업 초기화 완료 (스테이징 {stg_cnt}건, 업로드 {up_cnt}건, 릴레이 {rel_cnt}건 ➔ 대기열 복원)")
+
+                # 이전 세션의 잔여 IPC 실시간 전송률 파일 및 메모리 캐시 정리
+                FeederUtil._rclone_live_stats.clear()
+                try:
+                    prog_dir = FeederUtil.get_tmp_dir('rclone_progress')
+                    if os.path.exists(prog_dir):
+                        for fname in os.listdir(prog_dir):
+                            if fname.endswith('.json') or fname.endswith('.tmp'):
+                                try:
+                                    os.remove(os.path.join(prog_dir, fname))
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+
+        except Exception as e:
+            logger.error(f"[{self.name}] plugin_load 초기화 예외: {e}")
+            logger.error(traceback.format_exc())
+
+        try:
+            super(ModuleDownload, self).plugin_load()
+        except Exception:
+            pass
 
     def process_menu(self, page_name, req):
         try:
@@ -238,6 +287,93 @@ class ModuleDownload(PluginModuleBase):
                 logger.info(f"[{self.name}] 구글 드라이브 계정 풀 일괄 등록: {added_count}개 추가됨")
                 return jsonify({'ret': 'success', 'added_count': added_count, 'accounts': accounts})
 
+            elif command == 'adopt_orphan':
+                task_id = req.form.get('task_id', '').strip()
+                thash = req.form.get('hash', '').strip().lower()
+                engine_name = req.form.get('engine_name', '').strip()
+                title = req.form.get('title', '').strip()
+                file_name = req.form.get('file_name', '').strip()
+                source_path = req.form.get('source_path', '').strip()
+                raw_status = req.form.get('raw_status', '').strip()
+                profile_name = req.form.get('profile_name', '').strip()
+                try:
+                    fsize = int(req.form.get('file_size', 0))
+                except Exception:
+                    fsize = 0
+
+                # 중복 등록 검증
+                existing = None
+                if thash:
+                    existing = ModelDownload.get_by_infohash(thash)
+                if not existing and task_id:
+                    existing = db.session.query(ModelDownload).filter_by(engine_task_id=task_id).first()
+                if existing:
+                    return jsonify({'ret': 'exist', 'msg': f'이미 큐에 등록되어 있는 작업입니다 (상태: {existing.status})'})
+
+                # 지정 프로필 존재 여부 및 1순위 엔진 일치 엄격 검증
+                selected_profile = None
+                for p in FeederUtil.get_download_profiles():
+                    if p.get('name') == profile_name:
+                        selected_profile = p
+                        break
+
+                if not selected_profile:
+                    return jsonify({'ret': 'fail', 'msg': '지정한 다운로드 프로필을 찾을 수 없습니다.'})
+
+                chain = selected_profile.get('priority_chain', [])
+                if not chain or chain[0].lower() != engine_name.lower():
+                    first_engine = chain[0] if chain else '없음'
+                    return jsonify({'ret': 'fail', 'msg': f'선택한 프로필의 1순위 엔진({first_engine})이 대상 엔진({engine_name})과 일치하지 않습니다.'})
+
+                dest_cfg = FeederUtil.get_profile_destination(selected_profile, engine_name)
+                dest_type = dest_cfg.get('type', 'local')
+                use_local_staging = str(dest_cfg.get('use_local_staging', True)).lower() in ['true', 'on', '1']
+
+                # 등록 일시를 현재 시각으로 초기화하여 타임아웃 조기 종료 방지
+                now = datetime.now()
+                target_mag = f"magnet:?xt=urn:btih:{thash}" if thash else f"engine:{engine_name}:{task_id}"
+
+                item = ModelDownload(
+                    feed_name=selected_profile.get('feeds', ['*'])[0] if selected_profile.get('feeds') else 'ADOPTED',
+                    title=title or file_name or f"{engine_name}_{task_id}",
+                    magnet=target_mag,
+                    infohash=thash or None
+                )
+                item.file_name = file_name or title
+                item.file_size = fsize
+                item.priority_chain = chain
+                item.current_engine_index = 0
+                item.current_engine_name = engine_name
+                item.engine_task_id = str(task_id)
+                item.destination_type = dest_type
+                item.gdrive_upload_path = dest_cfg.get('upload_path', '')
+                item.gdrive_complete_path = dest_cfg.get('complete_path', '')
+                item.gdrive_remote_id = dest_cfg.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
+                item.local_path = source_path
+                item.created_time = now
+                item.updated_time = now
+                item.engine_added_time = now
+                item.last_status_time = now
+
+                # 엔진 상태 및 프로필 스테이징 설정에 따라 알맞은 파이프라인 단계로 진입
+                transporter = DownloadUtil.get_transporter(dest_type)
+                is_relay = bool(transporter and getattr(transporter, 'IS_RELAY_HANDLER', False))
+
+                if raw_status == 'completed':
+                    if is_relay:
+                        item.status = 'pending_relay'
+                    elif not use_local_staging:
+                        item.status = 'downloaded'
+                    else:
+                        item.status = 'pending_local_staging'
+                else:
+                    item.status = 'downloading'
+
+                db.session.add(item)
+                db.session.commit()
+                logger.info(f"[{self.name}] 고아 작업 흡수 완료: {item.title} -> 상태: {item.status}, 프로필: {profile_name}")
+                return jsonify({'ret': 'success', 'msg': f'[{item.title[:25]}] 작업을 큐에 성공적으로 등록했습니다.'})
+
             elif command == 'reset_blocked_accounts':
                 db.session.query(ModelDownloadStat).filter_by(stat_type='account_block').delete()
                 db.session.commit()
@@ -391,7 +527,7 @@ class ModuleDownload(PluginModuleBase):
 
                     if selected_profile:
                         item.priority_chain = list(selected_profile.get('priority_chain', []))
-                        dest = selected_profile.get('destination', {})
+                        dest = FeederUtil.get_profile_destination(selected_profile, item.current_engine_name)
                         item.destination_type = dest.get('type', 'local')
                         item.gdrive_upload_path = dest.get('upload_path', '')
                         item.gdrive_complete_path = dest.get('complete_path', '')
@@ -402,16 +538,74 @@ class ModuleDownload(PluginModuleBase):
                             item.priority_chain = enabled_downloaders
                         item.destination_type = item.destination_type or 'local'
 
+                    err_msg = str(item.error_message or '')
+                    clean_title = item.title[:25]
+
+                    # [소스 경로 없음] 실패 건 복구: CD2 마운트 루트에 실물이 있는지 확인 후 제자리로 이동 및 최종 완료 처리
+                    if '소스 경로 없음' in err_msg or not item.local_path:
+                        cd2_cfg = next((d for d in FeederUtil.get_downloaders() if d.get('engine_type') == 'cd2'), None)
+                        if cd2_cfg:
+                            mount_root = (cd2_cfg.get('cd2_mount_path') or '').strip()
+                            target_fname = item.file_name or item.title
+                            if mount_root and os.path.exists(mount_root) and target_fname:
+                                found_path = None
+                                candidate = os.path.join(mount_root, target_fname)
+                                if os.path.exists(candidate):
+                                    found_path = candidate
+                                else:
+                                    for entry in os.listdir(mount_root):
+                                        if entry == target_fname:
+                                            found_path = os.path.join(mount_root, entry)
+                                            break
+
+                                if found_path:
+                                    upload_sub = (item.gdrive_upload_path or (selected_profile.get('destination', {}).get('upload_path') if selected_profile else '') or '').strip('/')
+                                    target_dir = os.path.join(mount_root, upload_sub) if upload_sub else mount_root
+                                    os.makedirs(target_dir, exist_ok=True)
+                                    final_dest_path = os.path.join(target_dir, target_fname)
+
+                                    if os.path.abspath(found_path) != os.path.abspath(final_dest_path):
+                                        shutil.move(found_path, final_dest_path)
+                                        logger.info(f"[{self.name}] [CD2 복구] 루트 잔여 파일을 수신 경로로 이동 완료: {found_path} -> {final_dest_path}")
+                                    else:
+                                        final_dest_path = found_path
+
+                                    # 파일 실제 용량 반영
+                                    if os.path.isfile(final_dest_path):
+                                        item.file_size = os.path.getsize(final_dest_path)
+                                    else:
+                                        item.file_size = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(final_dest_path) for f in fs)
+
+                                    item.local_path = final_dest_path
+                                    item.status = 'completed'
+                                    item.completed_time = datetime.now()
+                                    item.error_message = None
+                                    item.last_status_time = None
+                                    db.session.commit()
+                                    logger.info(f"[{self.name}] [CD2 복구] {item.title} 복구 및 최종 완료(completed) 처리 완료")
+                                    return jsonify({'ret': 'success', 'msg': f'[{clean_title}] CD2 마운트 실물 파일을 제자리로 복구하여 최종 완료(completed) 처리했습니다.'})
+
+                    # [업로드 실패] 건 복구: 로컬 스테이징 실물 파일이 보존되어 있는 경우 다운로드 생략 후 업로드 대기열 직행
+                    if item.local_path and os.path.exists(item.local_path):
+                        item.status = 'pending_upload'
+                        item.error_message = None
+                        item.last_status_time = None
+                        db.session.commit()
+                        logger.info(f"[{self.name}] 로컬 스테이징 파일 보존 확인 -> 업로드 대기열(pending_upload)로 즉시 재시도: {item.title}")
+                        return jsonify({'ret': 'success', 'msg': f'[{clean_title}] 보존된 로컬 스테이징 파일을 감지하여 업로드 대기열에 등록했습니다.'})
+
+                    # [체인 소진] 또는 일반 실패 건: 1순위 엔진부터 처음부터 재시작
                     item.status = 'pending'
                     item.current_engine_index = 0
                     item.current_engine_name = None
                     item.engine_task_id = None
                     item.error_message = None
+                    item.last_status_time = None
                     db.session.commit()
 
                     chain_desc = ' -> '.join(item.priority_chain) if item.priority_chain else '기본'
                     logger.info(f"[{self.name}] 다운로드 재시도 대기열 등록 완료: {item.title} (체인: {chain_desc})")
-                    return jsonify({'ret': 'success', 'msg': f'[{item.title[:25]}] 재시도 대기열에 등록되었습니다.'})
+                    return jsonify({'ret': 'success', 'msg': f'[{clean_title}] 1순위 엔진부터 다운로드를 처음부터 재시작합니다.'})
 
                 elif action == 'force_complete':
                     item.status = 'completed'
@@ -436,10 +630,13 @@ class ModuleDownload(PluginModuleBase):
     def process_api(self, sub, req):
         try:
             if sub == 'sse':
-                return Response(
+                response = Response(
                     stream_with_context(self.generate_sse_stream()),
                     mimetype='text/event-stream'
                 )
+                response.headers['Cache-Control'] = 'no-cache'
+                response.headers['X-Accel-Buffering'] = 'no'
+                return response
             elif sub == 'relay_claim':
                 return self._handle_relay_claim(req)
             elif sub == 'relay_report':
@@ -565,8 +762,13 @@ class ModuleDownload(PluginModuleBase):
                 logger.info(f"[{self.name}] [Relay API] AllDebrid WebDAV Rclone 설정([{engine_remote}]) 동적 주입 완료")
 
         profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
-        dest_cfg = profile.get('destination', {})
-        remote_name = dest_cfg.get('remote_name') or P.ModelSetting.get('download_rclone_shared_remote_name') or 'gdrive_shared'
+        dest_cfg = FeederUtil.get_profile_destination(profile, item.current_engine_name)
+        remote_name = (
+            dest_cfg.get('shared_remote_name')
+            or dest_cfg.get('remote_name')
+            or P.ModelSetting.get('download_rclone_shared_remote_name')
+            or 'gdrive_shared'
+        )
         shared_drive_id = item.gdrive_remote_id or dest_cfg.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
         complete_path = (item.gdrive_complete_path or dest_cfg.get('complete_path') or 'uploads/default').strip('/')
         folder_name = item.file_name or f"item_{item.id}"
@@ -655,49 +857,66 @@ class ModuleDownload(PluginModuleBase):
 
     def generate_sse_stream(self):
         """실시간 대시보드용 SSE 스트림 (통계 카운트 + 활성 작업 목록 동시 전송)"""
+        sse_cycle = 0
+        engine_tasks_cache = []
         while True:
             try:
                 with F.app.app_context():
+                    sse_cycle += 1
                     counts = {
                         'pending': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending', 'pending_relay'])).count(),
                         'downloading': db.session.query(ModelDownload).filter_by(status='downloading').count(),
                         'staging': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_local_staging', 'local_staging'])).count(),
-                        'uploading': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_upload', 'uploading', 'relay_transferring'])).count(),
+                        'uploading': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['downloaded', 'pending_upload', 'uploading', 'relay_transferring'])).count(),
                         'completed': db.session.query(ModelDownload).filter_by(status='completed').count(),
                         'failed': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['failed', 'move_failed'])).count(),
                     }
-
-                    try:
-                        batch_limit = P.ModelSetting.get_int('download_batch_limit')
-                    except Exception:
-                        batch_limit = 50
 
                     active_statuses = [
                         'pending', 'downloading', 'pending_local_staging', 'local_staging',
                         'downloaded', 'pending_upload', 'uploading', 'pending_relay', 'relay_transferring'
                     ]
+
+                    # 상태별 우선순위 가중치: 실제 전송/진행 중인 작업을 신규 대기 항목보다 항상 최우선 정렬
+                    status_priority = case(
+                        (ModelDownload.status.in_(['local_staging', 'uploading', 'relay_transferring']), 1),
+                        (ModelDownload.status == 'downloading', 2),
+                        (ModelDownload.status.in_(['pending_local_staging', 'downloaded', 'pending_upload', 'pending_relay']), 3),
+                        (ModelDownload.status == 'pending', 4),
+                        else_=5
+                    )
+
                     active_rows = (
                         db.session.query(ModelDownload)
                         .filter(ModelDownload.status.in_(active_statuses))
-                        .order_by(desc(ModelDownload.id))
-                        .limit(batch_limit)
+                        .order_by(status_priority, desc(ModelDownload.id))
                         .all()
                     )
 
-                    # 활성화된 다운로더 엔진(AllDebrid 등)에서 전체 마그넷 목록 수집
-                    cloud_tasks = []
-                    for dl in FeederUtil.get_downloaders():
-                        if dl.get('enabled', True):
-                            engine = DownloadUtil.create_engine(dl)
-                            if engine and hasattr(engine, 'get_status'):
-                                try:
-                                    s_list, _ = engine.get_status()
-                                    if s_list:
-                                        for c_item in s_list:
-                                            c_item['engine_name'] = dl.get('name', 'alldebrid')
-                                        cloud_tasks.extend(s_list)
-                                except Exception:
-                                    pass
+                    # Rclone 진행률은 매 주기 갱신하고, 원격 엔진 목록은 2주기(6초)마다 갱신
+                    if sse_cycle == 1 or sse_cycle % 2 == 0:
+                        refreshed_tasks = []
+                        refresh_success = True
+                        for dl in FeederUtil.get_downloaders():
+                            if dl.get('enabled', True):
+                                engine = DownloadUtil.create_engine(dl)
+                                if engine and hasattr(engine, 'get_status'):
+                                    try:
+                                        s_list, status_error = engine.get_status()
+                                        if status_error:
+                                            refresh_success = False
+                                            logger.debug(f"[{self.name}] SSE 엔진 상태 갱신 오류({dl.get('name')}): {status_error}")
+                                            continue
+                                        if s_list:
+                                            for c_item in s_list:
+                                                c_item['engine_name'] = dl.get('name', 'alldebrid')
+                                            refreshed_tasks.extend(s_list)
+                                    except Exception as engine_ex:
+                                        refresh_success = False
+                                        logger.debug(f"[{self.name}] SSE 엔진 상태 갱신 실패({dl.get('name')}): {engine_ex}")
+                        if refresh_success:
+                            engine_tasks_cache = refreshed_tasks
+                    cloud_tasks = engine_tasks_cache
 
                     engine_live_data = {str(s.get('task_id')): s for s in cloud_tasks if s.get('task_id')}
                     engine_live_data.update({str(s.get('hash')).lower(): s for s in cloud_tasks if s.get('hash')})
@@ -760,13 +979,16 @@ class ModuleDownload(PluginModuleBase):
 
                         active_list.append({
                             'id': display_id,
+                            'task_id': tid,
+                            'hash': thash,
                             'feed_name': eng_name,
                             'title': c_task.get('filename') or f"{eng_name} Task {display_id}",
                             'file_name': c_task.get('filename') or '',
                             'file_size': c_task.get('file_size', 0),
                             'status': 'engine_unmanaged',
                             'current_engine_name': eng_name,
-                            'local_path': '',
+                            'local_path': c_task.get('source_path', ''),
+                            'raw_status': c_task.get('status', ''),
                             'created_time': f"{eng_name} 보관중"
                         })
 

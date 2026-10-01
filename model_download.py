@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime
-from sqlalchemy import desc, or_
+from sqlalchemy import desc, or_, case
 
 from .setup import *
 from .util_base import FeederUtil
@@ -86,9 +86,12 @@ class ModelDownload(ModelBase):
             return None
 
     @classmethod
-    def get_list_by_status(cls, statuses: list[str], limit: int = 50):
+    def get_list_by_status(cls, statuses: list[str], limit: int = None):
         try:
-            return db.session.query(cls).filter(cls.status.in_(statuses)).order_by(cls.id.asc()).limit(limit).all()
+            query = db.session.query(cls).filter(cls.status.in_(statuses)).order_by(cls.id.asc())
+            if limit and limit > 0:
+                query = query.limit(limit)
+            return query.all()
         except Exception as e:
             logger.error(f"ModelDownload.get_list_by_status 오류: {e}")
             return []
@@ -96,8 +99,18 @@ class ModelDownload(ModelBase):
     @classmethod
     def web_list(cls, req):
         try:
-            page = int(req.form.get('page', 1))
-            page_size = int(req.form.get('page_size', 25))
+            try:
+                raw_page = req.form.get('page')
+                page = int(raw_page) if (raw_page and str(raw_page).isdigit() and int(raw_page) > 0) else 1
+            except Exception:
+                page = 1
+
+            try:
+                raw_size = req.form.get('page_size')
+                page_size = int(raw_size) if (raw_size and str(raw_size).isdigit() and int(raw_size) > 0) else 25
+            except Exception:
+                page_size = 25
+
             status_filter = req.form.get('status_filter', 'all')
             search_word = req.form.get('search_word', '').strip()
 
@@ -120,7 +133,24 @@ class ModelDownload(ModelBase):
                 ))
 
             total_count = query.count()
-            items = query.order_by(desc(cls.id)).limit(page_size).offset((page - 1) * page_size).all()
+
+            import math
+            total_pages = max(1, math.ceil(total_count / page_size)) if page_size > 0 else 1
+            if page > total_pages:
+                page = total_pages
+
+            # 활성 큐 조회(active) 시 실제 진행 중인 작업을 최우선으로 배치
+            if status_filter == 'active':
+                status_priority = case(
+                    (cls.status.in_(['local_staging', 'uploading', 'relay_transferring']), 1),
+                    (cls.status == 'downloading', 2),
+                    (cls.status.in_(['pending_local_staging', 'downloaded', 'pending_upload', 'pending_relay']), 3),
+                    (cls.status == 'pending', 4),
+                    else_=5
+                )
+                items = query.order_by(status_priority, desc(cls.id)).limit(page_size).offset((page - 1) * page_size).all()
+            else:
+                items = query.order_by(desc(cls.id)).limit(page_size).offset((page - 1) * page_size).all()
 
             return {
                 'success': True,
@@ -130,6 +160,12 @@ class ModelDownload(ModelBase):
         except Exception as e:
             logger.error(f"[ModelDownload] web_list 쿼리 오류: {e}")
             return {'success': False, 'list': [], 'paging': None}
+
+        finally:
+            try:
+                db.session.remove()
+            except Exception:
+                pass
 
 
 class ModelDownloadStat(ModelBase):

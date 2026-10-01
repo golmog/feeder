@@ -58,10 +58,15 @@ class ModuleCrawl(PluginModuleBase):
 
     def plugin_load(self):
         try:
-            P.ModelSetting.set(f"{self.name}_is_running", "False")
-            P.ModelSetting.set(f"{self.name}_test_running", "False")
-            P.ModelSetting.set(f"{self.name}_running_start_time", "0")
-            FeederUtil.migrate_db()
+            with F.app.app_context():
+                # Celery 작업은 FF 재시작 후에도 이전 실행 플래그가 남을 수 있으므로
+                # 플러그인 로드 시 런타임 실행 상태를 항상 초기화한다.
+                FeederUtil.init_runtime_locks()
+                FeederUtil.reset_runtime_lock('crawl_pipeline')
+                P.ModelSetting.set(f"{self.name}_is_running", "False")
+                P.ModelSetting.set(f"{self.name}_test_running", "False")
+                P.ModelSetting.set(f"{self.name}_running_start_time", "0")
+                FeederUtil.migrate_db()
             # logger.info(f"[{self.name}] 플러그인 로드: 수집 런타임 락 플래그 초기화 완료")
         except Exception as e:
             logger.debug(f"[{self.name}] plugin_load 초기화 예외: {e}")

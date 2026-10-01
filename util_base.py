@@ -17,6 +17,7 @@ import requests
 import subprocess
 import unicodedata
 import threading
+import uuid
 from datetime import datetime, timedelta
 from sqlalchemy import func
 
@@ -35,6 +36,30 @@ class FeederUtil:
     # --------------------------------------------------------------------------
     # 경로 및 시스템 헬퍼
     # --------------------------------------------------------------------------
+    @staticmethod
+    def format_bytes(size: int) -> str:
+        """바이트 수를 사람이 읽을 수 있는 단위로 포맷"""
+        if size is None or size <= 0:
+            return "0 B"
+        value = float(size)
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
+            if value < 1024.0 or unit == 'PB':
+                return f"{value:.2f} {unit}"
+            value /= 1024.0
+        return f"{value:.2f} PB"
+
+    @staticmethod
+    def resolve_setting(key: str, profile_config: dict | None = None,
+                        engine_config: dict | None = None,
+                        global_value=None, default=None):
+        """프로필 > 엔진 > 플러그인 DB > 코드 기본값 순서로 설정을 해석"""
+        for config in (profile_config or {}, engine_config or {}):
+            if key in config and config[key] is not None:
+                return config[key]
+        if global_value is not None:
+            return global_value
+        return default
+
     @classmethod
     def ensure_custom_dirs(cls):
         """커스텀 스크립트 디렉터리 준비"""
@@ -281,8 +306,31 @@ class FeederUtil:
             logger.debug(f"[FeederUtil] Rclone 옵션 shlex 파싱 예외 (단순 분리 사용): {ex}")
             return [x.strip() for x in raw_opt.split() if x.strip()]
 
+    @classmethod
+    def get_rclone_exclude_options(cls) -> list[str]:
+        """DB에 설정된 전송 제외 파일 패턴을 Rclone --exclude 인자 리스트로 변환"""
+        raw_patterns = P.ModelSetting.get('download_exclude_pattern') if P.ModelSetting else ''
+        if not raw_patterns:
+            # YAML fallback
+            yaml_rclone = cls.load_yaml().get('rclone', {})
+            raw_patterns = yaml_rclone.get('exclude_patterns', [])
+            if isinstance(raw_patterns, list):
+                res = []
+                for p in raw_patterns:
+                    if p and str(p).strip():
+                        res.extend(['--exclude', str(p).strip()])
+                return res
+
+        options = []
+        for line in str(raw_patterns).splitlines():
+            pattern = line.strip()
+            if pattern and not pattern.startswith('#'):
+                options.extend(['--exclude', pattern])
+        return options
+
     _rclone_live_stats = {}
     _rclone_stats_lock = threading.Lock()
+    _rclone_stats_stale_after = 600
 
     @classmethod
     def set_rclone_progress(cls, item_id, progress_dict: dict):
@@ -290,7 +338,9 @@ class FeederUtil:
         if not item_id:
             return
         with cls._rclone_stats_lock:
-            cls._rclone_live_stats[str(item_id)] = progress_dict
+            value = dict(progress_dict or {})
+            value['_updated_at'] = time.time()
+            cls._rclone_live_stats[str(item_id)] = value
 
     @classmethod
     def get_rclone_progress(cls, item_id) -> dict:
@@ -298,7 +348,15 @@ class FeederUtil:
         if not item_id:
             return {}
         with cls._rclone_stats_lock:
-            return dict(cls._rclone_live_stats.get(str(item_id), {}))
+            now = time.time()
+            stale_ids = [
+                key for key, value in cls._rclone_live_stats.items()
+                if now - value.get('_updated_at', now) > cls._rclone_stats_stale_after
+            ]
+            for key in stale_ids:
+                cls._rclone_live_stats.pop(key, None)
+            value = cls._rclone_live_stats.get(str(item_id), {})
+            return dict(value)
 
     @classmethod
     def clear_rclone_progress(cls, item_id):
@@ -419,6 +477,94 @@ class FeederUtil:
                     db.session.rollback()
                 except Exception:
                     pass
+
+    @classmethod
+    def init_sqlite_concurrency(cls):
+        """SQLite 엔진에 WAL 저널 모드 및 60초 busy_timeout을 강제 적용하여 동시성 락 차단"""
+        try:
+            from sqlalchemy import event
+            try:
+                engine = db.get_engine(bind=P.package_name)
+            except Exception:
+                engine = db.engine
+
+            if engine.dialect.name == 'sqlite':
+                @event.listens_for(engine, "connect")
+                def _set_sqlite_pragma(dbapi_connection, connection_record):
+                    cursor = dbapi_connection.cursor()
+                    cursor.execute("PRAGMA journal_mode=WAL;")
+                    cursor.execute("PRAGMA busy_timeout=60000;")
+                    cursor.execute("PRAGMA synchronous=NORMAL;")
+                    cursor.close()
+                # logger.info(f"[FeederUtil] SQLite WAL 모드 및 60초 busy_timeout 동시성 최적화 완료 ({P.package_name}.db)")
+        except Exception as ex:
+            logger.debug(f"[FeederUtil] SQLite PRAGMA 설정 예외 (무시): {ex}")
+
+    @classmethod
+    def init_runtime_locks(cls):
+        """공유 DB에서 Celery 워커 간 실행권을 원자적으로 관리하는 락 테이블을 준비한다."""
+        try:
+            engine = db.get_engine(bind=P.package_name)
+        except Exception:
+            engine = db.engine
+        with engine.begin() as conn:
+            conn.execute(db.text(f"""
+                CREATE TABLE IF NOT EXISTS {P.package_name}_runtime_lock (
+                    lock_name VARCHAR(100) PRIMARY KEY,
+                    owner VARCHAR(100) NOT NULL,
+                    acquired_at REAL NOT NULL
+                )
+            """))
+
+    @classmethod
+    def acquire_runtime_lock(cls, lock_name: str, owner: str, stale_after: int = 86400) -> bool:
+        """만료된 실행권만 교체할 수 있는 원자적 DB 락을 획득한다."""
+        try:
+            engine = db.get_engine(bind=P.package_name)
+        except Exception:
+            engine = db.engine
+        now = time.time()
+        with engine.begin() as conn:
+            result = conn.execute(db.text(f"""
+                INSERT INTO {P.package_name}_runtime_lock (lock_name, owner, acquired_at)
+                VALUES (:lock_name, :owner, :acquired_at)
+                ON CONFLICT(lock_name) DO UPDATE SET
+                    owner = excluded.owner,
+                    acquired_at = excluded.acquired_at
+                WHERE {P.package_name}_runtime_lock.acquired_at < :expired_at
+            """), {
+                'lock_name': lock_name,
+                'owner': owner,
+                'acquired_at': now,
+                'expired_at': now - stale_after,
+            })
+            return result.rowcount == 1
+
+    @classmethod
+    def release_runtime_lock(cls, lock_name: str, owner: str) -> None:
+        """소유자가 바뀐 경우에는 새 소유자의 락을 건드리지 않는다."""
+        try:
+            engine = db.get_engine(bind=P.package_name)
+        except Exception:
+            engine = db.engine
+        with engine.begin() as conn:
+            conn.execute(db.text(f"""
+                DELETE FROM {P.package_name}_runtime_lock
+                WHERE lock_name = :lock_name AND owner = :owner
+            """), {'lock_name': lock_name, 'owner': owner})
+
+    @classmethod
+    def reset_runtime_lock(cls, lock_name: str) -> None:
+        """플러그인 로드 시 이전 프로세스의 런타임 락을 초기화한다."""
+        try:
+            engine = db.get_engine(bind=P.package_name)
+        except Exception:
+            engine = db.engine
+        with engine.begin() as conn:
+            conn.execute(db.text(f"""
+                DELETE FROM {P.package_name}_runtime_lock
+                WHERE lock_name = :lock_name
+            """), {'lock_name': lock_name})
 
     @classmethod
     def attach_download_info(cls, items: list) -> list[dict]:
@@ -746,6 +892,20 @@ class FeederUtil:
             if target in feeds or '*' in feeds:
                 return p
         return None
+
+    @classmethod
+    def get_profile_destination(cls, profile: dict | None, engine_name: str = '') -> dict:
+        """프로필 기본 목적지에 현재 엔진별 override를 적용"""
+        if not profile:
+            return {}
+        destination = dict(profile.get('destination') or {})
+        overrides = profile.get('destination_by_engine') or {}
+        target = str(engine_name or '').strip().lower()
+        for name, override in overrides.items():
+            if str(name).strip().lower() == target and isinstance(override, dict):
+                destination.update(override)
+                break
+        return destination
 
     @classmethod
     def save_download_profile(cls, item: dict) -> str:

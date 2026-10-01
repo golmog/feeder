@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import re
 import time
+import threading
+import uuid
 from urllib.parse import unquote
 from html import unescape
 from types import SimpleNamespace
@@ -36,6 +38,7 @@ class TaskCrawlBase:
 
 
 class TaskCrawl:
+    _run_mutex = threading.Lock()
 
     @staticmethod
     def start(trigger_type: str = "scheduler", target_crawler_id: int = None):
@@ -76,10 +79,22 @@ class TaskCrawl:
 
     @staticmethod
     def run_crawl(trigger_type: str = "scheduler", target_crawler_id: int = None):
+        if not TaskCrawl._run_mutex.acquire(blocking=False):
+            logger.info("[TaskCrawl] 이미 실행 중인 크롤링 작업이 있어 중복 실행을 건너뜁니다.")
+            return
+
+        owner = uuid.uuid4().hex
+        db_lock_acquired = False
         with F.app.app_context():
-            P.ModelSetting.set('crawl_is_running', 'True')
-            P.ModelSetting.set('crawl_running_start_time', str(int(time.time())))
             try:
+                FeederUtil.init_runtime_locks()
+                db_lock_acquired = FeederUtil.acquire_runtime_lock('crawl_pipeline', owner)
+                if not db_lock_acquired:
+                    logger.info("[TaskCrawl] 다른 Celery 워커가 실행 중이어서 중복 실행을 건너뜁니다.")
+                    return
+
+                P.ModelSetting.set('crawl_is_running', 'True')
+                P.ModelSetting.set('crawl_running_start_time', str(int(time.time())))
                 is_manual = (trigger_type == "manual")
                 mode_label = "즉시 실행" if is_manual else "스케줄러 정기 실행"
 
@@ -131,6 +146,8 @@ class TaskCrawl:
                     if not site_entity:
                         logger.warning(f"[TaskCrawl] 등록되지 않은 사이트명: {site_name}")
                         continue
+                    site_info = dict(site_entity.info or {})
+                    db.session.rollback()
 
                     boards = crawler.get('boards', [])
                     if not boards:
@@ -158,11 +175,13 @@ class TaskCrawl:
                         full_board_key = b.get('full_board_key') or board_id
 
                         last_bbs = ModelCrawlItem.get_last_item(site_name, full_board_key)
+                        last_post_id = last_bbs.post_id if last_bbs else None
+                        db.session.rollback()
                         max_id = 0
-                        extra = site_entity.info.get('EXTRA', []) if site_entity.info else []
+                        extra = site_info.get('EXTRA', [])
 
-                        if not always_max_page and 'USING_POST_CHAR_ID' not in extra and last_bbs and last_bbs.post_id:
-                            max_id = last_bbs.post_id
+                        if not always_max_page and 'USING_POST_CHAR_ID' not in extra and last_post_id:
+                            max_id = last_post_id
 
                         target_cfg.subcat_id = subcat_id
 
@@ -173,7 +192,7 @@ class TaskCrawl:
 
                         try:
                             crawled = TaskCrawl.execute_board_crawl(
-                                site_entity.info,
+                                site_info,
                                 board_id,
                                 max_page=max_page,
                                 max_id=max_id,
@@ -194,7 +213,7 @@ class TaskCrawl:
                             logger.error(traceback.format_exc())
                         finally:
                             CrawlUtil.close_sessions()
-                            crawl_delay = TaskCrawl.get_crawl_delay(site_entity.info, target_cfg=target_cfg)
+                            crawl_delay = TaskCrawl.get_crawl_delay(site_info, target_cfg=target_cfg)
                             if crawl_delay > 0:
                                 time.sleep(crawl_delay)
 
@@ -204,18 +223,25 @@ class TaskCrawl:
                 logger.error(f"[TaskCrawl] 크롤링 수집 중 오류: {e}")
                 logger.error(traceback.format_exc())
             finally:
-                P.ModelSetting.set('crawl_is_running', 'False')
+                if db_lock_acquired:
+                    FeederUtil.release_runtime_lock('crawl_pipeline', owner)
+                    P.ModelSetting.set('crawl_is_running', 'False')
                 CrawlUtil.close_sessions()
+                TaskCrawl._run_mutex.release()
 
     @staticmethod
     def get_crawl_delay(site_info: dict = None, target_cfg=None) -> float:
         try:
+            # 수집기 커스텀 -> 사이트 규칙 기본 -> 전역 DB 설정 -> 기본값(2.0) 계층 순서 적용
             if target_cfg:
                 cfg_delay = getattr(target_cfg, 'delay', None) or getattr(target_cfg, 'crawler_delay', None)
                 if cfg_delay not in [None, '']:
                     return float(cfg_delay)
 
-            global_delay = P.ModelSetting.get('crawl_crawler_delay')
+            if site_info and site_info.get('DELAY') not in [None, '']:
+                return float(site_info['DELAY'])
+
+            global_delay = P.ModelSetting.get('crawl_crawler_delay') if P.ModelSetting else None
             if global_delay not in [None, '']:
                 return float(global_delay)
 
@@ -380,6 +406,7 @@ class TaskCrawl:
 
                     if not is_test and post_id:
                         existing = ModelCrawlItem.get(site=site_name, board=full_board_key, post_id=int(post_id)) if str(post_id).isdigit() else ModelCrawlItem.get(site=site_name, board=full_board_key, post_char_id=str(post_id))
+                        db.session.rollback()
                         if existing:
                             logger.debug(f"[TaskCrawl] 이미 수집 완료된 게시물 건너뜀: [{site_name}] {item['title'][:30]} (ID: {post_id})")
                             continue
@@ -426,7 +453,9 @@ class TaskCrawl:
                         item['torrent_info'] = None
 
                     if not is_test and not allow_duplicate_magnet and item.get('magnet'):
-                        if ModelCrawlItem.is_exist_magnet(item['magnet']):
+                        duplicate_magnet = ModelCrawlItem.is_exist_magnet(item['magnet'])
+                        db.session.rollback()
+                        if duplicate_magnet:
                             logger.info(f"[TaskCrawl] 중복 마그넷이므로 수집 제외: {item['title'][:35]}...")
                             continue
 

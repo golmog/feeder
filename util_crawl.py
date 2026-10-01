@@ -252,10 +252,11 @@ class CrawlUtil:
             use_selenium = P.ModelSetting.get_bool('crawl_use_selenium')
             use_fs = P.ModelSetting.get_bool('crawl_use_flaresolverr')
 
-        if 'USE_SELENIUM' in extra or (site_info and site_info.get('USE_SELENIUM')):
-            use_selenium = True
-        if 'USE_FLARESOLVERR' in extra or (site_info and site_info.get('USE_FLARESOLVERR')):
-            use_fs = True
+        if scheduler_instance is None:
+            if 'USE_SELENIUM' in extra or (site_info and site_info.get('USE_SELENIUM')):
+                use_selenium = True
+            if 'USE_FLARESOLVERR' in extra or (site_info and site_info.get('USE_FLARESOLVERR')):
+                use_fs = True
 
         if use_selenium and not _SELENIUM_AVAILABLE:
             logger.warning(f"[CrawlUtil] [{host}] Selenium 사용이 설정되어 있으나 모듈이 없습니다. HTTP 요청으로 자동 폴백합니다.")

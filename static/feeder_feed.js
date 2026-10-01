@@ -59,18 +59,23 @@ $(document).ready(function () {
 // -----------------------------------------------------------------------------
 $('#search').click(function (e) {
   e.preventDefault();
+  var word = ($('#search_word').val() || '').trim();
+  localStorage.setItem(sub + '_search_word', word);
+  localStorage.setItem(sub + '_current_page', '1');
   window.globalRequestSearch('1', false);
 });
 
 $('#search_word').keydown(function (e) {
   if (e.which === 13) {
     e.preventDefault();
-    localStorage.setItem(sub + '_search_word', $('#search_word').val().trim());
+    var word = ($('#search_word').val() || '').trim();
+    localStorage.setItem(sub + '_search_word', word);
     localStorage.setItem(sub + '_current_page', '1');
     window.globalRequestSearch('1', false);
   }
 });
 
+// 셀렉트박스 변경 시 상태 캐시 즉시 저장 및 1페이지 이동
 $('#feed_select').change(function () {
   localStorage.setItem(sub + '_feed_select', $(this).val());
   localStorage.setItem(sub + '_current_page', '1');
@@ -94,12 +99,12 @@ $('#reset_btn').click(function (e) {
   if ($('#feed_select').length === 0) return;
 
   $('#feed_select').val('all');
-  localStorage.setItem(sub + '_feed_select', 'all');
   $('#status_filter').val('all');
   $('#page_size').val('25');
   $('#search_word').val('');
 
-  localStorage.removeItem(sub + '_search_word');
+  localStorage.setItem(sub + '_search_word', '');
+  localStorage.setItem(sub + '_feed_select', 'all');
   localStorage.setItem(sub + '_status_filter', 'all');
   localStorage.setItem(sub + '_page_size', '25');
   localStorage.setItem(sub + '_current_page', '1');
@@ -131,7 +136,7 @@ function make_list(data) {
       }
       str += j_col(2, site_col);
 
-      var detail_col = '<div class="mb-2"><strong><a href="' + item.url + '" target="_blank">' + item.title + '</a></strong></div>';
+      var detail_col = '<div class="mb-2" style="word-break: break-all;"><strong><a href="' + item.url + '" target="_blank">' + item.title + '</a></strong></div>';
 
       if (item.magnet && item.magnet.length > 0) {
         for (var j = 0; j < item.magnet.length; j++) {

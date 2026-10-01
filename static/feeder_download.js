@@ -10,6 +10,7 @@ var current_accounts = [];
 var available_feeds = [];
 var modal_profile_feeds = [];
 var modal_profile_chain = [];
+var modal_engine_destinations = {};
 var available_engine_schemas = [];
 var available_transporter_schemas = [];
 var dl_engine_editor = null;
@@ -43,9 +44,40 @@ $(document).ready(function () {
       sync_feeder_header_navbar();
     } catch (err) {}
 
-    request_active_queue();
+    load_retry_profiles();
+
+    var cachedQueueJson = sessionStorage.getItem('feeder_queue_cache');
+    var hasFreshCache = false;
+    if (cachedQueueJson) {
+      try {
+        var cacheObj = JSON.parse(cachedQueueJson);
+        var nowTime = Date.now();
+        if (cacheObj && cacheObj.timestamp && (nowTime - cacheObj.timestamp < 60000)) {
+          hasFreshCache = true;
+          if (cacheObj.counts) {
+            $('#stat_pending').text(cacheObj.counts.pending || 0);
+            $('#stat_downloading').text(cacheObj.counts.downloading || 0);
+            $('#stat_staging').text(cacheObj.counts.staging || 0);
+            $('#stat_uploading').text(cacheObj.counts.uploading || 0);
+            $('#stat_completed').text(cacheObj.counts.completed || 0);
+            $('#stat_failed').text(cacheObj.counts.failed || 0);
+          }
+          if (cacheObj.active_list && cacheObj.active_list.length > 0) {
+            render_queue_rows(cacheObj.active_list);
+          }
+          $('#queue_loading_overlay').hide();
+        }
+      } catch (e) {}
+    }
+
+    if (!hasFreshCache) {
+      $('#queue_loading_overlay').show();
+    }
+
     if (typeof enable_sse !== 'undefined' && enable_sse) {
       init_sse_listener();
+    } else {
+      request_active_queue();
     }
   }
 
@@ -57,15 +89,13 @@ $(document).ready(function () {
     } catch (err) {}
 
     var saved_status = localStorage.getItem(sub + '_status_filter') || 'all';
-    $('#status_filter').val(saved_status);
-
     var saved_size = localStorage.getItem(sub + '_page_size') || '25';
-    $('#page_size').val(saved_size);
-
     var saved_word = localStorage.getItem(sub + '_search_word') || '';
-    $('#search_word').val(saved_word);
-
     var saved_page = localStorage.getItem(sub + '_current_page') || '1';
+
+    $('#status_filter').val(saved_status);
+    $('#page_size').val(saved_size);
+    $('#search_word').val(saved_word);
 
     load_retry_profiles();
     window.globalRequestSearch(saved_page, false);
@@ -77,6 +107,9 @@ $(document).ready(function () {
       localStorage.setItem('feeder_last_download_page', 'setting');
       sync_feeder_header_navbar();
     } catch (err) {}
+
+    use_collapse('download_use_local_staging');
+    use_collapse('download_gdrive_use_impersonate');
 
     load_all_download_config();
     init_dl_engine_editor();
@@ -98,9 +131,7 @@ function init_sse_listener() {
     sse_source = new EventSource(sseUrl);
 
     sse_source.onopen = function () {
-      $('#sse_status_badge').removeClass('badge-secondary badge-danger')
-        .addClass('badge-success')
-        .html('<i class="fa fa-bolt mr-1"></i>실시간 라이브');
+      $('#sse_status_badge').hide();
     };
 
     sse_source.onmessage = function (event) {
@@ -116,29 +147,57 @@ function init_sse_listener() {
           $('#stat_failed').text(data.counts.failed || 0);
         }
 
-        // 활성 큐 테이블 실시간 자동 렌더링 (새로고침 없이 테이블 행 자동 동기화)
         if (data && Array.isArray(data.active_list) && $('#active_queue_tbody').length > 0) {
           render_queue_rows(data.active_list);
+          hide_queue_loading_overlay();
+
+          try {
+            sessionStorage.setItem('feeder_queue_cache', JSON.stringify({
+              timestamp: Date.now(),
+              counts: data.counts,
+              active_list: data.active_list
+            }));
+          } catch (cErr) {}
         }
       } catch (err) {}
     };
 
     sse_source.onerror = function () {
-      $('#sse_status_badge').removeClass('badge-success badge-secondary')
-        .addClass('badge-danger')
-        .html('<i class="fa fa-exclamation-circle mr-1"></i>연결 끊김 (재연결 시도중)');
+      $('#sse_status_badge').show();
+      hide_queue_loading_overlay();
     };
   }
 }
 
+window.addEventListener('pagehide', function () {
+  if (sse_source) {
+    try { sse_source.close(); } catch (e) {}
+    sse_source = null;
+  }
+});
+
+function hide_queue_loading_overlay() {
+  var overlay = $('#queue_loading_overlay');
+  if (overlay.length > 0 && overlay.is(':visible')) {
+    overlay.fadeOut(200, function () {
+      $(this).css('display', 'none');
+    });
+  }
+}
+
 function request_active_queue() {
+  $('#queue_loading_overlay').fadeIn(100);
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/web_list',
     type: 'POST',
-    data: { page: 1, page_size: 50, status_filter: 'active' },
+    data: { page: 1, page_size: 500, status_filter: 'active' },
     dataType: 'json',
     success: function (data) {
       render_queue_rows(data.list || []);
+      hide_queue_loading_overlay();
+    },
+    error: function () {
+      hide_queue_loading_overlay();
     }
   });
 }
@@ -151,18 +210,127 @@ function render_queue_rows(list) {
     return;
   }
 
+  var hasUploading = list.some(function (item) { return item.status === 'uploading'; });
+  var hasLocalStaging = list.some(function (item) { return item.status === 'local_staging'; });
+  var hasRelayTransfer = list.some(function (item) { return item.status === 'relay_transferring'; });
+  var activeStage = hasUploading ? 'upload' : (hasLocalStaging ? 'staging' : (hasRelayTransfer ? 'relay' : null));
+
+  list.sort(function (a, b) {
+    function getStatusRank(item) {
+      var stageRanks = {
+        upload: { active: 1, pending: 2, completed: 3 },
+        staging: { active: 1, pending: 2, completed: 3 },
+        relay: { active: 1, pending: 2, completed: 3 }
+      };
+      var stage = null;
+      var kind = 'other';
+      if (item.status === 'uploading' || item.status === 'pending_upload') {
+        stage = 'upload';
+        kind = item.status === 'uploading' ? 'active' : 'pending';
+      } else if (item.status === 'local_staging' || item.status === 'pending_local_staging') {
+        stage = 'staging';
+        kind = item.status === 'local_staging' ? 'active' : 'pending';
+      } else if (item.status === 'relay_transferring' || item.status === 'pending_relay') {
+        stage = 'relay';
+        kind = item.status === 'relay_transferring' ? 'active' : 'pending';
+      } else if (item.status === 'downloaded') {
+        stage = 'upload';
+        kind = 'completed';
+      }
+
+      if (stage && stage === activeStage) {
+        return stageRanks[stage][kind];
+      }
+      if (stage) {
+        return 10 + (stage === 'upload' ? 1 : (stage === 'staging' ? 2 : 3)) * 3 + stageRanks[stage][kind];
+      }
+      if (item.status === 'downloading') return 30;
+      if (item.status === 'pending') return 31;
+      return 40;
+    }
+
+    var rankA = getStatusRank(a);
+    var rankB = getStatusRank(b);
+    if (rankA !== rankB) return rankA - rankB;
+
+    // 1순위(현재 전송 중): 진행률(%) 높은 순 정렬
+    if (rankA === 1) {
+      var progA = parseFloat(a.progress) || 0;
+      var progB = parseFloat(b.progress) || 0;
+      if (progA !== progB) return progB - progA;
+    }
+
+    // 실제 전송 중인 같은 단계에서는 진행률이 높은 항목을 먼저 표시
+    if (
+      (a.status === 'uploading' && b.status === 'uploading') ||
+      (a.status === 'local_staging' && b.status === 'local_staging') ||
+      (a.status === 'relay_transferring' && b.status === 'relay_transferring')
+    ) {
+      var transferProgA = parseFloat(a.progress) || 0;
+      var transferProgB = parseFloat(b.progress) || 0;
+      if (transferProgA !== transferProgB) return transferProgB - transferProgA;
+    }
+
+    // 엔진 다운로드 중에는 완료에 임박한 항목을 먼저 표시
+    if (a.status === 'downloading' && b.status === 'downloading') {
+      var dlProgA = parseFloat(a.progress) || 0;
+      var dlProgB = parseFloat(b.progress) || 0;
+      if (dlProgA !== dlProgB) return dlProgB - dlProgA;
+    }
+
+    // 같은 단계에서는 작업 등록 순서(FIFO)를 유지
+    var numIdA = parseInt(String(a.id).replace(/[^0-9]/g, ''), 10) || 0;
+    var numIdB = parseInt(String(b.id).replace(/[^0-9]/g, ''), 10) || 0;
+    return numIdA - numIdB;
+  });
+
+  // 엔진별 실시간 다운로드 속도 합산 집계
+  var engineSpeeds = {};
+  for (var k = 0; k < list.length; k++) {
+    var rowItem = list[k];
+    if (rowItem.status === 'downloading') {
+      var spd = parseFloat(rowItem.download_speed) || 0;
+      if (spd > 0) {
+        var rawEng = rowItem.current_engine_name || rowItem.engine_name || '';
+        var engKey = rawEng ? (rawEng.length <= 4 ? rawEng.toUpperCase() : rawEng) : '엔진';
+        engineSpeeds[engKey] = (engineSpeeds[engKey] || 0) + spd;
+      }
+    }
+  }
+
+  var speedDisplay = '';
+  var engKeys = Object.keys(engineSpeeds);
+  if (engKeys.length === 1) {
+    var singleKey = engKeys[0];
+    speedDisplay = '<i class="fa fa-arrow-circle-o-down mr-1"></i>' + singleKey + ' 다운로드: ' + format_bytes(engineSpeeds[singleKey]) + '/s';
+  } else if (engKeys.length > 1) {
+    var parts = [];
+    for (var eIdx = 0; eIdx < engKeys.length; eIdx++) {
+      var eKey = engKeys[eIdx];
+      parts.push(eKey + ': ' + format_bytes(engineSpeeds[eKey]) + '/s');
+    }
+    speedDisplay = '<i class="fa fa-arrow-circle-o-down mr-1"></i>다운로드: ' + parts.join(' | ');
+  } else {
+    speedDisplay = '<i class="fa fa-arrow-circle-o-down mr-1"></i>다운로드: 0 B/s';
+  }
+
+  $('#queue_engine_speed_badge').html(speedDisplay);
+
   var str = '';
   for (var i = 0; i < list.length; i++) {
     var it = list[i];
     var statusBadge = '';
     if (it.status === 'pending') statusBadge = '<span class="badge badge-warning">대기 (Pending)</span>';
-    else if (it.status === 'downloading') statusBadge = '<span class="badge badge-primary">다운로드 중</span>';
+    else if (it.status === 'downloading') statusBadge = '<span class="badge badge-primary">다운로드</span>';
     else if (it.status === 'pending_local_staging' || it.status === 'local_staging') statusBadge = '<span class="badge badge-info">로컬 스테이징</span>';
     else if (it.status === 'pending_relay') statusBadge = '<span class="badge badge-warning">원격 릴레이 대기</span>';
     else if (it.status === 'relay_transferring') statusBadge = '<span class="badge badge-primary">원격 릴레이 전송 중</span>';
     else if (it.status === 'downloaded') statusBadge = '<span class="badge badge-success">다운로드 완료 (업로드 대기)</span>';
-    else if (it.status === 'ad_unmanaged') statusBadge = '<span class="badge badge-secondary">AD 미등록 (잔여)</span>';
-    else if (it.status === 'pending_upload' || it.status === 'uploading') statusBadge = '<span class="badge badge-primary">업로드 중</span>';
+    else if (it.status === 'engine_unmanaged' || it.status === 'ad_unmanaged') {
+      var engBadgeName = it.current_engine_name || it.feed_name || '엔진';
+      statusBadge = '<span class="badge badge-secondary">' + engBadgeName + ' 미등록 (잔여)</span>';
+    }
+    else if (it.status === 'pending_upload' || it.status === 'uploading') statusBadge = '<span class="badge badge-primary">업로드</span>';
     else if (it.status === 'completed') statusBadge = '<span class="badge badge-success">최종 완료</span>';
     else if (it.status === 'failed') statusBadge = '<span class="badge badge-danger">실패</span>';
     else statusBadge = '<span class="badge badge-secondary">' + it.status + '</span>';
@@ -182,7 +350,7 @@ function render_queue_rows(list) {
     var detailHtml = '';
 
     // 1행: 피드명 + 제목
-    detailHtml += '<div class="mb-1">';
+    detailHtml += '<div class="mb-1" style="word-break: break-all;">';
     detailHtml += '  <span class="badge badge-dark mr-1">' + (it.feed_name || 'Feed') + '</span>';
     detailHtml += '  <strong style="font-size: 0.95rem;">' + it.title + '</strong>';
     detailHtml += '</div>';
@@ -207,10 +375,12 @@ function render_queue_rows(list) {
       var speedStr = it.download_speed ? format_bytes(it.download_speed) + '/s' : (it.speed_str || '0 B/s');
       var dlBytesStr = it.downloaded_bytes ? format_bytes(it.downloaded_bytes) : '0 B';
       var totalBytesStr = it.file_size ? format_bytes(it.file_size) : '확인 중';
+      var rawEngineName = it.current_engine_name || it.engine_name || '';
+      var engLabel = rawEngineName ? (rawEngineName.length <= 4 ? rawEngineName.toUpperCase() : rawEngineName) : '엔진';
 
       detailHtml += '<div class="mt-1 p-1 px-2 rounded" style="background: rgba(0, 123, 255, 0.06); border: 1px solid rgba(0, 123, 255, 0.15);">';
       detailHtml += '  <div class="d-flex justify-content-between align-items-center mb-1 small font-weight-bold">';
-      detailHtml += '    <span class="text-primary" style="font-size: 0.82rem;"><i class="fa fa-arrow-circle-o-down mr-1"></i>엔진 다운로드 진행: ' + progVal + '% (' + dlBytesStr + ' / ' + totalBytesStr + ')</span>';
+      detailHtml += '    <span class="text-primary" style="font-size: 0.82rem;"><i class="fa fa-arrow-circle-o-down mr-1"></i>' + engLabel + ' 다운로드 진행: ' + progVal + '% (' + dlBytesStr + ' / ' + totalBytesStr + ')</span>';
       detailHtml += '    <span class="badge badge-info"><i class="fa fa-tachometer mr-1"></i>' + speedStr + '</span>';
       detailHtml += '  </div>';
       detailHtml += '  <div class="progress" style="height: 12px; background-color: rgba(255, 255, 255, 0.15); border-radius: 3px;">';
@@ -264,13 +434,22 @@ function render_queue_rows(list) {
 
     detailHtml += errorMsg;
 
-    str += '<tr>';
+    str += '<tr data-queue-id="' + it.id + '">';
     str += '  <td class="font-weight-bold">' + it.id + '</td>';
     str += '  <td>' + statusBadge + engineInfo + '</td>';
     str += '  <td class="text-left">' + detailHtml + '</td>';
     str += '  <td>';
     if (it.status === 'engine_unmanaged' || it.status === 'ad_unmanaged' || String(it.id).startsWith('EXT-') || String(it.id).startsWith('AD-')) {
-      str += '    <span class="text-muted small">-</span>';
+      str += '    <button type="button" class="btn btn-xs btn-outline-info adopt_orphan_btn" ' +
+             ' data-id="' + it.id + '"' +
+             ' data-task-id="' + (it.task_id || it.id) + '"' +
+             ' data-hash="' + (it.hash || '') + '"' +
+             ' data-engine="' + (it.current_engine_name || '') + '"' +
+             ' data-title="' + clean_title_attr(it.title) + '"' +
+             ' data-file-name="' + clean_title_attr(it.file_name || it.title) + '"' +
+             ' data-file-size="' + (it.file_size || 0) + '"' +
+             ' data-source-path="' + clean_title_attr(it.local_path || '') + '"' +
+             ' data-raw-status="' + (it.raw_status || '') + '">작업 흡수</button>';
     } else {
       str += '    <div class="btn-group btn-group-sm">';
       str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold queue_action_btn" data-action="retry" data-id="' + it.id + '">재시도</button>';
@@ -281,11 +460,43 @@ function render_queue_rows(list) {
     str += '  </td>';
     str += '</tr>';
   }
-  tbody.html(str);
+  var renderedRows = $(str);
+  var currentRows = {};
+  tbody.children('tr:not([data-queue-id])').remove();
+  tbody.children('tr[data-queue-id]').each(function () {
+    currentRows[String($(this).attr('data-queue-id'))] = this;
+  });
+
+  var renderedIds = {};
+  var orderedRows = document.createDocumentFragment();
+  for (var rowIdx = 0; rowIdx < renderedRows.length; rowIdx++) {
+    var renderedRow = renderedRows[rowIdx];
+    var rowId = String($(renderedRow).attr('data-queue-id'));
+    var existingRow = currentRows[rowId];
+    renderedIds[rowId] = true;
+
+    if (existingRow) {
+      if (existingRow.innerHTML !== renderedRow.innerHTML) {
+        existingRow.innerHTML = renderedRow.innerHTML;
+      }
+      orderedRows.appendChild(existingRow);
+    } else {
+      orderedRows.appendChild(renderedRow);
+    }
+  }
+  tbody[0].appendChild(orderedRows);
+
+  tbody.children('tr[data-queue-id]').each(function () {
+    if (!renderedIds[String($(this).attr('data-queue-id'))]) {
+      $(this).remove();
+    }
+  });
 }
 
 $('#queue_refresh_btn').click(function (e) {
   e.preventDefault();
+  sessionStorage.removeItem('feeder_queue_cache');
+  $('#queue_loading_overlay').fadeIn(100);
   request_active_queue();
   notify('작업 큐를 새로고침했습니다.', 'info');
 });
@@ -294,6 +505,7 @@ $(document).on('click', '.queue_action_btn', function (e) {
   e.preventDefault();
   var act = $(this).data('action');
   var id = $(this).data('id');
+  var targetRow = $(this).closest('tr');
 
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/item_action',
@@ -303,9 +515,98 @@ $(document).on('click', '.queue_action_btn', function (e) {
     success: function (data) {
       if (data.ret === 'success') {
         notify('작업이 처리되었습니다.', 'info');
-        request_active_queue();
+        if (act === 'delete' && targetRow.length > 0) {
+          targetRow.fadeOut(200, function () {
+            $(this).remove();
+            request_active_queue();
+          });
+        } else {
+          request_active_queue();
+        }
       } else {
         notify(data.msg || '실패', 'warning');
+      }
+    }
+  });
+});
+
+// 미등록 고아 작업 흡수 모달 열기 (1순위 엔진 일치 프로필만 필터링)
+$(document).on('click', '.adopt_orphan_btn', function (e) {
+  e.preventDefault();
+  var btn = $(this);
+  var targetEngine = (btn.data('engine') || '').trim();
+  var title = btn.data('title');
+  var fsize = parseInt(btn.data('file-size')) || 0;
+
+  $('#modal_adopt_task_id').val(btn.data('task-id'));
+  $('#modal_adopt_hash').val(btn.data('hash'));
+  $('#modal_adopt_engine').val(targetEngine);
+  $('#modal_adopt_file_name').val(btn.data('file-name'));
+  $('#modal_adopt_file_size').val(fsize);
+  $('#modal_adopt_source_path').val(btn.data('source-path'));
+  $('#modal_adopt_raw_status').val(btn.data('raw-status'));
+
+  $('#modal_adopt_title').text(title);
+  $('#modal_adopt_engine_display').text(targetEngine);
+  $('#modal_adopt_size_display').text(format_bytes(fsize));
+
+  var pSelect = $('#modal_adopt_profile_select');
+  pSelect.empty();
+
+  var matchingCount = 0;
+  if (cached_download_profiles && cached_download_profiles.length > 0) {
+    for (var i = 0; i < cached_download_profiles.length; i++) {
+      var p = cached_download_profiles[i];
+      // 1순위 엔진이 대상 엔진과 일치하는 프로필만 선택지로 추가
+      if (p.priority_chain && p.priority_chain.length > 0 && p.priority_chain[0].toLowerCase() === targetEngine.toLowerCase()) {
+        pSelect.append('<option value="' + p.name + '">' + p.name + ' (목적지: ' + (p.destination ? p.destination.type : 'local') + ')</option>');
+        matchingCount++;
+      }
+    }
+  }
+
+  if (matchingCount === 0) {
+    pSelect.append('<option value="">-- 1순위가 [' + targetEngine + ']인 프로필 없음 --</option>');
+    $('#btn_confirm_adopt_orphan').prop('disabled', true);
+  } else {
+    $('#btn_confirm_adopt_orphan').prop('disabled', false);
+  }
+
+  $('#adopt_orphan_modal').modal('show');
+});
+
+// 고아 작업 큐 흡수 실행 확인
+$(document).on('click', '#btn_confirm_adopt_orphan', function (e) {
+  e.preventDefault();
+  var profileName = $('#modal_adopt_profile_select').val();
+  if (!profileName) {
+    notify('적용할 프로필을 선택하세요.', 'warning');
+    return;
+  }
+
+  notify('작업 큐 흡수 요청 중...', 'info');
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/adopt_orphan',
+    type: 'POST',
+    data: {
+      task_id: $('#modal_adopt_task_id').val(),
+      hash: $('#modal_adopt_hash').val(),
+      engine_name: $('#modal_adopt_engine').val(),
+      title: $('#modal_adopt_title').text(),
+      file_name: $('#modal_adopt_file_name').val(),
+      file_size: $('#modal_adopt_file_size').val(),
+      source_path: $('#modal_adopt_source_path').val(),
+      raw_status: $('#modal_adopt_raw_status').val(),
+      profile_name: profileName
+    },
+    dataType: 'json',
+    success: function (data) {
+      if (data.ret === 'success') {
+        notify(data.msg || '작업이 큐에 성공적으로 등록되었습니다.', 'success');
+        $('#adopt_orphan_modal').modal('hide');
+        request_active_queue();
+      } else {
+        notify(data.msg || '작업 흡수 실패', 'warning');
       }
     }
   });
@@ -339,17 +640,13 @@ function make_list(list) {
     var it = list[i];
     var statusBadge = '';
     if (it.status === 'completed') statusBadge = '<span class="badge badge-success">최종 완료</span>';
-    else if (it.status === 'downloading') statusBadge = '<span class="badge badge-primary">다운로드 중</span>';
+    else if (it.status === 'downloading') statusBadge = '<span class="badge badge-primary">다운로드</span>';
     else if (it.status === 'pending') statusBadge = '<span class="badge badge-warning">대기 (Pending)</span>';
     else if (it.status === 'pending_local_staging' || it.status === 'local_staging') statusBadge = '<span class="badge badge-info">로컬 스테이징</span>';
     else if (it.status === 'pending_relay') statusBadge = '<span class="badge badge-warning">원격 릴레이 대기</span>';
     else if (it.status === 'relay_transferring') statusBadge = '<span class="badge badge-primary">원격 릴레이 전송 중</span>';
     else if (it.status === 'downloaded') statusBadge = '<span class="badge badge-success">다운로드 완료</span>';
-    else if (it.status === 'engine_unmanaged' || it.status === 'ad_unmanaged') {
-      var engBadgeName = it.current_engine_name || it.feed_name || '엔진';
-      statusBadge = '<span class="badge badge-secondary">' + engBadgeName + ' 미등록 (잔여)</span>';
-    }
-    else if (it.status === 'pending_upload' || it.status === 'uploading') statusBadge = '<span class="badge badge-primary">업로드 중</span>';
+    else if (it.status === 'pending_upload' || it.status === 'uploading') statusBadge = '<span class="badge badge-primary">업로드</span>';
     else if (it.status === 'move_failed') statusBadge = '<span class="badge badge-warning">이동 실패</span>';
     else if (it.status === 'failed') statusBadge = '<span class="badge badge-danger">실패</span>';
     else statusBadge = '<span class="badge badge-secondary">' + it.status + '</span>';
@@ -362,7 +659,7 @@ function make_list(list) {
     var detailHtml = '';
 
     // 1행: 피드명 + 제목
-    detailHtml += '<div class="mb-1">';
+    detailHtml += '<div class="mb-1" style="word-break: break-all;">';
     detailHtml += '  <span class="badge badge-dark mr-1">' + (it.feed_name || 'Feed') + '</span>';
     detailHtml += '  <strong style="font-size: 0.95rem;">' + it.title + '</strong>';
     detailHtml += '</div>';
@@ -399,10 +696,18 @@ function make_list(list) {
   tbody.html(str);
 }
 
-$('#status_filter, #page_size').change(function () {
-  if ($('#download_list_tbody').length > 0) {
-    window.globalRequestSearch('1', false);
-  }
+$(document).on('change', '#status_filter', function () {
+  if ($('#download_list_tbody').length === 0) return;
+  localStorage.setItem(sub + '_status_filter', $(this).val());
+  localStorage.setItem(sub + '_current_page', '1');
+  window.globalRequestSearch('1', false);
+});
+
+$(document).on('change', '#page_size', function () {
+  if ($('#download_list_tbody').length === 0) return;
+  localStorage.setItem(sub + '_page_size', $(this).val());
+  localStorage.setItem(sub + '_current_page', '1');
+  window.globalRequestSearch('1', false);
 });
 
 $('#reset_btn').click(function (e) {
@@ -413,7 +718,7 @@ $('#reset_btn').click(function (e) {
   $('#search_word').val('');
   $('#page_size').val('25');
 
-  localStorage.removeItem(sub + '_search_word');
+  localStorage.setItem(sub + '_search_word', '');
   localStorage.setItem(sub + '_status_filter', 'all');
   localStorage.setItem(sub + '_page_size', '25');
   localStorage.setItem(sub + '_current_page', '1');
@@ -424,6 +729,9 @@ $('#reset_btn').click(function (e) {
 $('#search').click(function (e) {
   e.preventDefault();
   if ($('#download_list_tbody').length === 0) return;
+  var word = ($('#search_word').val() || '').trim();
+  localStorage.setItem(sub + '_search_word', word);
+  localStorage.setItem(sub + '_current_page', '1');
   window.globalRequestSearch('1', false);
 });
 
@@ -431,6 +739,9 @@ $('#search_word').keydown(function (e) {
   if (e.which === 13) {
     e.preventDefault();
     if ($('#download_list_tbody').length === 0) return;
+    var word = ($('#search_word').val() || '').trim();
+    localStorage.setItem(sub + '_search_word', word);
+    localStorage.setItem(sub + '_current_page', '1');
     window.globalRequestSearch('1', false);
   }
 });
@@ -459,6 +770,7 @@ $(document).on('click', '.btn_list_action', function (e) {
   var id = $(this).data('id');
   var item = cached_download_list.find(function (x) { return String(x.id) === String(id); });
   var titleText = item ? item.title : ('ID: ' + id);
+  var targetRow = $(this).closest('tr');
 
   if (act === 'retry') {
     $('#modal_retry_item_id').val(id);
@@ -500,7 +812,14 @@ $(document).on('click', '.btn_list_action', function (e) {
     success: function (data) {
       if (data.ret === 'success') {
         notify(data.msg || '작업이 처리되었습니다.', 'success');
-        window.globalRequestSearch(null, true);
+        if (act === 'delete' && targetRow.length > 0) {
+          targetRow.fadeOut(200, function () {
+            $(this).remove();
+            window.globalRequestSearch(null, true);
+          });
+        } else {
+          window.globalRequestSearch(null, true);
+        }
       } else {
         notify(data.msg || '실패', 'warning');
       }
@@ -565,6 +884,9 @@ function init_dl_trans_editor() {
     feeder_ace_instances.push(dl_trans_editor);
   }
 }
+
+$('#download_use_local_staging').change(function () { use_collapse('download_use_local_staging'); });
+$('#download_gdrive_use_impersonate').change(function () { use_collapse('download_gdrive_use_impersonate'); });
 
 $('#download_script_modal').on('shown.bs.modal', function () {
   init_dl_engine_editor();
@@ -697,6 +1019,9 @@ function render_dynamic_engine_fields(engine_id, current_values) {
   for (var i = 0; i < fields.length; i++) {
     var f = fields[i];
     var val = (current_values && current_values[f.name] !== undefined) ? current_values[f.name] : (f.default !== undefined ? f.default : '');
+    if ((!current_values || current_values[f.name] === undefined) && f.name === 'use_impersonate') {
+      val = $('#download_gdrive_use_impersonate').is(':checked');
+    }
     var ph = f.placeholder || '';
     var descHtml = f.desc ? '<small class="form-text text-muted">' + f.desc + '</small>' : '';
 
@@ -720,6 +1045,10 @@ function render_dynamic_engine_fields(engine_id, current_values) {
     html += '</div>';
   }
   container.html(html);
+
+  try {
+    container.find('input[data-toggle="toggle"]').bootstrapToggle();
+  } catch (err) {}
 }
 
 $('#dl_engine_type').change(function () {
@@ -903,7 +1232,7 @@ $(document).on('click', '#download_script_new_btn', function (e) {
   e.preventDefault();
   $('#download_script_select').val('');
   $('#download_script_name').val('engine_new.py');
-  var SKELETON = '# -*- coding: utf-8 -*-\nfrom feeder.util_download import BaseDownloadEngine\n\nclass CustomEngine(BaseDownloadEngine):\n    ENGINE_ID = "custom"\n    ENGINE_NAME = "커스텀 다운로더"\n    CONFIG_SCHEMA = []\n    def add_magnet(self, link, title=None):\n        return True, "task_1", ""\n    def get_status(self, task_ids=None):\n        return [], ""\n    def delete_task(self, task_id):\n        return True\n';
+  var SKELETON = '# -*- coding: utf-8 -*-\nfrom feeder.util_download import BaseDownloadEngine\n\nclass CustomEngine(BaseDownloadEngine):\n    ENGINE_ID = "custom"\n    ENGINE_NAME = "커스텀 다운로더"\n    CONFIG_SCHEMA = []\n    def add_magnet(self, link, title=None, upload_path=None):\n        return True, "task_1", ""\n    def get_status(self, task_ids=None):\n        return [], ""\n    def delete_task(self, task_id):\n        return True\n';
   $('#download_script_code').val(SKELETON);
   if (dl_engine_editor) dl_engine_editor.setValue(SKELETON, -1);
   $('#download_script_status').text('새 템플릿 로드');
@@ -1013,20 +1342,20 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
     container.find('input[data-toggle="toggle"]').bootstrapToggle();
   } catch (err) {}
 
-  function toggleUploadPathField() {
+  function toggleStagingPathField() {
     var stagingChk = $('#dest_field_use_local_staging');
     if (stagingChk.length > 0) {
       if (stagingChk.is(':checked')) {
-        $('.dest-field-row-upload_path').show();
+        $('.dest-field-row-staging_path').show();
       } else {
-        $('.dest-field-row-upload_path').hide();
+        $('.dest-field-row-staging_path').hide();
       }
     }
   }
 
-  toggleUploadPathField();
+  toggleStagingPathField();
   $('#dest_field_use_local_staging').change(function () {
-    toggleUploadPathField();
+    toggleStagingPathField();
   });
 }
 
@@ -1034,9 +1363,13 @@ $('#profile_dest_type').change(function () {
   render_dynamic_dest_fields($(this).val(), null);
   var pName = $('#profile_name').val().trim() || 'default';
   var upField = $('#dest_field_upload_path');
+  var stagingField = $('#dest_field_staging_path');
   var compField = $('#dest_field_complete_path');
+  if (stagingField.length && (!stagingField.val() || stagingField.val() === 'default')) {
+    stagingField.val(pName);
+  }
   if (upField.length && (!upField.val() || upField.val() === 'default' || upField.val().startsWith('incoming/'))) {
-    upField.val(pName);
+    upField.val('incoming/' + pName);
   }
   if (compField.length && (!compField.val() || compField.val() === 'default' || compField.val().startsWith('uploads/'))) {
     compField.val('uploads/' + pName);
@@ -1047,9 +1380,13 @@ $(document).on('input change', '#profile_name', function () {
   if ($('#profile_mode').val() !== 'add') return;
   var pName = $(this).val().trim() || 'default';
   var upField = $('#dest_field_upload_path');
+  var stagingField = $('#dest_field_staging_path');
   var compField = $('#dest_field_complete_path');
+  if (stagingField.length && (!stagingField.val() || stagingField.val() === 'default')) {
+    stagingField.val(pName);
+  }
   if (upField.length && (!upField.val() || upField.val() === 'default' || upField.val().startsWith('incoming/'))) {
-    upField.val(pName);
+    upField.val('incoming/' + pName);
   }
   if (compField.length && (!compField.val() || compField.val() === 'default' || compField.val().startsWith('uploads/'))) {
     compField.val('uploads/' + pName);
@@ -1073,8 +1410,9 @@ function render_profiles(data) {
 
     var dest = p.destination || {};
     var destInfo = '<span class="badge badge-dark">' + (dest.type || 'local') + '</span>';
-    if (dest.type === 'rclone_simple' && dest.remote_path) {
-      destInfo += '<br><small class="text-muted">' + dest.remote_path + '</small>';
+    if (dest.type === 'rclone_simple') {
+      if (dest.upload_path) destInfo += '<br><small class="text-muted">임시: ' + dest.upload_path + '</small>';
+      if (dest.complete_path) destInfo += '<br><small class="text-muted">완료: ' + dest.complete_path + '</small>';
     } else if (dest.type === 'gdrive_rotation') {
       destInfo = '<span class="badge badge-success">GDrive 계정 풀</span>';
       if (dest.complete_path) destInfo += '<br><small class="text-muted">' + dest.complete_path + '</small>';
@@ -1166,7 +1504,81 @@ function render_chain_table() {
     str += '</tr>';
     tbody.append(str);
   }
+  render_engine_destinations();
 }
+
+function render_engine_destinations() {
+  var container = $('#profile_engine_destinations');
+  if (!container.length) return;
+  container.empty();
+  if (!modal_profile_chain || modal_profile_chain.length === 0) {
+    container.html('<span class="text-muted small">우선순위 엔진을 먼저 추가하세요.</span>');
+    return;
+  }
+
+  var html = '<div class="table-responsive border rounded"><table class="table table-sm mb-0">' +
+    '<thead class="thead-light"><tr><th style="min-width: 80px; white-space: nowrap;">엔진</th><th>목적지 유형 및 세부 설정</th></tr></thead><tbody>';
+  for (var i = 0; i < modal_profile_chain.length; i++) {
+    var engineName = modal_profile_chain[i];
+    var selectedConfig = modal_engine_destinations[engineName] || {};
+    if (typeof selectedConfig === 'string') selectedConfig = { type: selectedConfig };
+    var selected = selectedConfig.type || '';
+    var fieldPrefix = 'dest_override_' + String(engineName).replace(/[^a-zA-Z0-9_-]/g, '_');
+    html += '<tr><td class="font-weight-bold" style="min-width: 80px; white-space: nowrap;">' + engineName + '</td><td>' +
+      '<select class="form-control form-control-sm profile-engine-dest-select" data-engine="' + engineName + '">';
+    html += '<option value="">기본 목적지 사용</option>';
+    for (var j = 0; j < available_transporter_schemas.length; j++) {
+      var schema = available_transporter_schemas[j];
+      html += '<option value="' + schema.transporter_id + '"' +
+        (schema.transporter_id === selected ? ' selected' : '') + '>' +
+        schema.transporter_name + ' (' + schema.transporter_id + ')</option>';
+    }
+    html += '</select>';
+    if (selected) {
+        var selectedSchema = available_transporter_schemas.find(function (schema) {
+          return schema.transporter_id === selected;
+        });
+        if (selectedSchema && selectedSchema.config_schema) {
+          html += '<div class="mt-2 pl-2 border-left">';
+          for (var k = 0; k < selectedSchema.config_schema.length; k++) {
+            var f = selectedSchema.config_schema[k];
+            var value = selectedConfig[f.name] !== undefined ? selectedConfig[f.name] : (f.default !== undefined ? f.default : '');
+            var inputId = fieldPrefix + '_' + f.name;
+            html += '<div class="form-group mb-1">';
+            html += '<label class="small mb-1">' + f.label + '</label>';
+            if (f.type === 'checkbox') {
+              var checked = (value === true || value === 'true' || value === 'On' || value === 'on') ? ' checked' : '';
+              html += '<div><input type="checkbox" class="profile-engine-dest-field" id="' + inputId + '" data-engine="' + engineName + '" data-field="' + f.name + '"' + checked + '></div>';
+            } else {
+              html += '<input type="' + (f.type === 'number' ? 'number' : 'text') + '" class="form-control form-control-sm profile-engine-dest-field" id="' + inputId + '" data-engine="' + engineName + '" data-field="' + f.name + '" value="' + value + '" placeholder="' + (f.placeholder || '') + '">';
+            }
+            if (f.desc) html += '<small class="form-text text-muted">' + f.desc + '</small>';
+            html += '</div>';
+          }
+          html += '</div>';
+        }
+    }
+    html += '</td></tr>';
+  }
+  html += '</tbody></table></div>';
+  container.html(html);
+}
+
+$(document).on('change', '.profile-engine-dest-select', function () {
+  var engineName = $(this).data('engine');
+  var value = $(this).val();
+  if (value) modal_engine_destinations[engineName] = { type: value };
+  else delete modal_engine_destinations[engineName];
+  render_engine_destinations();
+});
+
+$(document).on('change input', '.profile-engine-dest-field', function () {
+  var engineName = $(this).data('engine');
+  var fieldName = $(this).data('field');
+  if (!modal_engine_destinations[engineName]) return;
+  var value = $(this).is(':checkbox') ? $(this).is(':checked') : $(this).val();
+  modal_engine_destinations[engineName][fieldName] = value;
+});
 
 $(document).on('click', '#btn_add_profile_feed', function (e) {
   e.preventDefault();
@@ -1234,6 +1646,7 @@ $(document).on('click', '#profile_add_btn', function (e) {
   $('#profile_modal_title').text('다운로드 프로필 추가');
   $('#profile_mode').val('add');
   $('#profile_name').val('').prop('readonly', false);
+  $('#profile_sync_hours').val('');
   $('#profile_append_hash_on_conflict').prop('checked', true);
 
   var default_trans = available_transporter_schemas.length > 0 ? available_transporter_schemas[0].transporter_id : '';
@@ -1241,12 +1654,15 @@ $(document).on('click', '#profile_add_btn', function (e) {
   render_dynamic_dest_fields(default_trans, null);
 
   var upField = $('#dest_field_upload_path');
+  var stagingField = $('#dest_field_staging_path');
   var compField = $('#dest_field_complete_path');
+  if (stagingField.length) stagingField.val('default');
   if (upField.length) upField.val('incoming/default');
   if (compField.length) compField.val('uploads/default');
 
   modal_profile_feeds = ['*'];
   modal_profile_chain = [];
+  modal_engine_destinations = {};
 
   update_profile_modal_dropdowns();
   render_selected_feeds();
@@ -1262,6 +1678,8 @@ $(document).on('click', '.edit_profile_btn', function (e) {
   $('#profile_modal_title').text('다운로드 프로필 수정: ' + p.name);
   $('#profile_mode').val('edit');
   $('#profile_name').val(p.name).prop('readonly', true);
+  var rawHours = (p.sync_hours !== undefined && p.sync_hours !== null) ? p.sync_hours : (p.sync_days ? p.sync_days * 24 : '');
+  $('#profile_sync_hours').val(rawHours);
   $('#profile_append_hash_on_conflict').prop('checked', p.append_hash_on_conflict !== false);
 
   var dest = p.destination || {};
@@ -1270,6 +1688,15 @@ $(document).on('click', '.edit_profile_btn', function (e) {
 
   modal_profile_feeds = (p.feeds && p.feeds.length > 0) ? JSON.parse(JSON.stringify(p.feeds)) : ['*'];
   modal_profile_chain = (p.priority_chain && p.priority_chain.length > 0) ? JSON.parse(JSON.stringify(p.priority_chain)) : [];
+  modal_engine_destinations = {};
+  var savedDestinations = p.destination_by_engine || {};
+  Object.keys(savedDestinations).forEach(function (engineName) {
+    if (savedDestinations[engineName]) {
+      modal_engine_destinations[engineName] = typeof savedDestinations[engineName] === 'string'
+        ? { type: savedDestinations[engineName] }
+        : JSON.parse(JSON.stringify(savedDestinations[engineName]));
+    }
+  });
 
   update_profile_modal_dropdowns();
   render_selected_feeds();
@@ -1307,10 +1734,15 @@ $(document).on('click', '#profile_save_btn', function (e) {
 
   var profile_obj = {
     name: name,
+    sync_hours: $('#profile_sync_hours').val().trim() !== '' ? parseInt($('#profile_sync_hours').val().trim(), 10) : '',
     feeds: modal_profile_feeds,
     priority_chain: modal_profile_chain,
     append_hash_on_conflict: $('#profile_append_hash_on_conflict').is(':checked'),
-    destination: destObj
+    destination: destObj,
+    destination_by_engine: Object.keys(modal_engine_destinations).reduce(function (result, engineName) {
+      result[engineName] = modal_engine_destinations[engineName];
+      return result;
+    }, {})
   };
 
   $.ajax({

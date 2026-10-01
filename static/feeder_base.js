@@ -44,9 +44,9 @@ function sync_feeder_header_navbar() {
     var lastCrawl = localStorage.getItem('feeder_last_crawl_page') || 'setting';
     var lastFeed = localStorage.getItem('feeder_last_feed_page') || 'setting';
     var lastDl = localStorage.getItem('feeder_last_download_page') || 'setting';
-    $('.navbar a[href*="/' + package_name + '/crawl"]').attr('href', '/' + package_name + '/crawl/' + lastCrawl);
-    $('.navbar a[href*="/' + package_name + '/feed"]').attr('href', '/' + package_name + '/feed/' + lastFeed);
-    $('.navbar a[href*="/' + package_name + '/download"]').attr('href', '/' + package_name + '/download/' + lastDl);
+    $('.navbar-nav > li > a[href*="/' + package_name + '/crawl"]:not(.dropdown-item)').attr('href', '/' + package_name + '/crawl/' + lastCrawl);
+    $('.navbar-nav > li > a[href*="/' + package_name + '/feed"]:not(.dropdown-item)').attr('href', '/' + package_name + '/feed/' + lastFeed);
+    $('.navbar-nav > li > a[href*="/' + package_name + '/download"]:not(.dropdown-item)').attr('href', '/' + package_name + '/download/' + lastDl);
   } catch (e) {}
 }
 
@@ -70,29 +70,6 @@ $(document).on('shown.bs.tab', '#nav-tab a[data-toggle="tab"]', function (e) {
       localStorage.setItem(package_name + '_' + sub + '_active_tab', targetTab);
     }
   } catch (err) {}
-});
-
-$(document).on('click', '.navbar a', function (e) {
-  var href = $(this).attr('href') || '';
-  if (href.indexOf('/' + package_name + '/crawl') !== -1) {
-    var lastCrawl = localStorage.getItem('feeder_last_crawl_page');
-    if (lastCrawl && lastCrawl !== 'setting') {
-      e.preventDefault();
-      window.location.href = '/' + package_name + '/crawl/' + lastCrawl;
-    }
-  } else if (href.indexOf('/' + package_name + '/feed') !== -1) {
-    var lastFeed = localStorage.getItem('feeder_last_feed_page');
-    if (lastFeed && lastFeed !== 'setting') {
-      e.preventDefault();
-      window.location.href = '/' + package_name + '/feed/' + lastFeed;
-    }
-  } else if (href.indexOf('/' + package_name + '/download') !== -1) {
-    var lastDl = localStorage.getItem('feeder_last_download_page');
-    if (lastDl && lastDl !== 'setting') {
-      e.preventDefault();
-      window.location.href = '/' + package_name + '/download/' + lastDl;
-    }
-  }
 });
 
 // =============================================================================
@@ -198,9 +175,9 @@ function render_pagination(paging) {
 
 window.globalRequestSearch = function (page, preserveScroll) {
   var storage_pfx = sub + '_';
-  var page_val = (page !== undefined && page !== null && page !== '')
-    ? page.toString()
-    : (localStorage.getItem(storage_pfx + 'current_page') || '1');
+  var raw_page = (page !== undefined && page !== null && page !== '') ? page : localStorage.getItem(storage_pfx + 'current_page');
+  var parsed_page = parseInt(raw_page, 10);
+  var page_val = (!isNaN(parsed_page) && parsed_page > 0) ? parsed_page.toString() : '1';
 
   var search_word = ($('#search_word').length > 0) ? ($('#search_word').val() || '').trim() : (localStorage.getItem(storage_pfx + 'search_word') || '');
   var page_size = ($('#page_size').length > 0) ? ($('#page_size').val() || '25') : (localStorage.getItem(storage_pfx + 'page_size') || '25');
@@ -295,10 +272,14 @@ window.globalRequestSearch = function (page, preserveScroll) {
         console.error('make_list 렌더링 에러:', renderErr);
         if ($('#list_div').length > 0) {
           $('#list_div').html('<div class="alert alert-danger m-3">렌더링 오류: ' + renderErr.message + '</div>');
+        } else if ($('#download_list_tbody').length > 0) {
+          $('#download_list_tbody').html('<tr><td colspan="4" class="text-center p-4 text-danger font-weight-bold">목록 렌더링 오류: ' + renderErr.message + '</td></tr>');
         }
         return;
       }
       if (ret.paging) {
+        var validCurPage = (ret.paging.current_page || ret.paging.page || 1).toString();
+        localStorage.setItem(storage_pfx + 'current_page', validCurPage);
         make_page_html(ret.paging);
       }
       if (preserveScroll && savedScrollTop > 0) {

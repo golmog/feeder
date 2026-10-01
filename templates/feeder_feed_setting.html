@@ -24,6 +24,7 @@
 
     {{ macros.m_tab_content_start('basic', true) }}
       {{ macros.setting_input_int('feed_feed_count', '실시간 RSS 피드 최대 수', value=arg['feed_feed_count'], min='1', placeholder='100', desc=['/api/feed 요청 시 반환될 최대 피드 항목 수']) }}
+      {{ macros.setting_input_text('feed_global_quality', '전역 기본 화질 필터', value=arg['feed_global_quality'], placeholder='예: 1080p+, 2160p+, 720p-1080p', desc=['개별 피드에 별도 화질 조건이 지정되지 않았을 때 모든 피드에 공통 적용될 기본 화질 조건']) }}
       {{ macros.m_hr() }}
       {{ macros.setting_checkbox('feed_make_rss_file', '공유용 RSS XML 파일 별도 생성', value=arg['feed_make_rss_file'], desc=['On: API Key 노출 없이 배포 가능한 정적 RSS XML 파일을 로컬 디스크에 자동 생성합니다.']) }}
       <div id="feed_make_rss_file_div" class="collapse">
