@@ -1,5 +1,5 @@
 title: "FEEDER"
-version: "1.2.4"
+version: "1.2.5"
 package_name: "feeder"
 developer: "golmog"
 description: "토렌트 사이트 크롤링 + more (for FF)"
