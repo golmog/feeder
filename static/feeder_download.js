@@ -147,6 +147,10 @@ function init_sse_listener() {
           $('#stat_failed').text(data.counts.failed || 0);
         }
 
+        if (data && data.total_upload_24h !== undefined) {
+          $('#queue_daily_upload_badge').html('<i class="fa fa-cloud-upload mr-1"></i>24시간 업로드: ' + format_bytes(data.total_upload_24h));
+        }
+
         if (data && Array.isArray(data.active_list) && $('#active_queue_tbody').length > 0) {
           render_queue_rows(data.active_list);
           hide_queue_loading_overlay();
@@ -1779,6 +1783,10 @@ $(document).on('click', '.delete_profile_btn', function (e) {
 function render_accounts(accounts, stats) {
   var tbody = $('#gdrive_account_list_tbody');
   if (!tbody.length) return;
+  if (stats) {
+    $('#gdrive_stat_total_24h').text(format_bytes(stats.total_usage_24h || 0));
+    $('#gdrive_stat_account_total').text(format_bytes(stats.account_total_usage || 0));
+  }
   if (!accounts || accounts.length === 0) {
     tbody.html('<tr><td colspan="5" class="py-4 text-muted">등록된 구글 드라이브 계정이 없습니다.</td></tr>');
     return;

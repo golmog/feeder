@@ -859,10 +859,22 @@ class ModuleDownload(PluginModuleBase):
         """실시간 대시보드용 SSE 스트림 (통계 카운트 + 활성 작업 목록 동시 전송)"""
         sse_cycle = 0
         engine_tasks_cache = []
+        last_stat_calc_time = 0
+        cached_24h_upload_bytes = 0
         while True:
             try:
                 with F.app.app_context():
                     sse_cycle += 1
+                    now_ts = time.time()
+                    if now_ts - last_stat_calc_time > 30:
+                        last_stat_calc_time = now_ts
+                        cutoff_ts = int(now_ts) - 86400
+                        total_res = db.session.query(func.sum(ModelDownloadStat.stat_value)).filter(
+                            ModelDownloadStat.stat_type == 'gdrive_usage',
+                            ModelDownloadStat.timestamp > cutoff_ts
+                        ).scalar()
+                        cached_24h_upload_bytes = int(total_res) if total_res else 0
+
                     counts = {
                         'pending': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending', 'pending_relay'])).count(),
                         'downloading': db.session.query(ModelDownload).filter_by(status='downloading').count(),
@@ -995,6 +1007,7 @@ class ModuleDownload(PluginModuleBase):
                     data_str = json.dumps({
                         'timestamp': int(time.time()),
                         'counts': counts,
+                        'total_upload_24h': cached_24h_upload_bytes,
                         'active_list': active_list
                     })
                     yield f"data: {data_str}\n\n"
@@ -1025,6 +1038,8 @@ class ModuleDownload(PluginModuleBase):
             .all()
         )
         usage_map = {r[0]: int(r[1]) for r in usage_rows if r[0]}
+        account_total = sum(v for k, v in usage_map.items() if k != 'SHARED_DRIVE_UPLOAD')
+        total_24h = sum(usage_map.values())
 
         blocked_rows = (
             db.session.query(ModelDownloadStat.stat_key, ModelDownloadStat.stat_value)
@@ -1036,7 +1051,12 @@ class ModuleDownload(PluginModuleBase):
         )
         blocked_map = {r[0]: int(r[1] - now) for r in blocked_rows if r[0]}
 
-        return {'usage_24h': usage_map, 'blocked_remains': blocked_map}
+        return {
+            'usage_24h': usage_map,
+            'blocked_remains': blocked_map,
+            'account_total_usage': account_total,
+            'total_usage_24h': total_24h
+        }
 
     def scheduler_function(self):
         if P.ModelSetting.get_bool(f"{self.name}_db_auto_delete"):

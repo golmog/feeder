@@ -138,20 +138,14 @@ class TaskDownload:
                         logger.info(f"[DownloadPipeline] 활성 다운로드 엔진 상태 점검 (진행: {downloading_cnt}건)")
                     TaskDownload.poll_active_downloads()
 
-                    # 로컬 스테이징 (스테이징 대기 항목이 있는 경우에만 실행)
-                    if staging_cnt > 0:
-                        logger.info(f"[DownloadPipeline] 로컬 스테이징 다운로드 시작 (대기: {staging_cnt}건)")
-                        TaskDownload.process_local_staging()
+                    # 로컬 스테이징 (대기 항목 존재 시 내부에서 실시간 쿼리하여 처리)
+                    TaskDownload.process_local_staging()
 
                     # 다운로드 완료 항목 이송 라우팅 (로컬 스테이징 완료 또는 다이렉트 전송 대기 항목)
-                    if downloaded_cnt > 0:
-                        logger.info(f"[DownloadPipeline] 다운로드 완료 항목 이송 라우팅 시작 (대상: {downloaded_cnt}건)")
-                        TaskDownload.route_completed_downloads()
+                    TaskDownload.route_completed_downloads()
 
-                    # Google Drive 업로드 파이프라인
-                    if uploading_cnt > 0:
-                        logger.info(f"[DownloadPipeline] Google Drive 업로드 파이프라인 시작 (대기: {uploading_cnt}건)")
-                        TaskDownload.process_uploads()
+                    # Google Drive 업로드 파이프라인 (pending_upload 실시간 쿼리하여 즉시 전송)
+                    TaskDownload.process_uploads()
 
                     # 해당 패스에서 실제 상태 전이가 발생했는지 판별
                     staging_after = db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_local_staging', 'local_staging'])).count()
@@ -412,6 +406,8 @@ class TaskDownload:
         # 다운로더 엔진별 실제 원격 진행 중 큐(In Progress: 다운로딩 + 대기열 전체) 사전 집계
         engine_in_progress_counts = {}
         full_engines = set()
+        engine_instances = {}
+        engine_status_maps = {}
 
         for dl in FeederUtil.get_downloaders():
             e_name = dl.get('name')
@@ -423,20 +419,31 @@ class TaskDownload:
             except Exception:
                 e_limit = 0
 
-            if e_limit > 0:
-                engine_inst = DownloadUtil.create_engine(dl)
-                if engine_inst and hasattr(engine_inst, 'get_status'):
-                    try:
-                        remote_tasks, _ = engine_inst.get_status()
-                        # 원격 엔진의 In Progress 전체(대기 중 + 다운로드 중) 집계
+            engine_inst = DownloadUtil.create_engine(dl)
+            if not engine_inst:
+                continue
+            engine_instances[e_name] = engine_inst
+
+            # 모든 엔진 공통: 원격 작업 목록을 1회 사전 조회하여 infohash 맵 구성
+            if hasattr(engine_inst, 'get_status'):
+                try:
+                    remote_tasks, _ = engine_inst.get_status()
+                    if remote_tasks:
+                        task_map = {}
+                        for t in remote_tasks:
+                            h = (t.get('hash') or '').lower()
+                            if h:
+                                task_map[h] = t
+                        engine_status_maps[e_name] = task_map
+
                         in_prog_cnt = sum(1 for t in remote_tasks if t.get('status') == 'downloading')
                         engine_in_progress_counts[e_name] = in_prog_cnt
 
-                        if in_prog_cnt >= e_limit:
+                        if e_limit > 0 and in_prog_cnt >= e_limit:
                             full_engines.add(e_name)
                             logger.info(f"[DownloadDispatch] [{e_name}] 원격 진행중 큐 한도({e_limit}건) 도달 (현재 In Progress: {in_prog_cnt}건) -> 신규 추가 일시 대기")
-                    except Exception as chk_err:
-                        logger.debug(f"[DownloadDispatch] [{e_name}] 원격 큐 사전 점검 예외 (DB 수치 참조): {chk_err}")
+                except Exception as chk_err:
+                    logger.debug(f"[DownloadDispatch] [{e_name}] 원격 큐 사전 점검 예외: {chk_err}")
 
         # 원격 조회가 불가했던 엔진용 로컬 DB 백업 집계
         if not engine_in_progress_counts:
@@ -493,6 +500,57 @@ class TaskDownload:
             if not engine:
                 continue
 
+            target_hash = FeederUtil.extract_info_hash(snapshot['magnet'])
+            target_hash_lower = target_hash.lower() if target_hash else ""
+            existing_task = engine_status_maps.get(engine_name, {}).get(target_hash_lower) if target_hash_lower else None
+
+            # 모든 엔진 공통: 원격 엔진에 이미 존재하는 작업인 경우 표준 규격에 따라 연동/재시작
+            if existing_task:
+                existing_tid = str(existing_task.get('task_id') or existing_task.get('id') or '')
+                std_status = existing_task.get('status')
+
+                if std_status == 'error':
+                    restarted = False
+                    if hasattr(engine, 'restart_task'):
+                        try:
+                            restarted = engine.restart_task(existing_tid)
+                        except Exception as ex:
+                            logger.debug(f"[DownloadDispatch] [{engine_name}] 기존 작업 재시작 예외: {ex}")
+
+                    if not restarted:
+                        # 원격 엔진이 재시작을 거부함 (AllDebrid no peer 등) -> 원격 작업 정리 후 다음 엔진으로 즉시 폴백
+                        logger.warning(f"[DownloadDispatch] [{engine_name}] 원격 에러 작업 재시작 불가 -> 다음 엔진 폴백: {snapshot['title']} (TaskID: {existing_tid})")
+                        try:
+                            engine.delete_task(existing_tid)
+                        except Exception:
+                            pass
+                        item = db.session.query(ModelDownload).filter_by(id=item_id).first()
+                        if item:
+                            item.current_engine_index = curr_idx + 1
+                            item.status = 'pending'
+                            item.engine_task_id = None
+                            item.error_message = f"[{engine_name}] 원격 작업 재시작 거부 (다음 엔진 폴백)"
+                            db.session.commit()
+                        continue
+
+                    logger.info(f"[DownloadDispatch] [{engine_name}] 원격 엔진에 에러 상태로 존재하는 작업 감지 -> 재시작(restart) 성공 및 연동: {snapshot['title']} (TaskID: {existing_tid})")
+                elif std_status == 'completed':
+                    logger.info(f"[DownloadDispatch] [{engine_name}] 원격 엔진에 이미 완료 상태로 존재하는 작업 감지 -> 작업 연동: {snapshot['title']} (TaskID: {existing_tid})")
+                else:
+                    logger.info(f"[DownloadDispatch] [{engine_name}] 원격 엔진에 이미 진행 중인 작업 감지 -> 작업 연동: {snapshot['title']} (TaskID: {existing_tid})")
+
+                item = db.session.query(ModelDownload).filter_by(id=item_id).first()
+                if item:
+                    item.status = 'downloading'
+                    item.current_engine_name = engine_name
+                    item.engine_task_id = existing_tid
+                    item.engine_added_time = datetime.now()
+                    item.last_status_time = datetime.now()
+                    item.error_message = None
+                    engine_in_progress_counts[engine_name] = current_count + 1
+                    db.session.commit()
+                continue
+
             # 링크 프로토콜(ed2k vs magnet) 지원 여부 판별
             is_ed2k = str(snapshot['magnet']).lower().startswith('ed2k://')
             target_proto = "ed2k" if is_ed2k else "magnet"
@@ -540,9 +598,13 @@ class TaskDownload:
                     db.session.commit()
                     logger.info(f"[DownloadDispatch] [{engine_name}] 원격 엔진 활성 한도 도달 ({err_str}) -> 신규 추가 일시 중단 및 대기열(pending) 유지: {snapshot['title']}")
                 else:
-                    item.error_message = f"[{engine_name}] 추가 지연: {err_str}"
+                    # no peer, 토렌트 오류 등으로 추가 거부된 경우 다음 우선순위 엔진으로 즉시 폴백
+                    item.current_engine_index = curr_idx + 1
+                    item.status = 'pending'
+                    item.engine_task_id = None
+                    item.error_message = f"[{engine_name}] 추가 실패 ({err_str}) -> 다음 엔진 폴백"
                     db.session.commit()
-                    logger.warning(f"[DownloadDispatch] [{engine_name}] 마그넷 추가 실패 ({err_str}) -> 대기열(pending) 유지: {snapshot['title']}")
+                    logger.warning(f"[DownloadDispatch] [{engine_name}] 마그넷 추가 불가 ({err_str}) -> 다음 엔진 폴백: {snapshot['title']}")
 
         db.session.commit()
 
@@ -600,7 +662,7 @@ class TaskDownload:
                     match_filters.append(ModelDownload.engine_task_id.in_(completed_task_ids))
                 if match_filters:
                     reverse_items = db.session.query(ModelDownload).filter(
-                        ModelDownload.status != 'completed',
+                        ModelDownload.status.in_(['downloading', 'pending']),
                         or_(
                             ModelDownload.current_engine_name == engine_name,
                             ModelDownload.current_engine_name.is_(None)
@@ -780,15 +842,29 @@ class TaskDownload:
                         it.error_message = f"[{engine_name}] 지연 제한시간({stalled_hours}시간) 초과"
                         db.session.commit()
                     elif std_status == 'error':
-                        # 타임아웃 전 일시적 엔진 에러는 폴백하지 않고 재시작 시도 및 대기
+                        restarted = False
                         if hasattr(engine, 'restart_task'):
                             try:
-                                engine.restart_task(it.engine_task_id)
+                                restarted = engine.restart_task(it.engine_task_id)
                             except Exception:
                                 pass
-                        it.error_message = f"[{engine_name}] 엔진 에러 수신 (타임아웃 전 재시도 대기)"
-                        db.session.commit()
-                        logger.debug(f"[DownloadPoll] [{engine_name}] 다운로드 에러 상태 감지 -> 타임아웃 전 재시도 대기: {it.title}")
+
+                        if not restarted:
+                            # 원격 엔진이 재시작 거부 시 지체 없이 다음 엔진으로 폴백
+                            logger.warning(f"[DownloadPoll] [{engine_name}] 에러 작업 재시작 실패 -> 다음 엔진 폴백: {it.title}")
+                            try:
+                                engine.delete_task(it.engine_task_id)
+                            except Exception:
+                                pass
+                            it.current_engine_index = (it.current_engine_index or 0) + 1
+                            it.status = 'pending'
+                            it.engine_task_id = None
+                            it.error_message = f"[{engine_name}] 원격 재시작 불가 에러"
+                            db.session.commit()
+                        else:
+                            it.error_message = f"[{engine_name}] 엔진 에러 수신 (재시작 요청 성공)"
+                            db.session.commit()
+                            logger.debug(f"[DownloadPoll] [{engine_name}] 다운로드 에러 작업 재시작 요청 완료: {it.title}")
 
         db.session.commit()
 

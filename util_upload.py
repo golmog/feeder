@@ -413,14 +413,18 @@ class UploadUtil:
         folder_name = base_name if (ext and not raw_name.endswith(('/', '\\'))) else raw_name
         item.file_name = folder_name
 
-        if is_remote_source:
-            fsize = item.file_size or 0
-        else:
-            fsize = item.file_size or sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(local_path) for f in fs)
-        item.file_size = fsize
-
         rclone_cfg = FeederUtil.load_yaml().get('rclone', {})
         rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or rclone_cfg.get('conf_path', '')
+
+        if is_remote_source:
+            fsize = item.file_size or 0
+            if fsize <= 0:
+                fsize = cls.get_remote_size(local_path, rclone_conf)
+                if fsize > 0:
+                    item.file_size = fsize
+        else:
+            fsize = item.file_size or sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(local_path) for f in fs)
+            item.file_size = fsize
 
         # 프로필의 최신 목적지 설정 동적 조회 (과거 DB 고정값 오버라이드)
         profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
@@ -547,7 +551,6 @@ class UploadUtil:
                 db.session.remove()
                 return False
 
-            is_dir = os.path.isdir(local_path)
             move_success = False
             base_move_opts = [
                 "--config", rclone_conf,
@@ -556,18 +559,84 @@ class UploadUtil:
                 "--stats-one-line", "--log-level", "NOTICE"
             ]
 
-            if mode == 'mydrive':
-                src_m = f"{effective_remote}:{{{acc.get('mydrive_rclone_id')}}}/{comp_path}/{folder_name}"
-                dst_m = f"{remote_shared}:{{{target_drive_id}}}/{comp_path}/{folder_name}"
-                cmd_action = "move" if (is_dir or is_remote_source) else "moveto"
-                move_cmd = ["rclone", cmd_action, src_m, dst_m] + impersonate_arg + base_move_opts
-                if is_dir or is_remote_source:
-                    move_cmd.append("--delete-empty-src-dirs")
-                move_success, _ = cls.run_rclone(move_cmd, f"서버사이드 이동(Across/{cmd_action}) {folder_name}", log_output=True, watchdog_timeout=None)
-            else:
-                dst_parent = f"{remote_shared}:{{{target_drive_id}}}/{comp_path}"
-                move_cmd = ["rclone", "backend", "chpar", dest_incoming, dst_parent, "--config", rclone_conf, "--log-level", "NOTICE"]
-                move_success, _ = cls.run_rclone(move_cmd, f"원자적 부모폴더 변경(chpar) {folder_name}", log_output=True, watchdog_timeout=None)
+            # 구글 드라이브 API 인덱스 반영 및 파일시스템 안정화 대기
+            time.sleep(3)
+
+            # 서버사이드 2단계 연쇄 이동 (내 드라이브 임시 -> 공유 드라이브 임시 -> 공유 드라이브 완료 chpar)
+            max_move_attempts = 3
+            for attempt in range(1, max_move_attempts + 1):
+                if mode == 'mydrive':
+                    # 1단계: 내 드라이브 임시 -> 공유 드라이브 임시 (드라이브 경계 간 move)
+                    src_mydrive = f"{effective_remote}:{{{acc.get('mydrive_rclone_id')}}}/{up_path}/{folder_name}"
+                    shared_incoming = f"{effective_remote}:{{{target_drive_id}}}/{up_path}/{folder_name}"
+                    move_across_cmd = [
+                        "rclone", "move", src_mydrive, shared_incoming,
+                        "--delete-empty-src-dirs"
+                    ] + impersonate_arg + base_move_opts
+
+                    step1_ok, _ = cls.run_rclone(
+                        move_across_cmd,
+                        f"서버사이드 이동(MyDrive->공유드라이브 임시) {folder_name}",
+                        log_output=True,
+                        watchdog_timeout=None
+                    )
+
+                    if not step1_ok:
+                        if attempt < max_move_attempts:
+                            retry_wait = attempt * 3
+                            logger.warning(f"[UploadUtil] MyDrive->공유드라이브 임시 이동 지연 감지 -> {retry_wait}초 후 재시도 ({attempt}/{max_move_attempts}): {folder_name}")
+                            time.sleep(retry_wait)
+                        continue
+
+                    # 2단계: 공유 드라이브 임시 -> 공유 드라이브 완료 (동일 드라이브 내 chpar 포인터 변경)
+                    dst_parent = f"{effective_remote}:{{{target_drive_id}}}/{comp_path}"
+                    mkdir_cmd = ["rclone", "mkdir", dst_parent, "--config", rclone_conf] + impersonate_arg
+                    cls.run_rclone(mkdir_cmd, log_output=False, watchdog_timeout=None)
+
+                    chpar_cmd = [
+                        "rclone", "backend", "chpar", shared_incoming, dst_parent,
+                        "--config", rclone_conf, "--log-level", "NOTICE"
+                    ] + impersonate_arg
+
+                    move_success, _ = cls.run_rclone(
+                        chpar_cmd,
+                        f"원자적 부모폴더 변경(chpar) {folder_name}",
+                        log_output=True,
+                        watchdog_timeout=None
+                    )
+
+                    if move_success:
+                        break
+
+                    if attempt < max_move_attempts:
+                        retry_wait = attempt * 3
+                        logger.warning(f"[UploadUtil] chpar 부모폴더 변경 지연 감지 -> {retry_wait}초 후 재시도 ({attempt}/{max_move_attempts}): {folder_name}")
+                        time.sleep(retry_wait)
+
+                else:
+                    # 공유 드라이브 직행: 이미 공유 드라이브 임시에 업로드 완료 -> 곧바로 완료 부모폴더로 chpar 수행
+                    dst_parent = f"{remote_shared}:{{{target_drive_id}}}/{comp_path}"
+                    mkdir_cmd = ["rclone", "mkdir", dst_parent, "--config", rclone_conf]
+                    cls.run_rclone(mkdir_cmd, log_output=False, watchdog_timeout=None)
+
+                    move_cmd = [
+                        "rclone", "backend", "chpar", dest_incoming, dst_parent,
+                        "--config", rclone_conf, "--log-level", "NOTICE"
+                    ]
+                    move_success, _ = cls.run_rclone(
+                        move_cmd,
+                        f"원자적 부모폴더 변경(chpar) {folder_name}",
+                        log_output=True,
+                        watchdog_timeout=None
+                    )
+
+                    if move_success:
+                        break
+
+                    if attempt < max_move_attempts:
+                        retry_wait = attempt * 3
+                        logger.warning(f"[UploadUtil] 서버사이드 chpar 지연 감지 -> {retry_wait}초 후 재시도 ({attempt}/{max_move_attempts}): {folder_name}")
+                        time.sleep(retry_wait)
 
             if move_success:
                 downloader_cfg = FeederUtil.get_downloader_by_name(current_engine_name)
