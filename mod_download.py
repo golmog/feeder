@@ -42,6 +42,7 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_rclone_conf_path": "",
             f"{self.name}_rclone_remote_name": "net",
             f"{self.name}_rclone_upload_remote_name": "",
+            f"{self.name}_use_gdrive_pool": "False",
             f"{self.name}_gdrive_use_impersonate": "False",
             f"{self.name}_gdrive_mydrive_remote_name": "gdrive_sa",
             f"{self.name}_rclone_shared_remote_name": "gf",

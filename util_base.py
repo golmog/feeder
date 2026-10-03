@@ -294,6 +294,30 @@ class FeederUtil:
             logger.error(f"[FeederUtil] DB VACUUM 실행 오류: {e}")
 
     @classmethod
+    def db_checkpoint(cls, mode: str = 'TRUNCATE'):
+        """SQLite WAL 파일의 커밋된 데이터를 메인 DB로 안전하게 병합(체크포인트) 및 파일 비우기"""
+        try:
+            try:
+                engine = db.get_engine(bind=P.package_name)
+            except Exception:
+                engine = db.engine
+
+            if engine.dialect.name == 'sqlite':
+                db.session.remove()
+                raw_conn = engine.raw_connection()
+                try:
+                    raw_conn.isolation_level = None
+                    cursor = raw_conn.cursor()
+                    cursor.execute(f"PRAGMA wal_checkpoint({mode});")
+                    result = cursor.fetchone()
+                    cursor.close()
+                    logger.debug(f"[FeederUtil] SQLite WAL 체크포인트({mode}) 완료: {result} ({P.package_name}.db)")
+                finally:
+                    raw_conn.close()
+        except Exception as e:
+            logger.debug(f"[FeederUtil] SQLite WAL 체크포인트 중 예외 (정상 스킵): {e}")
+
+    @classmethod
     def get_rclone_extra_options(cls) -> list[str]:
         """설정된 Rclone 확장 옵션 문자열을 안전하게 분리하여 리스트로 반환"""
         import shlex

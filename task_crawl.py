@@ -120,9 +120,9 @@ class TaskCrawl:
                     current_count = P.ModelSetting.get_int('crawl_scheduler_count')
 
                 try:
-                    max_page = P.ModelSetting.get_int('crawl_max_page')
+                    global_max_page = P.ModelSetting.get_int('crawl_max_page')
                 except Exception:
-                    max_page = 5
+                    global_max_page = 5
 
                 total_crawled_count = 0
                 for crawler in crawlers:
@@ -153,6 +153,12 @@ class TaskCrawl:
                     if not boards:
                         logger.debug(f"[TaskCrawl] [{site_name}] 등록된 게시판이 없어 건너뜀")
                         continue
+
+                    c_max_page = crawler.get('max_page')
+                    if c_max_page and str(c_max_page).isdigit() and int(c_max_page) > 0:
+                        max_page = int(c_max_page)
+                    else:
+                        max_page = global_max_page
 
                     target_cfg = SimpleNamespace(
                         use_proxy=crawler.get('use_proxy', False),
@@ -228,6 +234,7 @@ class TaskCrawl:
                     P.ModelSetting.set('crawl_is_running', 'False')
                 CrawlUtil.close_sessions()
                 TaskCrawl._run_mutex.release()
+                FeederUtil.db_checkpoint()
 
     @staticmethod
     def get_crawl_delay(site_info: dict = None, target_cfg=None) -> float:

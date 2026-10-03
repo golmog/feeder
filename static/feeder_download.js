@@ -109,6 +109,7 @@ $(document).ready(function () {
     } catch (err) {}
 
     use_collapse('download_use_local_staging');
+    use_collapse('download_use_gdrive_pool');
     use_collapse('download_gdrive_use_impersonate');
 
     load_all_download_config();
@@ -890,6 +891,7 @@ function init_dl_trans_editor() {
 }
 
 $('#download_use_local_staging').change(function () { use_collapse('download_use_local_staging'); });
+$('#download_use_gdrive_pool').change(function () { use_collapse('download_use_gdrive_pool'); });
 $('#download_gdrive_use_impersonate').change(function () { use_collapse('download_gdrive_use_impersonate'); });
 
 $('#download_script_modal').on('shown.bs.modal', function () {
@@ -1827,6 +1829,16 @@ function render_accounts(accounts, stats) {
   tbody.html(str);
 }
 
+$(document).on('click', '#gdrive_account_add_btn', function (e) {
+  e.preventDefault();
+  $('#modal_acc_index').val('-1');
+  $('#gdrive_account_modal_title').text('구글 드라이브 계정 추가');
+  $('#modal_acc_username').val('');
+  $('#modal_acc_mydrive_id').val('');
+  $('#modal_acc_remote_name').val('');
+  $('#gdrive_account_modal').modal('show');
+});
+
 $(document).on('click', '.edit_acc_btn', function (e) {
   e.preventDefault();
   var idx = parseInt($(this).data('index'));
@@ -1858,13 +1870,32 @@ $(document).on('click', '#gdrive_account_save_btn', function (e) {
     else delete current_accounts[idx].remote_name;
   }
 
+  var newAcc = {
+    username: uname,
+    mydrive_rclone_id: mydrive_id
+  };
+  if (rname) newAcc.remote_name = rname;
+
+  if (idx >= 0 && idx < current_accounts.length) {
+    current_accounts[idx] = newAcc;
+  } else {
+    var exists = current_accounts.some(function (acc) {
+      return acc.username === uname;
+    });
+    if (exists) {
+      notify('이미 등록된 계정 식별자입니다.', 'warning');
+      return;
+    }
+    current_accounts.push(newAcc);
+  }
+
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/save_accounts',
     type: 'POST',
     data: { accounts_json: JSON.stringify(current_accounts) },
     dataType: 'json',
     success: function (data) {
-      notify('계정 정보가 수정되었습니다.', 'success');
+      notify(idx >= 0 ? '계정 정보가 수정되었습니다.' : '신규 계정이 등록되었습니다.', 'success');
       $('#gdrive_account_modal').modal('hide');
       current_accounts = data.accounts || [];
       render_accounts(current_accounts, {});

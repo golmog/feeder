@@ -381,6 +381,7 @@ class ModuleCrawl(PluginModuleBase):
             except Exception:
                 interval_val = 1
 
+            max_page_raw = req.form.get('crawler_max_page', '').strip()
             delay_raw = req.form.get('crawler_delay', '').strip()
             max_retries_raw = req.form.get('crawler_max_retries', '').strip()
 
@@ -396,6 +397,7 @@ class ModuleCrawl(PluginModuleBase):
                 'site': site,
                 'boards': boards,
                 'interval': interval_val,
+                'max_page': int(max_page_raw) if max_page_raw.isdigit() else '',
                 'delay': float(delay_raw) if delay_raw else '',
                 'max_retries': int(max_retries_raw) if max_retries_raw.isdigit() else '',
                 'enabled': enabled,
@@ -696,6 +698,7 @@ class ModuleCrawl(PluginModuleBase):
             info['last'] = last_bbs.as_dict() if last_bbs else None
             info['boards'] = boards
             info['board_count'] = len(boards)
+            info['max_page'] = c.get('max_page', '')
             info['delay'] = c.get('delay', '')
             info['max_retries'] = c.get('max_retries', '')
             info['enabled'] = str(c.get('enabled', True)).lower() in ['true', 'on', '1']

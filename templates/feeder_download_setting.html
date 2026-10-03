@@ -45,23 +45,28 @@
       </div>
       {{ macros.m_hr() }}
 
-      <h6 class="text-info font-weight-bold text-center mt-2">Google Drive 기본 설정</h6>
-      {{ macros.setting_input_text('download_rclone_upload_remote_name', '일반 업로드 리모트', value=arg['download_rclone_upload_remote_name'], placeholder='예: onedrive', desc=['일반 Rclone 리모트 단순 업로드에서 사용할 리모트명입니다.']) }}
-      {{ macros.setting_checkbox('download_gdrive_use_impersonate', 'Google Workspace Impersonate', value=arg['download_gdrive_use_impersonate'], desc=['On: 단일 SA 기본 리모트에서 --drive-impersonate 옵션으로 각 구성원의 15GB MyDrive에 접근합니다 (도메인 전체 위임 필수).', 'Off: 위임 없이 각 계정별로 별도 등록된 독립 Rclone 리모트를 직접 사용합니다 (계정 풀에서 계정별 리모트명 지정 필요).']) }}
-      <div id="download_gdrive_use_impersonate_div" class="collapse">
-        {{ macros.setting_input_text('download_gdrive_mydrive_remote_name', '내 드라이브 SA 기본 리모트', value=arg['download_gdrive_mydrive_remote_name'], placeholder='예: gdrive_sa', desc=['Impersonate 사용 시 기준이 되는 서비스 계정(SA) Rclone 리모트 이름']) }}
-        {{ macros.setting_input_text('download_rclone_shared_remote_name', '기본 목적지 공유 드라이브 리모트', value=arg['download_rclone_shared_remote_name'], placeholder='예: gdrive_shared', desc=['기본 목적지 공유 드라이브에 접근할 Rclone 리모트 이름']) }}
-        {{ macros.setting_input_text('download_shared_drive_id', '기본 목적지 공유 드라이브 ID', value=arg['download_shared_drive_id'], placeholder='예: 0ABCDE12345678') }}
-        {{ macros.setting_input_text('download_mydrive_upload_threshold', '내 드라이브 바이패스 임계 용량', value=arg['download_mydrive_upload_threshold'], placeholder='14GB', desc=['이 용량 이하의 파일만 15GB MyDrive로 1차 업로드 후 공유 드라이브로 서버사이드 이동합니다. (기본값: 14GB)']) }}
-        {{ macros.setting_input_text('download_gdrive_upload_limit', '개인 계정 일일 업로드 한도', value=arg['download_gdrive_upload_limit'], placeholder='700GB', desc=['개인 SA 계정당 24시간 안전 업로드 제한량 (기본값: 700GB)']) }}
-        {{ macros.setting_input_text('download_shared_drive_upload_limit', '공유 드라이브 일일 업로드 한도', value=arg['download_shared_drive_upload_limit'], placeholder='3TB', desc=['공유 드라이브 전체 24시간 안전 업로드 제한량 (기본값: 3TB)']) }}
-        {{ macros.setting_input_text('download_shared_drive_quota_reset_time', '공유 드라이브 쿼터 리셋 시간', value=arg['download_shared_drive_quota_reset_time'], placeholder='16:00', desc=['구글 드라이브 일일 쿼터가 초기화되는 시각 (기본값: 16:00 KST)']) }}
-      </div>
       <h6 class="text-info font-weight-bold text-center mt-3">Rclone 기본 설정</h6>
       {{ macros.setting_input_text('download_rclone_conf_path', 'Rclone 설정 파일 경로', value=arg['download_rclone_conf_path'], placeholder='예: /root/.config/rclone/rclone.conf') }}
       {{ macros.setting_input_text('download_rclone_chunk_size', 'Rclone 청크 사이즈', value=arg['download_rclone_chunk_size'], placeholder='256M', desc=['구글 드라이브 업로드 청크 크기 (기본값: 256M)']) }}
       {{ macros.setting_input_text('download_rclone_extra_options', 'Rclone 추가 옵션', value=arg['download_rclone_extra_options'], placeholder='--timeout 30m', desc=['Rclone 실행 시 추가로 적용할 확장 옵션 문자열 (공백 구분, 기본값: --timeout 30m)']) }}
       {{ macros.m_hr() }}
+
+      <h6 class="text-info font-weight-bold text-center mt-2">Google Drive 기본 설정</h6>
+      {{ macros.setting_input_text('download_rclone_upload_remote_name', '기본 업로드 리모트', value=arg['download_rclone_upload_remote_name'], placeholder='예: my_remote', desc=['계정 풀 로테이션 미사용 시 기본으로 사용할 Rclone 리모트 이름']) }}
+      {{ macros.setting_checkbox('download_use_gdrive_pool', '계정 풀 로테이션 사용', value=arg['download_use_gdrive_pool'], desc=['On: 등록된 구글 계정 풀을 활용하여 쿼터를 분산하고 대용량 업로드를 로테이션합니다.', 'Off: 계정 풀을 사용하지 않고 기본 업로드 리모트로 직접 전송합니다.']) }}
+      <div id="download_use_gdrive_pool_div" class="collapse">
+        {{ macros.setting_checkbox('download_gdrive_use_impersonate', 'Google Workspace Impersonate', value=arg['download_gdrive_use_impersonate'], desc=['On: 단일 SA 위임 리모트에서 --drive-impersonate로 각 계정에 동적 접근합니다.', 'Off: 계정 풀에 등록된 개별 Rclone 리모트를 직접 사용합니다.']) }}
+        <div id="download_gdrive_use_impersonate_div" class="collapse">
+          {{ macros.setting_input_text('download_gdrive_mydrive_remote_name', '위임용 리모트', value=arg['download_gdrive_mydrive_remote_name'], placeholder='예: gdrive_sa', desc=['Impersonate 위임 사용 시 기준이 되는 서비스 계정(SA) Rclone 리모트 이름']) }}
+        </div>
+        {{ macros.setting_input_text('download_shared_drive_id', '기본 목적지 공유 드라이브 ID', value=arg['download_shared_drive_id'], placeholder='예: 0ABCDE12345678') }}
+        {{ macros.setting_input_text('download_mydrive_upload_threshold', '내 드라이브 바이패스 임계 용량', value=arg['download_mydrive_upload_threshold'], placeholder='14GB', desc=['이 용량 이하의 파일만 15GB MyDrive로 1차 업로드 후 공유 드라이브로 서버사이드 이동합니다. (기본값: 14GB)']) }}
+        {{ macros.setting_input_text('download_gdrive_upload_limit', '계정별 일일 업로드 한도', value=arg['download_gdrive_upload_limit'], placeholder='700GB', desc=['계정당 24시간 안전 업로드 제한량 (기본값: 700GB)']) }}
+        {{ macros.setting_input_text('download_shared_drive_upload_limit', '공유 드라이브 일일 업로드 한도', value=arg['download_shared_drive_upload_limit'], placeholder='3TB', desc=['공유 드라이브 전체 24시간 안전 업로드 제한량 (기본값: 3TB)']) }}
+        {{ macros.setting_input_text('download_shared_drive_quota_reset_time', '공유 드라이브 쿼터 리셋 시간', value=arg['download_shared_drive_quota_reset_time'], placeholder='16:00', desc=['구글 드라이브 일일 쿼터가 초기화되는 시각 (기본값: 16:00 KST)']) }}
+      </div>
+      {{ macros.m_hr() }}
+
       <div class="mt-3 mb-2 text-center">
         <button type="button" id="history_import_modal_btn" class="btn btn-sm btn-secondary">
           <i class="fa fa-database mr-1"></i>과거 이력 가져오기 (마이그레이션)
@@ -148,7 +153,8 @@
       </div>
       <div class="mb-2 d-flex justify-content-between align-items-center">
         <div>
-          <button type="button" id="gdrive_batch_modal_btn" class="btn btn-sm btn-primary">계정 일괄 등록 (텍스트)</button>
+          <button type="button" id="gdrive_account_add_btn" class="btn btn-sm btn-primary">계정 추가</button>
+          <button type="button" id="gdrive_batch_modal_btn" class="btn btn-sm btn-outline-primary ml-1">계정 일괄 등록 (텍스트)</button>
           <button type="button" id="gdrive_reset_blocks_btn" class="btn btn-sm btn-outline-warning ml-1">차단 일괄 해제</button>
         </div>
         <button type="button" id="gdrive_reload_btn" class="btn btn-sm btn-secondary">새로고침</button>
@@ -440,10 +446,10 @@
 
 <!-- 모달: 구글 드라이브 계정 일괄 등록 (텍스트) -->
 <div class="modal fade" id="gdrive_batch_modal" tabindex="-1" role="dialog" aria-hidden="true">
-  <div class="modal-dialog modal-lg">
+  <div class="modal-dialog modal-md">
     <div class="modal-content">
       <div class="modal-header d-flex align-items-center justify-content-between">
-        <h4 class="modal-title">Google Drive 계정 일괄 등록 (텍스트)</h4>
+        <h5 class="modal-title font-weight-bold">Google Drive 계정 일괄 등록 (텍스트)</h5>
         <button type="button" class="close" data-dismiss="modal" aria-label="Close"><span aria-hidden="true">&times;</span></button>
       </div>
       <div class="modal-body">
@@ -455,11 +461,11 @@
           <code>user01@example.com:0AIoBxxxxxx_MyDriveID:gdrive_user01</code><br>
           <code>user02@example.com:0AIoByyyyyy_MyDriveID:gdrive_user02</code>
         </p>
-        <textarea id="gdrive_batch_textarea" class="form-control" rows="12" style="font-family: monospace; font-size: 0.85rem;" placeholder="이메일:내드라이브ID:리모트명"></textarea>
+        <textarea id="gdrive_batch_textarea" class="form-control" rows="12" style="font-family: monospace; font-size: 0.85rem; width: 100% !important; max-width: 100% !important;" placeholder="이메일:내드라이브ID:리모트명"></textarea>
       </div>
       <div class="modal-footer">
-        <button id="gdrive_batch_save_btn" type="button" class="btn btn-primary">일괄 추가하기</button>
-        <button type="button" class="btn btn-secondary" data-dismiss="modal">닫기</button>
+        <button id="gdrive_batch_save_btn" type="button" class="btn btn-sm btn-primary">일괄 추가하기</button>
+        <button type="button" class="btn btn-sm btn-secondary" data-dismiss="modal">닫기</button>
       </div>
     </div>
   </div>

@@ -72,6 +72,7 @@ class TaskDownload:
                     P.ModelSetting.set('download_is_running', 'False')
                     P.ModelSetting.set('download_running_start_time', '0')
             TaskDownload._run_mutex.release()
+            FeederUtil.db_checkpoint()
 
     @staticmethod
     def _run_pipeline_locked(manual: bool = False):

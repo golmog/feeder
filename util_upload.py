@@ -225,14 +225,15 @@ class UploadUtil:
 
         def allocate_account(self, file_size: int) -> tuple[str, dict | None, str]:
             with self.lock:
-                if file_size > self.threshold:
-                    if 'SHARED_DRIVE_UPLOAD' in self.blocked_accounts:
-                        return 'skip', None, "공유 드라이브 403 쿼터 초과 차단 중"
-                    if self.shared_usage + file_size > self.limit_shared:
-                        return 'skip', None, "공유 드라이브 일일 설정 한도(3TB) 초과"
-                    self.shared_usage += file_size
-                    return 'shareddrive', None, "대용량 파일 (공유 드라이브 직행)"
+                # 공유 드라이브 403 쿼터 차단 및 일일 한도 체크
+                if 'SHARED_DRIVE_UPLOAD' in self.blocked_accounts:
+                    return 'skip', None, "공유 드라이브 403 쿼터 초과 차단 중"
+                if self.shared_usage + file_size > self.limit_shared:
+                    return 'skip', None, "공유 드라이브 일일 설정 한도 초과"
 
+                is_direct_shared = (file_size > self.threshold)
+
+                # 계정 풀에서 24시간 사용량이 가장 적은 계정 선점 (직행 여부와 무관하게 항상 계정 할당)
                 sorted_accs = sorted(self.accounts, key=lambda x: self.usage_map.get(x.get('username'), 0))
                 for acc in sorted_accs:
                     uname = acc.get('username')
@@ -243,14 +244,17 @@ class UploadUtil:
                         if current_u + file_size < self.limit_user:
                             self.busy_accounts.add(uname)
                             self.usage_map[uname] = current_u + file_size
+                            self.shared_usage += file_size
+                            if is_direct_shared:
+                                return 'shareddrive', acc, f"대용량 직행 ({uname})"
                             return 'mydrive', acc, f"내 드라이브 바이패스 ({uname})"
 
                 for acc in self.accounts:
                     uname = acc.get('username')
                     if uname not in self.blocked_accounts and self.usage_map.get(uname, 0) + file_size < self.limit_user:
-                        return 'wait', None, "모든 가용 SA 계정 작업 중 (잠시 대기)"
+                        return 'wait', None, "모든 가용 계정 작업 중 (대기)"
 
-                return 'skip', None, "모든 개인 계정 일일 한도 초과 또는 차단 상태"
+                return 'skip', None, "모든 계정 일일 한도 초과 또는 차단 상태"
 
         def release_account(self, username: str):
             with self.lock:
@@ -430,22 +434,21 @@ class UploadUtil:
         profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
         dest_cfg = FeederUtil.get_profile_destination(profile, item.current_engine_name)
 
-        # 리모트명 계층 판별: 프로필 목적지 리모트 -> 전역 DB 설정 -> YAML rclone -> 기본값
-        remote_net = (
+        # 계정 풀 로테이션 사용 여부 및 위임용 리모트 확인
+        use_pool = P.ModelSetting.get_bool('download_use_gdrive_pool')
+        remote_sa = (
             dest_cfg.get('mydrive_remote_name')
             or P.ModelSetting.get('download_gdrive_mydrive_remote_name')
-            or P.ModelSetting.get('download_rclone_remote_name')
             or rclone_cfg.get('mydrive_remote_name')
-            or rclone_cfg.get('remote_name', 'gdrive_sa')
+            or 'gdrive_sa'
         )
-        remote_shared = (
-            dest_cfg.get('shared_remote_name')
-            or P.ModelSetting.get('download_rclone_shared_remote_name')
-            or rclone_cfg.get('shared_remote_name', 'gdrive_shared')
+        target_drive_id = (
+            dest_cfg.get('shared_drive_id')
+            or item.gdrive_remote_id
+            or P.ModelSetting.get('download_shared_drive_id')
+            or rclone_cfg.get('shared_drive_id', '')
         )
 
-        # 공유 드라이브 ID 계층 판별: 프로필 설정 -> DB 기본 설정 -> YAML 설정
-        target_drive_id = dest_cfg.get('shared_drive_id') or item.gdrive_remote_id or P.ModelSetting.get('download_shared_drive_id') or rclone_cfg.get('shared_drive_id', '')
         if not target_drive_id:
             logger.error("[UploadUtil] 목적지 공유 드라이브 ID(shared_drive_id)가 설정되지 않았습니다.")
             item.status = 'failed'
@@ -453,7 +456,6 @@ class UploadUtil:
             db.session.commit()
             return False
 
-        # 최신 목적지 서브 경로 동적 갱신
         comp_path = (dest_cfg.get('complete_path') or item.gdrive_complete_path or 'uploads/default').strip('/')
         up_path = (dest_cfg.get('upload_path') or item.gdrive_upload_path or 'incoming/default').strip('/')
 
@@ -462,27 +464,26 @@ class UploadUtil:
             logger.info(f"[UploadUtil] 업로드 보류 ({reason}): {folder_name}")
             return False
 
-        acc_name = acc.get('username') if acc else 'Default_Shared'
-        usage_key = acc_name if mode == 'mydrive' else 'SHARED_DRIVE_UPLOAD'
-        use_impersonate = FeederUtil.resolve_setting(
-            'use_impersonate',
-            dest_cfg,
-            {},
-            P.ModelSetting.get_bool('download_gdrive_use_impersonate'),
-            False
-        )
-        use_impersonate = str(use_impersonate).lower() in ('true', 'on', '1')
+        acc_name = acc.get('username') if acc else 'Default_Account'
+        usage_key = acc_name
+        use_impersonate = P.ModelSetting.get_bool('download_gdrive_use_impersonate')
 
-        # 계정 락 영구 누수 방지를 위한 try-finally 보장 블록
+        # 계정 풀 미사용 시 기본 리모트 fallback, 계정 풀 사용 시 위임 여부에 따라 단일 리모트 확정
+        if not use_pool:
+            effective_remote = P.ModelSetting.get('download_rclone_upload_remote_name') or remote_sa
+            impersonate_arg = []
+        elif use_impersonate:
+            effective_remote = remote_sa
+            impersonate_arg = ["--drive-impersonate", acc_name]
+        else:
+            effective_remote = acc.get('remote_name') or remote_sa
+            impersonate_arg = []
+
         try:
             if mode == 'mydrive':
-                effective_remote = remote_net if use_impersonate else (acc.get('remote_name') or remote_net)
-                impersonate_arg = ["--drive-impersonate", acc_name] if use_impersonate else []
                 dest_incoming = f"{effective_remote}:{{{acc.get('mydrive_rclone_id')}}}/{up_path}/{folder_name}"
             else:
-                effective_remote = remote_shared
-                impersonate_arg = []
-                dest_incoming = f"{remote_shared}:{{{target_drive_id}}}/{up_path}/{folder_name}"
+                dest_incoming = f"{effective_remote}:{{{target_drive_id}}}/{up_path}/{folder_name}"
 
             clean_chk = ["rclone", "lsjson", dest_incoming, "--stat", "--config", rclone_conf] + impersonate_arg
             csuc, cout = cls.run_rclone(clean_chk, log_output=False, watchdog_timeout=None)
@@ -614,15 +615,15 @@ class UploadUtil:
                         time.sleep(retry_wait)
 
                 else:
-                    # 공유 드라이브 직행: 이미 공유 드라이브 임시에 업로드 완료 -> 곧바로 완료 부모폴더로 chpar 수행
-                    dst_parent = f"{remote_shared}:{{{target_drive_id}}}/{comp_path}"
-                    mkdir_cmd = ["rclone", "mkdir", dst_parent, "--config", rclone_conf]
+                    # 공유 드라이브 직행: 동일 드라이브 내 완료 부모폴더로 chpar 수행 (단일 effective_remote 유지)
+                    dst_parent = f"{effective_remote}:{{{target_drive_id}}}/{comp_path}"
+                    mkdir_cmd = ["rclone", "mkdir", dst_parent, "--config", rclone_conf] + impersonate_arg
                     cls.run_rclone(mkdir_cmd, log_output=False, watchdog_timeout=None)
 
                     move_cmd = [
                         "rclone", "backend", "chpar", dest_incoming, dst_parent,
                         "--config", rclone_conf, "--log-level", "NOTICE"
-                    ]
+                    ] + impersonate_arg
                     move_success, _ = cls.run_rclone(
                         move_cmd,
                         f"원자적 부모폴더 변경(chpar) {folder_name}",

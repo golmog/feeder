@@ -540,7 +540,8 @@ function render_crawlers(data) {
     str += '  <td class="font-weight-bold">' + item.id + '</td>';
     str += '  <td class="text-left"><strong>' + item.site + '</strong><br>' + boardsHtml + '</td>';
     str += '  <td class="text-left small" style="line-height: 1.6;">';
-    str += '    상태: ' + (isEnabled ? '<span class="text-success font-weight-bold">활성</span>' : '<span class="text-muted">중지</span>') + ' / ' + (item.interval || 1) + '회당 1회<br>';
+    var maxPageDisplay = item.max_page ? ' (최대 ' + item.max_page + 'p)' : '';
+    str += '    상태: ' + (isEnabled ? '<span class="text-success font-weight-bold">활성</span>' : '<span class="text-muted">중지</span>') + ' / ' + (item.interval || 1) + '회당 1회' + maxPageDisplay + '<br>';
     str += '    Proxy: ' + proxyDisplay + ' | Flare: ' + (isFlare ? '<span class="text-danger">ON</span>' : '<span class="text-muted">OFF</span>') + '<br>';
     str += '    Selenium: ' + (isSelenium ? '<span class="text-info">ON</span>' : '<span class="text-muted">OFF</span>') + ' | TorInfo: ' + (isTorrentInfo ? '<span class="text-primary">ON</span>' : '<span class="text-muted">OFF</span>');
     str += '  </td>';
@@ -720,6 +721,7 @@ $(document).on('click', '#crawler_add_btn', function (e) {
   $('#modal_crawler_board_input').val('');
   $('#modal_crawler_subcat_input').val('');
   $('#crawler_interval').val('1');
+  $('#crawler_max_page').val('');
   $('#crawler_delay').val('');
   $('#crawler_max_retries').val('');
   $('#crawler_proxy_url').val('');
@@ -756,6 +758,7 @@ $(document).on('click', '.crawler_edit_btn', function (e) {
   $('#modal_crawler_board_input').val('');
   $('#modal_crawler_subcat_input').val('');
   $('#crawler_interval').val(item.interval || 1);
+  $('#crawler_max_page').val(item.max_page !== undefined && item.max_page !== null ? item.max_page : '');
   $('#crawler_delay').val(item.delay !== undefined && item.delay !== null ? item.delay : '');
   $('#crawler_max_retries').val(item.max_retries !== undefined && item.max_retries !== null ? item.max_retries : '');
   $('#crawler_proxy_url').val(item.proxy_url || '');

@@ -3,6 +3,7 @@ import traceback
 
 from .setup import *
 from .util_feed import FeedUtil
+from .util_base import FeederUtil
 
 
 class TaskFeedBase:
@@ -37,3 +38,4 @@ class TaskFeed:
                     db.session.remove()
                 except Exception:
                     pass
+                FeederUtil.db_checkpoint()
