@@ -148,6 +148,10 @@ function init_sse_listener() {
           $('#stat_failed').text(data.counts.failed || 0);
         }
 
+        if (data && data.total_download_24h !== undefined) {
+          $('#queue_daily_download_badge').html('<i class="fa fa-check-circle mr-1"></i>24시간 완료: ' + format_bytes(data.total_download_24h));
+        }
+
         if (data && data.total_upload_24h !== undefined) {
           $('#queue_daily_upload_badge').html('<i class="fa fa-cloud-upload mr-1"></i>24시간 업로드: ' + format_bytes(data.total_upload_24h));
         }
@@ -330,7 +334,15 @@ function render_queue_rows(list) {
     else if (it.status === 'pending_local_staging' || it.status === 'local_staging') statusBadge = '<span class="badge badge-info">로컬 스테이징</span>';
     else if (it.status === 'pending_relay') statusBadge = '<span class="badge badge-warning">원격 릴레이 대기</span>';
     else if (it.status === 'relay_transferring') statusBadge = '<span class="badge badge-primary">원격 릴레이 전송 중</span>';
-    else if (it.status === 'downloaded') statusBadge = '<span class="badge badge-success">다운로드 완료 (업로드 대기)</span>';
+    else if (it.status === 'downloaded') {
+      if (it.destination_type === 'local') {
+        statusBadge = '<span class="badge badge-success">다운로드 완료 (이동 대기)</span>';
+      } else if (it.destination_type === 'rclone_simple') {
+        statusBadge = '<span class="badge badge-primary">다운로드 완료 (Rclone 대기)</span>';
+      } else {
+        statusBadge = '<span class="badge badge-success">다운로드 완료 (업로드 대기)</span>';
+      }
+    }
     else if (it.status === 'engine_unmanaged' || it.status === 'ad_unmanaged') {
       var engBadgeName = it.current_engine_name || it.feed_name || '엔진';
       statusBadge = '<span class="badge badge-secondary">' + engBadgeName + ' 미등록 (잔여)</span>';
@@ -414,10 +426,11 @@ function render_queue_rows(list) {
       var dlBytesStr = it.downloaded_bytes ? format_bytes(it.downloaded_bytes) : '0 B';
       var totalBytesStr = it.file_size ? format_bytes(it.file_size) : '확인 중';
       var etaStr = it.eta ? ' (ETA: ' + it.eta + ')' : '';
+      var uploadTargetTitle = (it.destination_type === 'rclone_simple') ? 'Rclone 전송' : 'Google Drive 업로드';
 
       detailHtml += '<div class="mt-1 p-1 px-2 rounded" style="background: rgba(40, 167, 69, 0.08); border: 1px solid rgba(40, 167, 69, 0.25);">';
       detailHtml += '  <div class="d-flex justify-content-between align-items-center mb-1 small font-weight-bold">';
-      detailHtml += '    <span class="text-success" style="font-size: 0.82rem;"><i class="fa fa-cloud-upload fa-spin mr-1"></i>Google Drive 업로드: ' + progVal + '% (' + dlBytesStr + ' / ' + totalBytesStr + ')' + etaStr + '</span>';
+      detailHtml += '    <span class="text-success" style="font-size: 0.82rem;"><i class="fa fa-cloud-upload fa-spin mr-1"></i>' + uploadTargetTitle + ': ' + progVal + '% (' + dlBytesStr + ' / ' + totalBytesStr + ')' + etaStr + '</span>';
       detailHtml += '    <span class="badge badge-success"><i class="fa fa-tachometer mr-1"></i>' + speedStr + '</span>';
       detailHtml += '  </div>';
       detailHtml += '  <div class="progress" style="height: 12px; background-color: rgba(255, 255, 255, 0.15); border-radius: 3px;">';
@@ -427,9 +440,19 @@ function render_queue_rows(list) {
     } else if (it.status === 'pending_local_staging') {
       detailHtml += '<div class="mt-1 small text-info font-weight-bold"><i class="fa fa-clock-o mr-1"></i>로컬 스테이징 대기 중...</div>';
     } else if (it.status === 'downloaded') {
-      detailHtml += '<div class="mt-1 small text-success font-weight-bold"><i class="fa fa-check-circle-o mr-1"></i>로컬 다운로드 완료 (Google Drive 업로드 대기 중...)</div>';
+      if (it.destination_type === 'local') {
+        detailHtml += '<div class="mt-1 small text-success font-weight-bold"><i class="fa fa-check-circle-o mr-1"></i>다운로드 완료 (단순 경로 이동 대기 중...)</div>';
+      } else if (it.destination_type === 'rclone_simple') {
+        detailHtml += '<div class="mt-1 small text-primary font-weight-bold"><i class="fa fa-clock-o mr-1"></i>다운로드 완료 (Rclone 전송 대기 중...)</div>';
+      } else {
+        detailHtml += '<div class="mt-1 small text-success font-weight-bold"><i class="fa fa-check-circle-o mr-1"></i>로컬 다운로드 완료 (Google Drive 업로드 대기 중...)</div>';
+      }
     } else if (it.status === 'pending_upload') {
-      detailHtml += '<div class="mt-1 small text-primary font-weight-bold"><i class="fa fa-clock-o mr-1"></i>Google Drive 업로드 대기 중...</div>';
+      if (it.destination_type === 'rclone_simple') {
+        detailHtml += '<div class="mt-1 small text-primary font-weight-bold"><i class="fa fa-clock-o mr-1"></i>Rclone 업로드 대기 중...</div>';
+      } else {
+        detailHtml += '<div class="mt-1 small text-primary font-weight-bold"><i class="fa fa-clock-o mr-1"></i>Google Drive 업로드 대기 중...</div>';
+      }
     } else if (it.status === 'relay_transferring') {
       detailHtml += '<div class="mt-1 small text-primary font-weight-bold"><i class="fa fa-cloud-upload fa-spin mr-1"></i>원격 릴레이 전송 진행 중...</div>';
     } else if (it.status === 'engine_unmanaged' || it.status === 'ad_unmanaged') {

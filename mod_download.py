@@ -862,6 +862,7 @@ class ModuleDownload(PluginModuleBase):
         engine_tasks_cache = []
         last_stat_calc_time = 0
         cached_24h_upload_bytes = 0
+        cached_24h_download_bytes = 0
         while True:
             try:
                 with F.app.app_context():
@@ -870,11 +871,20 @@ class ModuleDownload(PluginModuleBase):
                     if now_ts - last_stat_calc_time > 30:
                         last_stat_calc_time = now_ts
                         cutoff_ts = int(now_ts) - 86400
+                        cutoff_dt = datetime.now() - timedelta(hours=24)
+
                         total_res = db.session.query(func.sum(ModelDownloadStat.stat_value)).filter(
                             ModelDownloadStat.stat_type == 'gdrive_usage',
                             ModelDownloadStat.timestamp > cutoff_ts
                         ).scalar()
                         cached_24h_upload_bytes = int(total_res) if total_res else 0
+
+                        # CD2/로컬 완료를 포함한 24시간 총 완료 토렌트 용량 계산
+                        total_dl_res = db.session.query(func.sum(ModelDownload.file_size)).filter(
+                            ModelDownload.status == 'completed',
+                            ModelDownload.completed_time >= cutoff_dt
+                        ).scalar()
+                        cached_24h_download_bytes = int(total_dl_res) if total_dl_res else 0
 
                     counts = {
                         'pending': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending', 'pending_relay'])).count(),
@@ -1009,6 +1019,7 @@ class ModuleDownload(PluginModuleBase):
                         'timestamp': int(time.time()),
                         'counts': counts,
                         'total_upload_24h': cached_24h_upload_bytes,
+                        'total_download_24h': cached_24h_download_bytes,
                         'active_list': active_list
                     })
                     yield f"data: {data_str}\n\n"

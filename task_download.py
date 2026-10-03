@@ -316,10 +316,18 @@ class TaskDownload:
             if not profile:
                 continue
 
-            dest_cfg = FeederUtil.get_profile_destination(profile, item.current_engine_name)
+            # 현재 실행 중인 엔진 또는 현재 우선순위 체인 순번의 엔진 결정
+            effective_engine = item.current_engine_name
+            if not effective_engine and item.priority_chain:
+                chain_idx = item.current_engine_index or 0
+                if chain_idx < len(item.priority_chain):
+                    effective_engine = item.priority_chain[chain_idx]
+
+            # 기본 목적지보다 엔진별 지정 목적지(destination_by_engine)를 최우선 적용
+            dest_cfg = FeederUtil.get_profile_destination(profile, effective_engine)
             current_dest_type = dest_cfg.get('type', 'local')
             current_chain = profile.get('priority_chain', [])
-            engine_cfg = FeederUtil.get_downloader_by_name(item.current_engine_name) or {}
+            engine_cfg = FeederUtil.get_downloader_by_name(effective_engine) or {}
 
             # 우선순위 체인 동적 동기화
             if item.status == 'pending' and current_chain and item.priority_chain != current_chain:
@@ -548,6 +556,15 @@ class TaskDownload:
                     item.engine_added_time = datetime.now()
                     item.last_status_time = datetime.now()
                     item.error_message = None
+
+                    # 할당된 엔진의 개별 목적지 설정 즉시 반영
+                    profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
+                    dest_cfg = FeederUtil.get_profile_destination(profile, engine_name)
+                    item.destination_type = dest_cfg.get('type', 'local')
+                    item.gdrive_upload_path = dest_cfg.get('upload_path', '')
+                    item.gdrive_complete_path = dest_cfg.get('complete_path', '')
+                    item.gdrive_remote_id = dest_cfg.get('shared_drive_id') or ''
+
                     engine_in_progress_counts[engine_name] = current_count + 1
                     db.session.commit()
                 continue
@@ -584,6 +601,14 @@ class TaskDownload:
                 item.engine_added_time = datetime.now()
                 item.last_status_time = datetime.now()
                 item.error_message = None
+                
+                # 할당된 엔진의 개별 목적지 설정 즉시 반영
+                dest_cfg = FeederUtil.get_profile_destination(profile, engine_name)
+                item.destination_type = dest_cfg.get('type', 'local')
+                item.gdrive_upload_path = dest_cfg.get('upload_path', '')
+                item.gdrive_complete_path = dest_cfg.get('complete_path', '')
+                item.gdrive_remote_id = dest_cfg.get('shared_drive_id') or ''
+
                 engine_in_progress_counts[engine_name] = current_count + 1
 
                 db.session.commit()
@@ -603,6 +628,13 @@ class TaskDownload:
                     item.current_engine_index = curr_idx + 1
                     item.status = 'pending'
                     item.engine_task_id = None
+                    
+                    # 차순위 엔진이 존재하면 해당 엔진의 목적지 설정으로 선제 동기화
+                    if curr_idx + 1 < len(chain):
+                        next_engine = chain[curr_idx + 1]
+                        next_dest_cfg = FeederUtil.get_profile_destination(profile, next_engine)
+                        item.destination_type = next_dest_cfg.get('type', 'local')
+
                     item.error_message = f"[{engine_name}] 추가 실패 ({err_str}) -> 다음 엔진 폴백"
                     db.session.commit()
                     logger.warning(f"[DownloadDispatch] [{engine_name}] 마그넷 추가 불가 ({err_str}) -> 다음 엔진 폴백: {snapshot['title']}")
