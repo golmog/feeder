@@ -54,8 +54,8 @@ class TaskDownload:
 
         owner = uuid.uuid4().hex
         db_lock_acquired = False
-        try:
-            with F.app.app_context():
+        with F.app.app_context():
+            try:
                 FeederUtil.init_runtime_locks()
                 db_lock_acquired = FeederUtil.acquire_runtime_lock('download_pipeline', owner)
                 if not db_lock_acquired:
@@ -64,15 +64,14 @@ class TaskDownload:
                 P.ModelSetting.set('download_is_running', 'True')
                 P.ModelSetting.set('download_running_start_time', str(int(time.time())))
 
-            TaskDownload._run_pipeline_locked(manual=manual)
-        finally:
-            if db_lock_acquired:
-                with F.app.app_context():
+                TaskDownload._run_pipeline_locked(manual=manual)
+            finally:
+                if db_lock_acquired:
                     FeederUtil.release_runtime_lock('download_pipeline', owner)
                     P.ModelSetting.set('download_is_running', 'False')
                     P.ModelSetting.set('download_running_start_time', '0')
-            TaskDownload._run_mutex.release()
-            FeederUtil.db_checkpoint()
+                TaskDownload._run_mutex.release()
+                FeederUtil.db_checkpoint()
 
     @staticmethod
     def _run_pipeline_locked(manual: bool = False):
