@@ -46,6 +46,60 @@ class UploadUtil:
             size /= 1024.0
         return f"{size:.2f} {unit}"
 
+    @classmethod
+    def _get_pid_file(cls, item_id) -> str:
+        pids_dir = FeederUtil.get_tmp_dir('pids')
+        return os.path.join(pids_dir, f"rclone_{item_id}.pid")
+
+    @classmethod
+    def register_rclone_pid(cls, item_id, pid: int):
+        if not item_id:
+            return
+        try:
+            pid_file = cls._get_pid_file(item_id)
+            with open(pid_file, 'w', encoding='utf-8') as f:
+                f.write(str(pid))
+        except Exception:
+            pass
+
+    @classmethod
+    def unregister_rclone_pid(cls, item_id):
+        if not item_id:
+            return
+        try:
+            pid_file = cls._get_pid_file(item_id)
+            if os.path.exists(pid_file):
+                os.remove(pid_file)
+        except Exception:
+            pass
+
+    @classmethod
+    def kill_item_rclone(cls, item_id):
+        """특정 작업의 백그라운드 Rclone 프로세스를 즉시 강제 종료"""
+        if not item_id:
+            return
+        pid_file = cls._get_pid_file(item_id)
+        if not os.path.exists(pid_file):
+            return
+        try:
+            with open(pid_file, 'r', encoding='utf-8') as f:
+                pid_str = f.read().strip()
+            if pid_str.isdigit():
+                pid = int(pid_str)
+                import signal
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    time.sleep(0.5)
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception as ex:
+                    logger.debug(f"[UploadUtil] 프로세스 종료 예외: {ex}")
+                logger.info(f"[UploadUtil] 중단된 작업({item_id})의 Rclone 프로세스(PID: {pid}) 강제 종료 완료")
+        finally:
+            cls.unregister_rclone_pid(item_id)
+            FeederUtil.clear_rclone_progress(item_id)
+
     @staticmethod
     def run_rclone(cmd: list[str], description: str = "", log_output: bool = True, item_id=None, file_size=None, watchdog_timeout: int = None) -> tuple[bool, str]:
         """Rclone 서브프로세스 실행 및 실시간 출력/전송률 캡처"""
@@ -64,6 +118,9 @@ class UploadUtil:
                 encoding='utf-8',
                 env=env
             )
+
+            if item_id:
+                UploadUtil.register_rclone_pid(item_id, proc.pid)
 
             # 무전송 감시 타이머 (로컬 스테이징 등 지정된 경우에만 가동, 대용량 업로드 해싱 지연 보호)
             transfer_started = threading.Event()
@@ -158,6 +215,7 @@ class UploadUtil:
             return False, str(ex)
         finally:
             if item_id:
+                UploadUtil.unregister_rclone_pid(item_id)
                 FeederUtil.report_rclone_progress(item_id, {}, action='clear')
 
     @classmethod

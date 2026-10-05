@@ -191,10 +191,11 @@ class TaskCrawl:
 
                         target_cfg.subcat_id = subcat_id
 
+                        board_tag = f"{site_name}: {full_board_key}"
                         if always_max_page:
-                            logger.info(f"[TaskCrawl] [{site_name}] {full_board_key} [{mode_label}]: 항상 최대 페이지 탐색 (최대 {max_page}p 전체 탐색, 기수집건 스킵)")
+                            logger.info(f"[TaskCrawl] [{board_tag}] [{mode_label}]: 항상 최대 페이지 탐색 (최대 {max_page}p 전체 탐색, 기수집건 스킵)")
                         else:
-                            logger.info(f"[TaskCrawl] [{site_name}] {full_board_key} [{mode_label}]: 증분 탐색 (최근 수집 ID: {max_id})")
+                            logger.info(f"[TaskCrawl] [{board_tag}] [{mode_label}]: 증분 탐색 (최근 수집 ID: {max_id})")
 
                         try:
                             crawled = TaskCrawl.execute_board_crawl(
@@ -213,9 +214,9 @@ class TaskCrawl:
 
                             if crawled:
                                 total_crawled_count += len(crawled)
-                                logger.info(f"[TaskCrawl] [{site_name}] {full_board_key}: {len(crawled)}개 항목 수집 완료")
+                                logger.info(f"[TaskCrawl] [{board_tag}]: {len(crawled)}개 항목 수집 완료")
                         except Exception as board_err:
-                            logger.error(f"[TaskCrawl] [{site_name}] {full_board_key} 수집 중 오류: {board_err}")
+                            logger.error(f"[TaskCrawl] [{board_tag}] 수집 중 오류: {board_err}")
                             logger.error(traceback.format_exc())
                         finally:
                             CrawlUtil.close_sessions()
@@ -262,6 +263,7 @@ class TaskCrawl:
         site_name = site_info.get('NAME', '')
         subcat_param = getattr(target_cfg, 'subcat_id', None) if target_cfg else None
         board_id, subcat_id, full_board_key = TaskCrawl.parse_board_info(board, subcat_param)
+        log_tag = f"{site_name}: {full_board_key}"
 
         xpath_dict = site_info.get('XPATH_LIST_TAG', {})
         if 'BOARD_LIST' in site_info:
@@ -322,7 +324,7 @@ class TaskCrawl:
                     hook.on_init_session(site_info, target_cfg)
 
             if getattr(target_cfg, 'use_selenium', False) and CrawlUtil._selenium_driver is None:
-                logger.error(f"[TaskCrawl] [{site_name}] 세션 생성 실패로 게시판({full_board_key}) 수집을 시작할 수 없습니다.")
+                logger.error(f"[TaskCrawl] [{log_tag}] 세션 생성 실패로 게시판 수집을 시작할 수 없습니다.")
                 return None
 
             for cur_page in range(1, target_pages + 1):
@@ -330,13 +332,13 @@ class TaskCrawl:
                     time.sleep(crawl_delay)
 
                 board_url = TaskCrawl.build_board_url(site_info, board_id, cur_page, subcat=subcat_id)
-                logger.info(f"[TaskCrawl] [{cur_page}/{target_pages}p] 게시판 목록 URL 요청 시작: {board_url}")
+                logger.info(f"[TaskCrawl] [{log_tag}] [{cur_page}/{target_pages}p] 게시판 목록 URL 요청 시작: {board_url}")
 
                 list_wait_tag = site_info.get('SELENIUM_WAIT_TAG', 'body')
                 html_source = CrawlUtil.get_html(board_url, site_info=site_info, scheduler_instance=target_cfg, wait_tag=list_wait_tag)
 
                 if not html_source:
-                    logger.warning(f"[TaskCrawl] 게시판 HTML 수신 실패: {board_url}")
+                    logger.warning(f"[TaskCrawl] [{log_tag}] 게시판 HTML 수신 실패: {board_url}")
                     break
 
                 tree = html.fromstring(html_source)
@@ -382,13 +384,13 @@ class TaskCrawl:
 
                         raw_list.append({'id': post_id, 'title': title, 'url': detail_url})
                     except Exception as e:
-                        logger.error(f"[TaskCrawl] [{site_name}] 목록 행 파싱 예외 (인덱스 {i}): {e}")
+                        logger.error(f"[TaskCrawl] [{log_tag}] 목록 행 파싱 예외 (인덱스 {i}): {e}")
 
                 if not raw_list:
                     break
 
                 total_targets = min(len(raw_list), max_count) if (is_test and max_count > 0) else len(raw_list)
-                logger.info(f"[TaskCrawl] [{site_name}] 상세 페이지 파싱 대상: {total_targets}개")
+                logger.info(f"[TaskCrawl] [{log_tag}] 상세 페이지 파싱 대상: {total_targets}개")
 
                 detail_count = 0
                 for idx, item in enumerate(raw_list):
@@ -405,7 +407,7 @@ class TaskCrawl:
                     if not is_test and max_id > 0 and post_id:
                         try:
                             if int(post_id) <= max_id:
-                                logger.info(f"[TaskCrawl] 기존 수집 완료 지점(ID: {max_id}) 도달 -> 수집 종료")
+                                logger.info(f"[TaskCrawl] [{log_tag}] 기존 수집 완료 지점(ID: {max_id}) 도달 -> 수집 종료")
                                 stop_crawl = True
                                 break
                         except Exception:
@@ -415,13 +417,13 @@ class TaskCrawl:
                         existing = ModelCrawlItem.get(site=site_name, board=full_board_key, post_id=int(post_id)) if str(post_id).isdigit() else ModelCrawlItem.get(site=site_name, board=full_board_key, post_char_id=str(post_id))
                         db.session.rollback()
                         if existing:
-                            logger.debug(f"[TaskCrawl] 이미 수집 완료된 게시물 건너뜀: [{site_name}] {item['title'][:30]} (ID: {post_id})")
+                            logger.debug(f"[TaskCrawl] [{log_tag}] 이미 수집 완료된 게시물 건너뜀: {item['title'][:30]} (ID: {post_id})")
                             continue
 
                     if crawl_delay > 0:
                         time.sleep(crawl_delay)
 
-                    logger.info(f"[TaskCrawl] [{cur_page}p - {idx+1}/{total_targets}] 상세 수집: ID={item['id']} / {item['title'][:35]}...")
+                    logger.info(f"[TaskCrawl] [{log_tag}] [{cur_page}p - {idx+1}/{total_targets}] 상세 수집: ID={item['id']} / {item['title'][:35]}...")
                     detail_wait_tag = site_info.get('SELENIUM_DETAIL_WAIT_TAG', 'body')
                     detail_html = CrawlUtil.get_html(item['url'], site_info=site_info, scheduler_instance=target_cfg, referer=board_url, wait_tag=detail_wait_tag)
 
@@ -463,7 +465,7 @@ class TaskCrawl:
                         duplicate_magnet = ModelCrawlItem.is_exist_magnet(item['magnet'])
                         db.session.rollback()
                         if duplicate_magnet:
-                            logger.info(f"[TaskCrawl] 중복 마그넷이므로 수집 제외: {item['title'][:35]}...")
+                            logger.info(f"[TaskCrawl] [{log_tag}] 중복 마그넷이므로 수집 제외: {item['title'][:35]}...")
                             continue
 
                     # 수집 원본 DB 저장 (마그넷/파일이 있거나, 로그인 필요 상태인 경우)
@@ -619,10 +621,11 @@ class TaskCrawl:
 
             db.session.add(bbs)
             db.session.commit()
+            log_tag = f"{site_name}: {board_name}"
             if bbs.broadcast_status == 'LOGIN_REQUIRED':
-                logger.info(f"[TaskCrawl] DB 저장 완료 (로그인 필요 건너뜀 기록): [{site_name}] {bbs.title[:30]}... (ID: {post_id})")
+                logger.info(f"[TaskCrawl] DB 저장 완료 (로그인 필요 건너뜀 기록): [{log_tag}] {bbs.title[:30]}... (ID: {post_id})")
             else:
-                logger.info(f"[TaskCrawl] DB 저장 완료: [{site_name}] {bbs.title[:30]}... (ID: {post_id})")
+                logger.info(f"[TaskCrawl] DB 저장 완료: [{log_tag}] {bbs.title[:30]}... (ID: {post_id})")
             return bbs
         except Exception as e:
             logger.error(f"[TaskCrawl] 단일 항목 DB 저장 오류: {e}")

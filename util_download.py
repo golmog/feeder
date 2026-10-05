@@ -71,6 +71,16 @@ class BaseDownloadEngine:
     def delete_task(self, task_id: str) -> bool:
         raise NotImplementedError
 
+    def delete_tasks(self, task_ids: list[str]) -> bool:
+        """여러 작업을 일괄 삭제 (기본 구현: delete_task 순회 호출)"""
+        if not task_ids:
+            return True
+        success = True
+        for tid in task_ids:
+            if not self.delete_task(tid):
+                success = False
+        return success
+
     def restart_task(self, task_id: str) -> bool:
         return False
 
@@ -133,7 +143,8 @@ class QBittorrentEngine(BaseDownloadEngine):
             logger.debug(f"[QBittorrentEngine] 로그인 예외: {e}")
         return None
 
-    def add_magnet(self, link: str, title: str = None) -> tuple[bool, str, str]:
+    def add_magnet(self, link: str, title: str = None, upload_path: str = None) -> tuple[bool, str, str]:
+        """qBittorrent에 마그넷 등록 (동적 하위 저장 경로 지원)"""
         s = self._get_session()
         if not s:
             return False, "", "qBittorrent 로그인 실패"
@@ -146,8 +157,18 @@ class QBittorrentEngine(BaseDownloadEngine):
             'category': self.category,
             'autoTMM': 'false'
         }
-        if self.save_path:
-            payload['savepath'] = self.save_path
+
+        # 기본 저장 경로와 프로필 지정 하위 수신/완료 경로 결합
+        effective_save_path = self.save_path
+        if upload_path and str(upload_path).strip():
+            clean_sub = str(upload_path).strip().strip('/\\')
+            if effective_save_path:
+                effective_save_path = os.path.join(effective_save_path, clean_sub)
+            else:
+                effective_save_path = clean_sub
+
+        if effective_save_path:
+            payload['savepath'] = effective_save_path
 
         info_hash = FeederUtil.extract_info_hash(link)
 
@@ -155,7 +176,7 @@ class QBittorrentEngine(BaseDownloadEngine):
             res = s.post(add_url, data=payload, timeout=15)
             if res.status_code in [200, 204]:
                 task_id = info_hash or link[:40]
-                logger.info(f"[QBittorrentEngine] 작업 추가 성공: {task_id} ({title or link[:30]})")
+                logger.info(f"[QBittorrentEngine] 작업 추가 성공: {task_id} ({title or link[:30]}) -> 저장경로: {effective_save_path or '기본'}")
                 return True, task_id, ""
             return False, "", f"추가 실패: HTTP {res.status_code}"
         except Exception as e:
@@ -242,10 +263,8 @@ class CloudDrive2Engine(BaseDownloadEngine):
         {"name": "cd2_addr", "label": "CD2 주소", "type": "text", "default": "127.0.0.1", "required": True},
         {"name": "cd2_port", "label": "CD2 포트 (gRPC)", "type": "number", "default": 19798},
         {"name": "cd2_token", "label": "CD2 인증 토큰", "type": "password", "placeholder": "CloudDrive2 JWT 토큰"},
-# [추가/수정 코드 시작]
-        {"name": "cd2_virtual_path", "label": "마그넷 저장 기본 경로 루트", "type": "text", "default": "115open/云下载", "desc": "오프라인 다운로드가 저장될 CD2 내부 가상 기본 경로 루트"},
-        {"name": "cd2_mount_path", "label": "CD2 로컬 마운트 경로 루트", "type": "text", "placeholder": "예: /mnt/cd2/115open/云下载", "desc": "로컬 파일시스템에 마운트된 실제 기본 디렉터리 경로 루트"},
-# [추가/수정 코드 끝]
+        {"name": "cd2_mount_path", "label": "CD2 로컬 마운트 경로", "type": "text", "placeholder": "예: /mnt/cd2", "desc": "로컬 시스템에 CD2가 마운트된 FUSE 루트 디렉터리 (예: /mnt/cd2)"},
+        {"name": "cd2_virtual_path", "label": "마그넷 저장 가상 경로", "type": "text", "default": "115open/云下载", "placeholder": "예: 115open/云下载", "desc": "CD2 내부에서 오프라인 다운로드가 저장될 클라우드 상대 경로. 로컬 실물 탐색 시 [마운트 경로] + [가상 경로]가 자동 결합됩니다."},
         {"name": "use_local_staging", "label": "로컬 스테이징 기본 사용", "type": "checkbox", "default": False, "desc": "CD2 마운트는 기본적으로 직접 전송합니다. 다운로드 프로필에서 명시하면 프로필 설정이 우선합니다."},
         {"name": "cd2_max_pages", "label": "작업 목록 최대 탐색 페이지 수", "type": "number", "default": 1, "desc": "오프라인 작업 목록 조회 시 최대 탐색할 페이지 수 (기본값: 1페이지)"},
         {"name": "cd2_timeout", "label": "gRPC 타임아웃 (초)", "type": "number", "default": 30, "desc": "gRPC 요청 제한 시간(초) (기본값: 30초)"},
@@ -257,8 +276,9 @@ class CloudDrive2Engine(BaseDownloadEngine):
         self.addr = self.config.get('cd2_addr', '127.0.0.1')
         self.port = int(self.config.get('cd2_port', 19798))
         self.token = self.config.get('cd2_token', '').strip()
-        self.vpath = "/" + self.config.get('cd2_virtual_path', '115open/云下载').strip("/")
-        self.mount_path = self.config.get('cd2_mount_path', '').strip()
+        raw_vpath = str(self.config.get('cd2_virtual_path') or '').strip()
+        self.vpath = ("/" + raw_vpath.strip('/')) if raw_vpath else ""
+        self.mount_path = str(self.config.get('cd2_mount_path') or '').strip().rstrip('/\\')
 
         try:
             self.max_pages = int(self.config.get('cd2_max_pages') or 1)
@@ -268,35 +288,65 @@ class CloudDrive2Engine(BaseDownloadEngine):
             self.grpc_timeout = int(self.config.get('cd2_timeout') or 30)
         except Exception:
             self.grpc_timeout = 30
-        self._last_refresh_time = 0
+
+    def get_local_mount_path(self) -> str:
+        """로컬 파일시스템에서 마그넷 다운로드 폴더의 실제 절대 경로 반환 (자동 결합)"""
+        if not self.mount_path:
+            return ''
+        if not self.vpath:
+            return self.mount_path
+        rel_vpath = self.vpath.strip('/')
+        if self.mount_path.replace('\\', '/').endswith(rel_vpath):
+            return self.mount_path
+        return os.path.join(self.mount_path, rel_vpath)
 
     def _get_grpc_stub(self):
-        """gRPC 채널 및 스텁 생성"""
+        """gRPC 채널 재사용 및 스텁 생성 (소켓 낭비 방지)"""
         if not CD2_GRPC_AVAILABLE or not CloudDrive_pb2_grpc:
             return None, None
-        channel = grpc.insecure_channel(f"{self.addr}:{self.port}")
-        stub = CloudDrive_pb2_grpc.CloudDriveFileSrvStub(channel)
+        if not hasattr(self, '_channel') or self._channel is None:
+            self._channel = grpc.insecure_channel(f"{self.addr}:{self.port}")
+            self._stub = CloudDrive_pb2_grpc.CloudDriveFileSrvStub(self._channel)
         metadata = [('authorization', f"Bearer {self.token}")] if self.token else []
-        return stub, metadata
+        return self._stub, metadata
 
-    def refresh_cache(self, min_interval_sec: int = 300):
-        """클라우드 새 파일 반영을 위한 CD2 가상경로 캐시 갱신 (지나친 반복 방지를 위해 최소 5분 쿨다운 적용)"""
-        now = time.time()
-        if now - self._last_refresh_time < min_interval_sec:
-            return
-
+    def refresh_cache(self, path: str = None) -> list[str]:
+        """CD2 가상경로 디렉터리 캐시 갱신"""
         stub, metadata = self._get_grpc_stub()
         if not stub:
-            return
+            return []
+
+        target_path = "/" + (path or self.vpath or '').strip().strip('/')
+        # 대상 경로가 비어있거나 전체 루트('/')인 경우 CD2 전체 동기화 방지를 위해 스킵
+        if not target_path or target_path == "/":
+            return []
+
+        timeout_sec = min(20, max(10, self.grpc_timeout))
+        found_subfiles = []
 
         try:
-            self._last_refresh_time = now
-            req = CloudDrive_pb2.ListSubFileRequest(path=self.vpath, forceRefresh=True)
-            for _ in stub.GetSubFiles(req, metadata=metadata, timeout=self.grpc_timeout):
-                pass
-            logger.debug(f"[CloudDrive2Engine] CD2 가상 경로 캐시 강제 갱신 완료: {self.vpath}")
+            req = CloudDrive_pb2.ListSubFileRequest(path=target_path, forceRefresh=True)
+            response_stream = stub.GetSubFiles(req, metadata=metadata, timeout=timeout_sec)
+
+            for response in response_stream:
+                if hasattr(response, 'subFiles') and response.subFiles:
+                    for item in response.subFiles:
+                        fname = getattr(item, 'name', None)
+                        if fname:
+                            found_subfiles.append(fname)
+
+            if not found_subfiles:
+                logger.warning(f"[CloudDrive2Engine] CD2 조회 결과가 비어 있습니다: {target_path}")
+            else:
+                logger.info(f"[CloudDrive2Engine] CD2 캐시 갱신 완료: {target_path} (총 {len(found_subfiles)}개 요소 발견)")
+            return found_subfiles
+
+        except grpc.RpcError as e:
+            logger.warning(f"[CloudDrive2Engine] CD2 gRPC 갱신 실패/타임아웃 ({timeout_sec}s): 코드={e.code()} | 상세={e.details()}")
+            return []
         except Exception as e:
-            logger.debug(f"[CloudDrive2Engine] CD2 캐시 갱신 예외 ({self.grpc_timeout}s 타임아웃): {e}")
+            logger.error(f"[CloudDrive2Engine] CD2 처리 중 예외: {e}")
+            return []
 
     def add_magnet(self, link: str, title: str = None, upload_path: str = None) -> tuple[bool, str, str]:
         """CD2 gRPC를 통한 오프라인 다운로드 추가 (수신 경로 하위 폴더 자동 생성 및 결합)"""
@@ -321,14 +371,16 @@ class CloudDrive2Engine(BaseDownloadEngine):
             req = CloudDrive_pb2.AddOfflineFileRequest(urls=link, toFolder=target_vpath)
             res = stub.AddOfflineFiles(req, metadata=metadata, timeout=20)
 
+            info_hash = FeederUtil.extract_info_hash(link)
+            task_id = info_hash or link[:40]
+
             if hasattr(res, 'success') and not res.success:
                 err_msg = getattr(res, 'errorMessage', 'API Task Add Failed')
                 if "10008" in err_msg or "任务已存在" in err_msg:
                     logger.info(f"[CloudDrive2Engine] CD2에 이미 존재하는 작업입니다 (정상 수용): {title or link[:30]}")
-                    return True, link[:40], ""
+                    return True, task_id, ""
                 return False, "", f"CD2 작업 추가 실패: {err_msg}"
 
-            task_id = link[:40]
             logger.info(f"[CloudDrive2Engine] CD2 작업 추가 성공: {title or link[:30]}")
             return True, task_id, ""
 
@@ -356,30 +408,64 @@ class CloudDrive2Engine(BaseDownloadEngine):
                     if not res.offlineFiles:
                         break
 
+                    def _get_pb_attr(pb_obj, *attr_names, default=None):
+                        for name in attr_names:
+                            if hasattr(pb_obj, name):
+                                val = getattr(pb_obj, name)
+                                if val is not None:
+                                    return val
+                        return default
+
                     for t in res.offlineFiles:
-                        infohash = getattr(t, 'infoHash', '').lower()
+                        infohash = _get_pb_attr(t, 'infoHash', 'info_hash', 'infohash', 'hash', default='')
+                        infohash = str(infohash).strip().lower()
                         original_url = getattr(t, 'url', '')
                         if not infohash and original_url:
-                            infohash = FeederUtil.extract_info_hash(original_url) or ''
+                            infohash = (FeederUtil.extract_info_hash(original_url) or '').lower()
 
-                        fname = getattr(t, 'name', '') or ''
-                        fsize = getattr(t, 'size', 0) or 0
-                        status_code = getattr(t, 'status', 0)
+                        fname = _get_pb_attr(t, 'name', 'fileName', 'file_name', default='')
+                        fsize = int(_get_pb_attr(t, 'size', 'totalSize', 'total_size', default=0) or 0)
+                        status_code = int(_get_pb_attr(t, 'status', default=0) or 0)
 
                         # CD2 작업 상태 코드: 2 완료(FINISHED), 3 에러(ERROR), 그 외 다운로드 중
                         if status_code == 2:
                             std_status = 'completed'
+                            progress_val = 100.0
+                            dl_bytes = fsize
                         elif status_code == 3:
                             std_status = 'error'
+                            progress_val = 0.0
+                            dl_bytes = 0
                         else:
                             std_status = 'downloading'
+                            raw_pct = _get_pb_attr(t, 'percent', 'percentage', 'progress', 'percentDone', default=None)
+                            if raw_pct is not None:
+                                pct = float(raw_pct)
+                                progress_val = round(pct * 100.0, 1) if (0.0 < pct <= 1.0) else round(pct, 1)
+                            else:
+                                progress_val = 0.0
+
+                            raw_bytes = _get_pb_attr(t, 'downloadedBytes', 'downloaded_bytes', 'downloaded', 'downloadedSize', default=None)
+                            if raw_bytes is not None:
+                                dl_bytes = int(raw_bytes)
+                            elif fsize > 0 and progress_val > 0:
+                                dl_bytes = int(fsize * (progress_val / 100.0))
+                            else:
+                                dl_bytes = 0
+
+                        raw_speed = _get_pb_attr(t, 'speed', 'downloadSpeed', 'download_speed', 'rate', default=0)
+                        dl_speed = int(raw_speed) if raw_speed else 0
 
                         ret.append({
                             'task_id': infohash or original_url[:40],
                             'hash': infohash,
                             'status': std_status,
+                            'statusCode': status_code,
                             'filename': fname,
                             'file_size': fsize,
+                            'downloaded_bytes': dl_bytes,
+                            'download_speed': dl_speed,
+                            'progress': progress_val,
                             'source_path': ''
                         })
 
@@ -492,7 +578,7 @@ class LocalTransporter(BaseTransporter):
     TRANSPORTER_NAME = "단순 경로 이동"
 
     CONFIG_SCHEMA = [
-        {"name": "complete_path", "label": "최종 완료 이동 경로", "type": "text", "placeholder": "예: uploads/프로필명 (엔진 루트 하위)", "desc": "로컬 출력 엔진의 설정 루트 하위 경로입니다. 엔진 루트(cd2_mount_path, save_path 등)와 조합하며, /로 시작해도 절대 경로가 아닌 루트 하위 상대 경로로 처리합니다."}
+        {"name": "complete_path", "label": "최종 완료 이동 경로", "type": "text", "placeholder": "예: /mnt/mergerfs/uploads 또는 uploads/프로필명", "desc": "'/'로 시작하면 시스템 절대경로(mergerfs 마운트 등)로 직접 이동하며, 상대경로로 입력하면 엔진 설정 루트 하위 경로로 자동 결합됩니다."}
     ]
 
     def transport(self, item, source_path: str, dest_config: dict) -> tuple[bool, str, str]:
@@ -666,11 +752,14 @@ class DownloadUtil:
     def get_local_root(config: dict | None) -> str:
         """Return the configured filesystem root for an engine's local output."""
         config = config or {}
-        for key in ('local_root', 'cd2_mount_path', 'save_path', 'download_path', 'output_path'):
-            value = str(config.get(key) or '').strip()
-            if value:
-                return value
-        return ''
+        if config.get('engine_type') == 'cd2':
+            mount = str(config.get('cd2_mount_path') or '').strip().rstrip('/\\')
+            vpath = str(config.get('cd2_virtual_path') or '').strip().strip('/')
+            if mount and vpath:
+                if mount.replace('\\', '/').endswith(vpath):
+                    return mount
+                return os.path.join(mount, vpath)
+            return mount or vpath
 
     @staticmethod
     def add_magnet(engine, link: str, title: str = None, upload_path: str = None):
@@ -811,3 +900,46 @@ class DownloadUtil:
         except Exception as e:
             logger.error(f"[DownloadUtil] 이송 핸들러 생성 오류 ({transporter_id}): {e}")
             return None
+
+    @classmethod
+    def delete_remote_tasks(cls, item) -> None:
+        """작업 취소/삭제 시 연동된 모든 다운로더 엔진에서 해당 원격 작업을 확실히 선제 삭제"""
+        target_hash = (item.infohash or FeederUtil.extract_info_hash(item.magnet) or '').lower()
+        target_tid = str(item.engine_task_id or '')
+
+        engines_to_check = set()
+        if item.current_engine_name:
+            engines_to_check.add(item.current_engine_name)
+        if item.priority_chain:
+            for eng in item.priority_chain:
+                engines_to_check.add(eng)
+        if not engines_to_check:
+            for d in FeederUtil.get_downloaders():
+                if d.get('enabled', True):
+                    engines_to_check.add(d.get('name'))
+
+        for engine_name in engines_to_check:
+            downloader_cfg = FeederUtil.get_downloader_by_name(engine_name)
+            if not downloader_cfg:
+                continue
+            engine = cls.create_engine(downloader_cfg)
+            if not engine:
+                continue
+
+            try:
+                # 작업 ID로 직접 삭제 시도
+                if target_tid and str(item.current_engine_name) == str(engine_name):
+                    engine.delete_task(target_tid)
+
+                # 원격 엔진 목록을 조회하여 동일 해시를 가진 잔여 작업 모두 삭제
+                if target_hash and hasattr(engine, 'get_status'):
+                    status_list, err = engine.get_status()
+                    if not err and status_list:
+                        for s in status_list:
+                            s_hash = (s.get('hash') or '').lower()
+                            s_tid = str(s.get('task_id') or s.get('id') or '')
+                            if (s_hash and s_hash == target_hash) or (s_tid and s_tid == target_tid):
+                                engine.delete_task(s_tid)
+                                logger.info(f"[DownloadUtil] [{engine_name}] 원격 소스 작업 삭제 완료: ID={s_tid}, Title={item.title[:25]}")
+            except Exception as ex:
+                logger.debug(f"[DownloadUtil] [{engine_name}] 원격 소스 삭제 중 예외: {ex}")

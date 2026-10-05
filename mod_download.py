@@ -14,6 +14,7 @@ from .model_download import ModelDownload, ModelDownloadStat
 from .util_base import FeederUtil
 from .util_download import DownloadUtil
 from .task_download import TaskDownloadBase
+from .util_upload import UploadUtil
 
 name = 'download'
 
@@ -617,10 +618,36 @@ class ModuleDownload(PluginModuleBase):
                     return jsonify({'ret': 'success', 'msg': '최종 완료(completed) 처리되었습니다.'})
 
                 elif action == 'delete':
-                    db.session.delete(item)
+                    # 실행 중인 Rclone 프로세스 즉시 강제 종료
+                    UploadUtil.kill_item_rclone(item_id)
+
+                    # 레코드 유실 전 원격 소스(AllDebrid, CD2 등)에서 작업 선제 삭제
+                    DownloadUtil.delete_remote_tasks(item)
+
+                    # 로컬 스테이징 임시 파일 정리
+                    if item.local_path and os.path.exists(item.local_path) and ':' not in item.local_path:
+                        try:
+                            if os.path.isdir(item.local_path):
+                                shutil.rmtree(item.local_path, ignore_errors=True)
+                            elif os.path.isfile(item.local_path):
+                                os.remove(item.local_path)
+                        except Exception:
+                            pass
+
+                    # 재등록 방지를 위한 영구 격리(cancelled) 처리
+                    # 이미 취소된 항목을 다시 삭제할 때만 DB에서 완전 제거
+                    if item.status == 'cancelled':
+                        db.session.delete(item)
+                        db.session.commit()
+                        logger.info(f"[{self.name}] 취소된 작업 영구 DB 삭제 완료: ID={item_id}")
+                        return jsonify({'ret': 'success', 'msg': '작업이 DB에서 완전히 삭제되었습니다.'})
+
+                    item.status = 'cancelled'
+                    item.error_message = '사용자 수동 삭제/취소 (영구 격리)'
+                    item.last_status_time = datetime.now()
                     db.session.commit()
-                    logger.info(f"[{self.name}] 큐 항목 수동 삭제 완료: ID={item_id}")
-                    return jsonify({'ret': 'success', 'msg': '항목이 삭제되었습니다.'})
+                    logger.info(f"[{self.name}] 큐 항목 소스 삭제 및 영구 격리(cancelled) 완료: ID={item_id}")
+                    return jsonify({'ret': 'success', 'msg': '원격 소스에서 삭제되었으며, 재등록되지 않도록 영구 격리되었습니다.'})
 
             return super(ModuleDownload, self).process_ajax(sub, req)
         except Exception as e:

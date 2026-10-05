@@ -8,7 +8,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from sqlalchemy import or_
+from sqlalchemy import or_, func, and_
 
 from .setup import *
 from .model_crawl import ModelCrawlItem
@@ -57,7 +57,7 @@ class TaskDownload:
         with F.app.app_context():
             try:
                 FeederUtil.init_runtime_locks()
-                db_lock_acquired = FeederUtil.acquire_runtime_lock('download_pipeline', owner)
+                db_lock_acquired = FeederUtil.acquire_runtime_lock('download_pipeline', owner, stale_after=21600)
                 if not db_lock_acquired:
                     logger.info("[DownloadPipeline] 다른 Celery 워커가 실행 중이어서 중복 실행을 건너뜁니다.")
                     return
@@ -411,6 +411,23 @@ class TaskDownload:
             })
         db.session.rollback()
 
+        # 동일 폴더명 충돌 방지: 현재 다운로드, 스테이징, 업로드 중인 작업들의 폴더명 집합 수집
+        active_statuses = [
+            'downloading', 'pending_local_staging', 'local_staging',
+            'downloaded', 'pending_upload', 'uploading', 'pending_relay', 'relay_transferring'
+        ]
+        active_items = db.session.query(ModelDownload.file_name, ModelDownload.title).filter(
+            ModelDownload.status.in_(active_statuses)
+        ).all()
+
+        active_folder_names = set()
+        for af_name, at_title in active_items:
+            raw = af_name or at_title or ''
+            if raw:
+                b_name, ext = os.path.splitext(raw)
+                f_name = b_name if (ext and not raw.endswith(('/', '\\'))) else raw
+                active_folder_names.add(f_name.strip().lower())
+
         # 다운로더 엔진별 실제 원격 진행 중 큐(In Progress: 다운로딩 + 대기열 전체) 사전 집계
         engine_in_progress_counts = {}
         full_engines = set()
@@ -470,6 +487,15 @@ class TaskDownload:
             item_id = snapshot['id']
             chain = snapshot['priority_chain']
             curr_idx = snapshot['current_engine_index']
+
+            # 클라우드/엔진 내 동일 폴더 충돌 방지: 선행 작업이 완료될 때까지 신규 다운로드 대기
+            raw_target = snapshot.get('file_name') or snapshot.get('title') or ''
+            b_target, ext = os.path.splitext(raw_target)
+            target_folder = (b_target if (ext and not raw_target.endswith(('/', '\\'))) else raw_target).strip().lower()
+
+            if target_folder and target_folder in active_folder_names:
+                logger.info(f"[DownloadDispatch] 동일 폴더명('{target_folder}') 작업이 이미 진행/이송 중이므로 대기열 유지: {snapshot['title']}")
+                continue
 
             if curr_idx >= len(chain):
                 item = db.session.query(ModelDownload).filter_by(id=item_id).first()
@@ -564,6 +590,9 @@ class TaskDownload:
                     item.gdrive_complete_path = dest_cfg.get('complete_path', '')
                     item.gdrive_remote_id = dest_cfg.get('shared_drive_id') or ''
 
+                    if target_folder:
+                        active_folder_names.add(target_folder)
+
                     engine_in_progress_counts[engine_name] = current_count + 1
                     db.session.commit()
                 continue
@@ -608,6 +637,9 @@ class TaskDownload:
                 item.gdrive_complete_path = dest_cfg.get('complete_path', '')
                 item.gdrive_remote_id = dest_cfg.get('shared_drive_id') or ''
 
+                if target_folder:
+                    active_folder_names.add(target_folder)
+
                 engine_in_progress_counts[engine_name] = current_count + 1
 
                 db.session.commit()
@@ -642,97 +674,102 @@ class TaskDownload:
 
     @staticmethod
     def poll_active_downloads():
-        items = ModelDownload.get_list_by_status(['downloading'], limit=100)
-
-        if not items:
+        now = datetime.now()
+        enabled_downloaders = [d for d in FeederUtil.get_downloaders() if d.get('enabled', True)]
+        if not enabled_downloaders:
             return
 
-        items_by_engine = {}
-        for it in items:
-            e_name = it.current_engine_name
-            if e_name not in items_by_engine:
-                items_by_engine[e_name] = []
-            items_by_engine[e_name].append(it)
-
-        now = datetime.now()
-
-        for engine_name, engine_items in items_by_engine.items():
-            downloader_cfg = FeederUtil.get_downloader_by_name(engine_name)
-            if not downloader_cfg:
+        for downloader_cfg in enabled_downloaders:
+            engine_name = downloader_cfg.get('name')
+            if not engine_name:
                 continue
 
             engine = DownloadUtil.create_engine(downloader_cfg)
             if not engine:
                 continue
 
-            # 원격 상태 조회가 DB의 활성 읽기 트랜잭션을 기다리지 않도록 worklist 조회를 종료
+            # 해당 엔진에 할당된 downloading 작업 조회 (엔진별 독립 조회)
+            engine_items = (
+                db.session.query(ModelDownload)
+                .filter_by(status='downloading', current_engine_name=engine_name)
+                .order_by(ModelDownload.id.asc())
+                .all()
+            )
+
+            # 원격 상태 조회가 DB의 활성 읽기 트랜잭션을 기다리지 않도록 조회 종료
             db.session.rollback()
             status_list, err = engine.get_status()
             if err:
                 logger.warning(f"[DownloadPoll] [{engine_name}] 상태 조회 실패: {err}")
                 continue
 
+            # 클라우드 마운트 엔진(CD2): 완료 작업이 위치한 임시 업로드 서브폴더만 특정하여 캐시 선제 갱신
+            if (engine_name == 'cd2' or getattr(engine, 'OUTPUT_TYPE', '') == 'cloud_storage') and hasattr(engine, 'refresh_cache'):
+                if any(s.get('status') == 'completed' for s in status_list):
+                    refreshed_vpaths = set()
+                    for it_chk in engine_items:
+                        p_chk = FeederUtil.get_download_profile_by_feed(it_chk.feed_name) or {}
+                        d_chk = FeederUtil.get_profile_destination(p_chk, engine_name)
+                        u_sub = (it_chk.gdrive_upload_path or d_chk.get('upload_path') or '').strip('/\\')
+                        target_vpath = f"{engine.vpath}/{u_sub}".rstrip('/') if u_sub else engine.vpath
+                        if target_vpath not in refreshed_vpaths:
+                            refreshed_vpaths.add(target_vpath)
+                            engine.refresh_cache(path=target_vpath)
+
             status_map_by_tid = {str(s.get('task_id')): s for s in status_list if s.get('task_id')}
             status_map_by_hash = {str(s.get('hash')).lower(): s for s in status_list if s.get('hash')}
 
-            # 엔진 히스토리에서 완료 항목을 먼저 역추적한다. Feeder 쪽 상태가
-            # downloading이 아니거나 current_engine_name이 유실된 경우에도
-            # hash/task ID로 원래 큐 항목을 찾아 완료 전이를 적용한다.
-            completed_statuses = [s for s in status_list if s.get('status') == 'completed']
-            reverse_items = []
-            if completed_statuses:
-                completed_hashes = {
-                    str(s.get('hash')).lower() for s in completed_statuses if s.get('hash')
-                }
-                completed_task_ids = {
-                    str(s.get('task_id')) for s in completed_statuses if s.get('task_id')
-                }
-                match_filters = []
-                if completed_hashes:
-                    match_filters.append(ModelDownload.infohash.in_(completed_hashes))
-                if completed_task_ids:
-                    match_filters.append(ModelDownload.engine_task_id.in_(completed_task_ids))
-                if match_filters:
-                    reverse_items = db.session.query(ModelDownload).filter(
-                        ModelDownload.status.in_(['downloading', 'pending']),
-                        or_(
-                            ModelDownload.current_engine_name == engine_name,
-                            ModelDownload.current_engine_name.is_(None)
-                        ),
-                        or_(*match_filters)
-                    ).all()
-                    known_ids = {item.id for item in engine_items}
-                    for reverse_item in reverse_items:
-                        if reverse_item.id not in known_ids:
-                            reverse_item.current_engine_name = engine_name
-                            engine_items.append(reverse_item)
-                    if reverse_items:
-                        db.session.rollback()
-                        logger.info(
-                            f"[DownloadPoll] [{engine_name}] 완료 히스토리 역추적 매칭: "
-                            f"{len(reverse_items)}건"
-                        )
+            # 모든 엔진 공통:
+            # - Feeder DB에서 이미 완료(completed)된 작업은 원격 상태(완료/에러)와 무관하게 원격 엔진에서 삭제 정리
+            # - Feeder DB에서 이미 다른 엔진으로 이관된 작업의 에러 잔여물도 원격 엔진에서 삭제 정리
+            all_remote_hashes = [s.get('hash').lower() for s in status_list if s.get('hash')]
+            all_remote_tids = [str(s.get('task_id')) for s in status_list if s.get('task_id')]
 
-            # CD2 등 히스토리가 쌓이는 엔진의 경우: Feeder에서 이미 최종 완료(completed)된 작업들을 CD2 히스토리에서 일괄 삭제 정리
-            if engine_name == 'cd2' and hasattr(engine, 'delete_tasks'):
-                completed_hashes = [s.get('hash').lower() for s in status_list if s.get('status') == 'completed' and s.get('hash')]
-                if completed_hashes:
-                    already_done_rows = db.session.query(ModelDownload.infohash, ModelDownload.engine_task_id).filter(
+            if all_remote_hashes or all_remote_tids:
+                done_or_migrated_rows = db.session.query(
+                    ModelDownload.infohash,
+                    ModelDownload.engine_task_id,
+                    ModelDownload.status,
+                    ModelDownload.current_engine_name
+                ).filter(
+                    or_(
                         ModelDownload.status == 'completed',
-                        ModelDownload.infohash.in_(completed_hashes)
-                    ).all()
+                        and_(
+                            ModelDownload.status.in_(['downloading', 'pending']),
+                            ModelDownload.current_engine_name.isnot(None),
+                            ModelDownload.current_engine_name != engine_name
+                        )
+                    ),
+                    or_(
+                        ModelDownload.infohash.in_(all_remote_hashes),
+                        ModelDownload.engine_task_id.in_(all_remote_tids)
+                    )
+                ).all()
 
-                    cleanup_ids = set()
-                    for r_hash, r_tid in already_done_rows:
-                        if r_hash:
-                            cleanup_ids.add(r_hash)
-                        elif r_tid:
-                            cleanup_ids.add(r_tid)
+                cleanup_targets = set()
+                for r_hash, r_tid, r_status, r_engine in done_or_migrated_rows:
+                    target_key = (r_hash or '').lower()
+                    s_item = status_map_by_hash.get(target_key) or status_map_by_tid.get(str(r_tid))
+                    if not s_item:
+                        continue
+                    s_tid = str(s_item.get('task_id') or s_item.get('id') or '')
+                    s_status = s_item.get('status')
 
-                    if cleanup_ids:
-                        db.session.rollback()
-                        logger.info(f"[DownloadPoll] [cd2] Feeder에서 이미 최종 완료(completed)된 작업 {len(cleanup_ids)}건 감지 -> CD2 오프라인 히스토리 자동 정리")
-                        engine.delete_tasks(list(cleanup_ids))
+                    # DB 완료 건은 상태 무관 삭제, 타 엔진 이관 건은 에러 상태인 경우 즉시 삭제
+                    if r_status == 'completed' or s_status == 'error':
+                        cleanup_targets.add(s_tid or target_key)
+
+                if cleanup_targets:
+                    db.session.rollback()
+                    if hasattr(engine, 'delete_tasks'):
+                        engine.delete_tasks(list(cleanup_targets))
+                    elif hasattr(engine, 'delete_task'):
+                        for tid in cleanup_targets:
+                            try:
+                                engine.delete_task(tid)
+                            except Exception:
+                                pass
+                    logger.info(f"[DownloadPoll] [{engine_name}] 완료 또는 타엔진 이관 잔여 작업 {len(cleanup_targets)}건 감지 -> 원격 히스토리 자동 삭제 정리 완료")
 
             matched_count = sum(1 for it in engine_items if (str(it.engine_task_id) in status_map_by_tid or (it.infohash and str(it.infohash).lower() in status_map_by_hash)))
             logger.debug(f"[DownloadPoll] [{engine_name}] 전체 토렌트 {len(status_list)}건 수신 (큐 매칭: {matched_count}건, 미등록 잔여: {len(status_list) - matched_count}건)")
@@ -772,6 +809,9 @@ class TaskDownload:
                     source_path = matched_status.get('source_path', '')
                     it.local_path = source_path
 
+                    # 원격 엔진이 보고한 실제 원본 파일명 보존
+                    raw_engine_name = matched_status.get('filename') or fname or it.file_name or ''
+
                     if fname:
                         duplicate_item = (
                             db.session.query(ModelDownload.id)
@@ -784,25 +824,56 @@ class TaskDownload:
                             fname = f"{n}_{short_hash}{e}" if e else f"{fname}_{short_hash}"
                             it.file_name = fname
                             logger.info(f"[DownloadPoll] 동일 파일명 감지 -> '{fname}' 분리: {it.title}")
+
                     # CD2(115 클라우드) 엔진인 경우 마운트 경로 실물 파일 검증 및 경로 매칭
                     if engine_name == 'cd2' or getattr(engine, 'OUTPUT_TYPE', '') == 'cloud_storage':
-                        mount_root = (downloader_cfg.get('cd2_mount_path') or '').strip()
-                        target_search_name = fname or it.file_name or it.title
+                        base_mount_root = engine.get_local_mount_path() if hasattr(engine, 'get_local_mount_path') else DownloadUtil.get_local_root(downloader_cfg)
+
+                        profile = FeederUtil.get_download_profile_by_feed(it.feed_name) or {}
+                        dest_cfg = FeederUtil.get_profile_destination(profile, engine_name)
+                        upload_sub = (it.gdrive_upload_path or dest_cfg.get('upload_path') or '').strip('/\\')
+                        search_roots = []
+                        if base_mount_root:
+                            if upload_sub:
+                                search_roots.append(os.path.join(base_mount_root, upload_sub))
+                            search_roots.append(base_mount_root)
+
+                        target_search_name = raw_engine_name or it.file_name or it.title or ''
                         matched_real_path = ""
 
-                        if mount_root and os.path.exists(mount_root):
-                            # 마운트 루트 직하 및 서브폴더에서 실물 파일/폴더 탐색
-                            candidate_path = os.path.join(mount_root, target_search_name)
-                            if os.path.exists(candidate_path):
-                                matched_real_path = candidate_path
-                            else:
-                                for r, dirs, files in os.walk(mount_root):
-                                    if target_search_name in dirs or target_search_name in files:
-                                        matched_real_path = os.path.join(r, target_search_name)
-                                        break
+                        for search_dir in search_roots:
+                            if not os.path.exists(search_dir):
+                                continue
+
+                            if it.local_path and os.path.exists(it.local_path):
+                                matched_real_path = it.local_path
+                                break
+
+                            search_candidates = []
+                            for candidate in [raw_engine_name, it.file_name, it.title]:
+                                if candidate and candidate not in search_candidates:
+                                    search_candidates.append(candidate)
+
+                            for candidate in search_candidates:
+                                direct_path = os.path.join(search_dir, candidate)
+                                if os.path.exists(direct_path):
+                                    matched_real_path = direct_path
+                                    break
+
+                            if not matched_real_path:
+                                try:
+                                    entries = os.listdir(search_dir)
+                                    for candidate in search_candidates:
+                                        if candidate in entries:
+                                            matched_real_path = os.path.join(search_dir, candidate)
+                                            break
+                                except Exception:
+                                    pass
+
+                            if matched_real_path:
+                                break
 
                         if not matched_real_path:
-                            # 115 원격 완료되었으나 아직 로컬 마운트에 출현하지 않은 경우 성급히 넘기지 않고 대기 유지
                             logger.debug(f"[DownloadPoll] [{engine_name}] 115 완료 감지 -> 마운트 경로 파일 출현 대기 중: {target_search_name}")
                             continue
 
@@ -910,6 +981,10 @@ class TaskDownload:
             db.session.commit()
             logger.info(f"[LocalStaging] 멈춰있던 스테이징 작업 {len(stuck_staging)}건을 대기열(pending_local_staging)로 자동 복구했습니다.")
 
+        # 로컬 스테이징 기본 루트 디렉터리 준비
+        staging_root = P.ModelSetting.get('download_local_staging_path') or FeederUtil.get_global().get('local_staging_path') or os.path.join(FeederUtil.get_tmp_dir(), 'staging')
+        os.makedirs(staging_root, exist_ok=True)
+
         # 로컬 스토리지 보호: 현재 로컬 디스크를 점유 중인 작업 수 점검 (0은 무제한)
         try:
             max_staging_items = max(0, P.ModelSetting.get_int('download_max_staging_items'))
@@ -917,9 +992,17 @@ class TaskDownload:
             max_staging_items = 10
 
         if max_staging_items > 0:
+            # 실제 로컬 스테이징 디렉터리를 점유 중인 작업만 정밀 카운트 (원격 스트리밍 및 외부 마운트 제외)
             current_local_count = db.session.query(ModelDownload).filter(
-                ModelDownload.status.in_(['local_staging', 'downloaded'])
+                or_(
+                    ModelDownload.status == 'local_staging',
+                    db.and_(
+                        ModelDownload.status == 'downloaded',
+                        ModelDownload.local_path.like(f"{staging_root}%")
+                    )
+                )
             ).count()
+
             if current_local_count >= max_staging_items:
                 logger.info(f"[LocalStaging] 로컬 스테이징 보관 한도({max_staging_items}건) 도달 (현재: {current_local_count}건). 업로드 완료 시까지 신규 스테이징을 대기합니다.")
                 return
@@ -940,9 +1023,6 @@ class TaskDownload:
         item_ids = [item.id for item in items]
         db.session.rollback()
         db.session.remove()
-
-        staging_root = P.ModelSetting.get('download_local_staging_path') or FeederUtil.get_global().get('local_staging_path') or os.path.join(FeederUtil.get_tmp_dir(), 'staging')
-        os.makedirs(staging_root, exist_ok=True)
 
         try:
             staging_workers = max(1, P.ModelSetting.get_int('download_staging_workers'))
@@ -1060,7 +1140,7 @@ class TaskDownload:
                             it_update.file_name = target_folder_name
                             it_update.status = 'downloaded'
                             it_update.error_message = None
-                            logger.info(f"[LocalStaging] 폴더 스테이징 완료: {upload_path}/{target_folder_name} -> downloaded 전환")
+                            logger.info(f"[LocalStaging] 폴더 스테이징 완료: {staging_path}/{target_folder_name} -> downloaded 전환")
                         else:
                             if os.path.exists(item_staging_dir):
                                 shutil.rmtree(item_staging_dir, ignore_errors=True)
@@ -1113,20 +1193,21 @@ class TaskDownload:
             source_path = item.local_path
             title = item.title
 
-            # 모든 로컬 출력 엔진의 목적지는 엔진 설정 루트 하위 경로로 해석한다.
+            # 로컬 단순 경로 이동: '/'로 시작하면 시스템 절대경로로 직접 처리, 상대경로인 경우에만 엔진 로컬 루트와 결합
             if dest_type == 'local' and item.current_engine_name:
                 downloader_cfg = FeederUtil.get_downloader_by_name(item.current_engine_name) or {}
                 local_root = DownloadUtil.get_local_root(downloader_cfg)
                 complete_path = (dest_cfg.get('complete_path') or dest_cfg.get('target_folder') or '').strip()
-                if local_root and complete_path:
-                    # 선행 슬래시는 절대 경로가 아니라 루트 하위 경로 구분자로 취급한다.
-                    relative_complete_path = complete_path.lstrip('/\\')
+                if complete_path:
                     dest_cfg = dict(dest_cfg)
-                    dest_cfg['complete_path'] = os.path.join(local_root, relative_complete_path)
-                    logger.debug(
-                        f"[RouteComplete] 엔진 로컬 루트 기준 최종 경로 해석: "
-                        f"{complete_path} -> {dest_cfg['complete_path']}"
-                    )
+                    if complete_path.startswith('/'):
+                        # '/'로 시작하는 절대경로: mergerfs 등 지정된 시스템 절대경로 그대로 이동
+                        dest_cfg['complete_path'] = os.path.abspath(complete_path)
+                        logger.debug(f"[RouteComplete] 시스템 절대경로 적용: {dest_cfg['complete_path']}")
+                    elif local_root:
+                        # 상대경로: 엔진 설정 루트 하위 경로로 결합
+                        dest_cfg['complete_path'] = os.path.join(local_root, complete_path)
+                        logger.debug(f"[RouteComplete] 엔진 로컬 루트 기준 결합 경로: {complete_path} -> {dest_cfg['complete_path']}")
 
             transporter = DownloadUtil.get_transporter(dest_type)
             if not transporter:

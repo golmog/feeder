@@ -334,6 +334,7 @@ function render_queue_rows(list) {
     else if (it.status === 'pending_local_staging' || it.status === 'local_staging') statusBadge = '<span class="badge badge-info">로컬 스테이징</span>';
     else if (it.status === 'pending_relay') statusBadge = '<span class="badge badge-warning">원격 릴레이 대기</span>';
     else if (it.status === 'relay_transferring') statusBadge = '<span class="badge badge-primary">원격 릴레이 전송 중</span>';
+    else if (it.status === 'cancelled') statusBadge = '<span class="badge badge-secondary">삭제/취소</span>';
     else if (it.status === 'downloaded') {
       if (it.destination_type === 'local') {
         statusBadge = '<span class="badge badge-success">다운로드 완료 (이동 대기)</span>';
@@ -670,6 +671,7 @@ function make_list(list) {
     if (it.status === 'completed') statusBadge = '<span class="badge badge-success">최종 완료</span>';
     else if (it.status === 'downloading') statusBadge = '<span class="badge badge-primary">다운로드</span>';
     else if (it.status === 'pending') statusBadge = '<span class="badge badge-warning">대기 (Pending)</span>';
+    else if (it.status === 'cancelled') statusBadge = '<span class="badge badge-secondary">삭제/취소</span>';
     else if (it.status === 'pending_local_staging' || it.status === 'local_staging') statusBadge = '<span class="badge badge-info">로컬 스테이징</span>';
     else if (it.status === 'pending_relay') statusBadge = '<span class="badge badge-warning">원격 릴레이 대기</span>';
     else if (it.status === 'relay_transferring') statusBadge = '<span class="badge badge-primary">원격 릴레이 전송 중</span>';
