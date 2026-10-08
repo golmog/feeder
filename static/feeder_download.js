@@ -414,7 +414,7 @@ function render_queue_rows(list) {
 
       detailHtml += '<div class="mt-1 p-1 px-2 rounded" style="background: rgba(23, 162, 184, 0.08); border: 1px solid rgba(23, 162, 184, 0.25);">';
       detailHtml += '  <div class="d-flex justify-content-between align-items-center mb-1 small font-weight-bold">';
-      detailHtml += '    <span class="text-info" style="font-size: 0.82rem;"><i class="fa fa-hdd-o fa-spin mr-1"></i>로컬 스테이징 수신: ' + progVal + '% (' + dlBytesStr + ' / ' + totalBytesStr + ')' + etaStr + '</span>';
+      detailHtml += '    <span class="text-info" style="font-size: 0.82rem;"><i class="fa fa-hdd-o mr-1"></i>로컬 스테이징 수신: ' + progVal + '% (' + dlBytesStr + ' / ' + totalBytesStr + ')' + etaStr + '</span>';
       detailHtml += '    <span class="badge badge-info"><i class="fa fa-tachometer mr-1"></i>' + speedStr + '</span>';
       detailHtml += '  </div>';
       detailHtml += '  <div class="progress" style="height: 12px; background-color: rgba(255, 255, 255, 0.15); border-radius: 3px;">';
@@ -431,7 +431,7 @@ function render_queue_rows(list) {
 
       detailHtml += '<div class="mt-1 p-1 px-2 rounded" style="background: rgba(40, 167, 69, 0.08); border: 1px solid rgba(40, 167, 69, 0.25);">';
       detailHtml += '  <div class="d-flex justify-content-between align-items-center mb-1 small font-weight-bold">';
-      detailHtml += '    <span class="text-success" style="font-size: 0.82rem;"><i class="fa fa-cloud-upload fa-spin mr-1"></i>' + uploadTargetTitle + ': ' + progVal + '% (' + dlBytesStr + ' / ' + totalBytesStr + ')' + etaStr + '</span>';
+      detailHtml += '    <span class="text-success" style="font-size: 0.82rem;"><i class="fa fa-cloud-upload mr-1"></i>' + uploadTargetTitle + ': ' + progVal + '% (' + dlBytesStr + ' / ' + totalBytesStr + ')' + etaStr + '</span>';
       detailHtml += '    <span class="badge badge-success"><i class="fa fa-tachometer mr-1"></i>' + speedStr + '</span>';
       detailHtml += '  </div>';
       detailHtml += '  <div class="progress" style="height: 12px; background-color: rgba(255, 255, 255, 0.15); border-radius: 3px;">';
@@ -455,7 +455,7 @@ function render_queue_rows(list) {
         detailHtml += '<div class="mt-1 small text-primary font-weight-bold"><i class="fa fa-clock-o mr-1"></i>Google Drive 업로드 대기 중...</div>';
       }
     } else if (it.status === 'relay_transferring') {
-      detailHtml += '<div class="mt-1 small text-primary font-weight-bold"><i class="fa fa-cloud-upload fa-spin mr-1"></i>원격 릴레이 전송 진행 중...</div>';
+      detailHtml += '<div class="mt-1 small text-primary font-weight-bold"><i class="fa fa-cloud-upload mr-1"></i>원격 릴레이 전송 진행 중...</div>';
     } else if (it.status === 'engine_unmanaged' || it.status === 'ad_unmanaged') {
       var engLabelName = it.current_engine_name || it.feed_name || '다운로더';
       detailHtml += '<div class="mt-1 small text-muted"><i class="fa fa-cloud mr-1"></i>' + engLabelName + ' 계정 내 보관 중 (DB 미등록 잔여 항목)</div>';
