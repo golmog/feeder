@@ -335,6 +335,7 @@ function render_queue_rows(list) {
     else if (it.status === 'pending_relay') statusBadge = '<span class="badge badge-warning">원격 릴레이 대기</span>';
     else if (it.status === 'relay_transferring') statusBadge = '<span class="badge badge-primary">원격 릴레이 전송 중</span>';
     else if (it.status === 'cancelled') statusBadge = '<span class="badge badge-secondary">삭제/취소</span>';
+    else if (it.status === 'waiting_transporter') statusBadge = '<span class="badge badge-warning">이송 설정 복구 대기</span>';
     else if (it.status === 'downloaded') {
       if (it.destination_type === 'local') {
         statusBadge = '<span class="badge badge-success">다운로드 완료 (이동 대기)</span>';
@@ -483,6 +484,7 @@ function render_queue_rows(list) {
       str += '    <div class="btn-group btn-group-sm">';
       str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold queue_action_btn" data-action="retry" data-id="' + it.id + '">재시도</button>';
       str += '      <button type="button" class="btn btn-success text-white queue_action_btn" data-action="force_complete" data-id="' + it.id + '">완료</button>';
+      str += '      <button type="button" class="btn btn-secondary text-white queue_action_btn" data-action="force_fail" data-id="' + it.id + '">실패</button>';
       str += '      <button type="button" class="btn btn-danger text-white queue_action_btn" data-action="delete" data-id="' + it.id + '">삭제</button>';
       str += '    </div>';
     }
@@ -677,7 +679,8 @@ function make_list(list) {
     else if (it.status === 'relay_transferring') statusBadge = '<span class="badge badge-primary">원격 릴레이 전송 중</span>';
     else if (it.status === 'downloaded') statusBadge = '<span class="badge badge-success">다운로드 완료</span>';
     else if (it.status === 'pending_upload' || it.status === 'uploading') statusBadge = '<span class="badge badge-primary">업로드</span>';
-    else if (it.status === 'move_failed') statusBadge = '<span class="badge badge-warning">이동 실패</span>';
+    else if (it.status === 'waiting_transporter') statusBadge = '<span class="badge badge-warning">이송 설정 복구 대기</span>';
+    else if (it.status === 'move_failed') statusBadge = it.successful ? '<span class="badge badge-success">소스 없음 · 성공 종료 (move_failed)</span>' : '<span class="badge badge-warning">이동 실패</span>';
     else if (it.status === 'failed') statusBadge = '<span class="badge badge-danger">실패</span>';
     else statusBadge = '<span class="badge badge-secondary">' + it.status + '</span>';
 
@@ -718,6 +721,7 @@ function make_list(list) {
     str += '    <div class="btn-group btn-group-sm">';
     str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold btn_list_action" data-action="retry" data-id="' + it.id + '">재시도</button>';
     str += '      <button type="button" class="btn btn-success text-white btn_list_action" data-action="force_complete" data-id="' + it.id + '">완료</button>';
+    str += '      <button type="button" class="btn btn-secondary text-white btn_list_action" data-action="force_fail" data-id="' + it.id + '">실패</button>';
     str += '      <button type="button" class="btn btn-danger text-white btn_list_action" data-action="delete" data-id="' + it.id + '">삭제</button>';
     str += '    </div>';
     str += '  </td>';
@@ -995,7 +999,7 @@ function render_downloaders(data) {
     } else {
       // 커스텀 엔진(AllDebrid, PikPak 등): 식별용 주요 설정값 동적 표시
       var keys = Object.keys(item).filter(function (k) {
-        return ['name', 'engine_type', 'enabled', 'stalled_timeout_hours'].indexOf(k) === -1;
+        return ['name', 'engine_type', 'enabled', 'stalled_timeout_hours', 'missing_timeout_hours'].indexOf(k) === -1;
       });
       connDetail = keys.slice(0, 3).map(function (k) {
         var val = item[k];

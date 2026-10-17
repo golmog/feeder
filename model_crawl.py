@@ -192,26 +192,6 @@ class ModelCrawlItem(ModelBase):
                     query = query.filter(cls.files.isnot(None), cls.files != '')
                 elif status_filter in ['download_completed', 'download_active', 'not_downloaded']:
                     query = FeederUtil.apply_download_status_filter(cls, query, status_filter)
-                    if status_filter == 'download_completed':
-                        target_statuses = ['completed']
-                    elif status_filter == 'download_active':
-                        target_statuses = ['downloading', 'pending', 'local_staging', 'uploading', 'colab_transferring']
-                    else:
-                        target_statuses = None
-
-                    if target_statuses:
-                        subq = db.session.query(ModelDownload.id).filter(
-                            ModelDownload.status.in_(target_statuses),
-                            ModelDownload.infohash.isnot(None),
-                            cls.magnet.like(func.concat('%', ModelDownload.infohash, '%'))
-                        ).exists()
-                        query = query.filter(subq)
-                    else:
-                        subq = db.session.query(ModelDownload.id).filter(
-                            ModelDownload.infohash.isnot(None),
-                            cls.magnet.like(func.concat('%', ModelDownload.infohash, '%'))
-                        ).exists()
-                        query = query.filter(~subq)
 
             # 검색 키워드 필터링
             if search:

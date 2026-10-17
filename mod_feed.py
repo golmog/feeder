@@ -6,6 +6,7 @@ import traceback
 from datetime import datetime, timedelta
 from flask import Response, request, jsonify, render_template
 from sqlalchemy import and_, or_, desc
+from werkzeug.exceptions import HTTPException
 
 from .setup import *
 from .model_crawl import ModelCrawlItem
@@ -258,6 +259,11 @@ class ModuleFeed(PluginModuleBase):
 
     def process_api(self, sub, req):
         try:
+            if sub == 'download':
+                crawl_mod = P.get_module('crawl')
+                if not crawl_mod:
+                    return jsonify({'ret': 'fail', 'msg': '수집 모듈 비활성화 상태'}), 503
+                return crawl_mod._handle_download_stream(req.args.get('id'), source_type='feed')
             if sub in ['feed', 'rss']:
                 feed_id = req.args.get('id')
                 feed_name = req.args.get('name')
@@ -267,6 +273,8 @@ class ModuleFeed(PluginModuleBase):
                 logger.warning(f"[FeedAPI] 피드 식별자 누락: {req.args}")
                 return jsonify({'ret': 'fail', 'msg': '피드 식별자 누락'}), 400
             return jsonify({'ret': 'fail', 'msg': f'알 수 없는 API 명령: {sub}'}), 404
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"[FeedAPI] process_api 에러 ({sub}): {e}")
             return jsonify({'ret': 'error', 'msg': str(e)}), 500
@@ -282,7 +290,7 @@ class ModuleFeed(PluginModuleBase):
             if raw_feed_count and str(raw_feed_count).isdigit() and int(raw_feed_count) > 0:
                 feed_count = int(raw_feed_count)
             else:
-                feed_count = P.ModelSetting.get_int(f"{self.name}_feed_count") if P.ModelSetting else 100
+                feed_count = max(1, P.ModelSetting.get_int(f"{self.name}_feed_count")) if P.ModelSetting else 100
 
             feed_records = (
                 db.session.query(ModelFeedItem)
@@ -293,7 +301,7 @@ class ModuleFeed(PluginModuleBase):
             )
 
             feed_title = f"FEED: {current_feed_name}"
-            xml_content = self.generate_rss_feed(feed_title, feed_records)
+            xml_content = self.generate_rss_feed(feed_title, feed_records, max_items=feed_count)
             return Response(xml_content, mimetype='application/xml; charset=utf-8')
         except Exception as e:
             logger.error(f"[FeedAPI] _handle_feed_rss 에러: {e}")
@@ -304,7 +312,7 @@ class ModuleFeed(PluginModuleBase):
             except Exception:
                 pass
 
-    def generate_rss_feed(self, title: str, items: list, include_apikey: bool = True) -> str:
+    def generate_rss_feed(self, title: str, items: list, include_apikey: bool = True, max_items: int = None) -> str:
         ddns = FeederUtil.get_ddns().rstrip('/')
         apikey = FeederUtil.get_system_apikey() if include_apikey else ''
 
@@ -315,46 +323,52 @@ class ModuleFeed(PluginModuleBase):
         xml += f'    <link>{ddns}</link>\n'
         xml += '    <description>Feeder Generated RSS Feed</description>\n'
 
+        emitted_count = 0
+
+        def append_item(item_title, item_link, date_str):
+            nonlocal xml, emitted_count
+            if max_items is not None and emitted_count >= max_items:
+                return
+            xml += '    <item>\n'
+            xml += f'      <title>{FeederUtil.clean_xml_string(item_title)}</title>\n'
+            xml += f'      <link>{FeederUtil.clean_xml_string(item_link)}</link>\n'
+            xml += f'      <pubDate>{date_str}</pubDate>\n'
+            xml += '    </item>\n'
+            emitted_count += 1
+
         for bbs in items:
+            FeederUtil.cooperate()
+            if max_items is not None and emitted_count >= max_items:
+                break
             date_str = bbs.created_time.strftime('%a, %d %b %Y %H:%M:%S +0900') if bbs.created_time else ''
             bbs_dict = bbs.as_dict()
             has_magnet = False
 
             if bbs.torrent_info:
                 for t_info in bbs.torrent_info:
+                    FeederUtil.cooperate()
                     has_magnet = True
                     target_name = t_info.get('name', bbs.title)
                     target_hash = t_info.get('info_hash', '')
                     magnet_link = f"magnet:?xt=urn:btih:{target_hash}"
 
-                    xml += '    <item>\n'
-                    xml += f'      <title>{FeederUtil.clean_xml_string(target_name)}</title>\n'
-                    xml += f'      <link>{magnet_link}</link>\n'
-                    xml += f'      <pubDate>{date_str}</pubDate>\n'
-                    xml += '    </item>\n'
+                    append_item(target_name, magnet_link, date_str)
             elif bbs_dict.get('magnet'):
                 for mag in bbs_dict['magnet']:
+                    FeederUtil.cooperate()
                     has_magnet = True
-                    xml += '    <item>\n'
-                    xml += f'      <title>{FeederUtil.clean_xml_string(bbs.title)}</title>\n'
-                    xml += f'      <link>{FeederUtil.clean_xml_string(mag)}</link>\n'
-                    xml += f'      <pubDate>{date_str}</pubDate>\n'
-                    xml += '    </item>\n'
+                    append_item(bbs.title, mag, date_str)
 
             if bbs_dict.get('files'):
                 for f_idx, file_item in enumerate(bbs_dict['files']):
+                    FeederUtil.cooperate()
                     filename = file_item[1]
                     if has_magnet and filename.lower().endswith('.torrent'):
                         continue
 
                     apikey_param = f"&apikey={apikey}" if include_apikey and apikey else ""
-                    download_proxy_url = f"{ddns}/{P.package_name}/api/crawl/download?id={bbs.id}_{f_idx}{apikey_param}"
-
-                    xml += '    <item>\n'
-                    xml += f'      <title>{FeederUtil.clean_xml_string(filename)}</title>\n'
-                    xml += f'      <link>{FeederUtil.clean_xml_string(download_proxy_url)}</link>\n'
-                    xml += f'      <pubDate>{date_str}</pubDate>\n'
-                    xml += '    </item>\n'
+                    download_proxy_url = f"{ddns}/{P.package_name}/api/feed/download?id={bbs.id}_{f_idx}{apikey_param}"
+                    append_item(filename, download_proxy_url, date_str)
 
         xml += '  </channel>\n'
         xml += '</rss>'

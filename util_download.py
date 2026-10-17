@@ -52,6 +52,7 @@ except Exception:
 class BaseDownloadEngine:
     """모든 다운로더 엔진의 표준 인터페이스"""
     ENGINE_ID = "base"
+    status_list_complete = True
     ENGINE_NAME = "Base Engine"
     OUTPUT_TYPE = "local"
     SUPPORTED_PROTOCOLS = ["magnet"]
@@ -77,6 +78,7 @@ class BaseDownloadEngine:
             return True
         success = True
         for tid in task_ids:
+            FeederUtil.cooperate()
             if not self.delete_task(tid):
                 success = False
         return success
@@ -196,6 +198,7 @@ class QBittorrentEngine(BaseDownloadEngine):
             torrents = res.json()
             ret = []
             for t in torrents:
+                FeederUtil.cooperate()
                 t_hash = t.get('hash', '').lower()
                 progress = t.get('progress', 0.0)
                 state = t.get('state', '')
@@ -329,8 +332,10 @@ class CloudDrive2Engine(BaseDownloadEngine):
             response_stream = stub.GetSubFiles(req, metadata=metadata, timeout=timeout_sec)
 
             for response in response_stream:
+                FeederUtil.cooperate()
                 if hasattr(response, 'subFiles') and response.subFiles:
                     for item in response.subFiles:
+                        FeederUtil.cooperate()
                         fname = getattr(item, 'name', None)
                         if fname:
                             found_subfiles.append(fname)
@@ -394,6 +399,7 @@ class CloudDrive2Engine(BaseDownloadEngine):
 
     def get_status(self, task_ids: list[str] = None) -> tuple[list[dict], str]:
         """CD2 gRPC 오프라인 작업 목록 조회 및 로컬 마운트 경로 매핑"""
+        self.status_list_complete = False
         stub, metadata = self._get_grpc_stub()
         if not stub:
             return [], "CD2 gRPC 모듈 미로드"
@@ -402,14 +408,17 @@ class CloudDrive2Engine(BaseDownloadEngine):
             ret = []
             max_pages = max(1, self.max_pages)
             for page_num in range(1, max_pages + 1):
+                FeederUtil.cooperate()
                 try:
                     req = CloudDrive_pb2.OfflineFileListAllRequest(path=self.vpath, page=page_num)
                     res = stub.ListAllOfflineFiles(req, metadata=metadata, timeout=self.grpc_timeout)
                     if not res.offlineFiles:
+                        self.status_list_complete = True
                         break
 
                     def _get_pb_attr(pb_obj, *attr_names, default=None):
                         for name in attr_names:
+                            FeederUtil.cooperate()
                             if hasattr(pb_obj, name):
                                 val = getattr(pb_obj, name)
                                 if val is not None:
@@ -417,6 +426,7 @@ class CloudDrive2Engine(BaseDownloadEngine):
                         return default
 
                     for t in res.offlineFiles:
+                        FeederUtil.cooperate()
                         infohash = _get_pb_attr(t, 'infoHash', 'info_hash', 'infohash', 'hash', default='')
                         infohash = str(infohash).strip().lower()
                         original_url = getattr(t, 'url', '')
@@ -471,10 +481,11 @@ class CloudDrive2Engine(BaseDownloadEngine):
 
                     page_count = getattr(res, 'pageCount', 0)
                     if page_count > 0 and page_num >= page_count:
+                        self.status_list_complete = True
                         break
                 except Exception as page_err:
                     logger.debug(f"[CloudDrive2Engine] 오프라인 작업 목록 조회 예외 ({page_num}p): {page_err}")
-                    break
+                    return ret, f'CD2 작업 목록 조회 실패 ({page_num}p): {page_err}'
 
             return ret, ""
 
@@ -496,6 +507,7 @@ class CloudDrive2Engine(BaseDownloadEngine):
         # stub에서 오프라인 삭제 RPC 메서드 탐색
         method_name = None
         for name in ['DeleteOfflineFiles', 'RemoveOfflineFiles', 'DeleteOfflineFile', 'RemoveOfflineFile', 'CancelOfflineFiles']:
+            FeederUtil.cooperate()
             if hasattr(stub, name):
                 method_name = name
                 break
@@ -507,6 +519,7 @@ class CloudDrive2Engine(BaseDownloadEngine):
         # CloudDrive_pb2에서 요청 메시지 클래스 탐색
         req_cls = None
         for name in [f"{method_name}Request", 'DeleteOfflineFilesRequest', 'RemoveOfflineFilesRequest', 'DeleteOfflineFileRequest']:
+            FeederUtil.cooperate()
             if hasattr(CloudDrive_pb2, name):
                 req_cls = getattr(CloudDrive_pb2, name)
                 break
@@ -583,18 +596,22 @@ class LocalTransporter(BaseTransporter):
 
     def transport(self, item, source_path: str, dest_config: dict) -> tuple[bool, str, str]:
         target_folder = (dest_config.get('complete_path') or dest_config.get('target_folder') or '').strip()
-        folder_name = item.file_name or os.path.basename(source_path)
+        folder_name = getattr(item, 'output_folder_name', None) or item.file_name or os.path.basename(source_path or '')
+        if source_path and os.path.isfile(source_path) and getattr(item, 'output_folder_name', None):
+            folder_name += os.path.splitext(os.path.basename(source_path))[1]
 
         if not source_path or not os.path.exists(source_path):
             logger.error(f"[LocalTransporter] 로컬 소스 경로가 존재하지 않음: {source_path}")
             return False, "failed", f"로컬 파일 없음: {source_path}"
 
         final_path = source_path
+        if not target_folder and getattr(item, 'output_folder_name', None):
+            target_folder = os.path.dirname(os.path.abspath(source_path))
         if target_folder:
             try:
                 os.makedirs(target_folder, exist_ok=True)
                 dest_file = os.path.join(target_folder, folder_name)
-                if os.path.exists(dest_file):
+                if os.path.exists(dest_file) and os.path.abspath(source_path) != os.path.abspath(dest_file):
                     short_hash = (item.infohash[:6] if item.infohash else f"id_{item.id}")
                     if os.path.isdir(source_path):
                         candidate_name = f"{folder_name}_[{short_hash}]"
@@ -665,7 +682,7 @@ class RcloneSimpleTransporter(BaseTransporter):
             return False, "failed", "일반 업로드 Rclone 리모트명이 설정되지 않았습니다."
         raw_name = item.file_name or os.path.basename(source_path)
         base_name, ext = os.path.splitext(raw_name)
-        folder_name = base_name if (ext and not raw_name.endswith(('/', '\\'))) else raw_name
+        folder_name = getattr(item, 'output_folder_name', None) or (base_name if DownloadUtil.is_single_file(raw_name, source_path) else raw_name)
         temp_full = f"{remote_name}:{upload_path}/{folder_name}"
         final_full = f"{remote_name}:{complete_path}/{folder_name}"
         chunk_size = P.ModelSetting.get('download_rclone_chunk_size') or '256M'
@@ -749,6 +766,56 @@ class GDrivePoolTransporter(BaseTransporter):
 # ==============================================================================
 class DownloadUtil:
     @staticmethod
+    def is_single_file(name: str, source_path: str = '') -> bool:
+        if source_path and os.path.exists(source_path):
+            return os.path.isfile(source_path)
+        return os.path.splitext(name)[1].lower() in {
+            '.mkv', '.mp4', '.avi', '.mov', '.wmv', '.ts', '.m2ts', '.webm',
+            '.mp3', '.flac', '.zip', '.rar', '.7z', '.torrent', '.iso', '.srt', '.ass'
+        }
+
+    @classmethod
+    def reserve_output_folder(cls, item, source_name: str = '') -> str:
+        """실물 존재 여부와 무관하게 DB의 이전 이름 이력을 기준으로 출력 폴더명을 확정한다."""
+        if item.output_folder_name:
+            return item.output_folder_name
+        from .model_download import ModelDownload
+        raw_name = source_name or item.source_file_name or item.file_name or item.title or f'item_{item.id}'
+        base = os.path.splitext(raw_name)[0] if cls.is_single_file(raw_name, item.local_path or '') else raw_name
+        rows = db.session.query(ModelDownload.id, ModelDownload.source_file_name,
+                                ModelDownload.file_name, ModelDownload.output_folder_name,
+                                ModelDownload.title).filter(ModelDownload.id != item.id).all()
+        used = set()
+        duplicate = False
+        for row_id, original, file_name, output, title in rows:
+            FeederUtil.cooperate()
+            historical = original or file_name or title or ''
+            historical_base = os.path.splitext(historical)[0] if cls.is_single_file(historical) else historical
+            used.add((output or historical_base).casefold())
+            if row_id < item.id and (historical_base.casefold() == base.casefold() or (output or '').casefold() == base.casefold()):
+                duplicate = True
+        result = base
+        if duplicate or base.casefold() in used:
+            short_hash = item.infohash[:6] if item.infohash else f'id_{item.id}'
+            result = f'{base}_[{short_hash}]'
+            if result.casefold() in used:
+                result = f'{result}_{item.id}'
+        item.source_file_name = raw_name
+        item.output_folder_name = result
+        db.session.commit()
+        return result
+
+    @staticmethod
+    def get_queue_limit(config: dict) -> int:
+        """Feeder의 엔진 큐 개수 제한은 AllDebrid에만 적용한다."""
+        if str(config.get('engine_type', '')).lower() != 'alldebrid':
+            return 0
+        try:
+            return max(0, int(config.get('max_active_tasks') or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
     def get_local_root(config: dict | None) -> str:
         """Return the configured filesystem root for an engine's local output."""
         config = config or {}
@@ -789,6 +856,7 @@ class DownloadUtil:
 
         py_files = glob.glob(os.path.join(FeederUtil.ENGINES_DIR, "*.py"))
         for fpath in py_files:
+            FeederUtil.cooperate()
             fname = os.path.basename(fpath)
             if fname.startswith("__"):
                 continue
@@ -800,6 +868,7 @@ class DownloadUtil:
                 spec.loader.exec_module(mod)
 
                 for attr_name in dir(mod):
+                    FeederUtil.cooperate()
                     obj = getattr(mod, attr_name)
                     if isinstance(obj, type) and issubclass(obj, BaseDownloadEngine) and obj is not BaseDownloadEngine:
                         e_id = getattr(obj, 'ENGINE_ID', '').lower()
@@ -815,11 +884,18 @@ class DownloadUtil:
 
         schemas = []
         for e_id, e_cls in cls._engine_classes.items():
+            config_schema = list(getattr(e_cls, 'CONFIG_SCHEMA', []))
+            if not any(field.get('name') == 'missing_timeout_hours' for field in config_schema):
+                config_schema.append({
+                    'name': 'missing_timeout_hours', 'label': '원격 목록 누락 유예 (시간)',
+                    'type': 'number', 'default': 24,
+                    'desc': '전체 목록 조회 성공 후에도 계속 보이지 않는 작업의 실패 처리 유예 시간. 0은 자동 실패 안 함. CD2 페이지 제한으로 일부 목록만 조회한 경우에는 판정하지 않습니다.'
+                })
             schemas.append({
                 'engine_id': e_id,
                 'engine_name': getattr(e_cls, 'ENGINE_NAME', e_id),
                 'output_type': getattr(e_cls, 'OUTPUT_TYPE', 'local'),
-                'config_schema': getattr(e_cls, 'CONFIG_SCHEMA', [])
+                'config_schema': config_schema
             })
         return schemas
 
@@ -852,6 +928,7 @@ class DownloadUtil:
 
         py_files = glob.glob(os.path.join(FeederUtil.TRANSPORTERS_DIR, "*.py"))
         for fpath in py_files:
+            FeederUtil.cooperate()
             fname = os.path.basename(fpath)
             if fname.startswith("__") or fname.endswith("_worker.py") or "worker" in fname:
                 continue
@@ -864,6 +941,7 @@ class DownloadUtil:
                 spec.loader.exec_module(mod)
 
                 for attr_name in dir(mod):
+                    FeederUtil.cooperate()
                     obj = getattr(mod, attr_name)
                     if isinstance(obj, type) and issubclass(obj, BaseTransporter) and obj is not BaseTransporter:
                         t_id = getattr(obj, 'TRANSPORTER_ID', '').lower()

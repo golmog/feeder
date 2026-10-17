@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime
-from sqlalchemy import desc, or_, case
+from sqlalchemy import desc, or_, and_, case
 
 from .setup import *
 from .util_base import FeederUtil
@@ -24,6 +24,8 @@ class ModelDownload(ModelBase):
     magnet = db.Column(db.String, index=True)
     infohash = db.Column(db.String, index=True, nullable=True)
     file_name = db.Column(db.String, nullable=True, index=True)
+    source_file_name = db.Column(db.String, nullable=True)
+    output_folder_name = db.Column(db.String, nullable=True, index=True)
     file_size = db.Column(db.BigInteger, default=0)
 
     status = db.Column(db.String, index=True, default='pending')
@@ -39,9 +41,12 @@ class ModelDownload(ModelBase):
     gdrive_complete_path = db.Column(db.String, nullable=True)
     gdrive_remote_id = db.Column(db.String, nullable=True)
     gdrive_account = db.Column(db.String, nullable=True)
+    # 업로드 완료 이후 원격 이동/원본 정리 재시도에 필요한 단계와 경로
+    upload_state = db.Column(db.JSON, nullable=True)
 
     engine_added_time = db.Column(db.DateTime, nullable=True)
     last_status_time = db.Column(db.DateTime, nullable=True)
+    remote_missing_since = db.Column(db.DateTime, nullable=True)
     last_move_attempt_time = db.Column(db.DateTime, nullable=True)
 
     error_message = db.Column(db.Text, nullable=True)
@@ -64,8 +69,18 @@ class ModelDownload(ModelBase):
         ret['completed_time'] = self.completed_time.strftime('%Y-%m-%d %H:%M:%S') if self.completed_time else ''
         ret['engine_added_time'] = self.engine_added_time.strftime('%Y-%m-%d %H:%M:%S') if self.engine_added_time else ''
         ret['last_status_time'] = self.last_status_time.strftime('%Y-%m-%d %H:%M:%S') if self.last_status_time else ''
+        ret['remote_missing_since'] = self.remote_missing_since.strftime('%Y-%m-%d %H:%M:%S') if self.remote_missing_since else ''
         ret['last_move_attempt_time'] = self.last_move_attempt_time.strftime('%Y-%m-%d %H:%M:%S') if self.last_move_attempt_time else ''
+        ret['successful'] = self.status == 'completed' or (self.status == 'move_failed' and self.completed_time is not None)
         return ret
+
+    @classmethod
+    def success_filter(cls):
+        return or_(cls.status == 'completed', and_(cls.status == 'move_failed', cls.completed_time.isnot(None)))
+
+    @classmethod
+    def failure_filter(cls):
+        return or_(cls.status == 'failed', and_(cls.status == 'move_failed', cls.completed_time.is_(None)))
 
     @classmethod
     def get_by_magnet(cls, magnet: str):
@@ -117,10 +132,14 @@ class ModelDownload(ModelBase):
             query = db.session.query(cls)
 
             if status_filter != 'all':
-                if status_filter == 'active':
+                if status_filter == 'completed':
+                    query = query.filter(cls.success_filter())
+                elif status_filter == 'failed':
+                    query = query.filter(cls.failure_filter())
+                elif status_filter == 'active':
                     query = query.filter(cls.status.in_([
                         'pending', 'downloading', 'pending_local_staging',
-                        'local_staging', 'downloaded', 'pending_upload', 'uploading',
+                        'local_staging', 'downloaded', 'waiting_transporter', 'pending_upload', 'uploading',
                         'pending_relay', 'relay_transferring'
                     ]))
                 else:
@@ -144,7 +163,7 @@ class ModelDownload(ModelBase):
                 status_priority = case(
                     (cls.status.in_(['local_staging', 'uploading', 'relay_transferring']), 1),
                     (cls.status == 'downloading', 2),
-                    (cls.status.in_(['pending_local_staging', 'downloaded', 'pending_upload', 'pending_relay']), 3),
+                    (cls.status.in_(['pending_local_staging', 'downloaded', 'waiting_transporter', 'pending_upload', 'pending_relay']), 3),
                     (cls.status == 'pending', 4),
                     else_=5
                 )

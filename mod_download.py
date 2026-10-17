@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 from flask import render_template, request, jsonify, Response, stream_with_context
 from sqlalchemy import desc, func, case
 import sqlite3
+import shutil
+import subprocess
 
 from .setup import *
 from .model_download import ModelDownload, ModelDownloadStat
@@ -66,6 +68,7 @@ class ModuleDownload(PluginModuleBase):
                 P.ModelSetting.set(f"{self.name}_is_running", "False")
                 P.ModelSetting.set(f"{self.name}_running_start_time", "0")
                 FeederUtil.init_sqlite_concurrency()
+                FeederUtil.migrate_db()
 
                 stg_cnt = db.session.query(ModelDownload).filter_by(status='local_staging').update({'status': 'pending_local_staging'})
                 up_cnt = db.session.query(ModelDownload).filter_by(status='uploading').update({'status': 'pending_upload'})
@@ -269,6 +272,7 @@ class ModuleDownload(PluginModuleBase):
                 accounts = FeederUtil.get_gdrive_accounts()
                 added_count = 0
                 for line in batch_text.splitlines():
+                    FeederUtil.cooperate()
                     line = line.strip()
                     if not line or line.startswith('#') or ':' not in line:
                         continue
@@ -315,6 +319,7 @@ class ModuleDownload(PluginModuleBase):
                 # 지정 프로필 존재 여부 및 1순위 엔진 일치 엄격 검증
                 selected_profile = None
                 for p in FeederUtil.get_download_profiles():
+                    FeederUtil.cooperate()
                     if p.get('name') == profile_name:
                         selected_profile = p
                         break
@@ -389,6 +394,7 @@ class ModuleDownload(PluginModuleBase):
                 added_count, skipped_count = 0, 0
 
                 for line in lines:
+                    FeederUtil.cooperate()
                     infohash = FeederUtil.extract_info_hash(line)
                     target_mag = f"magnet:?xt=urn:btih:{infohash}" if infohash else line
 
@@ -441,6 +447,7 @@ class ModuleDownload(PluginModuleBase):
                     rows = cur.fetchall()
 
                     for r in rows:
+                        FeederUtil.cooperate()
                         r_dict = dict(r)
                         raw_mag = str(r_dict.get(magnet_col, '')).strip()
                         if not raw_mag:
@@ -516,11 +523,13 @@ class ModuleDownload(PluginModuleBase):
                     return jsonify({'ret': 'fail', 'msg': '항목을 찾을 수 없습니다.'})
 
                 if action == 'retry':
+                    item.completed_time = None
                     profile_name = req.form.get('profile_name', '').strip()
                     selected_profile = None
 
                     if profile_name:
                         for p in FeederUtil.get_download_profiles():
+                            FeederUtil.cooperate()
                             if p.get('name') == profile_name:
                                 selected_profile = p
                                 break
@@ -556,6 +565,7 @@ class ModuleDownload(PluginModuleBase):
                                     found_path = candidate
                                 else:
                                     for entry in os.listdir(mount_root):
+                                        FeederUtil.cooperate()
                                         if entry == target_fname:
                                             found_path = os.path.join(mount_root, entry)
                                             break
@@ -576,7 +586,7 @@ class ModuleDownload(PluginModuleBase):
                                     if os.path.isfile(final_dest_path):
                                         item.file_size = os.path.getsize(final_dest_path)
                                     else:
-                                        item.file_size = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(final_dest_path) for f in fs)
+                                        item.file_size = FeederUtil.directory_size(final_dest_path)
 
                                     item.local_path = final_dest_path
                                     item.status = 'completed'
@@ -608,6 +618,14 @@ class ModuleDownload(PluginModuleBase):
                     chain_desc = ' -> '.join(item.priority_chain) if item.priority_chain else '기본'
                     logger.info(f"[{self.name}] 다운로드 재시도 대기열 등록 완료: {item.title} (체인: {chain_desc})")
                     return jsonify({'ret': 'success', 'msg': f'[{clean_title}] 1순위 엔진부터 다운로드를 처음부터 재시작합니다.'})
+
+                elif action == 'force_fail':
+                    UploadUtil.kill_item_rclone(item_id)
+                    item.status = 'failed'
+                    item.completed_time = None
+                    item.error_message = '사용자 수동 실패 처리'
+                    db.session.commit()
+                    return jsonify({'ret': 'success', 'msg': '실패 처리되었습니다. 원본 파일은 보존합니다.'})
 
                 elif action == 'force_complete':
                     item.status = 'completed'
@@ -799,33 +817,32 @@ class ModuleDownload(PluginModuleBase):
         )
         shared_drive_id = item.gdrive_remote_id or dest_cfg.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
         complete_path = (item.gdrive_complete_path or dest_cfg.get('complete_path') or 'uploads/default').strip('/')
-        folder_name = item.file_name or f"item_{item.id}"
-
-        # 단일 파일 여부 판별 (확장자가 있고 끝이 슬래시가 아닌 경우)
-        _, ext = os.path.splitext(folder_name)
-        is_single_file = bool(ext and not folder_name.endswith(('/', '\\')))
+        source_name = item.source_file_name or item.file_name or f"item_{item.id}"
+        folder_name = DownloadUtil.reserve_output_folder(item, source_name)
+        is_single_file = DownloadUtil.is_single_file(source_name, item.local_path or '')
 
         if shared_drive_id:
             dest_base_path = f"{remote_name}:{{{shared_drive_id}}}/{complete_path}"
         else:
             dest_base_path = f"{remote_name}:{complete_path}"
 
-        dest_full_path = f"{dest_base_path}/{folder_name}"
-        dest_dir_path = dest_base_path if is_single_file else dest_full_path
+        dest_dir_path = f"{dest_base_path}/{folder_name}"
+        dest_full_path = f"{dest_dir_path}/{source_name}" if is_single_file else dest_dir_path
 
         if engine_remote and engine_base:
-            src_full_path = item.local_path or f"{engine_remote}:{engine_base}/{folder_name}"
+            src_full_path = item.local_path or f"{engine_remote}:{engine_base}/{source_name}"
         elif engine_remote:
-            src_full_path = item.local_path or f"{engine_remote}:{folder_name}"
+            src_full_path = item.local_path or f"{engine_remote}:{source_name}"
         else:
-            src_full_path = item.local_path or folder_name
+            src_full_path = item.local_path or source_name
 
         buffer_limit_gb = dest_cfg.get('buffer_limit_gb', 50)
 
         task_data = {
             'id': item.id,
             'title': item.title,
-            'file_name': folder_name,
+            'file_name': source_name,
+            'output_folder_name': folder_name,
             'is_single_file': is_single_file,
             'file_size': item.file_size or 0,
             'remote_source_path': src_full_path,
@@ -850,7 +867,15 @@ class ModuleDownload(PluginModuleBase):
 
         data = req.get_json(silent=True) or req.form or {}
         task_id = int(data.get('id', -1))
-        is_success = bool(data.get('success', False))
+        raw_success = data.get('success', False)
+        if isinstance(raw_success, bool):
+            is_success = raw_success
+        elif str(raw_success).strip().lower() in ['true', '1', 'on', 'yes']:
+            is_success = True
+        elif str(raw_success).strip().lower() in ['false', '0', 'off', 'no', '']:
+            is_success = False
+        else:
+            return jsonify({'ret': 'fail', 'msg': 'success 값이 올바르지 않습니다.'}), 400
         error_msg = data.get('error_msg', '')
         bytes_transferred = int(data.get('bytes_transferred', 0))
 
@@ -908,7 +933,7 @@ class ModuleDownload(PluginModuleBase):
 
                         # CD2/로컬 완료를 포함한 24시간 총 완료 토렌트 용량 계산
                         total_dl_res = db.session.query(func.sum(ModelDownload.file_size)).filter(
-                            ModelDownload.status == 'completed',
+                            ModelDownload.success_filter(),
                             ModelDownload.completed_time >= cutoff_dt
                         ).scalar()
                         cached_24h_download_bytes = int(total_dl_res) if total_dl_res else 0
@@ -917,21 +942,21 @@ class ModuleDownload(PluginModuleBase):
                         'pending': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending', 'pending_relay'])).count(),
                         'downloading': db.session.query(ModelDownload).filter_by(status='downloading').count(),
                         'staging': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_local_staging', 'local_staging'])).count(),
-                        'uploading': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['downloaded', 'pending_upload', 'uploading', 'relay_transferring'])).count(),
-                        'completed': db.session.query(ModelDownload).filter_by(status='completed').count(),
-                        'failed': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['failed', 'move_failed'])).count(),
+                        'uploading': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['downloaded', 'waiting_transporter', 'pending_upload', 'uploading', 'relay_transferring'])).count(),
+                        'completed': db.session.query(ModelDownload).filter(ModelDownload.success_filter()).count(),
+                        'failed': db.session.query(ModelDownload).filter(ModelDownload.failure_filter()).count(),
                     }
 
                     active_statuses = [
                         'pending', 'downloading', 'pending_local_staging', 'local_staging',
-                        'downloaded', 'pending_upload', 'uploading', 'pending_relay', 'relay_transferring'
+                        'downloaded', 'waiting_transporter', 'pending_upload', 'uploading', 'pending_relay', 'relay_transferring'
                     ]
 
                     # 상태별 우선순위 가중치: 실제 전송/진행 중인 작업을 신규 대기 항목보다 항상 최우선 정렬
                     status_priority = case(
                         (ModelDownload.status.in_(['local_staging', 'uploading', 'relay_transferring']), 1),
                         (ModelDownload.status == 'downloading', 2),
-                        (ModelDownload.status.in_(['pending_local_staging', 'downloaded', 'pending_upload', 'pending_relay']), 3),
+                        (ModelDownload.status.in_(['pending_local_staging', 'downloaded', 'waiting_transporter', 'pending_upload', 'pending_relay']), 3),
                         (ModelDownload.status == 'pending', 4),
                         else_=5
                     )
@@ -948,6 +973,7 @@ class ModuleDownload(PluginModuleBase):
                         refreshed_tasks = []
                         refresh_success = True
                         for dl in FeederUtil.get_downloaders():
+                            FeederUtil.cooperate()
                             if dl.get('enabled', True):
                                 engine = DownloadUtil.create_engine(dl)
                                 if engine and hasattr(engine, 'get_status'):
@@ -959,6 +985,7 @@ class ModuleDownload(PluginModuleBase):
                                             continue
                                         if s_list:
                                             for c_item in s_list:
+                                                FeederUtil.cooperate()
                                                 c_item['engine_name'] = dl.get('name', 'alldebrid')
                                             refreshed_tasks.extend(s_list)
                                     except Exception as engine_ex:
@@ -978,6 +1005,7 @@ class ModuleDownload(PluginModuleBase):
                     # 각 아이템 딕셔너리에 실시간 속도, 진행률 병합
                     active_list = []
                     for it in active_rows:
+                        FeederUtil.cooperate()
                         d = it.as_dict()
 
                         # 엔진 라이브 진행 정보는 DB 상태가 실제 다운로드 중(downloading)일 때만 반영
@@ -1016,6 +1044,7 @@ class ModuleDownload(PluginModuleBase):
 
                     # DB에 등록되지 않은 다운로더 엔진(AllDebrid, PikPak 등) 잔여 항목들을 동적 엔진명으로 큐에 노출
                     for c_task in cloud_tasks:
+                        FeederUtil.cooperate()
                         tid = str(c_task.get('task_id', ''))
                         thash = str(c_task.get('hash', '')).lower()
                         if tid and tid in db_tids:
@@ -1106,7 +1135,7 @@ class ModuleDownload(PluginModuleBase):
                     deleted = (
                         db.session.query(ModelDownload)
                         .filter(
-                            ModelDownload.status == 'completed',
+                            ModelDownload.success_filter(),
                             ModelDownload.completed_time < target_date
                         )
                         .delete()

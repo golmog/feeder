@@ -2,56 +2,75 @@
 
 **Feeder**는 웹 크롤링을 통한 토렌트/마그넷 수집부터 맞춤형 RSS 피드 발행, 그리고 멀티 다운로더 엔진과 대용량 클라우드(Google Drive, Rclone, CD2 등)를 아우르는 자동화 다운로드·이송 파이프라인을 제공하는 FlaskFarm(FF) 전용 통합 미디어 관리 플러그인입니다.
 
-과거 SJVA3의 플러그인이었던 `rss2`의 설계 사상을 계승하고 현대화하여, **수집(CRAWL) ➔ 피드(FEED) ➔ 다운로드(DOWNLOAD)** 3대 핵심 모듈로 완전 디커플링하였으며, **Celery 비동기 워커, YAML 기반 통합 스케줄링, 4단계 보안 우회 엔진(`curl_cffi`, FlareSolverr, Remote Selenium), 플러그형 다운로더/트랜스포터 확장 구조, Google Drive SA 풀 15GB 우회 파이프라인, 실시간 SSE 대시보드**를 지원합니다.
+기존 `rss2`의 수집·피드 기능을 바탕으로 **수집(CRAWL) ➔ 피드(FEED) ➔ 다운로드(DOWNLOAD)** 모듈을 구성합니다. **Celery 비동기 작업, YAML 기반 수집기·피드·다운로드 프로필, HTTP/FlareSolverr/Remote Selenium 수집, 다운로더·이송 핸들러 확장, Google Drive 계정 풀, 실시간 SSE 대시보드**를 제공합니다.
+
+**문서 기준:** `info.yaml`의 버전 **1.2.5**와 현재 구현. 각 모듈의 기본 설정과 스케줄은 FF 설정 DB에, 수집기·피드·엔진·프로필·계정 목록은 `feeder_settings.yaml`에 저장됩니다.
 
 ---
 
 ### 1. 주요 특징
 
 #### 1) 수집 계층 (CRAWL)
-* **4단계 지능형 스크래핑 엔진:**
-  * **1단계:** TLS/JA3 브라우저 지문 에뮬레이션(`curl_cffi`) 기반 초고속 수집 (HTTP Keep-Alive 세션 풀링).
-  * **2단계:** 표준 `requests` 세션 자동 폴백.
-  * **3단계:** Cloudflare Turnstile 및 5초 챌린지 대응을 위한 `FlareSolverr` 스마트 우회 (도메인별 토큰 캐싱).
-  * **4단계:** 동적 렌더링 및 봇 탐지 우회를 위한 스텔스 `Remote Selenium` 연동 (단일 브라우저 프로세스 영속 세션 유지).
-* **프록시 로테이션:** 단일 프록시뿐 아니라 쉼표(`,`) 또는 줄바꿈으로 복수 프록시 등록 시 차단 감지 및 게시판 전환 시 자동 로테이션.
-* **마그넷 & ed2k & 첨부파일 다중 지원:** 토렌트 BTIH 마그넷 주소뿐 아니라 ed2k 링크, `.torrent` 파일 파싱을 통한 마그넷 역추출 지원.
-* **토렌트 메타데이터 분석:** `torrent_info` 플러그인(m2i API) 또는 `qBittorrent Web API`와 연동하여 마그넷 해시로부터 원본 파일명 및 용량을 선제 분석.
-* **커스텀 사이트 훅 (`feeder_custom/sites`):** 단순 정규식/XPath로 해결되지 않는 복잡한 사이트(성인 확인 게이트 클릭, 암호화 링크, 다중 분할 압축 zip/rar 첨부파일 해제 및 인코딩별 텍스트 분석)를 순수 파이썬 코드로 유연하게 확장.
+
+* **선택 가능한 수집 방식:**
+  * 일반 HTTP 수집은 `curl_cffi`를 먼저 사용하고, 실패하거나 사용할 수 없으면 표준 `requests` 세션으로 폴백합니다.
+  * FlareSolverr 사용 시 초기 인가를 먼저 요청하고, 실패하면 HTTP 경로를 시도합니다. 차단 감지 후 프록시 전환과 FlareSolverr 재인가도 수행합니다.
+  * Selenium 사용 시 Remote WebDriver 경로를 사용합니다. 일반 HTTP 수집의 마지막 단계로 항상 실행되는 구조는 아닙니다.
+* **프록시 로테이션:** 단일 프록시 또는 쉼표·줄바꿈으로 구분한 복수 프록시를 지원합니다. 차단·응답 실패와 게시판 전환 시 프록시를 바꿉니다. HTTP 경로의 재시도 수는 등록 프록시 수와 재시도 설정값 중 큰 값을 사용합니다.
+* **페이지 기반 수집:** 기본 최대 5페이지이며 수집기별로 덮어쓸 수 있습니다. 증분 수집은 최근 수집 ID에 도달하면 조기 종료하고, **항상 최대 페이지 수집**을 켜면 기수집 게시물을 건너뛰며 설정 페이지까지 탐색합니다.
+* **마그넷·ed2k·첨부파일:** 링크 추출과 `.torrent` 첨부파일의 info hash 분석을 지원합니다. 토렌트 메타데이터는 `torrent_info` 플러그인(m2i API) 또는 qBittorrent Web API로 조회합니다. ed2k 링크에는 토렌트 메타데이터 조회를 수행하지 않습니다.
+* **중복 제어:** 동일 사이트·게시판의 게시물 ID를 확인하며, 마그넷 중복 허용을 끄면 다른 게시판에서 이미 수집한 해시도 제외합니다.
+* **커스텀 사이트 훅 (`feeder_custom/sites`):** 세션 초기화, 페이지 로드 후 처리, 상세 링크 추출을 확장할 수 있습니다. 로그인·압축파일 분석 등 사이트별 로직은 해당 훅에서 구현합니다.
 
 #### 2) 피드 가공 및 발행 계층 (FEED)
-* **표준 RSS 2.0 피드 생성:** 태스크별 개별 피드 및 다중 사이트/게시판/외부 RSS 통합 믹싱(Multiplexing) 피드 지원 (동일 마그넷 중복 자동 단일화).
-* **외부 원격 RSS 소스 통합:** 내부 크롤러 수집 게시판뿐만 아니라 외부 RSS 피드 URL을 소스로 지정하여 필터링 후 재발행 가능.
-* **Flexget 규격 정규식 및 화질 필터:** 제목·파일명 기반 해상도 판별(`quality: 2160p+`, `>=1080p`, `720p-1080p` 등) 및 정규식(`regexp: reject/accept/reject_excluding/accept_all`) 엔진 내장.
-* **외부 배포용 무인증 RSS XML 파일 생성:** API Key 노출 없는 정적 XML 자동 생성, 보관 기간(기본 14일) 및 최대 항목 수 자동 정리(Retention).
+
+* **RSS 2.0 생성:** 여러 내부 게시판과 외부 RSS URL을 하나의 피드로 조합합니다. 동기화 중복 판정은 **피드 이름 + 원본 URL**을 기준으로 합니다.
+* **화질·정규식 필터:** `2160p+`, `>=1080p`, `720p-1080p` 등의 화질 조건과 `regexp.reject`, `accept`, `reject_excluding`, 별도 `accept_all` 설정을 지원합니다.
+* **동기화와 출력 제한 분리:** FEED DB 동기화에는 RSS API/XML의 최대 항목 수나 XML 보관 기간을 적용하지 않습니다. API 응답과 XML 파일은 각자의 설정에 따라 실제 `<item>` 수를 제한합니다.
+* **공유용 XML 파일:** 기본 14일·최대 100항목을 출력하며, 저장 경로와 파일명을 지정할 수 있습니다. 파일 생성은 전역 생성 옵션과 개별 피드 옵션을 함께 켜야 합니다. UI의 개별 강제 생성은 이 옵션과 관계없이 실행합니다.
+* **API Key 처리:** 정적 XML에는 API Key를 넣지 않습니다. 정적 파일을 배포할 웹 서버는 별도로 준비하며, XML 안의 FF 첨부파일 다운로드 링크에 필요한 인증은 FF API 설정에 따릅니다.
 
 #### 3) 다운로드 및 클라우드 파이프라인 (DOWNLOAD)
-* **멀티 다운로더 우선순위 체인 (Priority Chain):**
-  * 여러 다운로더 엔진을 순위별로 연결하여 앞선 엔진이 지연(Stalled Timeout)되거나 실패할 경우 차순위 엔진으로 자동 폴백(Fallback).
-  * 지원 기본 엔진: **qBittorrent**(로컬 클라이언트), **CloudDrive2 (CD2)**(gRPC 기반 115 오프라인 다운로드), **AllDebrid**(오프라인 고속 캐시 수득 및 WebDAV 연동).
-  * 파이썬 스크립트 기반 커스텀 다운로더 엔진(`feeder_custom/engines`) 동적 로드 지원.
-* **유연한 이송 핸들러 (Transporter):**
-  * **단순 경로 이동 (`local`):** 다운로드 완료 후 로컬 디스크/엔진 루트 내 최종 정리 및 중복 해시 충돌 방지 폴더링.
-  * **일반 Rclone 업로드 (`rclone_simple`):** 로컬 스테이징 또는 원격 다이렉트 스트리밍을 통한 원격 리모트 업로드 및 최종 이동.
-  * **Google Drive 계정 풀 (`gdrive_rotation`):** 대규모 SA 계정 풀 기반 업로드 및 쿼터 관리.
-  * 커스텀 이송 핸들러(`feeder_custom/transporters`) 동적 로드 지원.
-* **로컬 스테이징 vs 다이렉트 전송 모드:**
-  * 로컬 디스크 공간 보호를 위한 최대 보관 수 제어 및 병렬 다운로드 워커 지원.
-  * 로컬 디스크를 전혀 거치지 않는 다이렉트(on-the-fly) 스트리밍 전송 지원.
-* **Google Workspace Impersonate & 15GB MyDrive 우회 아키텍처:**
-  * 내 드라이브 임계값 설정(기본 14GB) 이하 파일은 개인 SA의 MyDrive로 1차 업로드 후, 공유 드라이브 임시로 서버사이드 이동(`move`), 이후 공유 드라이브 완료 폴더로 원자적 부모 폴더 포인터 변경(`chpar`)을 수행하여 일일 750GB 제한 우회.
-  * 24시간 안전 업로드 한도(개인 700GB, 공유 드라이브 3TB) 및 403 쿼터 초과 자동 감지/차단 로테이션.
-* **원격 릴레이 시스템 (Colab / VPS 무트래픽 워커):**
-  * 로컬 대역폭을 소모하지 않고 원격 헤드리스 노드가 `/api/download/relay_claim` 및 `/api/download/relay_report`를 통해 클라우드 간 다이렉트 전송 수행.
-* **과거 이력 흡수 (마이그레이션):**
-  * 기존 오프라인 다운로더의 SQLite DB(`.db`) 또는 마그넷 텍스트 목록을 불러와 완료(`completed`) 이력으로 즉시 등록하여 재다운로드 방지.
+
+* **다운로더 우선순위 체인:**
+  * 내장 엔진은 **qBittorrent**와 **CloudDrive2(CD2)**입니다. **AllDebrid** 및 기타 엔진은 `feeder_custom/engines`의 확장 스크립트가 설치되어 있어야 선택할 수 있습니다.
+  * 프로토콜 미지원·작업 추가 실패·재시작 불가·지연 타임아웃에는 다음 엔진을 시도합니다. 비활성 엔진이나 큐 한도 도달은 대기하고, 원격 목록 누락 유예 초과는 해당 엔진 내 실패로 기록합니다.
+  * `max_active_tasks`는 AllDebrid에만 적용합니다. 원격에 이미 존재하는 작업은 새로 등록하지 않고 연동할 수 있습니다.
+* **이송 핸들러:** `local`(로컬 이동), `rclone_simple`(일반 리모트 복사 후 최종 이동), `gdrive_rotation`(Google Drive 계정 풀/기본 리모트)을 내장하며 커스텀 핸들러를 추가할 수 있습니다.
+* **로컬 스테이징과 다이렉트 전송:** 원격 소스를 로컬 버퍼로 먼저 받거나 Rclone으로 목적지에 직접 전송합니다. 다이렉트 모드도 별도 원격 워커를 사용하지 않으면 FF 호스트에서 전송 프로세스가 실행됩니다.
+* **DB 이력 기준 폴더명 분리:** 이전 DB 이력에 같은 이름이 있으면 파일이 사라졌더라도 `_[해시 앞 6자리]`를 붙입니다. 원본 파일명과 출력 폴더명을 별도 보존하며, 같은 이름을 이유로 다운로드를 대기시키지 않습니다.
+* **Google Drive 계정 풀:** 작은 작업은 설정 임계값(기본 14GB)에 따라 MyDrive를 경유하고 큰 작업은 공유 드라이브로 직행합니다. 계정 풀이 OFF면 계정 목록 없이 기본 업로드 리모트로 공유 드라이브에 직행합니다.
+* **원격 릴레이 API:** 작업 선점·완료 보고 API를 제공합니다. 릴레이용 이송 핸들러와 원격 워커는 별도로 준비해야 합니다.
+* **이력 가져오기와 고아 작업 흡수:** 기존 SQLite DB·마그넷 텍스트의 완료 이력 가져오기와, 엔진에만 남아 있는 작업을 프로필에 연결하는 기능을 제공합니다.
 
 #### 4) 실시간 대시보드 및 운영 편의성
-* **SSE(Server-Sent Events) 실시간 대시보드:** Rclone `--stats-one-line` IPC 텔레메트리를 파싱하여 큐 화면 새로고침 없이 전송 속도, 진행률(ETA), 활성 작업 게이지 바 실시간 노출.
-* **24시간 업로드 통계:** 30초 TTL 메모리 캐시를 적용하여 DB 부하 없이 작업 큐 및 계정 풀 페이지에서 24시간 총 업로드량 실시간 확인.
-* **미등록 고아 작업 큐 흡수 (Adopt Orphan):** 엔진(AllDebrid, CD2 등)에는 파일이 남아있으나 Feeder DB에 등록되지 않은 잔여 작업을 원클릭으로 감지하여 프로필을 지정해 파이프라인으로 흡수.
-* **안정적인 동시성 제어:** SQLite WAL 저널 모드 및 60초 `busy_timeout` 강제 적용, Celery 워커 간 원자적 DB 런타임 락(`_runtime_lock`), 대용량 Rclone 실행 중 DB 락 해제(Zero-Lock).
-* **내장 Monokai Ace Editor:** 사이트 JSON 규칙, 파이썬 커스텀 스크립트 작성/편집, JSON Prettier 자동 정렬, 창 크기 조절 및 전체화면 지원.
+
+* **SSE 대시보드:** 큐 상태, 엔진 진행률, Rclone 전송량·속도·ETA를 갱신합니다. Rclone의 `MiB`, `GiB` 등 IEC 단위도 처리합니다.
+* **24시간 통계:** 최근 성공 종료 용량과 Google Drive 사용량 기록을 표시합니다. Google Drive 사용량은 전송 시도 시 기록한 파일 크기 합계로, 성공 전송 바이트만 집계한 값과 차이가 있을 수 있습니다. SSE 통계는 30초 간격으로 다시 계산합니다.
+* **작업 제어:** 재시도, 수동 완료·실패, 삭제/취소를 지원합니다. 이송 핸들러를 찾지 못하면 `waiting_transporter`로 원본을 보존하고 설정 복구를 기다립니다.
+* **재시작 복구:** 이전 실행의 스테이징·업로드·릴레이 전송 상태를 대기 상태로 되돌립니다. 필요한 DB 컬럼·인덱스는 플러그인 로드 시 추가합니다.
+* **동시성 제어:** SQLite WAL·busy timeout 설정, 프로세스 내 실행 락과 DB 런타임 락을 사용합니다. 스테이징·Google Drive Rclone 전송 전에는 DB 세션을 반환합니다.
+* **내장 편집기:** 사이트 JSON, YAML, 커스텀 Python 스크립트를 편집하며 JSON 정렬·창 크기 조절·전체화면을 지원합니다.
+
+#### 5) 처음 사용하는 순서
+
+1. **CRAWL 설정:** 사이트 규칙을 등록하고 수집기에 게시판·최대 페이지·프록시/브라우저 옵션을 지정한 뒤 사이트 테스트와 수동 수집을 실행합니다.
+2. **FEED 설정:** 수집 게시판 또는 외부 RSS를 소스로 등록하고 필터를 설정합니다. 피드 동기화 후 목록과 RSS API 응답을 확인합니다.
+3. **DOWNLOAD 설정:** 엔진을 등록하여 연결을 테스트하고, 프로필에 대상 피드·우선순위 체인·목적지를 지정합니다. Rclone 사용 시 FF와 Celery 워커 환경에서 실행 파일·설정 파일·원본 경로에 접근할 수 있어야 합니다.
+4. **Google Drive 사용 시:** 공유 드라이브 ID와 경로를 설정합니다. 계정 풀 사용 시 계정별 리모트 또는 Impersonate 설정과 계정 목록을 준비합니다. 14GB·700GB·3TB는 플러그인의 기본 설정값이며 실제 서비스의 저장 공간·권한·쿼터를 보장하는 값은 아닙니다.
+5. 각 모듈의 **자동 & DB정리**에서 실행 주기와 자동 시작을 설정합니다. 기본 주기는 CRAWL/FEED 10분, DOWNLOAD 5분이며 FF 스케줄러의 Interval/Cron 형식을 사용합니다.
+
+#### 6) 처리 개수 제한의 범위
+
+| 계층 | 설정 | 적용 범위 |
+| :--- | :--- | :--- |
+| CRAWL | 최대 수집 페이지 수 (`crawl_max_page`, 수집기의 `max_page`) | 게시판별 최대 탐색 페이지. 일반 수집에는 별도의 게시물 개수 상한을 적용하지 않습니다. |
+| FEED API | 실시간 RSS 피드 최대 수 (`feed_count` / `feed_feed_count`) | RSS API가 반환하는 `<item>` 수. 기본 100개. |
+| FEED XML | 피드 보관 최대 항목 수 (`rss_file_items` / `feed_rss_file_items`) | XML 파일에 넣는 `<item>` 수. 기본 100개. API 제한과 독립적입니다. |
+| DOWNLOAD | 로컬 스테이징 최대 보관 수 (`download_max_staging_items`) | DB에 경로가 기록되고 스테이징 루트 아래에 실제 남아 있는 작업 수. 업로드 대기·실패 파일도 포함합니다. 기본 10개, 0은 무제한. |
+| AllDebrid | `max_active_tasks` | 해당 AllDebrid 엔진의 진행 중 다운로드 큐. 0은 무제한. |
+
+테스트 수집 개수(기본 3개·목록 1페이지), 화면 페이지 크기, 병렬 워커 수는 각각 테스트·표시·동시 실행 범위입니다. CD2의 `cd2_max_pages`는 상태 목록 조회 범위를 제한하는 별도 보호 설정입니다. FEED XML 보관 기간, 다운로드 대상 기간(`sync_hours`), DB 자동 정리는 개수 제한과 별도로 적용합니다.
 
 ---
 
@@ -70,7 +89,7 @@ FEEDER
 └── DOWNLOAD (다운로드)
     ├── 설정 및 관리 (기본 설정, 다운로더 엔진 관리, 다운로드 라우팅 프로필, Google Drive 계정 풀, 자동 & DB정리)
     ├── 다운로드 큐 및 대시보드 (실시간 SSE 게이지 바, 속도 배지, 작업 제어, 고아 작업 흡수)
-    └── 다운로드 리스트 (전체 다운로드 완료/실패 이력 검색, 재시도, 완료 처리)
+    └── 다운로드 리스트 (전체 상태 및 완료/실패 이력 검색, 재시도, 완료·실패·삭제 처리)
 ```
 
 | 모듈 | 페이지/탭 | 주요 기능 |
@@ -80,7 +99,7 @@ FEEDER
 | **FEED** | **피드 리스트** | 생성된 피드별 발행 결과 조회, 마그넷 복사, 다운로드 큐 직접 추가. |
 | | **설정 및 관리** | 전역 화질/정규식 필터, 피드(Feed)별 소스(내부 수집기+외부 RSS) 조합, Flexget 화질 및 정규식 필터, 무인증 공유용 RSS XML 파일 생성 및 보관 기간 설정. |
 | **DOWNLOAD** | **다운로드 큐 및 대시보드** | 활성 작업 실시간 모니터링(대기, 엔진 다운로드, 로컬 스테이징, GDrive 업로드), 실시간 속도/진행률/24시간 업로드 배지, 작업 강제완료/재시도/삭제, 고아 작업 큐 흡수. |
-| | **다운로드 리스트** | 최종 완료 및 실패 이력 검색, 실패 작업 프로필 변경 재시도, 이력 삭제. |
+| | **다운로드 리스트** | 이송 핸들러 복구 대기·이동 실패를 포함한 상태 검색, 프로필 변경 재시도, 수동 완료·실패·삭제. |
 | | **설정 및 관리** | 다운로더 엔진(`BaseDownloadEngine`) 등록, 다운로드 라우팅 프로필(`BaseTransporter`) 구성, Google Drive SA 계정 풀 등록 및 24시간 통계 확인, 과거 이력 마이그레이션. |
 
 ---
@@ -105,7 +124,6 @@ FEEDER
     "XPATH": "//tbody/tr[%s]//td[2]//a",
     "INDEX_START": 1,
     "INDEX_STEP": 1,
-    "TITLE_XPATH": "./text()",
     "TITLE_REGEX": "(?P<title>.*)"
   },
   "BOARD_LIST": {
@@ -151,8 +169,8 @@ FEEDER
 | :--- | :---: | :---: | :--- |
 | `NAME` | **필수** | - | 사이트 식별명. 커스텀 스크립트 훅(`site_{NAME}.py`)과의 매핑 키로 사용됩니다. |
 | `TORRENT_SITE_URL` | **필수** | - | 대상 사이트 도메인 주소 (끝에 `/` 제외). |
-| `DELAY` | 선택 | `2.0` | 페이지 요청 간 대기 시간(초). 미입력 시 전역 설정값이 적용됩니다. |
-| `USER_AGENT` | 선택 | 기본 크롬 UA | 사이트 요청 헤더 및 Selenium 드라이버에 적용할 User-Agent. |
+| `DELAY` | 선택 | `2.0` | 요청 간 대기 시간(초). 수집기 `delay` → 사이트 `DELAY` → CRAWL 기본 딜레이 순으로 적용합니다. |
+| `USER_AGENT` | 선택 | 기본 크롬 UA | 사이트 요청에 사용할 User-Agent. 우회 인가에서 받은 User-Agent가 있으면 해당 값이 우선할 수 있습니다. |
 | `COOKIE` | 선택 | - | 고정 세션 쿠키 문자열 (`name=val; name2=val2`). |
 | `BOARD_URL_RULE` | 선택 | 그누보드 기본 | 기본 게시판 목록 URL 템플릿. `{URL}`, `{BOARD_NAME}`, `{PAGE}` 치환자 지원. |
 | `SUBCAT_URL_RULE` | 선택 | - | 분류 필터(서브 카테고리) URL 템플릿. `{URL}`, `{BOARD_NAME}`, `{FID}`, `{SUBCAT}`, `{TYPEID}`, `{PAGE}` 치환자 지원. |
@@ -161,24 +179,31 @@ FEEDER
 | `SELENIUM_WAIT_TAG` | 선택 | `body` | Selenium으로 목록 로드 시 대기할 요소의 XPath. |
 | `SELENIUM_DETAIL_WAIT_TAG` | 선택 | `body` | Selenium으로 상세 페이지 로드 시 대기할 요소의 XPath. |
 | `SELENIUM_TIMEOUT` | 선택 | 기본 설정값 | 해당 사이트에만 적용할 Selenium 로딩 타임아웃(초). |
+| `SELENIUM_REMOTE_URL` | 선택 | CRAWL 기본 설정 | 사이트별 Remote WebDriver 주소. 미지정 시 `crawl_selenium_remote_url`을 사용합니다. |
+| `BOARD_LIST` | 선택 | - | 게시판 ID를 별도의 목록 XPath 규칙 키에 연결하는 딕셔너리. |
 | `MAGNET_REGEX` | 선택 | 자동 정규식 | 본문에서 마그넷 주소를 추출하기 위한 정규식 규칙 `[매칭정규식, 치환포맷]`. |
 | `DOWNLOAD_REGEX` | 선택 | - | 첨부파일 다운로드 주소와 파일명을 추출하는 정규식 (`(?P<url>...)`, `(?P<filename>...)` 그룹 필수). |
 | `EXTRA` | 선택 | `[]` | 사이트별 특수 플래그 배열 (`USE_PROXY`, `USE_FLARESOLVERR`, `USE_SELENIUM`, `USE_TORRENT_INFO`, `USING_POST_CHAR_ID`, `ONLY_FILE`, `MAGNET_ONLY_ONE_LAST`). |
 | `DESCRIPTION` | 선택 | - | 웹 UI 사이트 목록 테이블에 표시할 안내 문구. |
 
+`XPATH_LIST_TAG`의 `XPATH`, `INDEX_START`, `INDEX_STEP`으로 목록을 순회하고, 선택적인 `TITLE_REGEX`의 `title` 그룹으로 제목을 가공합니다. 제목 원문은 링크 태그의 텍스트에서 얻으며 `TITLE_XPATH`는 현재 사용하지 않습니다. `BOARD_LIST`는 게시판 ID를 별도 XPath 규칙 키에 연결합니다.
+
+`USING_POST_CHAR_ID`는 숫자 ID 기준 조기 종료를 사용하지 않을 때, `ONLY_FILE`은 첨부파일 중심 게시물을 저장할 때 사용합니다. 정기 수집의 프록시·Selenium·메타데이터 사용 여부는 수집기 설정을 확인하세요. 사이트 옵션만 켜고 수집기의 해당 옵션을 끈 경우 같은 동작을 기대할 수 없습니다.
+
 ---
 
 ### 4. 통합 설정 파일 (`feeder_settings.yaml`) 가이드
 
-플러그인 상단의 **YAML 편집** 버튼을 누르거나 `{path_data}/db/feeder_settings.yaml` 파일을 수정하여 모든 수집기, 피드, 다운로더 엔진, 다운로드 프로필, 구글 드라이브 계정 풀을 단일 파일에서 선언적으로 관리할 수 있습니다.
+플러그인 상단의 **YAML 편집** 버튼을 누르거나 `{path_data}/db/feeder_settings.yaml` 파일을 수정하여 수집기, 피드, 다운로더 엔진, 다운로드 프로필, Google Drive 계정 목록을 관리할 수 있습니다. 사이트 JSON 규칙과 각 모듈의 기본 설정·스케줄은 FF DB에 별도로 저장되므로 이 YAML에 전부 포함되지는 않습니다.
 
 <br>
 #### 전체 YAML 구조 예시
 
+AllDebrid 부분은 설치한 확장 엔진의 스키마에 맞게 조정하세요. 아래 `use_rss_file`만으로 정기 XML 생성이 켜지지는 않으며 FEED 기본 설정의 전역 스위치도 필요합니다.
+
 ```yaml
 GLOBAL:
   quality: 1080p+
-  append_hash_on_conflict: true
   regexp:
     reject:
       - \btrailer\b: {from: title}
@@ -192,6 +217,9 @@ CRAWLERS:
     boards:
       - board: '2_2'
     interval: 1
+    max_page: 5
+    delay: 2.0
+    max_retries: 3
     enabled: true
     use_proxy: false
     use_flaresolverr: false
@@ -219,6 +247,10 @@ FEEDS:
       - site: sukebei
         board: '2_2'
     quality: 2160p+
+    feed_count: 100
+    rss_file_items: 50
+    rss_file_days: 14
+    rss_file_path: /data/rss
     use_rss_file: true
     rss_file: sukebei_4k.xml
 
@@ -248,15 +280,17 @@ DOWNLOADERS:
     save_path: '/data/downloads'
     category: feeder
     stalled_timeout_hours: 12
+    missing_timeout_hours: 24
 
   - name: ad
-    engine_type: alldebrid
+    engine_type: alldebrid  # 별도 확장 엔진 스크립트 설치 필요
     enabled: true
     apikey: 'YOUR_ALLDEBRID_API_KEY'
     remote_name: 'ad'
     rclone_base_path: 'magnets'
     max_active_tasks: 20
     stalled_timeout_hours: 6
+    missing_timeout_hours: 24
 
   - name: cd2
     engine_type: cd2
@@ -265,8 +299,11 @@ DOWNLOADERS:
     cd2_port: 19798
     cd2_token: 'YOUR_CD2_JWT_TOKEN'
     cd2_virtual_path: '115open/云下载'
-    cd2_mount_path: '/mnt/cd2/115open/云下载'
+    cd2_mount_path: '/mnt/cd2'
+    cd2_max_pages: 1
+    cd2_timeout: 30
     stalled_timeout_hours: 24
+    missing_timeout_hours: 24
 
 DOWNLOAD_PROFILES:
   - name: default_profile
@@ -277,7 +314,6 @@ DOWNLOAD_PROFILES:
       - ad
       - cd2
       - qbit_main
-    append_hash_on_conflict: true
     destination:
       type: gdrive_rotation
       use_local_staging: false
@@ -288,11 +324,12 @@ DOWNLOAD_PROFILES:
     destination_by_engine:
       qbit_main:
         type: local
-        complete_path: 'uploads/default'
+        complete_path: '/data/library/default'
 
 GDRIVE_ACCOUNTS:
   - username: 'user01@example.com'
     mydrive_rclone_id: '0AIoBxxxxxx_FolderID1'
+    remote_name: 'gdrive_user01'
   - username: 'user02@example.com'
     mydrive_rclone_id: '0AIoByyyyyy_FolderID2'
     remote_name: 'gdrive_user02'
@@ -300,94 +337,193 @@ GDRIVE_ACCOUNTS:
 
 #### YAML 섹션별 필드 설명
 
+##### `GLOBAL` (피드 공통 필터)
+
+* `quality`: 개별 피드에 화질 조건이 지정되지 않았을 때 사용할 기본 조건.
+* `regexp`: 모든 피드에 적용할 `reject`, `accept`, `reject_excluding` 규칙 목록. 문자열 또는 `패턴: {from: 필드}` 형식을 사용합니다.
+* `accept_all`: 앞선 거부·화질·필수 포함 조건을 통과한 미허용 항목까지 허용할지 지정합니다. `regexp` 안이 아닌 `GLOBAL` 또는 개별 피드의 최상위 키입니다.
+* **필터 순서:** 전역/개별 `reject` → 화질 → 전역/개별 `reject_excluding` → 전역/개별 `accept` → `accept_all`. `accept`와 `accept_all`이 앞선 거부를 무효화하지 않습니다. `accept` 규칙이 없으면 앞 단계에서 거부되지 않은 항목을 기본 허용합니다.
+
+##### `CRAWLERS` (수집기)
+
+| 필드 | 설명 |
+| :--- | :--- |
+| `id`, `site` | 수집기 ID와 등록된 사이트의 `NAME`. UI에서 새 수집기를 저장하면 ID를 부여하며, 같은 사이트의 중복 수집기 추가는 제한합니다. |
+| `boards` | `board`, 선택적인 `subcat` 목록. `166:875`처럼 입력한 게시판도 정규화한 `full_board_key`로 관리합니다. |
+| `enabled` | 정기 실행 여부. 개별 수집기 수동 실행은 비활성 수집기도 지정할 수 있습니다. |
+| `interval` | CRAWL 스케줄러 N회 실행마다 수집. 분 단위 주기는 CRAWL 기본 설정의 스케줄 항목에 지정합니다. |
+| `max_page` | 개별 수집기의 최대 탐색 페이지. 미입력 시 CRAWL 기본 설정 사용. |
+| `delay`, `max_retries` | 개별 요청 딜레이·최대 재시도 횟수. 미입력 시 각각 사이트/전역 딜레이, 전역 재시도 설정을 사용합니다. |
+| `use_proxy`, `proxy_url` | 프록시 사용 여부와 단일/복수 주소. 개별 주소가 비어 있으면 기본 프록시 주소를 사용합니다. |
+| `use_flaresolverr`, `use_selenium`, `use_torrent_info` | 이 수집기에서 사용할 우회·브라우저·메타데이터 옵션. 서비스 주소와 메타데이터 조회 방식은 CRAWL 기본 설정에 지정합니다. |
+
+##### `FEEDS` (피드)
+
+| 필드 | 설명 |
+| :--- | :--- |
+| `id`, `name` | 피드 ID와 고유 이름. RSS API는 둘 중 하나로 피드를 지정합니다. |
+| `sources` | 내부 소스는 `site`, `board`, 선택적인 `subcat`; 외부 소스는 `type: rss`, `url`을 지정합니다. 외부 URL을 `board`에 넣는 기존 형식도 처리합니다. |
+| `quality`, `regexp`, `accept_all` | 개별 필터. `quality`는 문자열 또는 조건 목록으로 지정할 수 있습니다. |
+| `feed_count` | API RSS 응답 최대 항목 수. 미입력 시 `feed_feed_count`(기본 100). |
+| `use_rss_file`, `rss_file`, `rss_file_path` | 정적 XML 생성 여부·파일명·저장 디렉터리. 파일명 기본값은 `{피드명}.xml`, 경로 미입력 시 FEED 기본 저장 경로 사용. |
+| `rss_file_items`, `rss_file_days` | XML 최대 항목 수·보관 기간. 미입력 시 FEED 기본 설정(100개·14일). DB 항목을 삭제하거나 동기화 범위를 줄이는 값으로 사용하지 않습니다. |
+| `use_proxy`, `proxy_url` | 외부 RSS 요청의 프록시. 개별 사용 여부가 명시되면 우선 적용하고, 주소가 비어 있으면 FEED 기본 주소를 사용합니다. |
+
+XML 정기 생성에는 FEED 기본 설정의 **공유용 RSS XML 파일 별도 생성**도 켜고 저장 경로를 지정해야 합니다. DB 보관 기간은 **자동 & DB정리**의 별도 설정입니다.
+
 ##### `DOWNLOADERS` (다운로더 엔진 설정)
 * `name`: 프로필 우선순위 체인에서 참조할 고유 영문 식별명.
 * `engine_type`: 엔진 타입 (`qbittorrent`, `cd2`, `alldebrid` 또는 `feeder_custom/engines`에 등록된 커스텀 엔진 ID).
 * `enabled`: 엔진 활성화 여부.
 * `stalled_timeout_hours`: 해당 시간 동안 완료되지 않고 지연될 경우 다음 순위 엔진으로 자동 폴백할 시간(0 입력 시 무제한 대기).
-* `max_active_tasks`: 해당 엔진의 동시 진행 큐 제한 (0은 무제한).
+* `missing_timeout_hours`: 원격 전체 목록에서 작업이 연속으로 보이지 않을 때 해당 엔진 내 실패로 처리하기까지의 유예 시간(기본 24시간, 0은 자동 실패 안 함). 조회 오류나 CD2 페이지 제한으로 전체 목록을 확인하지 못한 경우에는 누락으로 판정하지 않습니다. 다시 발견하면 유예 시간을 초기화합니다.
+* `max_active_tasks`: AllDebrid의 동시 진행 큐 제한 (0은 무제한). 다른 엔진에는 적용하지 않습니다. 원격에 이미 존재하는 작업의 연동은 신규 큐 슬롯을 소비하지 않습니다.
+* `cd2_max_pages`, `cd2_timeout`: CD2 상태 조회 최대 페이지(기본 1)와 요청 타임아웃(기본 30초). 마운트 경로는 `cd2_mount_path`와 `cd2_virtual_path`를 조합하며 이미 가상 경로가 포함된 마운트 경로도 처리합니다.
 * 기타 필드는 각 엔진의 `CONFIG_SCHEMA`에 따라 동적으로 설정됩니다.
 
 ##### `DOWNLOAD_PROFILES` (다운로드 라우팅 프로필)
 * `name`: 프로필 식별명.
-* `sync_hours`: 최근 N시간 이내에 수집된 게시글만 다운로드 대상으로 탐색 (기본값: 72시간).
+* `sync_hours`: 최근 N시간 이내의 FEED DB 항목을 다운로드 큐 등록 대상으로 탐색합니다. 미입력 시 DOWNLOAD 기본 설정(기본 72시간), 0 이하이면 기간 제한 없이 탐색합니다. 이전 `sync_days`는 호환용으로 시간으로 환산합니다.
 * `feeds`: 해당 프로필을 적용할 피드 목록 (`['*']`는 전체 적용).
 * `priority_chain`: 순서대로 시도할 다운로더 엔진 식별명 배열 (`['ad', 'cd2', 'qbit_main']`).
-* `append_hash_on_conflict`: 동일한 폴더명이 이미 존재할 때 해시(`_[hash]`)를 붙여 충돌을 방지할지 여부.
+* 자동 큐 등록은 FEED 항목마다 첫 마그넷을 우선 선택하고, 마그넷이 없으면 첫 링크(ed2k 등)를 선택합니다. 이미 등록된 info hash 또는 링크는 다시 추가하지 않습니다. 첨부파일은 RSS의 다운로드 링크로 제공합니다.
+* 동일 폴더명은 실제 파일 존재 여부와 무관하게 DB 이력을 기준으로 해시 접미사(`_[hash]`)를 붙여 구분합니다. 원본 파일명과 출력 폴더명을 별도로 보존하며, 기존 `append_hash_on_conflict` 옵션으로 이 규칙을 끄지 않습니다.
 * `destination`: 기본 이송 핸들러 설정 딕셔너리 (`type: local | rclone_simple | gdrive_rotation`).
   * `use_local_staging`: 로컬 디스크로 임시 다운로드 후 전송할지(`true`), 원격 소스에서 목적지로 다이렉트(on-the-fly) 스트리밍할지(`false`) 여부.
   * `staging_path`: 로컬 스테이징 시 사용할 서브 디렉터리 경로.
-  * `upload_path`: 클라우드 임시 수신 경로 (기본: `incoming/{profile_name}`).
-  * `complete_path`: 최종 보관 경로 (기본: `uploads/{profile_name}`).
+  * `upload_path`: 리모트 내 임시 업로드 경로. `gdrive_rotation`의 미설정 시 기본값은 `incoming/default`이며 `rclone_simple`은 명시해야 합니다.
+  * `complete_path`: 최종 보관 경로. `gdrive_rotation`의 기본값은 `uploads/default`이며 `rclone_simple`은 명시해야 합니다. `local`은 FF 파일시스템의 절대 경로 사용을 권장합니다. CD2 상대 경로는 엔진 마운트 루트와 결합합니다.
   * `shared_drive_id`: 목적지 공유 드라이브 ID.
-* `destination_by_engine`: 특정 엔진 전용 목적지 오버라이드 딕셔너리 (예: 로컬 클라이언트인 `qbit_main`은 클라우드로 올리지 않고 로컬 완료 경로로 단순 이동).
+* `destination_by_engine`: 엔진 **식별명**별 목적지 override. 기본 `destination`에 해당 엔진의 필드를 병합합니다. 엔진 타입명 대신 `qbit_main`, `cd2` 등 `DOWNLOADERS.name`을 사용합니다.
+* `rclone_simple`은 `remote_name`, `upload_path`, `complete_path`를 사용합니다. `gdrive_rotation`은 `mydrive_remote_name`, `shared_drive_id`, 업로드/완료 경로를 확인하고 계정 풀·Impersonate 스위치는 DOWNLOAD 기본 설정에 지정합니다.
 
 ##### `GDRIVE_ACCOUNTS` (Google Drive 계정 풀)
 * `username`: 계정 식별자 (위임 사용 시 `--drive-impersonate` 대상 이메일 주소).
 * `mydrive_rclone_id`: 1차 15GB 우회 업로드를 수행할 MyDrive 폴더의 Rclone ID.
 * `remote_name`: 비위임(독립 리모트) 사용 시 `rclone.conf` 상의 개별 리모트 이름 (선택 사항).
 
+##### 각 모듈의 기본 설정 (FF 설정 DB)
+
+아래 값은 YAML의 `GLOBAL`에 옮겨 적는 항목이 아니라 각 모듈의 **기본 설정 / 자동 & DB정리** 화면에서 관리하는 값입니다.
+
+| 설정 | 기본값 | 용도 |
+| :--- | :--- | :--- |
+| `crawl_interval`, `feed_interval`, `download_interval` | `10`, `10`, `5` | 모듈별 정기 실행 주기(분). Cron 형식도 지원. 자동 시작 기본 OFF. |
+| `crawl_max_page`, `crawl_always_max_page` | `5`, OFF | 최대 탐색 페이지와 증분 수집 조기 종료 여부. |
+| `crawl_crawler_delay`, `crawl_crawler_max_retries` | `2.0`, `3` | 기본 요청 딜레이(초)와 재시도 횟수. |
+| `crawl_flaresolverr_url`, `crawl_selenium_remote_url` | 빈 값 | 선택한 우회/브라우저 서비스 주소. 서비스는 별도 실행해야 합니다. |
+| `crawl_torrent_info_method` | `plugin` | 토렌트 메타데이터 조회 방식. `plugin`은 `torrent_info` 플러그인, `qbittorrent`는 `crawl_qb_url`·사용자명·비밀번호 설정을 사용합니다. |
+| `feed_feed_count` | `100` | API RSS 최대 항목 수. |
+| `feed_make_rss_file`, `feed_rss_file_path` | OFF, 빈 값 | 정적 XML 정기 생성 스위치와 기본 저장 경로. |
+| `feed_rss_file_items`, `feed_rss_file_days` | `100`, `14` | XML 최대 항목 수와 출력 대상 기간(일). |
+| `download_feed_sync_hours` | `72` | 다운로드 큐에 새로 등록할 FEED 항목의 기간(시간). |
+| `download_use_local_staging`, `download_max_staging_items` | ON, `10` | 전역 스테이징 사용 여부와 최대 보관 작업 수. |
+| `download_staging_workers`, `download_upload_workers` | `2`, `2` | 스테이징·Google Drive 업로드 병렬도. |
+| `download_rclone_conf_path`, `download_rclone_upload_remote_name` | 빈 값, 빈 값 | FF/워커가 읽을 설정 파일의 경로와 기본 업로드 리모트명. |
+| `download_rclone_chunk_size`, `download_rclone_extra_options` | `256M`, `--timeout 30m` | Google Drive 업로드 청크 크기와 지원 경로에 적용할 추가 옵션. |
+| `download_use_gdrive_pool`, `download_gdrive_use_impersonate` | OFF, OFF | 계정 풀 사용과 도메인 위임 사용 여부. |
+| `download_gdrive_mydrive_remote_name`, `download_shared_drive_id` | `gdrive_sa`, 빈 값 | MyDrive 기본 리모트와 목적지 공유 드라이브 ID. |
+| `download_mydrive_upload_threshold`, `download_gdrive_upload_limit`, `download_shared_drive_upload_limit` | `14GB`, `700GB`, `3TB` | MyDrive 경유 분기와 사용량 설정 한도. |
+| `download_shared_drive_quota_reset_time` | `16:00` | 공유 드라이브 쿼터 차단 해제 시각(Asia/Seoul). |
+| `crawl_db_auto_delete`, `feed_db_auto_delete`, `download_db_auto_delete` | 모두 OFF | 각 DB 자동 정리. `*_db_delete_day` 기본값은 30일. |
+
+일부 Rclone 경로·옵션은 YAML의 소문자 `rclone` 섹션도 호환 경로로 읽지만, 새 설정은 우선 UI의 필드와 개별 프로필을 사용하세요. 모든 설정이 동일한 우선순위를 공유하는 구조는 아닙니다.
+
+
 ---
 
 ### 5. 다운로드 파이프라인 및 클라우드 연동 가이드
 
-Feeder는 대용량 트래픽 및 클라우드 서비스의 제한(Google Drive 일일 750GB 쿼터 등)을 우회하고 효율적으로 라이브러리를 구축할 수 있도록 강력한 파이프라인을 내장하고 있습니다.
+FEED는 수집 항목을 필터링해 DB에 적재하고, DOWNLOAD는 프로필의 대상 피드·기간·우선순위 체인을 기준으로 작업을 만듭니다. RSS API/XML의 출력 개수는 다운로드 큐 등록 개수를 제한하지 않습니다.
 
 ```text
-[피드 아이템 동기화 (sync_feed_items)]
-       │
-       ▼
-[대기열 (pending)] ──> 우선순위 체인 1순위 엔진 선택
-       │
-       ├─ [엔진 다운로드 (downloading)] ──(타임아웃 발생 시)──> 차순위 엔진으로 자동 폴백
-       │       │
-       │       ▼ (다운로드 완료 감지)
-       │
-       ├─ [로컬 스테이징 활성화 시]
-       │       ▼
-       │   [로컬 스테이징 (local_staging)] ──> Rclone으로 로컬 임시 버퍼 수신
-       │       ▼
-       │   [다운로드 완료 (downloaded)]
-       │
-       └─ [다이렉트 스트리밍 모드 시 (로컬 스테이징 OFF)]
-               ▼
-           [다운로드 완료 (downloaded)] (원격 소스 경로 유지)
-                   │
-                   ▼ [이송 라우팅 (route_completed_downloads)]
-       ┌───────────┴───────────────────────────────┐
-       ▼                                           ▼
-[단순 경로 이동 (local)]              [Google Drive 계정 풀 (gdrive_rotation)]
-       │                                           │
-       ▼                                           ▼
-[최종 완료 (completed)]                    [업로드 대기 (pending_upload)]
-                                                   │
-                                                   ▼ [execute_upload (Zero-Lock)]
-                                           1. 소스 ➔ MyDrive 임시 (incoming) 복사
-                                           2. 3초 안정화 대기 (Eventual Consistency 방어)
-                                           3. MyDrive 임시 ➔ 공유 드라이브 임시 (Across move)
-                                           4. 공유 드라이브 임시 ➔ 공유 드라이브 완료 (chpar 원자적 이동)
-                                           5. MyDrive 휴지통 비우기 (cleanup)
-                                                   │
-                                                   ▼
-                                           [최종 완료 (completed)]
+[FEED DB → 프로필별 다운로드 대상 동기화 / 직접 다운로드 등록]
+                         │
+                         ▼
+                     pending
+                         │ 엔진 선택·원격 기존 작업 연동 또는 신규 등록
+                         ▼
+                    downloading
+                         │ 완료 확인
+             ┌───────────┼────────────────┐
+             ▼           ▼                ▼
+  pending_local_staging  downloaded    pending_relay
+             │           │                │ 원격 워커 선점
+       local_staging     │          relay_transferring
+             │           │                │ 결과 보고
+             └──────→ downloaded          └──→ completed / failed
+                         │ 이송 핸들러 선택
+          ┌──────────────┼─────────────────────┐
+          ▼              ▼                     ▼
+        local       rclone_simple       gdrive_rotation
+          │              │                     │
+          │       임시 업로드 → 최종 이동   pending_upload
+          │              │                     │
+          │              │                  uploading
+          │              │                     │
+          └───────→ completed ←──── 원격 이동·소스 정리
+
+이송 핸들러 없음/초기화 실패 → waiting_transporter → 설정 복구 후 재이송
+다운로드 추가/재시작 불가·지연 → 다음 엔진의 pending 또는 체인 소진 failed
+원격 전체 목록 연속 누락 유예 초과 → 해당 엔진에서 failed
+Google Drive 업로드 후 이동/정리 실패 → move_failed
 ```
 
-#### 1) Google Drive 15GB MyDrive 바이패스 및 2단계 이동 메커니즘
-* **목적:** Google Workspace 공유 드라이브의 일일 750GB 업로드 한도를 우회하여 수 TB를 연속 업로드.
-* **동작 순서:**
-  1. 내 드라이브 임계값 설정(기본 14GB) 이하의 파일은 SA(서비스 계정) 풀에서 24시간 사용량이 가장 적은 계정의 15GB MyDrive 임시 폴더(`incoming/...`)로 1차 업로드.
-  2. 파일시스템 인덱싱 안정화를 위해 3초 대기.
-  3. `rclone move`를 통해 MyDrive 임시 폴더에서 목적지 공유 드라이브의 임시 폴더(`incoming/...`)로 서버사이드 이동.
-  4. 같은 공유 드라이브 내에서 `rclone backend chpar`를 호출하여 완료 폴더(`uploads/...`)로 부모 포인터만 즉시 원자적 교체.
-  5. MyDrive의 휴지통을 비워 15GB 공간을 즉시 원상 복구.
-* **리모트 분리 원칙:**
-  - 내 드라이브를 경유할 때는 전송부터 최종 이동까지 **`내 드라이브 SA 기본 리모트`** 단 하나만 일관되게 사용합니다.
-  - 내 드라이브 임계값 설정 크기를 초과하는 대용량 파일이 공유 드라이브로 직행할 때만 **`기본 목적지 공유 드라이브 리모트`**를 단독 사용합니다.(도메인 위임 미사용시)
+#### 1) Google Drive 계정 풀 및 2단계 이동
 
-#### 2) Zero-Lock Rclone 전송 및 통계 브로드캐스트
-* 장시간 지속되는 대용량 Rclone 업로드 중 SQLite DB가 잠기지 않도록, 서브프로세스 기동 직전 `db.session.remove()`로 세션을 반환합니다.
-* Rclone의 `--stats-one-line` 출력을 실시간 정규식으로 파싱하여 SSE 스트림으로 UI에 브로드캐스트합니다.
-* 24시간 총 업로드량 통계는 **30초 TTL 메모리 캐시**가 적용되어 DB 쿼리 부하 없이 실시간 배지에 반영됩니다.
+* **계정 풀 ON:** 24시간 사용량이 적은 가용 계정을 할당합니다. 파일 크기가 MyDrive 임계값(기본 14GB) 이하이면 MyDrive를 경유하고, 초과하면 같은 선택 계정의 리모트로 공유 드라이브에 직행합니다. 두 경로 모두 작업 종료 시 계정 점유를 해제합니다.
+* **계정 풀 OFF:** 계정 목록 없이 기본 업로드 리모트를 사용해 공유 드라이브로 직행합니다. MyDrive 경유를 위한 계정 할당은 수행하지 않습니다.
+* **MyDrive 경유 순서:**
+  1. 소스를 계정의 MyDrive `upload_path/출력폴더명`에 복사합니다.
+  2. 인덱스 반영을 위해 대기한 뒤 공유 드라이브의 임시 경로로 `rclone move`합니다.
+  3. 공유 드라이브 안에서 `rclone backend chpar`로 `complete_path` 아래로 이동합니다.
+  4. 성공 후 로컬 소스 또는 스테이징 파일과 다운로더 작업 이력을 정리합니다.
+  5. 정상 MyDrive 경유 후처리는 `rclone cleanup`도 호출합니다. 잔여 incoming 파일을 보존하는 순회 복구 경로에서는 이 명령을 실행하지 않습니다.
+* **공유 드라이브 직행:** 공유 드라이브 임시 경로에 복사한 뒤 최종 경로로 `chpar`합니다.
+* **리모트 선택:** 풀 ON·Impersonate ON은 MyDrive 기본 리모트와 계정 이메일을, 풀 ON·Impersonate OFF는 계정 `remote_name`(없으면 기본 리모트)을 사용합니다. 풀 OFF는 기본 업로드 리모트(없으면 MyDrive 기본 리모트)를 사용합니다. 이 흐름에서 선택한 리모트를 원격 이동에도 유지합니다.
+* **권한과 제한:** 대상 공유 드라이브 ID, 경로, 계정 권한을 준비해야 합니다. 기본 개인 사용량 700GB·공유 드라이브 설정 한도 3TB·MyDrive 임계값 14GB는 Feeder의 설정값입니다. 서비스가 부과하는 제한과 별개이며, 임계값·계정 수만으로 전송 성공이나 쿼터 우회를 보장하지 않습니다.
+* **프로필별 설정:** `mydrive_remote_name`, `shared_drive_id`, `upload_path`, `complete_path`를 확인하세요. `shared_remote_name`은 릴레이 목적지 구성에서 사용하며, 기본 Google Drive 풀 업로드는 위의 선택 리모트 규칙을 따릅니다.
+
+#### 2) 로컬 스테이징·전송률·통계
+
+* 스테이징 사용 여부는 **프로필(현재 엔진의 목적지 override 포함) → 엔진 → DOWNLOAD 기본 설정 → 코드 기본값** 순으로 해석합니다. CD2는 엔진 설정에서 기본 OFF를 제공하며, 프로필에서 명시적으로 변경할 수 있습니다.
+* 스테이징 경로는 `스테이징 루트 / staging_path / 출력폴더명`입니다. `staging_path`가 비어 있으면 프로필 이름 또는 `default`를 사용합니다. 루트 미설정 시 `{path_data}/tmp/feeder/staging`을 사용합니다.
+* 최대 보관 수에는 스테이징 이후 **업로드 대기·실패 등으로 디스크에 남은 작업**도 포함합니다. 최대 보관 수는 작업 수 기준이며 디스크 여유 바이트를 직접 예약하는 기능은 아닙니다.
+* 스테이징과 Google Drive 업로드 워커는 각각 기본 2개입니다. 동시 실행 수와 보관 개수 제한은 별도로 적용합니다.
+* 대량 수집·피드 동기화·큐 순회·디렉터리 용량 계산·SSE 목록 구성 중에는 실행 컨텍스트별로 약 20ms마다 1ms씩 양보합니다. gevent 활성 환경에서는 gevent에, 일반 워커에서는 OS 스케줄러에 실행 기회를 주며 기존 수집 딜레이와 재시도 간격은 그대로 적용합니다.
+* Rclone 추가 옵션 기본값은 `--timeout 30m`, Google Drive 청크 크기는 `256M`입니다. 전송 제외 패턴은 스테이징과 Google Drive 업로드 명령에 적용합니다.
+* 스테이징·Google Drive 전송률은 `--stats-one-line` 출력을 파싱해 IPC API로 웹 프로세스에 전달합니다. SSE는 약 3초 주기이며 원격 엔진 상태는 약 6초, 24시간 집계는 약 30초 간격으로 갱신합니다. 실제 주기는 엔진 응답 시간에 따라 길어질 수 있습니다.
+* 업로드 사용량은 전송 시도 시 파일 크기로 기록하므로 재업로드·실패 시도가 통계에 포함될 수 있습니다.
+
+#### 3) 상태 조회와 실패·대기 정책
+
+| 상태 | 의미와 처리 |
+| :--- | :--- |
+| `pending` | 엔진 추가 대기. 비활성 엔진 또는 AllDebrid 큐 한도 도달 시 대기 유지. |
+| `downloading` | 엔진에서 진행 중. 상태는 작업 ID 또는 info hash로 매칭합니다. |
+| `pending_local_staging` / `local_staging` | 로컬 수신 대기 / 수신 중. |
+| `downloaded` | 다운로드 또는 스테이징 완료, 이송 라우팅 대기. |
+| `waiting_transporter` | 목적지 ID 오타, 확장 스크립트 삭제·로드 실패, 생성 오류 등으로 핸들러를 사용할 수 없음. 원본을 보존하고 다음 실행에서 재확인합니다. 목록 필터와 수동 완료·실패·삭제를 지원합니다. |
+| `pending_upload` / `uploading` | Google Drive 업로드 대기 / 실행 중. 복사 실패는 보존한 소스로 다음 주기에 재시도합니다. |
+| `pending_relay` / `relay_transferring` | 외부 워커 선점 대기 / 릴레이 전송 중. |
+| `move_failed` | Google Drive 업로드 후 이동·소스 정리 실패 이력. 아래 재시도 정책을 적용합니다. |
+| `completed` | 최종 완료 또는 사용자가 수동 완료한 작업. |
+| `failed` | 체인 소진, 원격 누락 유예 초과, 이송 실패 또는 수동 실패. |
+| `cancelled` | 사용자 삭제/취소로 재등록 방지 이력을 유지하는 상태. |
+
+* **원격 누락:** 전체 목록을 정상 조회했는데도 작업이 계속 없으면 `missing_timeout_hours`(기본 24시간) 후 해당 엔진에서 실패 처리합니다. 다음 엔진으로 자동 전환하지 않습니다. 조회 오류·CD2의 부분 목록은 누락 유예를 초기화하고, 다시 발견한 경우에도 초기화합니다.
+* **CD2 조회 제한:** `cd2_max_pages` 기본값은 1입니다. 긴 115 히스토리를 매번 전체 조회하지 않도록 유지하는 보호 설정입니다. 범위 밖으로 밀린 작업을 찾기 위해 자동으로 추가 페이지를 조회하지 않습니다.
+* **지연 타임아웃:** `stalled_timeout_hours`는 엔진 추가 시점 기준 경과 시간으로 판정하며, 전송 속도가 0인 시간만 누적하는 방식은 아닙니다. 초과 시 다음 엔진을 시도합니다.
+* **`move_failed` 재시도:** 마지막 시도 후 1시간이 지난 미종료 작업을 확인합니다. 소스가 있으면 이전 원격 잔여 파일을 최종 경로로 보존한 후 재업로드합니다. 소스가 없으면 상태는 `move_failed`로 두고 완료 시각·설명을 기록해 성공 종료로 집계합니다. 원격 소스 조회 오류는 파일 없음으로 확정하지 않습니다.
+* **리모트 잔여 파일:** 작업에 기록된 경로와 프로필의 `upload_path` → `complete_path` 경로를 이용해 최종 경로로 이동합니다. 순회 정리에서 잔여 파일을 `purge`하거나 휴지통을 비우지 않으며, 진행/대기 중인 업로드 계정은 순회 대상에서 보호합니다. 소스 없음 성공 종료와 원격 파일 복구 결과는 별도로 확인합니다. 새 업로드 전에 드라이브별 최상위 목록을 한 번씩 조회합니다. MyDrive는 계정별로, 공유 드라이브는 인증 계정 수와 관계없이 드라이브별로 중복을 제거합니다. `incoming` 등 설정된 스테이징 경로 필터로 조회 범위를 제한하고 해당 결과를 재사용하여 실제 파일이 남은 분류 경로만 이동합니다. 빈 분류·작업 폴더는 복구 이동 대상에서 제외합니다. 이동 완료 후 파일이 남지 않은 최상위 스테이징 경로(`incoming` 등)에 `rclone rmdirs`를 실행하여 해당 경로와 하위 빈 폴더를 정리합니다. 파일이 남았거나 조회·이동이 실패한 경로는 빈 폴더 정리를 보류합니다. 개별 원격 복구·빈 폴더 정리 명령은 60초 내에 종료하며, 조회·이동·빈 폴더 정리 실패 시 로그를 남기고 새 업로드를 보류합니다.
+* **수동 제어:** 수동 실패는 원본을 보존합니다. 삭제/취소는 실행 중 Rclone·원격 엔진 작업·접근 가능한 로컬 파일을 정리하고 `cancelled` 이력을 남깁니다. 이미 취소된 항목을 다시 삭제하면 DB에서 제거합니다. DB 이력을 지우면 해당 이력에 의존하던 재등록·이름 중복 방지 근거도 사라집니다.
+
+#### 4) 설정 반영·재시작·DB 보관
+
+* 활성 큐에는 현재 피드에 매칭되는 프로필과 엔진별 목적지 override를 다시 적용합니다. `feeds`의 `*`와 구체 피드가 겹치면 순서에 영향을 받으므로 프로필 적용 범위를 구분해 설정하세요.
+* 재시작 시 `local_staging`, `uploading`, `relay_transferring`를 각 대기 상태로 되돌립니다. 업로드 단계 기록(`upload_state`)이 있으면 완료한 복사를 반복하지 않고 후처리를 재개할 수 있습니다. `move_failed`로 전환된 작업에는 앞 절의 소스 유무 재시도 정책을 적용합니다.
+* `source_file_name`, `output_folder_name`, `remote_missing_since`, `upload_state` 등 필요한 컬럼·인덱스는 로드 시 추가합니다.
+* DB 자동 정리는 모듈별로 켭니다. 기본 보관 기간은 30일이며 기본 자동 삭제는 OFF입니다. DOWNLOAD는 오래된 성공 종료 이력을 정리하고, CRAWL/FEED는 각 DB의 생성 시각 기준으로 정리합니다. XML 출력 보관 기간과는 독립적입니다.
 
 ---
 
@@ -397,7 +533,7 @@ Feeder의 모든 핵심 계층은 `{path_data}/db/feeder_custom/` 디렉터리�
 
 <br>
 #### 1) 커스텀 사이트 훅 (`feeder_custom/sites/site_{NAME}.py`)
-사이트 수집 라이프사이클에 개입하여 로그인 세션 유지, 챌린지 해결, 본문 내 복합 첨부파일 해제 등을 수행합니다.
+사이트 수집 라이프사이클의 필요한 단계만 구현합니다. `SITE_NAME`은 사이트 JSON의 `NAME`과 매칭하며 `DEFAULT_SITE_INFO`는 미등록 사이트의 기본 규칙으로 등록합니다. `on_extract_detail`을 제공하면 기본 마그넷 추출 대신 반환값을 사용하므로, 기본 추출을 유지하려면 해당 메서드를 생략하거나 명시적으로 호출해야 합니다.
 
 ```python
 # -*- coding: utf-8 -*-
@@ -443,6 +579,7 @@ class CustomEngine(BaseDownloadEngine):
     ENGINE_NAME = "커스텀 다운로더"
     OUTPUT_TYPE = "local"              # "local", "cloud_storage", "remote_cloud"
     SUPPORTED_PROTOCOLS = ["magnet"]   # "magnet", "ed2k"
+    status_list_complete = True       # 현재 응답이 전체 목록일 때만 True
 
     CONFIG_SCHEMA = [
         {"name": "api_url", "label": "API 주소", "type": "text", "default": "http://127.0.0.1:9091"},
@@ -451,18 +588,18 @@ class CustomEngine(BaseDownloadEngine):
 
     def add_magnet(self, link: str, title: str = None, upload_path: str = None) -> tuple[bool, str, str]:
         """마그넷 추가 (성공여부, 작업ID, 에러메시지) 반환"""
-        return True, "task_12345", ""
+        raise NotImplementedError("실제 엔진의 작업 추가 API를 구현하세요")
 
     def get_status(self, task_ids: list[str] = None) -> tuple[list[dict], str]:
         """
         작업 상태 목록 조회
         반환 규격: [{'task_id': str, 'hash': str, 'status': 'completed'|'downloading'|'error', 'filename': str, 'file_size': int, 'source_path': str}]
         """
-        return [], ""
+        raise NotImplementedError("상태 조회와 목록 완전성 판정을 구현하세요")
 
     def delete_task(self, task_id: str) -> bool:
         """작업 삭제"""
-        return True
+        raise NotImplementedError("엔진 작업/히스토리 삭제를 구현하세요")
 
     def restart_task(self, task_id: str) -> bool:
         """에러/중단 작업 재시작 (선택 사항)"""
@@ -470,8 +607,15 @@ class CustomEngine(BaseDownloadEngine):
 
     def test_connection(self) -> tuple[bool, str]:
         """연결 테스트"""
-        return True, "연결 성공"
+        raise NotImplementedError("연결 확인을 구현하세요")
 ```
+
+엔진 구현 시 다음 계약을 지켜야 합니다.
+
+* `get_status()`의 `task_id`·`hash`는 추가 시 반환한 작업 ID 및 원본 링크의 해시와 매칭되어야 합니다. 완료 항목에는 실제 파일명·용량·사용 가능한 `source_path`를 제공하세요. CD2처럼 파이프라인에서 마운트를 별도로 찾는 내장 엔진은 예외입니다.
+* 전체 목록을 성공적으로 확인한 경우에만 `status_list_complete = True`로 설정합니다. 페이지/필터로 일부만 반환하면 `False`, 조회 오류는 반환 튜플의 오류 문자열로 전달해야 원격 누락 오판을 피할 수 있습니다.
+* 커스텀 엔진에도 공통 `missing_timeout_hours` 설정 필드가 추가됩니다. `restart_task()`가 `False`이면 엔진 오류 시 다음 우선순위로 전환할 수 있습니다.
+* 스크립트는 로드 시 실행됩니다. UI 저장 후 엔진 목록·연결 테스트로 등록 여부를 확인하세요. 위 예제의 `NotImplementedError` 부분은 실제 동작으로 교체해야 합니다.
 
 #### 3) 커스텀 이송 핸들러 (`feeder_custom/transporters/trans_{ID}.py`)
 `BaseTransporter`를 상속받아 다운로드 완료 후 특정 스토리지로 전송하거나 텔레그램 알림을 발송하는 후처리기를 추가합니다.
@@ -495,51 +639,139 @@ class CustomTransporter(BaseTransporter):
         반환: (성공여부, 다음상태['completed'|'failed'|'pending_upload' 등], 메시지)
         """
         logger.info(f"이송 실행: {item.title} -> {dest_config.get('target_path')}")
-        return True, "completed", "이송 완료"
+        raise NotImplementedError("실제 이송 성공을 확인한 뒤 상태를 반환하세요")
 ```
+
+출력 이름은 `item.output_folder_name`, 원본 이름은 `item.source_file_name`으로 구분합니다. 이송 핸들러 호출 전에 DB 세션을 반환하므로, 별도 조회가 필요한 구현은 자신의 세션 범위를 관리해야 합니다. 성공 반환은 실제 이송을 확인한 뒤에만 하세요.
+
+원격 릴레이 핸들러는 `IS_RELAY_HANDLER = True`를 선언하고 `pending_relay`로 인계합니다. 대기 작업을 다시 기동하려면 선택적으로 `resume_relay(dest_config)`를 구현할 수 있습니다. 워커 실행 방법과 전송 로직은 해당 확장의 책임입니다.
 
 ---
 
 ### 7. API 엔드포인트 명세
 
+아래 경로의 `/feeder`는 플러그인 패키지 경로입니다. RSS·첨부파일·SSE 요청은 FF의 API 인증 설정을 따르며, 릴레이 선점/보고는 시스템 API Key를 별도로 확인합니다. 피드 이름 등 쿼리 값은 URL 인코딩해서 전달하세요.
+
 #### 1) 피드 및 첨부파일 API
-* **RSS 피드 발행 (XML 스트림):**
+
+* **RSS 피드 발행 (XML):**
+
   ```text
   GET /feeder/api/feed/rss?name={FEED_NAME}&apikey={APIKEY}
   GET /feeder/api/feed/rss?id={FEED_ID}&apikey={APIKEY}
   ```
-* **첨부파일 직접 다운로드 스트림:**
+
+  FEED DB에 동기화된 항목을 반환합니다. 피드의 `feed_count` 또는 FEED 기본 최대 수를 적용하며, 한 DB 항목이 여러 마그넷/첨부파일로 펼쳐져도 실제 RSS `<item>` 수가 상한을 넘지 않습니다. 피드가 없으면 404, 식별자 누락은 400입니다. GET 요청이 수집기를 실행하거나 외부 RSS를 새로 수집하지는 않습니다.
+
+* **첨부파일 다운로드:**
+
   ```text
-  GET /feeder/api/crawl/download?id={POST_ID}_{FILE_INDEX}&apikey={APIKEY}
-  ```
-* **사이트 규칙 원격 업데이트:**
-  ```text
-  POST /feeder/api/crawl/site_update
-  (Body: content={BASE64_ENCODED_JSON})
+  GET /feeder/api/crawl/download?id={CRAWL_ITEM_ID}_{FILE_INDEX}&apikey={APIKEY}
+  GET /feeder/api/feed/download?id={FEED_ITEM_ID}_{FILE_INDEX}&apikey={APIKEY}
   ```
 
+  `FILE_INDEX`는 0부터 시작합니다. CRAWL과 FEED는 서로 다른 DB 항목 ID를 사용하므로 각 경로에 해당하는 ID를 전달해야 합니다. FEED RSS의 첨부파일 링크는 `/api/feed/download`를 사용합니다.
+
+* **사이트 규칙 업데이트:**
+
+  ```text
+  POST /feeder/api/crawl/site_update?apikey={APIKEY}
+  Content-Type: application/x-www-form-urlencoded
+  content={UTF-8_JSON을_BASE64로_인코딩한_값}
+  ```
+
+  JSON의 `NAME`으로 사이트를 추가하거나 기존 규칙을 갱신합니다. 수집기·피드·프로필 설정을 함께 갱신하는 API는 아닙니다.
+
 #### 2) 다운로드 및 릴레이 API
-* **대시보드 실시간 SSE 스트림:**
+
+* **대시보드 SSE:**
+
   ```text
   GET /feeder/api/download/sse?apikey={APIKEY}
   ```
-  *(반환 데이터: `counts`, `total_upload_24h`, `active_list` 실시간 브로드캐스트)*
-* **원격 릴레이 작업 선점 (Claim Task):**
+
+  `text/event-stream`의 `data:` JSON으로 `timestamp`, `counts`, `total_upload_24h`, `total_download_24h`, `active_list`를 전달합니다. 활성 항목에는 진행률·속도·ETA가 포함될 수 있고, 원격에만 남은 작업은 `engine_unmanaged`로 표시합니다. `counts.completed`는 소스 없음으로 성공 종료한 `move_failed`도 포함합니다.
+
+* **원격 릴레이 작업 선점 (Claim):**
+
   ```text
   POST /feeder/api/download/relay_claim
-  (Body: apikey={APIKEY})
+  Content-Type: application/x-www-form-urlencoded
+  apikey={APIKEY}
   ```
-  *(반환 데이터: 대기 중인 `pending_relay` 작업 정보, Rclone 설정 및 SA 자격 증명 번들)*
-* **원격 릴레이 작업 완료 보고 (Report Task):**
+
+  `pending_relay` 한 건을 `relay_transferring`으로 바꾸고 반환합니다. 대기 작업이 없으면 `has_task: false`입니다. 반환 필드는 `ret`, `has_task`, `item`, `rclone_conf`, `sa_files`이며 `item`에는 다음 값이 포함됩니다.
+
+  | 필드 | 의미 |
+  | :--- | :--- |
+  | `id`, `title`, `file_name`, `file_size` | 작업 식별·표시·용량 정보. |
+  | `output_folder_name` | DB 이력에 따라 해시 접미사까지 확정한 출력 폴더명. 원본 `file_name`과 구분합니다. |
+  | `is_single_file` | 단일 파일 여부. |
+  | `remote_source_path` | 실제 원격 소스. 출력 이름으로 소스 경로를 재조합하지 마세요. |
+  | `dest_path`, `dest_dir_path` | 최종 대상 경로와 대상 디렉터리. 단일 파일도 출력 폴더 아래에 배치합니다. |
+  | `buffer_limit_bytes` | 커스텀 워커가 사용할 버퍼 한도. 목적지 설정 `buffer_limit_gb`의 기본값은 50입니다. |
+
+  `rclone_conf`와 `sa_files`는 FF에서 읽을 수 있는 설정 및 서비스 계정 파일을 워커용으로 전달하는 값입니다. API만으로 워커를 생성하지 않으며, 실제 전송과 아래 결과 보고를 구현해야 합니다.
+
+* **원격 릴레이 결과 보고 (Report):**
+
   ```text
   POST /feeder/api/download/relay_report
-  (Body: apikey={APIKEY}, id={TASK_ID}, success=true/false, bytes_transferred={BYTES})
+  Content-Type: application/json
   ```
-* **Rclone 전송률 실시간 보고 (IPC):**
+
+  ```json
+  {
+    "apikey": "YOUR_FF_API_KEY",
+    "id": 123,
+    "success": false,
+    "bytes_transferred": 0,
+    "error_msg": "전송 실패 원인"
+  }
+  ```
+
+  JSON boolean을 권장하며, 폼 전송의 `true`/`false`, `1`/`0`, `on`/`off`, `yes`/`no`도 처리합니다. 허용되지 않는 `success` 값은 400입니다. 성공 시 `completed`와 완료 시각을 기록하고 원격 다운로더 작업을 정리하며, 실패 시 `failed`와 오류 메시지를 기록합니다.
+
+* **Rclone 진행률 보고 (IPC):**
+
   ```text
-  POST /feeder/api/download/progress_update
-  (Body: apikey={APIKEY}, item_id={ID}, data={PROGRESS_DICT}, action='update'|'clear')
+  POST /feeder/api/download/progress_update?apikey={APIKEY}
+  Content-Type: application/json
   ```
+
+  ```json
+  {
+    "item_id": 123,
+    "action": "update",
+    "data": {
+      "progress": 50.0,
+      "speed_str": "8 MiB/s",
+      "download_speed": 8388608,
+      "downloaded_bytes": 52428800,
+      "total_bytes": 104857600,
+      "eta": "6s"
+    }
+  }
+  ```
+
+  `action: clear`는 저장한 진행률을 지웁니다. 이 API는 화면용 진행률만 갱신하며 작업 완료 상태는 릴레이 결과 보고 또는 파이프라인이 처리합니다.
+
+#### 3) 웹 UI의 작업 제어 요청
+
+FF 웹 UI가 사용하는 AJAX 경로입니다. 웹 UI와 동일한 로그인·접근 설정에서 호출합니다.
+
+```text
+POST /feeder/ajax/download/item_action
+Content-Type: application/x-www-form-urlencoded
+id={TASK_ID}&action={ACTION}
+```
+
+| `action` | 동작 |
+| :--- | :--- |
+| `retry` | 프로필을 다시 적용해 재시도합니다. 선택적인 `profile_name`을 전달할 수 있습니다. 소스 경로·기존 오류에 따라 복구 경로를 선택합니다. |
+| `force_complete` | 최종 완료로 기록합니다. 실제 파일을 전송하는 명령은 아닙니다. |
+| `force_fail` | 실행 중 Rclone을 중단하고 실패로 기록합니다. 원본 파일은 보존합니다. |
+| `delete` | 실행 중 전송·원격 엔진 작업·로컬 소스를 정리하고 `cancelled`로 보존합니다. 취소된 항목을 다시 삭제하면 DB에서 제거합니다. |
 
 ---
 
@@ -547,8 +779,22 @@ class CustomTransporter(BaseTransporter):
 
 | 증상 | 원인 및 해결 방법 |
 | :--- | :--- |
-| **AllDebrid 추가 실패 (`File not available due to no peer`)** | 피어가 없는 토렌트입니다. Feeder는 재시작 거부 감지 시 우선순위 체인의 다음 엔진(CD2, qBittorrent 등)으로 자동 폴백합니다. 체인에 대체 엔진을 등록해 두세요. |
-| **Google Drive 업로드 중 `directory not found`** | 내 드라이브 임시(`incoming`)에서 공유 드라이브 임시로 이동(`move`) 후 완료 폴더로 `chpar`하는 2단계 이동이 진행됩니다. 프로필의 `upload_path`와 `complete_path` 설정이 올바른지 확인하세요. |
-| **계정 풀 사용량 분산** | 계정 풀은 24시간 사용량이 가장 적은 계정부터 고르게 할당(Least-Used)하므로 개별 수치가 낮게 보일 수 있습니다. 계정 풀 상단의 `24시간 총 업로드` 카드를 통해 전체 합산 수치를 확인하세요. |
-| **Cloudflare 403 차단 발생** | FlareSolverr 및 Selenium 원격 드라이버가 동일한 프록시(예: Gluetun)를 경유하도록 설정되어 있는지 확인하세요. IP가 일치해야 발급된 `cf_clearance` 토큰이 유효합니다. |
-| **CD2 오프라인 작업 목록 타임아웃** | 115 API 응답 지연 시 발생할 수 있습니다. 수집기 및 다운로더 설정에서 CD2 gRPC 타임아웃을 기본 30초 이상으로 넉넉히 지정하세요. |
+| **AllDebrid가 엔진 목록에 없음** | 내장 엔진은 qBittorrent/CD2입니다. AllDebrid 확장 스크립트를 `feeder_custom/engines`에 설치하고 로드 오류와 엔진 목록을 확인하세요. 예제 YAML만 추가해서 엔진 구현이 설치되지는 않습니다. |
+| **AllDebrid 추가 실패 (`File not available due to no peer`)** | 원격 작업 추가 또는 재시작이 거부되면 다음 우선순위 엔진을 시도할 수 있습니다. 체인 구성과 해당 엔진의 오류 메시지를 확인하세요. |
+| **AllDebrid 큐가 가득 차 신규 등록이 안 됨** | `max_active_tasks` 또는 서비스의 큐 제한에 도달하면 `pending`으로 기다립니다. 원격에 이미 존재하는 동일 해시 작업은 연동 대상입니다. |
+| **FEED가 최대 100개에서 더 동기화되지 않는 것으로 보임** | 현재 구현에서 API/XML 출력 상한은 DB 동기화 개수를 제한하지 않습니다. 실제 FEED 목록·필터·동기화 로그와 API/XML 각각의 최대 수를 확인하세요. |
+| **정적 XML이 생성되지 않음** | FEED 전역 생성 스위치와 개별 `use_rss_file`, 저장 경로·쓰기 권한을 확인하세요. 피드의 개별 강제 생성으로 경로 문제를 점검할 수 있습니다. |
+| **XML 항목이 사라졌는데 DB에는 남아 있음** | XML 출력 기간·최대 수와 DB 보관은 독립적입니다. DB 삭제는 각 모듈의 자동 정리 또는 수동 DB 정리 설정을 확인하세요. |
+| **RSS 첨부파일이 다른 파일이거나 404/인증 오류** | 현재 생성한 FEED 링크는 `/api/feed/download`와 FEED 항목 ID를 사용합니다. 이전에 배포한 XML은 재생성하고, CRAWL/FEED ID 혼용·첨부파일 인덱스·원본 파일 유무·FF API 인증 설정을 확인하세요. 정적 XML에는 API Key가 들어가지 않습니다. |
+| **Cloudflare 403 또는 Selenium 초기화 실패** | 수집기 옵션, 프록시 주소, FlareSolverr/Selenium 원격 주소와 서비스 접근성을 확인하세요. Selenium 모드는 별도 수집 경로이며, 사이트별 로그인·페이지 처리가 필요하면 훅을 구현합니다. |
+| **CD2 작업이 목록에서 보이지 않음** | `cd2_max_pages` 기본값은 1이므로 이전 히스토리가 범위 밖에 있을 수 있습니다. 필요한 경우 값을 조정하되 긴 목록의 반복 조회 부하를 고려하세요. 부분 목록은 원격 누락 실패 판정에서 제외합니다. |
+| **CD2 gRPC 타임아웃** | 다운로더의 `cd2_timeout`(기본 30초), CD2 주소·포트·토큰과 응답 상태를 확인하세요. CRAWL의 Selenium/요청 타임아웃과 다른 설정입니다. |
+| **엔진 작업이 원격 목록 누락으로 실패함** | `missing_timeout_hours` 동안 전체 조회 성공 후에도 계속 매칭되지 않은 경우입니다. 해당 엔진의 실제 작업 ID·해시·원격 삭제 여부를 확인하세요. 자동으로 다음 엔진에 넘기지 않습니다. |
+| **`waiting_transporter`에서 대기함** | 프로필의 목적지 타입, 커스텀 이송 스크립트의 ID·파일·로드 로그를 확인하세요. 복구 시 다음 실행에서 다시 이송합니다. 목록에서 수동 완료·실패·삭제도 가능합니다. |
+| **동일 제목 작업의 출력 폴더명에 해시가 붙음** | DB에 같은 폴더명 이력이 있으면 적용하는 정상 동작입니다. 실제 파일을 삭제해도 DB 이력이 남아 있으면 이름을 분리합니다. `source_file_name`과 `output_folder_name`을 구분하세요. |
+| **스테이징 한도 도달로 대기함** | 완료 대기뿐 아니라 업로드 보류·실패 후 남은 로컬 경로도 보관 수에 포함됩니다. 해당 파일의 업로드·정리 상태를 확인하세요. 워커 수를 늘리는 것과 보관 한도를 늘리는 것은 별개입니다. |
+| **Google Drive 이동 실패 / `directory not found`** | 작업에 기록된 MyDrive·공유 드라이브 임시/최종 경로, 리모트와 권한을 확인하세요. `move_failed`는 소스가 있으면 재업로드하고, 소스가 없으면 상태 이력을 남겨 성공 종료합니다. 리모트 잔여 파일은 최종 경로로 이동해 보존합니다. |
+| **`move_failed`가 완료 필터·성공 통계에 함께 보임** | 소스 없음으로 성공 종료하면서 원래 이동 실패 이력을 보존한 작업입니다. 완료 시각과 설명, 별도의 원격 파일 복구 결과를 확인하세요. |
+| **계정 풀 OFF인데 Google Drive 업로드가 안 됨** | 계정 목록 대신 기본 업로드 리모트·공유 드라이브 ID·Rclone 설정 경로를 확인하세요. 풀 OFF 경로는 공유 드라이브 직행입니다. |
+| **24시간 업로드 통계가 실제 성공 용량보다 큼** | 통계는 전송 시도 시 기록한 파일 크기를 합산하므로 실패·재업로드가 포함될 수 있습니다. 완료 작업 용량과 함께 확인하세요. |
+| **재시작 후 전송 중 작업이 대기 상태로 바뀜** | 이전 실행의 스테이징·업로드·릴레이 상태를 복구하는 동작입니다. 큐와 로그를 확인한 뒤 다음 실행을 진행하세요. |

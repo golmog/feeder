@@ -3,6 +3,7 @@ import re
 import time
 import threading
 import uuid
+import traceback
 from urllib.parse import unquote
 from html import unescape
 from types import SimpleNamespace
@@ -126,6 +127,7 @@ class TaskCrawl:
 
                 total_crawled_count = 0
                 for crawler in crawlers:
+                    FeederUtil.cooperate()
                     if not is_manual:
                         if not crawler.get('enabled', True):
                             logger.debug(f"[TaskCrawl] 비활성화된 수집기 건너뜀: {crawler.get('site')}")
@@ -173,6 +175,7 @@ class TaskCrawl:
                     logger.info(f"[TaskCrawl] [{mode_label}] 사이트 크롤러 시작: [{site_name}] (대상 게시판={len(boards)}개, 최대 탐색={max_page}p)")
 
                     for b_idx, b in enumerate(boards):
+                        FeederUtil.cooperate()
                         if b_idx > 0:
                             CrawlUtil.rotate_proxy(scheduler_instance=target_cfg, reason="게시판 전환 부하 분산")
 
@@ -291,6 +294,7 @@ class TaskCrawl:
             r'/(?P<id>\d+)$'
         ]
         for s_reg in standard_regexs:
+            FeederUtil.cooperate()
             if s_reg not in id_regexs:
                 id_regexs.append(s_reg)
 
@@ -323,11 +327,8 @@ class TaskCrawl:
                     logger.info(f"[{site_name}] 커스텀 훅 세션 초기화(on_init_session) 실행")
                     hook.on_init_session(site_info, target_cfg)
 
-            if getattr(target_cfg, 'use_selenium', False) and CrawlUtil._selenium_driver is None:
-                logger.error(f"[TaskCrawl] [{log_tag}] 세션 생성 실패로 게시판 수집을 시작할 수 없습니다.")
-                return None
-
             for cur_page in range(1, target_pages + 1):
+                FeederUtil.cooperate()
                 if cur_page > 1 and crawl_delay > 0:
                     time.sleep(crawl_delay)
 
@@ -348,6 +349,7 @@ class TaskCrawl:
 
                 raw_list = []
                 for i in range(index_start, len(elements) + 1, index_step):
+                    FeederUtil.cooperate()
                     try:
                         target_tags = tree.xpath(list_xpath % i) if '[%s]' in list_xpath else [elements[i - 1]]
                         if not target_tags:
@@ -366,6 +368,7 @@ class TaskCrawl:
 
                         post_id = ''
                         for regex in id_regexs:
+                            FeederUtil.cooperate()
                             match_id = re.search(regex, detail_url)
                             if match_id and 'id' in match_id.groupdict():
                                 post_id = match_id.group('id')
@@ -374,6 +377,7 @@ class TaskCrawl:
                         if not post_id:
                             url_no_query = detail_url.split('?')[0]
                             for regex in id_regexs:
+                                FeederUtil.cooperate()
                                 match_id = re.search(regex, url_no_query)
                                 if match_id and 'id' in match_id.groupdict():
                                     post_id = match_id.group('id')
@@ -394,6 +398,7 @@ class TaskCrawl:
 
                 detail_count = 0
                 for idx, item in enumerate(raw_list):
+                    FeederUtil.cooperate()
                     if P.ModelSetting.get_bool('crawl_task_stop_flag'):
                         stop_crawl = True
                         break
@@ -440,6 +445,7 @@ class TaskCrawl:
                         item['download'] = item.get('download') or []
                         if not item['magnet'] and item['download']:
                             for d_item in item['download']:
+                                FeederUtil.cooperate()
                                 f_link = d_item.get('link', '')
                                 f_name = d_item.get('filename', '').lower()
                                 if f_name.endswith('.torrent') and f_link:
@@ -475,10 +481,6 @@ class TaskCrawl:
                     bbs_list.append(item)
                     detail_count += 1
 
-                    if not is_test and max_count > 0 and len(bbs_list) >= max_count:
-                        stop_crawl = True
-                        break
-
                 if stop_crawl:
                     break
         finally:
@@ -498,6 +500,7 @@ class TaskCrawl:
             if tree is not None:
                 elements = tree.xpath("//a[starts-with(@href,'magnet')]")
                 for elem in elements:
+                    FeederUtil.cooperate()
                     href = elem.attrib.get('href', '').strip()
                     if not href:
                         continue
@@ -515,6 +518,7 @@ class TaskCrawl:
             if page_html:
                 text_magnets = re.findall(r'magnet:\?xt=urn:btih:[a-zA-Z0-9]+', page_html, re.IGNORECASE)
                 for raw_mag in text_magnets:
+                    FeederUtil.cooperate()
                     info_hash = FeederUtil.extract_info_hash(raw_mag)
                     if info_hash:
                         if info_hash in seen_hashes:
@@ -528,6 +532,7 @@ class TaskCrawl:
 
                 text_ed2k = re.findall(r'ed2k://\|file\|[^|]+\|[0-9]+\|[a-fA-F0-9]{32}(?:\|[^|]*)?\|/', page_html, re.IGNORECASE)
                 for raw_ed2k in text_ed2k:
+                    FeederUtil.cooperate()
                     ed2k_hash = FeederUtil.extract_info_hash(raw_ed2k)
                     if ed2k_hash:
                         if ed2k_hash in seen_hashes:
@@ -545,6 +550,7 @@ class TaskCrawl:
                 pattern, template = str(magnet_rule), "%s"
 
             for m in re.findall(pattern, page_html):
+                FeederUtil.cooperate()
                 extracted_str = m[0] if isinstance(m, tuple) else m
                 formatted = (template % extracted_str).lower() if '%s' in template else extracted_str.lower()
                 info_hash = FeederUtil.extract_info_hash(formatted)
@@ -571,6 +577,7 @@ class TaskCrawl:
 
         matches = re.finditer(site_info['DOWNLOAD_REGEX'], page_html, re.MULTILINE)
         for m in matches:
+            FeederUtil.cooperate()
             filename = unescape(unquote(m.group('filename').strip()))
             link = unescape(unquote(m.group('url').strip()))
             if not filename or not link:

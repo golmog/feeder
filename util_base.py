@@ -13,15 +13,13 @@ import hashlib
 import requests
 import subprocess
 import unicodedata
-import requests
-import subprocess
-import unicodedata
 import threading
 import uuid
 from datetime import datetime, timedelta
 from sqlalchemy import func
 
 from .setup import *
+from .util_runtime import cooperate
 
 
 class FeederUtil:
@@ -32,6 +30,19 @@ class FeederUtil:
     ENGINES_DIR = os.path.join(CUSTOM_DIR, 'engines')
     TRANSPORTERS_DIR = os.path.join(CUSTOM_DIR, 'transporters')
     SITES_DIR = os.path.join(CUSTOM_DIR, 'sites')
+
+    cooperate = staticmethod(cooperate)
+
+    @classmethod
+    def directory_size(cls, path: str) -> int:
+        """Measure a directory while allowing other work to run during large scans."""
+        total = 0
+        for root, _, files in os.walk(path):
+            cls.cooperate()
+            for filename in files:
+                cls.cooperate()
+                total += os.path.getsize(os.path.join(root, filename))
+        return total
 
     # --------------------------------------------------------------------------
     # 경로 및 시스템 헬퍼
@@ -424,21 +435,24 @@ class FeederUtil:
             target_statuses = ['completed']
         elif status_filter == 'download_active':
             target_statuses = [
-                'downloading', 'pending', 'local_staging', 'uploading',
+                'downloading', 'pending', 'downloaded', 'waiting_transporter', 'local_staging', 'uploading',
                 'pending_local_staging', 'pending_upload', 'pending_relay',
                 'relay_transferring'
             ]
         else:
             target_statuses = [
-                'completed', 'downloading', 'pending', 'local_staging', 'uploading',
+                'completed', 'downloading', 'pending', 'downloaded', 'waiting_transporter', 'local_staging', 'uploading',
                 'pending_local_staging', 'pending_upload', 'pending_relay',
                 'relay_transferring'
             ]
 
+        status_condition = ModelDownload.status.in_(target_statuses)
+        if status_filter != 'download_active':
+            status_condition = or_(status_condition, ModelDownload.success_filter())
         subq = (
             db.session.query(ModelDownload.infohash)
             .filter(
-                ModelDownload.status.in_(target_statuses),
+                status_condition,
                 ModelDownload.infohash.isnot(None)
             )
             .subquery()
@@ -462,6 +476,17 @@ class FeederUtil:
                 from sqlalchemy import inspect
                 inspector = inspect(engine)
 
+                download_table = f'{P.package_name}_download'
+                if download_table in inspector.get_table_names():
+                    columns = {c['name'] for c in inspector.get_columns(download_table)}
+                    with engine.begin() as conn:
+                        for name, sql_type in [('upload_state', 'JSON'), ('source_file_name', 'VARCHAR'),
+                                               ('output_folder_name', 'VARCHAR'), ('remote_missing_since', 'DATETIME')]:
+                            FeederUtil.cooperate()
+                            if name not in columns:
+                                conn.execute(db.text(f"ALTER TABLE {download_table} ADD COLUMN {name} {sql_type}"))
+                        conn.execute(db.text(f"CREATE INDEX IF NOT EXISTS ix_{download_table}_output_folder_name ON {download_table} (output_folder_name)"))
+
                 # feeder_bbs 테이블 infohash 컬럼 확인 및 자동 추가
                 if f'{P.package_name}_bbs' in inspector.get_table_names():
                     columns = [c['name'] for c in inspector.get_columns(f'{P.package_name}_bbs')]
@@ -476,6 +501,7 @@ class FeederUtil:
                         from .model_crawl import ModelCrawlItem
                         rows = db.session.query(ModelCrawlItem).filter(ModelCrawlItem.infohash.is_(None), ModelCrawlItem.magnet.isnot(None)).all()
                         for r in rows:
+                            FeederUtil.cooperate()
                             r.infohash = cls.extract_info_hash(r.magnet)
                         db.session.commit()
                         logger.info(f"[FeederUtil] feeder_bbs 기존 레코드 {len(rows)}건 infohash 자동 채움 완료")
@@ -493,6 +519,7 @@ class FeederUtil:
                         from .model_feed import ModelFeedItem
                         rows = db.session.query(ModelFeedItem).filter(ModelFeedItem.infohash.is_(None), ModelFeedItem.magnet.isnot(None)).all()
                         for r in rows:
+                            FeederUtil.cooperate()
                             r.infohash = cls.extract_info_hash(r.magnet)
                         db.session.commit()
                         logger.info(f"[FeederUtil] feeder_feed 기존 레코드 {len(rows)}건 infohash 자동 채움 완료")
@@ -602,8 +629,10 @@ class FeederUtil:
 
         all_page_hashes = {}
         for item_obj in items:
+            FeederUtil.cooperate()
             m_list = cls.split_magnets(item_obj.magnet)
             for m_str in m_list:
+                FeederUtil.cooperate()
                 h = cls.extract_info_hash(m_str)
                 if h:
                     all_page_hashes[h] = item_obj.id
@@ -616,14 +645,17 @@ class FeederUtil:
                 .all()
             )
             for d_hash, d_status, d_id in dl_records:
+                FeederUtil.cooperate()
                 dl_map[d_hash] = {'status': d_status, 'id': d_id}
 
         item_dicts = []
         for item_obj in items:
+            FeederUtil.cooperate()
             d = item_obj.as_dict()
             d_links = d.get('magnet', [])
             matched_dl = None
             for m_str in d_links:
+                FeederUtil.cooperate()
                 h = cls.extract_info_hash(m_str)
                 if h and h in dl_map:
                     matched_dl = dl_map[h]

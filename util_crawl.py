@@ -78,6 +78,7 @@ class CrawlUtil:
         candidate_files.extend(glob.glob(os.path.join(FeederUtil.CUSTOM_DIR, "site_*.py")))
 
         for fpath in set(candidate_files):
+            FeederUtil.cooperate()
             fname = os.path.basename(fpath)
             if fname.startswith("__"):
                 continue
@@ -88,6 +89,7 @@ class CrawlUtil:
                 spec.loader.exec_module(mod)
 
                 for attr_name in dir(mod):
+                    FeederUtil.cooperate()
                     obj = getattr(mod, attr_name)
                     if isinstance(obj, type) and hasattr(obj, 'SITE_NAME') and obj.SITE_NAME:
                         cls._hooks[obj.SITE_NAME.lower()] = obj
@@ -103,6 +105,7 @@ class CrawlUtil:
         try:
             with F.app.app_context():
                 for site_key, hook_cls in cls._hooks.items():
+                    FeederUtil.cooperate()
                     default_info = getattr(hook_cls, 'DEFAULT_SITE_INFO', None)
                     if default_info and isinstance(default_info, dict):
                         target_name = default_info.get('NAME') or getattr(hook_cls, 'SITE_NAME', '')
@@ -245,6 +248,9 @@ class CrawlUtil:
         except Exception:
             retry_interval = 2.0
 
+        p_list = cls._get_proxy_list(scheduler_instance)
+        effective_retries = max(len(p_list), max_retries) if p_list else max_retries
+
         if scheduler_instance:
             use_selenium = getattr(scheduler_instance, 'use_selenium', False)
             use_fs = getattr(scheduler_instance, 'use_flaresolverr', False)
@@ -280,16 +286,16 @@ class CrawlUtil:
 
         if use_fs and not cls._has_valid_clearance(host):
             logger.info(f"[CrawlUtil] [{host}] Cloudflare 사이트 감지 -> FlareSolverr 최우선 인가 요청: {url}")
-            for fs_try in range(1, max_retries + 1):
+            for fs_try in range(1, effective_retries + 1):
                 tree, fs_html = cls.get_by_flaresolverr(url, proxies=proxies)
                 if fs_html and 'Just a moment...' not in fs_html and 'cf-turnstile' not in fs_html:
                     logger.info(f"[CrawlUtil] [{host}] FlareSolverr 인가 및 1차 페이지 수신 완료")
                     return fs_html
-                if fs_try < max_retries:
-                    logger.debug(f"[CrawlUtil] [{host}] FlareSolverr 초기 인가 재시도 ({fs_try}/{max_retries})...")
+                if fs_try < effective_retries:
+                    logger.debug(f"[CrawlUtil] [{host}] FlareSolverr 초기 인가 재시도 ({fs_try}/{effective_retries})...")
                     time.sleep(retry_interval)
 
-            logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 초기 인가 {max_retries}회 실패, HTTP 세션으로 폴백 시도")
+            logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 초기 인가 {effective_retries}회 실패, HTTP 세션으로 폴백 시도")
 
         headers = cls.DEFAULT_HEADERS.copy()
         if host in cls._cf_user_agents:
@@ -309,7 +315,7 @@ class CrawlUtil:
                 current_cookie_str = headers.get('Cookie', '')
                 headers['Cookie'] = f"{current_cookie_str}; {injected}".strip('; ')
 
-        for attempt in range(1, max_retries + 1):
+        for attempt in range(1, effective_retries + 1):
             proxies = cls.get_proxies(scheduler_instance)
             proxy_display = proxies.get('http') if (proxies and 'http' in proxies) else 'Direct'
 
@@ -334,6 +340,18 @@ class CrawlUtil:
                     err_msg = str(e)
                     logger.debug(f"[CrawlUtil] curl_cffi 요청 실패 ({proxy_display} / {url}): {err_msg}")
 
+            try:
+                req_session = cls._requests_sessions.get(host)
+                if req_session is None:
+                    req_session = requests.Session()
+                    cls._requests_sessions[host] = req_session
+                cls._sync_clearance_to_sessions(host)
+                res = req_session.get(url, headers=headers, proxies=proxies, timeout=25)
+                if res.status_code == 200 and 'Just a moment...' not in res.text and 'cf-turnstile' not in res.text:
+                    return res.text
+            except Exception as e:
+                logger.debug(f"[CrawlUtil] requests 폴백 실패 ({proxy_display} / {url}): {e}")
+
             # 차단(403, 429), 서버오류(503), SSL/TLS 연결 단절 감지 시 즉시 세션 파기 및 프록시 로테이션
             if host in cls._cffi_sessions:
                 try:
@@ -341,9 +359,15 @@ class CrawlUtil:
                 except Exception:
                     pass
                 cls._cffi_sessions.pop(host, None)
+            req_session = cls._requests_sessions.pop(host, None)
+            if req_session is not None:
+                try:
+                    req_session.close()
+                except Exception:
+                    pass
 
             # 등록된 프록시가 있을 경우 즉시 다음 프록시로 전환하여 차단 우회
-            rotated_proxy = cls.rotate_proxy(scheduler_instance=scheduler_instance, reason=f"차단/응답불가 대응 ({attempt}/{max_retries})")
+            rotated_proxy = cls.rotate_proxy(scheduler_instance=scheduler_instance, reason=f"차단/응답불가 대응 ({attempt}/{effective_retries})")
             if rotated_proxy:
                 proxies = cls.get_proxies(scheduler_instance)
 
@@ -356,7 +380,7 @@ class CrawlUtil:
                     logger.info(f"[CrawlUtil] [{host}] 새 프록시로 FlareSolverr 인가 및 페이지 수신 성공")
                     return source
 
-            if attempt < max_retries:
+            if attempt < effective_retries:
                 time.sleep(retry_interval)
 
         return None
@@ -841,6 +865,7 @@ class CrawlUtil:
 
         byte_io = io.BytesIO()
         for chunk in res.iter_content(chunk_size=4096):
+            FeederUtil.cooperate()
             if chunk:
                 byte_io.write(chunk)
 
@@ -866,6 +891,7 @@ class CrawlUtil:
         results = []
 
         for magnet in magnet_list:
+            FeederUtil.cooperate()
             if not str(magnet).startswith('magnet:'):
                 logger.debug(f"[CrawlUtil] 비토렌트 P2P 링크 메타데이터 분석 건너뜀: {magnet[:50]}")
                 continue

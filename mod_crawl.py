@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from flask import render_template, request, jsonify, abort, send_file
 from sqlalchemy import and_, or_, desc
 import threading
+import time
+from werkzeug.exceptions import HTTPException
 from sqlalchemy.orm.attributes import flag_modified
 
 from .setup import *
@@ -503,32 +505,44 @@ class ModuleCrawl(PluginModuleBase):
                     return feed_mod.process_api(sub, req)
                 return jsonify({'ret': 'fail', 'msg': '피드 모듈 비활성화 상태'}), 500
             return jsonify({'ret': 'fail', 'msg': f'알 수 없는 API 명령: {sub}'}), 404
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"[CrawlAPI] process_api 에러 ({sub}): {e}")
             return jsonify({'ret': 'error', 'msg': str(e)}), 500
 
-    def _handle_download_stream(self, bbs_file_id):
+    def _handle_download_stream(self, bbs_file_id, source_type='crawl'):
         try:
-            tokens = bbs_file_id.split('_')
-            post_id = int(tokens[0])
-            file_index = int(tokens[1])
+            try:
+                post_id, file_index = map(int, (bbs_file_id or '').split('_'))
+            except (TypeError, ValueError):
+                abort(400)
 
-            post = ModelCrawlItem.get(id=post_id)
+            if source_type == 'feed':
+                from .model_feed import ModelFeedItem
+                post = db.session.query(ModelFeedItem).filter_by(id=post_id).first()
+            else:
+                post = ModelCrawlItem.get(id=post_id)
             if not post:
                 abort(404)
 
             post_dict = post.as_dict()
-            if not post_dict['files'] or len(post_dict['files']) <= file_index:
+            if not post_dict['files'] or not 0 <= file_index < len(post_dict['files']):
                 abort(404)
 
             target_file = post_dict['files'][file_index]
             download_url = target_file[0]
             filename = target_file[1]
 
-            target_crawler = FeederUtil.get_crawler_by_board(post.site, post.board)
+            if source_type == 'feed':
+                target_crawler = FeederUtil.get_feed_by_name(post.feed_name)
+                setting_prefix = 'feed'
+            else:
+                target_crawler = FeederUtil.get_crawler_by_board(post.site, post.board)
+                setting_prefix = self.name
             target_cfg = SimpleNamespace(
-                use_proxy=target_crawler.get('use_proxy', False) if target_crawler else P.ModelSetting.get_bool(f"{self.name}_use_proxy"),
-                proxy_url=target_crawler.get('proxy_url', '') if target_crawler else P.ModelSetting.get(f"{self.name}_proxy_url"),
+                use_proxy=target_crawler.get('use_proxy', False) if target_crawler else P.ModelSetting.get_bool(f"{setting_prefix}_use_proxy"),
+                proxy_url=target_crawler.get('proxy_url', '') if target_crawler else P.ModelSetting.get(f"{setting_prefix}_proxy_url"),
                 use_flaresolverr=target_crawler.get('use_flaresolverr', False) if target_crawler else False
             )
 
@@ -539,6 +553,8 @@ class ModuleCrawl(PluginModuleBase):
                 return send_file(byte_io, mimetype=mimetype, as_attachment=True, download_name=filename)
             except TypeError:
                 return send_file(byte_io, mimetype=mimetype, as_attachment=True, attachment_filename=filename)
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"[CrawlAPI] _handle_download_stream 에러: {e}")
             abort(500)
@@ -633,6 +649,7 @@ class ModuleCrawl(PluginModuleBase):
                 fixed_bbs_count = 0
                 bbs_rows = db.session.query(ModelCrawlItem).filter(ModelCrawlItem.magnet.isnot(None)).all()
                 for row in bbs_rows:
+                    FeederUtil.cooperate()
                     if not row.magnet:
                         continue
                     links = FeederUtil.split_magnets(row.magnet)
@@ -649,6 +666,7 @@ class ModuleCrawl(PluginModuleBase):
                 deleted_dl_count = 0
                 dl_rows = db.session.query(ModelDownload).all()
                 for dl in dl_rows:
+                    FeederUtil.cooperate()
                     mag = (dl.magnet or '').strip()
                     if mag == 'ed2k://' or mag == 'file' or mag == '/' or (mag.startswith('ed2k://') and not mag.endswith('|/')):
                         matched_bbs = None
@@ -683,6 +701,7 @@ class ModuleCrawl(PluginModuleBase):
         crawlers = FeederUtil.get_crawlers()
 
         for c in crawlers:
+            FeederUtil.cooperate()
             info = dict(c)
             site_name = c.get('site')
             boards = c.get('boards', [])
@@ -715,6 +734,7 @@ class ModuleCrawl(PluginModuleBase):
         ret = {'site': [], 'board': {}}
 
         for c in FeederUtil.get_crawlers():
+            FeederUtil.cooperate()
             s = c.get('site')
             if not s:
                 continue
@@ -724,6 +744,7 @@ class ModuleCrawl(PluginModuleBase):
                 ret['board'][s] = []
 
             for b_item in c.get('boards', []):
+                FeederUtil.cooperate()
                 b_val = b_item.get('board', '')
                 sub_val = str(b_item.get('subcat', '')).strip()
                 _, _, f_key = TaskCrawl.parse_board_info(b_val, sub_val)
@@ -737,6 +758,7 @@ class ModuleCrawl(PluginModuleBase):
         try:
             db_boards = db.session.query(ModelCrawlItem.site, ModelCrawlItem.board).distinct().all()
             for s, b in db_boards:
+                FeederUtil.cooperate()
                 if not s or not b:
                     continue
                 if s not in ret['site']:
@@ -750,6 +772,7 @@ class ModuleCrawl(PluginModuleBase):
 
         all_sites = ModelCrawlSite.get_list()
         for s in all_sites:
+            FeederUtil.cooperate()
             s_name = s.name if hasattr(s, 'name') else s.get('name')
             if s_name and s_name not in ret['site']:
                 ret['site'].append(s_name)

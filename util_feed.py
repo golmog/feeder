@@ -363,6 +363,7 @@ class FeedUtil:
             # encoding 선언이 포함된 XML 파싱 시 반드시 bytes(res.content) 전달
             root = ET.fromstring(res.content)
             for item_elem in root.findall('.//item'):
+                FeederUtil.cooperate()
                 title = (item_elem.findtext('title') or '').strip()
                 link = (item_elem.findtext('link') or '').strip()
                 guid = (item_elem.findtext('guid') or '').strip()
@@ -387,6 +388,7 @@ class FeedUtil:
                 # 중복 링크 제거
                 unique_magnets = []
                 for m in magnets:
+                    FeederUtil.cooperate()
                     if m not in unique_magnets:
                         unique_magnets.append(m)
 
@@ -419,6 +421,7 @@ class FeedUtil:
             # 내부 크롤러 게시판 소스 동기화
             internal_conds = []
             for src in sources:
+                FeederUtil.cooperate()
                 s_type = src.get('type') or 'crawl'
                 if s_type == 'crawl':
                     s_name = src.get('site')
@@ -427,38 +430,20 @@ class FeedUtil:
                         internal_conds.append(and_(ModelCrawlItem.site == s_name, ModelCrawlItem.board == b_name))
 
             if internal_conds:
-                def _safe_int(val, fallback=0):
-                    try:
-                        if val is not None and str(val).strip() != '':
-                            return int(val)
-                    except Exception:
-                        pass
-                    return fallback
-
-                # 목표 아이템 수 산출 (설정값이 있으면 우선 적용, 미설정 시 기본 100)
-                f_items = _safe_int(feed.get('rss_file_items'), _safe_int(P.ModelSetting.get('feed_rss_file_items'), 0))
-                f_count = _safe_int(feed.get('feed_count'), _safe_int(P.ModelSetting.get('feed_feed_count'), 0))
-                target_item_count = max(f_items, f_count) if (f_items > 0 or f_count > 0) else 100
-
-                # 보관 기간 산출 (일 단위, 0 이하면 기간 무제한)
-                days_val = _safe_int(feed.get('rss_file_days'), _safe_int(P.ModelSetting.get('feed_rss_file_days'), 14))
-                cutoff_date = (datetime.now() - timedelta(days=days_val)) if days_val > 0 else None
-
-                # 현재 피드 DB에 이미 적재되어 있는 유효(기간 내) 항목 수 확인
-                valid_count_query = db.session.query(ModelFeedItem).filter_by(feed_name=feed_name)
-                if cutoff_date:
-                    valid_count_query = valid_count_query.filter(ModelFeedItem.created_time >= cutoff_date)
-                current_valid_count = valid_count_query.count()
-
                 batch_size = 100
                 last_seen_id = None
                 scanned_total = 0
 
-                # 원본 개수 제한 없이 (기간 AND 최대 개수) 조건을 충족할 때까지 커서 페이징 탐색
-                while current_valid_count < target_item_count:
+                # RSS API/XML의 출력 제한은 동기화할 원본 범위를 제한하지 않는다.
+                # batch_size는 메모리 사용을 위한 조회 단위이며 전체 처리 개수 제한이 아니다.
+                while True:
+                    FeederUtil.cooperate()
                     query = db.session.query(ModelCrawlItem).filter(or_(*internal_conds))
-                    if cutoff_date:
-                        query = query.filter(ModelCrawlItem.created_time >= cutoff_date)
+                    already_synced = db.session.query(ModelFeedItem.id).filter(
+                        ModelFeedItem.feed_name == feed_name,
+                        ModelFeedItem.url == ModelCrawlItem.url
+                    ).exists()
+                    query = query.filter(~already_synced)
                     if last_seen_id is not None:
                         query = query.filter(ModelCrawlItem.id < last_seen_id)
 
@@ -468,6 +453,7 @@ class FeedUtil:
 
                     scanned_total += len(candidates)
                     for bbs in candidates:
+                        FeederUtil.cooperate()
                         last_seen_id = bbs.id
 
                         b_dict = bbs.as_dict()
@@ -499,17 +485,14 @@ class FeedUtil:
                             db.session.add(new_feed_item)
                             db.session.commit()
                             added_count += 1
-                            current_valid_count += 1
                             logger.debug(f"[FeedUtil] [{feed_name}] 크롤러 아이템 적재: '{bbs.title[:35]}'")
 
-                            if current_valid_count >= target_item_count:
-                                break
-
                 if scanned_total > 0:
-                    logger.debug(f"[FeedUtil] [{feed_name}] 원본 {scanned_total}건 탐색 완료 -> 유효 피드 {current_valid_count}/{target_item_count}건 충족 (신규 적재: {added_count}건)")
+                    logger.debug(f"[FeedUtil] [{feed_name}] 원본 {scanned_total}건 탐색 완료 (신규 적재: {added_count}건)")
 
             # 외부 RSS 피드 소스 동기화
             for src in sources:
+                FeederUtil.cooperate()
                 src_board = str(src.get('board', '')).strip()
                 src_url = (src.get('url') or src_board).strip()
                 is_rss_source = (src.get('type') == 'rss') or src_board.startswith(('http://', 'https://'))
@@ -517,6 +500,7 @@ class FeedUtil:
                 if is_rss_source and src_url:
                     remote_items = cls.fetch_remote_rss_items(src_url, feed_cfg=feed)
                     for r_item in remote_items:
+                        FeederUtil.cooperate()
                         exists = db.session.query(ModelFeedItem.id).filter_by(feed_name=feed_name, url=r_item['url']).first()
                         if exists:
                             continue
@@ -564,6 +548,7 @@ class FeedUtil:
         """모든 활성 피드 동기화 수행"""
         total_added = 0
         for f in FeederUtil.get_feeds():
+            FeederUtil.cooperate()
             total_added += cls.sync_feed(f)
         return total_added
 
@@ -605,7 +590,7 @@ class FeedUtil:
                 days_val = 14
 
             try:
-                items_val = int(feed.get('rss_file_items') or P.ModelSetting.get('feed_rss_file_items') or P.ModelSetting.get('feed_feed_count') or 100)
+                items_val = max(1, int(feed.get('rss_file_items') or P.ModelSetting.get('feed_rss_file_items') or 100))
             except Exception:
                 items_val = 100
 
@@ -621,7 +606,7 @@ class FeedUtil:
                 return False
 
             feed_title = f"{feed_name} (Shared Feed)"
-            xml_content = feed_mod.generate_rss_feed(feed_title, feed_records, include_apikey=False)
+            xml_content = feed_mod.generate_rss_feed(feed_title, feed_records, include_apikey=False, max_items=items_val)
 
             os.makedirs(save_dir, exist_ok=True)
             target_filepath = os.path.join(save_dir, filename)
@@ -644,6 +629,7 @@ class FeedUtil:
         """설정된 모든 피드의 RSS 파일 일괄 갱신"""
         count = 0
         for f in FeederUtil.get_feeds():
+            FeederUtil.cooperate()
             if str(f.get('use_rss_file', False)).lower() in ['true', 'on', '1']:
                 if cls.save_rss_file(f):
                     count += 1
