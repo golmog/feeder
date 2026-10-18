@@ -43,14 +43,18 @@ if any(c in str(root) for c in ('%', '\\', '"', '\n', '\r')):
     raise SystemExit('설치 경로에 %, 따옴표, 역슬래시, 줄바꿈은 사용할 수 없습니다.')
 text = (root / 'deploy/feeder-worker-user.service').read_text()
 text = text.replace('WorkingDirectory=%h/feeder-worker', f'WorkingDirectory={root}')
-text = text.replace('EnvironmentFile=%h/feeder-worker/.env', f'EnvironmentFile="{root}/.env"')
+text = text.replace('EnvironmentFile=%h/feeder-worker/.env', f'EnvironmentFile={root}/.env')
 text = text.replace('ExecStart=%h/feeder-worker/venv/bin/python', f'ExecStart="{root}/venv/bin/python"')
 with tempfile.TemporaryDirectory(prefix='feeder-unit-', dir=destination.parent) as temporary:
     candidate = Path(temporary) / 'feeder-worker.service'
     candidate.write_text(text)
     candidate.chmod(0o600)
-    # 실제 systemd 파서 검증에 통과한 파일만 원자적으로 반영한다.
-    subprocess.run(['systemd-analyze', '--user', 'verify', str(candidate)], check=True)
+    # 종료 코드가 0이어도 설정 무시 등의 경고가 있으면 등록하지 않는다.
+    result = subprocess.run(['systemd-analyze', '--user', 'verify', str(candidate)],
+                            capture_output=True, text=True)
+    if result.returncode or result.stderr.strip():
+        sys.stderr.write(result.stderr)
+        raise SystemExit('서비스 파일 검증을 통과하지 못했습니다. 위의 오류 또는 경고를 확인해주세요.')
     candidate.replace(destination)
 PY
 systemctl --user daemon-reload
