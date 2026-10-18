@@ -3,6 +3,12 @@
 // =============================================================================
 var sse_source = null;
 var cached_download_list = [];
+var pipeline_control_timer = null;
+var pipeline_control_loading = false;
+var pipeline_control_changing = false;
+var pipeline_control_version = 0;
+var last_pipeline_control = null;
+var pipeline_control_sse_time = 0;
 
 var current_downloaders = [];
 var current_profiles = [];
@@ -13,6 +19,23 @@ var modal_profile_chain = [];
 var modal_engine_destinations = {};
 var available_engine_schemas = [];
 var available_transporter_schemas = [];
+
+$(document).on('click', '#test_remote_worker_btn, #save_remote_worker_btn', function () {
+  var save = this.id === 'save_remote_worker_btn';
+  var buttons = $('#test_remote_worker_btn, #save_remote_worker_btn');
+  buttons.prop('disabled', true);
+  $('#remote_worker_result').text(save ? '연결 설정을 저장합니다…' : '워커 접속과 인증을 확인합니다…');
+  $.ajax({url: '/' + package_name + '/ajax/' + sub + '/' + (save ? 'save_remote_worker' : 'test_remote_worker'), type: 'POST', timeout: 30000,
+    data: {worker_url: $('#worker_connection_url').val().trim(), worker_token: $('#worker_connection_token').val().trim()},
+    success: function (data) {
+      $('#remote_worker_result').text(data.msg);
+      if (save && data.ret === 'success') $('#worker_connection_token').val('').attr('placeholder', '저장된 토큰 사용 · 변경할 때만 입력');
+      $.notify(data.msg, {type: data.ret === 'success' ? 'success' : 'warning'});
+    },
+    error: function () { $('#remote_worker_result').text('워커 연결 상태를 확인하지 못했습니다. 서버 상태와 Tailscale 연결을 확인해주세요.'); },
+    complete: function () { buttons.prop('disabled', false); }
+  });
+});
 var dl_engine_editor = null;
 var dl_trans_editor = null;
 
@@ -39,6 +62,8 @@ $(document).ready(function () {
 
   // Queue 대시보드 화면 진입 시
   if ($('#active_queue_tbody').length > 0) {
+    refresh_pipeline_control();
+    pipeline_control_timer = setInterval(refresh_pipeline_control, 3000);
     try {
       localStorage.setItem('feeder_last_download_page', 'queue');
       sync_feeder_header_navbar();
@@ -58,7 +83,7 @@ $(document).ready(function () {
             $('#stat_pending').text(cacheObj.counts.pending || 0);
             $('#stat_downloading').text(cacheObj.counts.downloading || 0);
             $('#stat_staging').text(cacheObj.counts.staging || 0);
-            $('#stat_uploading').text(cacheObj.counts.uploading || 0);
+            render_upload_queue_count(cacheObj.counts);
             $('#stat_completed').text(cacheObj.counts.completed || 0);
             $('#stat_failed').text(cacheObj.counts.failed || 0);
           }
@@ -138,12 +163,16 @@ function init_sse_listener() {
     sse_source.onmessage = function (event) {
       try {
         var data = JSON.parse(event.data);
+        if (data && data.control && !pipeline_control_changing) {
+          pipeline_control_sse_time = Date.now();
+          render_pipeline_control(data.control);
+        }
         // 상단 통계 카드 수치 실시간 업데이트
         if (data && data.counts) {
           $('#stat_pending').text(data.counts.pending || 0);
           $('#stat_downloading').text(data.counts.downloading || 0);
           $('#stat_staging').text(data.counts.staging || 0);
-          $('#stat_uploading').text(data.counts.uploading || 0);
+          render_upload_queue_count(data.counts);
           $('#stat_completed').text(data.counts.completed || 0);
           $('#stat_failed').text(data.counts.failed || 0);
         }
@@ -172,6 +201,8 @@ function init_sse_listener() {
     };
 
     sse_source.onerror = function () {
+      pipeline_control_sse_time = 0;
+      refresh_pipeline_control();
       $('#sse_status_badge').show();
       hide_queue_loading_overlay();
     };
@@ -179,10 +210,89 @@ function init_sse_listener() {
 }
 
 window.addEventListener('pagehide', function () {
+  if (pipeline_control_timer) {
+    clearInterval(pipeline_control_timer);
+    pipeline_control_timer = null;
+  }
   if (sse_source) {
     try { sse_source.close(); } catch (e) {}
     sse_source = null;
   }
+});
+
+function render_upload_queue_count(counts) {
+  var current = counts.upload_current === undefined ? '—' : counts.upload_current;
+  var total = counts.upload_total === undefined ? (counts.uploading || 0) : counts.upload_total;
+  $('#stat_uploading').text(current + ' / ' + total);
+}
+
+function render_pipeline_control(control) {
+  if (last_pipeline_control && control.observed_at < last_pipeline_control.observed_at) return;
+  last_pipeline_control = control;
+  var labels = {
+    idle: '작업 실행 대기 중',
+    running: '작업 실행 중',
+    stopping: '중단 예약됨 · 진행 중인 작업이 끝나면 중단합니다',
+    paused: '작업 중단됨 · Feeder 업로드가 종료되어 FF를 재시작할 수 있습니다'
+  };
+  $('#pipeline_control_status').text(labels[control.state] || '작업 상태 확인 중...');
+  $('#pipeline_pause_btn').toggle(!control.pause_requested).prop('disabled', pipeline_control_changing);
+  $('#pipeline_resume_btn').toggle(!!control.pause_requested).prop('disabled', pipeline_control_changing)
+    .html('<i class="fa fa-play mr-1"></i>' + (control.state === 'stopping' ? '중단 예약 취소' : '작업 재개'));
+}
+
+function refresh_pipeline_control() {
+  if (pipeline_control_loading || pipeline_control_changing) return;
+  if (last_pipeline_control && sse_source && sse_source.readyState === 1 &&
+      pipeline_control_sse_time && Date.now() - pipeline_control_sse_time < 10000) return;
+  pipeline_control_loading = true;
+  var version = pipeline_control_version;
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/pipeline_control_state',
+    type: 'POST', dataType: 'json', timeout: 10000, global: false
+  }).done(function (data) {
+    if (version !== pipeline_control_version) return;
+    if (data.ret === 'success' && data.counts) render_upload_queue_count(data.counts);
+    if (data.ret === 'success' && data.control) render_pipeline_control(data.control);
+    else pipeline_control_unavailable();
+  }).fail(function () {
+    if (version === pipeline_control_version) pipeline_control_unavailable();
+  }).always(function () { pipeline_control_loading = false; });
+}
+
+function pipeline_control_unavailable() {
+  $('#pipeline_control_status').text('작업 상태를 확인할 수 없습니다. 연결을 확인하세요.');
+  $('#pipeline_pause_btn, #pipeline_resume_btn').prop('disabled', true);
+}
+
+$('#pipeline_pause_btn, #pipeline_resume_btn').click(function () {
+  if (pipeline_control_changing) return;
+  var command = this.id === 'pipeline_pause_btn' ? 'pause_pipeline' : 'resume_pipeline';
+  pipeline_control_changing = true;
+  pipeline_control_version += 1;
+  $('#pipeline_pause_btn, #pipeline_resume_btn').prop('disabled', true);
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/' + command,
+    type: 'POST', dataType: 'json', timeout: 10000
+  }).done(function (data) {
+    if (data.ret === 'success' && data.control) {
+      render_pipeline_control(data.control);
+      notify(command === 'pause_pipeline' ? '진행 중인 작업이 끝나면 중단합니다.' : '작업 중단 상태를 해제했습니다.', 'info');
+    } else {
+      last_pipeline_control = null;
+      pipeline_control_unavailable();
+      notify(data.msg || '작업 상태 변경에 실패했습니다.', 'warning');
+    }
+  }).fail(function () {
+    last_pipeline_control = null;
+    pipeline_control_unavailable();
+    notify('작업 상태 변경 결과를 확인하지 못했습니다. 상태를 다시 조회합니다.', 'warning');
+  })
+    .always(function () {
+      pipeline_control_changing = false;
+      if (last_pipeline_control) render_pipeline_control(last_pipeline_control);
+      refresh_pipeline_control();
+    });
 });
 
 function hide_queue_loading_overlay() {
@@ -335,6 +445,7 @@ function render_queue_rows(list) {
     else if (it.status === 'pending_relay') statusBadge = '<span class="badge badge-warning">원격 릴레이 대기</span>';
     else if (it.status === 'relay_transferring') statusBadge = '<span class="badge badge-primary">원격 릴레이 전송 중</span>';
     else if (it.status === 'cancelled') statusBadge = '<span class="badge badge-secondary">삭제/취소</span>';
+    else if (it.status === 'blocked') statusBadge = '<span class="badge badge-danger">차단</span>';
     else if (it.status === 'waiting_transporter') statusBadge = '<span class="badge badge-warning">이송 설정 복구 대기</span>';
     else if (it.status === 'downloaded') {
       if (it.destination_type === 'local') {
@@ -480,12 +591,14 @@ function render_queue_rows(list) {
              ' data-file-size="' + (it.file_size || 0) + '"' +
              ' data-source-path="' + clean_title_attr(it.local_path || '') + '"' +
              ' data-raw-status="' + (it.raw_status || '') + '">작업 흡수</button>';
+      str += ' <button type="button" class="btn btn-xs btn-outline-danger block_orphan_btn" data-task-id="' + clean_title_attr(String(it.task_id || it.id)) + '" data-engine="' + clean_title_attr(it.current_engine_name || '') + '" data-hash="' + clean_title_attr(it.hash || '') + '" data-title="' + clean_title_attr(it.title || '') + '">중단·차단</button>';
     } else {
       str += '    <div class="btn-group btn-group-sm">';
       str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold queue_action_btn" data-action="retry" data-id="' + it.id + '">재시도</button>';
       str += '      <button type="button" class="btn btn-success text-white queue_action_btn" data-action="force_complete" data-id="' + it.id + '">완료</button>';
       str += '      <button type="button" class="btn btn-secondary text-white queue_action_btn" data-action="force_fail" data-id="' + it.id + '">실패</button>';
       str += '      <button type="button" class="btn btn-danger text-white queue_action_btn" data-action="delete" data-id="' + it.id + '">삭제</button>';
+      str += '      <button type="button" class="btn btn-outline-danger queue_action_btn" data-action="block" data-id="' + it.id + '">중단·차단</button>';
       str += '    </div>';
     }
     str += '  </td>';
@@ -538,6 +651,8 @@ $(document).on('click', '.queue_action_btn', function (e) {
   var id = $(this).data('id');
   var targetRow = $(this).closest('tr');
 
+  if (act === 'block' && !confirm('전송을 즉시 중단하고 이 콘텐츠를 차단하시겠습니까?\n로컬 스테이징과 원격 임시 업로드 파일도 삭제합니다.')) return;
+
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/item_action',
     type: 'POST',
@@ -545,7 +660,7 @@ $(document).on('click', '.queue_action_btn', function (e) {
     dataType: 'json',
     success: function (data) {
       if (data.ret === 'success') {
-        notify('작업이 처리되었습니다.', 'info');
+        notify(data.msg || '작업이 처리되었습니다.', 'info');
         if (act === 'delete' && targetRow.length > 0) {
           targetRow.fadeOut(200, function () {
             $(this).remove();
@@ -682,6 +797,7 @@ function make_list(list) {
     else if (it.status === 'waiting_transporter') statusBadge = '<span class="badge badge-warning">이송 설정 복구 대기</span>';
     else if (it.status === 'move_failed') statusBadge = it.successful ? '<span class="badge badge-success">소스 없음 · 성공 종료 (move_failed)</span>' : '<span class="badge badge-warning">이동 실패</span>';
     else if (it.status === 'failed') statusBadge = '<span class="badge badge-danger">실패</span>';
+    else if (it.status === 'blocked') statusBadge = '<span class="badge badge-danger">차단</span>';
     else statusBadge = '<span class="badge badge-secondary">' + it.status + '</span>';
 
     var engineInfo = it.current_engine_name ? '<br><small class="text-muted">엔진: ' + it.current_engine_name + '</small>' : '';
@@ -719,10 +835,14 @@ function make_list(list) {
     str += '  <td class="text-left">' + detailHtml + '</td>';
     str += '  <td>';
     str += '    <div class="btn-group btn-group-sm">';
+    if (it.status !== 'blocked') {
     str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold btn_list_action" data-action="retry" data-id="' + it.id + '">재시도</button>';
     str += '      <button type="button" class="btn btn-success text-white btn_list_action" data-action="force_complete" data-id="' + it.id + '">완료</button>';
     str += '      <button type="button" class="btn btn-secondary text-white btn_list_action" data-action="force_fail" data-id="' + it.id + '">실패</button>';
+    }
     str += '      <button type="button" class="btn btn-danger text-white btn_list_action" data-action="delete" data-id="' + it.id + '">삭제</button>';
+    if (it.status !== 'blocked') str += '      <button type="button" class="btn btn-outline-danger btn_list_action" data-action="block" data-id="' + it.id + '">중단·차단</button>';
+    else str += '      <button type="button" class="btn btn-outline-danger blacklist_open_btn">차단 관리</button>';
     str += '    </div>';
     str += '  </td>';
     str += '</tr>';
@@ -831,6 +951,7 @@ $(document).on('click', '.btn_list_action', function (e) {
     return;
   }
 
+  if (act === 'block' && !confirm('전송을 즉시 중단하고 이 콘텐츠를 차단하시겠습니까?\n로컬 스테이징과 원격 임시 업로드 파일도 삭제합니다.')) return;
   if (act === 'force_complete') {
     if (!confirm('[' + id + '번 항목]\n"' + titleText + '"\n\n해당 작업을 최종 완료(completed) 상태로 변경하시겠습니까?')) return;
   } else if (act === 'delete') {
@@ -2156,3 +2277,62 @@ $(document).on('click', '#transporter_script_delete_btn', function (e) {
     }
   });
 });
+
+// 차단 이력은 다운로드 행과 독립적으로 조회하고 관리한다.
+var blacklistPage = 1;
+$(document).on('click', '.block_orphan_btn', function() {
+  if (!confirm('이 원격 작업을 즉시 중단하고 콘텐츠를 차단하시겠습니까?')) return;
+  var button = $(this);
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/block_orphan', type: 'POST', dataType: 'json',
+    data: {task_id: button.data('task-id'), engine_name: button.data('engine'), hash: button.data('hash'), title: button.data('title')},
+    success: function(data) {
+      notify(data.msg || '처리 완료', data.ret === 'success' ? 'info' : 'warning');
+      if (data.ret === 'success') request_active_queue();
+    }
+  });
+});
+function request_blacklist() {
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/blacklist_list',
+    type: 'POST', data: {page: blacklistPage}, dataType: 'json', global: false,
+    success: function(data) {
+      if (data.ret !== 'success') { notify(data.msg || '차단 목록 조회 실패', 'warning'); return; }
+      var rows = $('#download_blacklist_rows').empty();
+      if (!data.list.length) rows.text('차단된 콘텐츠가 없습니다.');
+      data.list.forEach(function(it) {
+        var row = $('<div class="border-bottom py-2"></div>');
+        $('<div class="font-weight-bold"></div>').text(it.title || '(제목 없음)').appendTo(row);
+        $('<div class="small text-muted"></div>').text(it.pending ? (it.error ? '정리 실패: ' + it.error : '임시 파일 정리 중/대기') : '임시 파일 정리 완료').appendTo(row);
+        $('<button type="button" class="btn btn-sm btn-outline-danger mt-1 blacklist_action_btn"></button>')
+          .text(it.pending ? '정리 재시도' : '차단 해제').attr('data-key', it.key)
+          .attr('data-action', it.pending ? 'cleanup' : 'unblock').appendTo(row);
+        rows.append(row);
+      });
+      $('#blacklist_page').text(blacklistPage + ' 페이지 · 전체 ' + data.total + '개');
+      $('#blacklist_prev').prop('disabled', blacklistPage <= 1);
+      $('#blacklist_next').prop('disabled', blacklistPage * 50 >= data.total);
+    }
+  });
+}
+$(document).on('click', '.blacklist_open_btn', function() {
+  blacklistPage = 1; request_blacklist(); $('#download_blacklist_modal').modal('show');
+});
+$('#blacklist_prev').click(function() { if (blacklistPage > 1) { blacklistPage--; request_blacklist(); } });
+$('#blacklist_next').click(function() { blacklistPage++; request_blacklist(); });
+$(document).on('click', '.blacklist_action_btn', function() {
+  var button = $(this);
+  if (button.data('action') === 'unblock' && !confirm('이 콘텐츠의 차단을 해제하시겠습니까?')) return;
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/blacklist_action',
+    type: 'POST', dataType: 'json', data: {key: button.data('key'), action: button.data('action')},
+    success: function(data) {
+      notify(data.msg || '처리 완료', data.ret === 'success' ? 'info' : 'warning');
+      request_blacklist();
+      if ($('#download_list_tbody').length) window.globalRequestSearch(null, true);
+    }
+  });
+});
+$('#download_blacklist_modal').on('shown.bs.modal', function() {
+  window.feederBlacklistTimer = setInterval(request_blacklist, 4000);
+}).on('hidden.bs.modal', function() { clearInterval(window.feederBlacklistTimer); });

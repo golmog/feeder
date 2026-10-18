@@ -620,6 +620,63 @@ class FeederUtil:
             """), {'lock_name': lock_name})
 
     @classmethod
+    def is_download_paused(cls) -> bool:
+        """FF/Celery 사이에서 캐시 없이 영속적인 중단 요청을 확인한다."""
+        try:
+            engine = db.get_engine(bind=P.package_name)
+        except Exception:
+            engine = db.engine
+        with engine.connect() as conn:
+            return conn.execute(db.text(f"""
+                SELECT 1 FROM {P.package_name}_runtime_lock
+                WHERE lock_name = 'download_pause'
+            """)).first() is not None
+
+    @classmethod
+    def set_download_paused(cls, paused: bool) -> None:
+        cls.init_runtime_locks()
+        try:
+            engine = db.get_engine(bind=P.package_name)
+        except Exception:
+            engine = db.engine
+        with engine.begin() as conn:
+            if paused:
+                conn.execute(db.text(f"""
+                    INSERT INTO {P.package_name}_runtime_lock (lock_name, owner, acquired_at)
+                    VALUES ('download_pause', 'user', :now)
+                    ON CONFLICT(lock_name) DO NOTHING
+                """), {'now': time.time()})
+            else:
+                conn.execute(db.text(f"""
+                    DELETE FROM {P.package_name}_runtime_lock WHERE lock_name = 'download_pause'
+                """))
+
+    @classmethod
+    def get_download_control_state(cls) -> dict:
+        try:
+            engine = db.get_engine(bind=P.package_name)
+        except Exception:
+            engine = db.engine
+        with engine.connect() as conn:
+            locks = {row[0] for row in conn.execute(db.text(f"""
+                SELECT lock_name FROM {P.package_name}_runtime_lock
+                WHERE lock_name IN ('download_pause', 'download_pipeline')
+            """))}
+            active_transfers = conn.execute(db.text(f"""
+                SELECT COUNT(*) FROM {P.package_name}_download
+                WHERE status IN ('uploading', 'local_staging')
+            """)).scalar()
+        paused = 'download_pause' in locks
+        running = 'download_pipeline' in locks or bool(active_transfers)
+        return {
+            'pause_requested': paused,
+            'running': running,
+            'state': ('stopping' if running else 'paused') if paused else ('running' if running else 'idle'),
+            'active_transfers': active_transfers,
+            'observed_at': time.time(),
+        }
+
+    @classmethod
     def attach_download_info(cls, items: list) -> list[dict]:
         """수집/피드 목록 아이템에 다운로드 상태(download_info) 매핑 주입 공통 로직"""
         if not items:
@@ -1006,6 +1063,8 @@ class FeederUtil:
         from .model_download import ModelDownload
 
         infohash = cls.extract_info_hash(magnet)
+        if ModelDownload.is_blocked(infohash, magnet):
+            return {'ret': 'fail', 'msg': '차단된 콘텐츠입니다. 차단 목록에서 먼저 해제해주세요.'}
         existing = ModelDownload.get_by_infohash(infohash) if infohash else ModelDownload.get_by_magnet(magnet)
         if existing:
             return {'ret': 'exist', 'msg': f'이미 다운로드 큐에 등록된 작업입니다 (상태: {existing.status}).'}

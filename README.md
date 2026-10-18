@@ -36,7 +36,8 @@
   * 내장 엔진은 **qBittorrent**와 **CloudDrive2(CD2)**입니다. **AllDebrid** 및 기타 엔진은 `feeder_custom/engines`의 확장 스크립트가 설치되어 있어야 선택할 수 있습니다.
   * 프로토콜 미지원·작업 추가 실패·재시작 불가·지연 타임아웃에는 다음 엔진을 시도합니다. 비활성 엔진이나 큐 한도 도달은 대기하고, 원격 목록 누락 유예 초과는 해당 엔진 내 실패로 기록합니다.
   * `max_active_tasks`는 AllDebrid에만 적용합니다. 원격에 이미 존재하는 작업은 새로 등록하지 않고 연동할 수 있습니다.
-* **이송 핸들러:** `local`(로컬 이동), `rclone_simple`(일반 리모트 복사 후 최종 이동), `gdrive_rotation`(Google Drive 계정 풀/기본 리모트)을 내장하며 커스텀 핸들러를 추가할 수 있습니다.
+* **이송 핸들러:** `local`(로컬 이동), `rclone_simple`(일반 리모트 복사 후 최종 이동), `gdrive_rotation`(Google Drive 계정 풀/기본 리모트), `remote_worker`(원격 서버 복사)를 내장하며 커스텀 핸들러를 추가할 수 있습니다.
+* **원격 워커:** AD/WebDAV → Google Drive 복사를 별도 Linux 서버에서 실행하고 Feeder가 서버 측 폴더 이동으로 마무리합니다. 로컬 스테이징을 생략하며, 기존 업로드 큐·동시 전송 수·중단 예약·차단 정리에 연결됩니다. 작업 ID를 보존해 응답 유실이나 FF 재시작 뒤 중복 전송을 방지하고, SSE 알림과 REST 재조회로 진행률을 확인합니다. 특정 클라우드 서비스에 종속되지 않습니다.
 * **로컬 스테이징과 다이렉트 전송:** 원격 소스를 로컬 버퍼로 먼저 받거나 Rclone으로 목적지에 직접 전송합니다. 다이렉트 모드도 별도 원격 워커를 사용하지 않으면 FF 호스트에서 전송 프로세스가 실행됩니다.
 * **DB 이력 기준 폴더명 분리:** 이전 DB 이력에 같은 이름이 있으면 파일이 사라졌더라도 `_[해시 앞 6자리]`를 붙입니다. 원본 파일명과 출력 폴더명을 별도 보존하며, 같은 이름을 이유로 다운로드를 대기시키지 않습니다.
 * **Google Drive 계정 풀:** 작은 작업은 설정 임계값(기본 14GB)에 따라 MyDrive를 경유하고 큰 작업은 공유 드라이브로 직행합니다. 계정 풀이 OFF면 계정 목록 없이 기본 업로드 리모트로 공유 드라이브에 직행합니다.
@@ -47,7 +48,7 @@
 
 * **SSE 대시보드:** 큐 상태, 엔진 진행률, Rclone 전송량·속도·ETA를 갱신합니다. Rclone의 `MiB`, `GiB` 등 IEC 단위도 처리합니다.
 * **24시간 통계:** 최근 성공 종료 용량과 Google Drive 사용량 기록을 표시합니다. Google Drive 사용량은 전송 시도 시 기록한 파일 크기 합계로, 성공 전송 바이트만 집계한 값과 차이가 있을 수 있습니다. SSE 통계는 30초 간격으로 다시 계산합니다.
-* **작업 제어:** 재시도, 수동 완료·실패, 삭제/취소를 지원합니다. 이송 핸들러를 찾지 못하면 `waiting_transporter`로 원본을 보존하고 설정 복구를 기다립니다.
+* **작업 제어:** 재시도, 수동 완료·실패, 삭제/취소를 지원합니다. **중단·차단**은 해당 콘텐츠의 전송을 즉시 중단하고 로컬 스테이징·원격 임시 업로드 파일을 정리합니다. 차단 이력은 다운로드 항목과 별도로 보관하여 같은 해시의 재등록을 막으며, 큐/리스트의 **콘텐츠 차단 목록**에서 정리 상태 확인·재시도·차단 해제가 가능합니다. 최종 보관 파일은 삭제하지 않습니다. 이송 핸들러를 찾지 못하면 `waiting_transporter`로 원본을 보존하고 설정 복구를 기다립니다.
 * **재시작 복구:** 이전 실행의 스테이징·업로드·릴레이 전송 상태를 대기 상태로 되돌립니다. 필요한 DB 컬럼·인덱스는 플러그인 로드 시 추가합니다.
 * **동시성 제어:** SQLite WAL·busy timeout 설정, 프로세스 내 실행 락과 DB 런타임 락을 사용합니다. 스테이징·Google Drive Rclone 전송 전에는 DB 세션을 반환합니다.
 * **내장 편집기:** 사이트 JSON, YAML, 커스텀 Python 스크립트를 편집하며 JSON 정렬·창 크기 조절·전체화면을 지원합니다.
@@ -67,9 +68,10 @@
 | CRAWL | 최대 수집 페이지 수 (`crawl_max_page`, 수집기의 `max_page`) | 게시판별 최대 탐색 페이지. 일반 수집에는 별도의 게시물 개수 상한을 적용하지 않습니다. |
 | FEED API | 실시간 RSS 피드 최대 수 (`feed_count` / `feed_feed_count`) | RSS API가 반환하는 `<item>` 수. 기본 100개. |
 | FEED XML | 피드 보관 최대 항목 수 (`rss_file_items` / `feed_rss_file_items`) | XML 파일에 넣는 `<item>` 수. 기본 100개. API 제한과 독립적입니다. |
-| DOWNLOAD | 로컬 스테이징 최대 보관 수 (`download_max_staging_items`) | DB에 경로가 기록되고 스테이징 루트 아래에 실제 남아 있는 작업 수. 업로드 대기·실패 파일도 포함합니다. 기본 10개, 0은 무제한. |
+| DOWNLOAD | Google Drive 업로드 최대 큐 (`download_max_staging_items`) | 스테이징 중·직접 업로드를 포함한 업로드 대기/진행·로컬 버퍼 잔여 작업을 ID 기준으로 중복 없이 합산합니다. 기본 10개, 0은 무제한. |
 | AllDebrid | `max_active_tasks` | 해당 AllDebrid 엔진의 진행 중 다운로드 큐. 0은 무제한. |
 
+<br>
 테스트 수집 개수(기본 3개·목록 1페이지), 화면 페이지 크기, 병렬 워커 수는 각각 테스트·표시·동시 실행 범위입니다. CD2의 `cd2_max_pages`는 상태 목록 조회 범위를 제한하는 별도 보호 설정입니다. FEED XML 보관 기간, 다운로드 대상 기간(`sync_hours`), DB 자동 정리는 개수 제한과 별도로 적용합니다.
 
 ---
@@ -186,6 +188,7 @@ FEEDER
 | `EXTRA` | 선택 | `[]` | 사이트별 특수 플래그 배열 (`USE_PROXY`, `USE_FLARESOLVERR`, `USE_SELENIUM`, `USE_TORRENT_INFO`, `USING_POST_CHAR_ID`, `ONLY_FILE`, `MAGNET_ONLY_ONE_LAST`). |
 | `DESCRIPTION` | 선택 | - | 웹 UI 사이트 목록 테이블에 표시할 안내 문구. |
 
+<br>
 `XPATH_LIST_TAG`의 `XPATH`, `INDEX_START`, `INDEX_STEP`으로 목록을 순회하고, 선택적인 `TITLE_REGEX`의 `title` 그룹으로 제목을 가공합니다. 제목 원문은 링크 태그의 텍스트에서 얻으며 `TITLE_XPATH`는 현재 사용하지 않습니다. `BOARD_LIST`는 게시판 ID를 별도 XPath 규칙 키에 연결합니다.
 
 `USING_POST_CHAR_ID`는 숫자 ID 기준 조기 종료를 사용하지 않을 때, `ONLY_FILE`은 첨부파일 중심 게시물을 저장할 때 사용합니다. 정기 수집의 프록시·Selenium·메타데이터 사용 여부는 수집기 설정을 확인하세요. 사이트 옵션만 켜고 수집기의 해당 옵션을 끈 경우 같은 동작을 기대할 수 없습니다.
@@ -335,6 +338,139 @@ GDRIVE_ACCOUNTS:
     remote_name: 'gdrive_user02'
 ```
 
+#### 원격 워커 설정
+
+별도 Linux 서버에서 AllDebrid WebDAV → Google Drive 복사를 실행합니다. 파일 데이터는 원격 서버에서 전송하며, FF는 작업 등록·상태 확인·최종 폴더 이동을 담당합니다. **Feeder Remote Worker 0.5.0 이상**, Python 3.10 이상, systemd 사용자 서비스와 Tailscale을 사용할 수 있는 서버가 필요합니다.
+
+##### 설치 전 준비
+
+* 서버에 Python·venv·pip·curl과 Rclone을 설치하고, FF와 워커를 같은 Tailscale 네트워크에 연결합니다. Debian/Ubuntu에서 Python 준비 패키지는 `python3 python3-venv python3-pip curl`입니다.
+* 워커 서버의 Rclone에 WebDAV 소스와 Google Drive 목적지 리모트를 설정합니다. Feeder에서 사용하는 AllDebrid 계정과 일치해야 합니다. 기존 wiserain MOD를 사용 중이라면 그대로 유지합니다. 설치 프로그램은 Rclone이나 리모트 인증을 설치·교체하지 않습니다.
+* FF에서도 최종 폴더 이동을 위해 같은 이름의 Drive 리모트가 필요합니다. 공유 드라이브와 `backend chpar`를 지원하는 Rclone 구성을 준비합니다.
+* TCP 8000을 공용 인터넷에 개방할 필요가 없습니다. Tailscale 정책에서 FF → 워커 접속을 허용합니다.
+
+##### 한 줄 설치
+
+**워커 서버의 일반 사용자 계정**으로 실행합니다. 기본 설치 위치는 `$HOME/feeder-worker`입니다.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/golmog/feeder/main/worker/install.sh | bash
+```
+
+설치 프로그램은 Tailscale IPv4와 Rclone 설정(`$HOME/.config/rclone/rclone.conf`)을 확인합니다. 해당 종류의 리모트가 하나면 자동 선택하고, 여러 개면 터미널에서 선택할 이름을 입력받습니다. 자동 확인이 어려운 환경은 옵션을 지정하세요. 아래 주소·리모트 이름·경로는 예시입니다.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/golmog/feeder/main/worker/install.sh | bash -s -- \
+  --bind 100.64.0.10 --port 8000 \
+  --source-remotes ad --destination-remotes in \
+  --rclone-config "$HOME/.config/rclone/rclone.conf" \
+  --rclone-binary /usr/bin/rclone
+```
+
+`--install-dir`로 설치 위치를 변경할 수 있습니다. 기존 `.env`, `config/`, `venv/`, 작업 DB와 Rclone 설정은 보존합니다. 기존 `.env`가 있으면 새 옵션으로 덮어쓰지 않으므로, 설정 변경은 서비스를 중지한 뒤 해당 파일에서 수행하세요. 설치 실패 시 원인을 해결하고 같은 명령을 다시 실행할 수 있습니다.
+
+사용자 서비스는 부팅 후에도 동작하도록 linger를 활성화합니다. 권한이 부족하면 설치 안내에 나온 `sudo loginctl enable-linger <사용자명>`을 관리자가 실행한 뒤 다시 설치하세요. Python 가상환경 생성 오류는 배포판의 `python3-venv` 패키지 설치 여부를 확인합니다.
+
+##### 토큰 등록과 연결 확인
+
+1. 설치가 끝나면 **워커 주소와 인증 토큰**이 터미널에 표시됩니다. 토큰은 최초 설치 시 워커에서 자동 생성하며, 재설치해도 기존 값을 유지합니다. 워커에서는 `.env`에 권한 600으로 보관합니다.
+2. Feeder의 **DOWNLOAD → 기본 설정 → 원격 워커**에서 주소와 토큰을 입력합니다. 신규 설정의 기본값은 비어 있으며, 입력칸의 주소는 예시입니다.
+3. **연결 테스트**를 눌러 접속·인증·버전·실행/대기 작업 수를 확인합니다. 저장하지 않은 입력값도 테스트할 수 있으며, 테스트는 전송 작업을 만들지 않습니다.
+4. **연결 설정 저장**을 누릅니다. 이 버튼은 상단의 일반 설정 저장과 별도로 동작합니다. Feeder는 토큰을 설정 DB에 저장하고 화면에는 다시 표시하지 않습니다. 이후 토큰 칸을 비워두면 저장된 값을 사용합니다.
+5. 프로필의 이송 핸들러를 **원격 워커**로 선택하고 목적지 설정을 저장합니다. 기존 프로필은 자동 변경되지 않습니다.
+
+기존 인증 파일 방식의 설정은 FF 재시작 또는 첫 워커 사용 시 설정 DB로 이전합니다. 원본 파일은 보존하며 이후에는 DB의 토큰을 사용합니다. FF 설정 DB와 백업에도 인증 정보가 들어 있으므로 비공개로 보관하세요. 작업 스냅샷·SSE 주소·연결 테스트 응답에는 토큰을 넣지 않습니다.
+
+설치 안내를 다시 확인하려면 워커 서버에서 다음을 실행합니다. 이 명령은 토큰을 터미널에 표시하므로 출력을 공유하지 마세요.
+
+```bash
+cd "$HOME/feeder-worker"
+venv/bin/python deploy/setup_install.py --root "$PWD" --show-connection
+```
+
+프로필의 기본 목적지 또는 AD 엔진별 목적지를 다음과 같이 지정합니다. 기존 프로필은 자동 변경하지 않습니다.
+
+```yaml
+destination_by_engine:
+  ad:
+    type: remote_worker
+    remote_name: in
+    shared_drive_id: '목적지_드라이브_ID'
+    upload_path: 'feeder-worker-incoming/my-profile'
+    complete_path: 'uploads/my-profile'
+```
+
+* 원격 서버와 FF의 Rclone에 **같은 이름의 Drive 리모트**가 필요합니다. 리모트 이름을 변환하지 않습니다. 소스의 `ad:...`도 워커의 허용 WebDAV 리모트와 일치해야 합니다.
+* 워커의 AD 리모트와 Feeder의 AD 엔진은 같은 AllDebrid 계정을 사용해야 합니다. 리모트 인증 파일은 자동 동기화하지 않습니다.
+* 임시 경로는 `feeder-worker-incoming/` 아래에 두며, 최종 경로는 이 영역 밖에 지정합니다. 기존 SA 잔여 파일 사전 정리와 진행 중 원격 복사가 서로 간섭하지 않도록 경로를 분리합니다.
+* 원격 핸들러는 프로필/전역 스테이징 옵션과 관계없이 로컬 스테이징을 생략합니다. 동일한 **Google Drive 업로드 최대 큐**를 소비하고, 워커에는 실제 실행 슬롯만큼만 제출합니다. 동시 실행 수는 Feeder 동시 전송 수와 Worker 설정의 상한을 함께 따릅니다.
+* 파일 데이터는 원격 서버와 AD/Drive 사이에서 흐릅니다. Feeder가 실행하는 최종 `backend chpar`는 서버 측 폴더 이동이며 홈 서버에서 파일을 다시 내려받지 않습니다. 이 단계가 실패하면 기존 `move_failed` 복구 흐름을 사용합니다.
+* 원격 서버에 설정된 고정 Drive 리모트를 사용합니다. Feeder의 Google 계정 풀 로테이션·계정별 impersonate는 원격 핸들러에 적용하지 않으며, 공유 드라이브 업로드 한도는 Feeder에서 확인합니다. 기존 청크/인증 설정을 유지하고 전송 제외 패턴만 작업 요청에 함께 보냅니다. 홈 서버의 임의 Rclone 추가 옵션을 워커에서 실행하지 않습니다.
+* Feeder에서 원격 AD 전송을 예약했거나 원격 종료가 미확인된 동안에는 홈 서버의 AD 스테이징·업로드를 보류합니다. 다른 플러그인이나 외부 프로그램의 AD 접속은 이 제어의 대상이 아닙니다.
+* 중단 예약은 현재 전송·최종 이동까지 마무리하고 다음 원격 등록을 막습니다. 즉시 차단·삭제·재시도는 원격 종료 확인을 먼저 수행합니다. 통신 장애로 종료를 확인하지 못하면 임시 파일/원본 삭제를 보류하며 차단 목록에서 정리를 재시도할 수 있습니다.
+* 원격 전송 실패는 스냅샷을 보존하고 항목을 실패로 표시합니다. 항목 재시도 시 종료 확인과 임시 파일 정리 후 새 시도 ID를 생성합니다. 이미 복사가 완료됐다면 다시 업로드하지 않고 최종 이동을 재개합니다.
+
+##### 운영·업데이트·복구
+
+워커는 기본 동시 작업 1개, 최대 2개를 지원합니다. Rclone은 작업당 `--transfers 1`, `--checkers 2`, `--multi-thread-streams 0`, 버퍼 8MiB를 기본 사용하며 기존 리모트의 청크 설정을 유지합니다. 서비스의 메모리 상한은 768MiB입니다. SSE가 끊겨도 전송은 계속되며 Feeder는 REST 조회로 상태를 확인합니다.
+
+```bash
+systemctl --user status feeder-worker
+journalctl --user -u feeder-worker -n 50 --no-pager
+```
+
+업데이트나 서버 재시작 전에는 Feeder에서 **작업 중단**을 예약하고 현재 업로드가 끝났는지 확인하세요. 워커의 실행·대기 작업이 모두 비어 있을 때 다음 순서로 업데이트합니다.
+
+```bash
+systemctl --user stop feeder-worker
+curl -fsSL https://raw.githubusercontent.com/golmog/feeder/main/worker/install.sh | bash
+```
+
+기본 경로 외에 설치했다면 이전과 같은 `--install-dir`을 사용합니다. 설치 프로그램은 실행 중 서비스의 덮어쓰기를 거부하며, 이전 소스는 설치 폴더의 `backups/source-*`에 보관합니다. 업데이트 후 Feeder에서 연결 테스트를 하고 작업을 재개하세요. Feeder 플러그인 코드도 변경됐다면 FF 재시작이 필요합니다.
+
+워커 서버에서 다음 명령으로 전송 없이 설정·Rclone 버전·DB 무결성을 점검하거나 SQLite 온라인 백업을 만들 수 있습니다.
+
+```bash
+cd "$HOME/feeder-worker"
+venv/bin/python -m app.manage check
+venv/bin/python -m app.manage backup
+```
+
+DB 백업은 설치 폴더의 `data/backups/`에 저장됩니다(별도 DB 경로 설정 시 그 DB 폴더 아래). 복원은 서비스를 중지한 뒤 수행하며 SQLite의 DB·WAL·SHM 파일을 서로 다른 시점의 것으로 섞지 마세요. 복원 후에는 Feeder가 기존 작업 ID의 최신 상태를 다시 확인하게 합니다. 워커 재시작 시 대기는 복원하고, 안전하게 재연결할 수 없는 이전 실행 작업은 실패/취소로 정리합니다. 무한 자동 재시도는 하지 않습니다.
+
+| 증상 | 확인할 사항 |
+| :--- | :--- |
+| 연결 실패 | 워커 서비스 상태, 양쪽 Tailscale 연결, 주소/포트, Tailscale 접근 정책 |
+| HTTP 401 | 워커 `.env`의 토큰과 Feeder에 저장한 토큰 일치 여부 |
+| 리모트/경로 오류 | 허용 리모트 이름·종류, 인증 파일 권한, FF와 워커의 Drive 리모트 일치 여부 |
+| 업로드가 시작되지 않음 | Feeder 작업 중단 상태, 업로드 큐 제한, 기존 원격 작업의 종료 확인 대기 여부 |
+| 복사는 완료됐지만 최종 이동 실패 | FF의 Rclone 설정, 공유 드라이브 권한, 최종 경로와 `move_failed` 복구 상태 |
+
+토큰을 바꾸려면 전송을 마치고 서비스를 중지한 뒤 워커 `.env`의 `WORKER_API_TOKEN`을 새 무작위 값으로 바꿉니다. `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`로 생성할 수 있습니다. 서비스를 다시 시작하고 Feeder에도 같은 토큰을 저장하세요. Rclone 인증 파일과 계정 JSON은 별도 준비하며 API로 자동 동기화하지 않습니다.
+
+##### API 참고
+
+모든 경로는 `/api/v1` 아래에 있으며 **health와 SSE를 포함한 모든 요청에** `Authorization: Bearer <토큰>`이 필요합니다. Rclone 원격 경로만 허용하며 로컬 경로·임의 실행 옵션은 받지 않습니다.
+
+| 메서드·경로 | 기능 |
+| :--- | :--- |
+| `GET /health` | 버전, Rclone/DB 상태, 실행·대기 작업 수 |
+| `POST /jobs` | `job_id`, `source`, `destination`, `config_version`, 선택적 `exclude_patterns`로 복사 등록 |
+| `GET /jobs/{job_id}` | 상태, 전송 바이트, 속도, ETA, 오류·Rclone 종료 코드 확인 |
+| `GET /jobs?status=running&limit=20&offset=0` | 상태별 작업 목록 조회 |
+| `POST /jobs/{job_id}/cancel` | 대기는 즉시 취소, 실행 중이면 프로세스 종료 요청 |
+| `GET /events` | 순차 이벤트 ID와 heartbeat를 제공하는 SSE 구독 |
+| `GET /config` | 현재 설정과 버전 확인 (`?version=N`으로 이전 버전 조회) |
+| `PUT /config` | 전체 실행 설정을 현재 버전 + 1로 갱신 |
+
+`POST /jobs`는 성공 시 202, 입력 오류는 400, 동일 ID에 다른 내용은 409를 반환합니다. 같은 ID와 같은 내용의 재요청은 중복 실행하지 않습니다. 작업은 `queued → running → completed/failed/cancelled`로 바뀝니다. Rclone은 `copy`만 실행하며 원본 삭제와 완료 후 정리는 Feeder가 담당합니다.
+
+취소 요청의 202는 종료 완료를 뜻하지 않습니다. 최신 상태가 종료 상태인지 확인한 뒤 부분 파일을 정리해야 합니다. 아직 등록되지 않은 ID의 취소는 404와 `X-Worker-Cancel-Tombstone: 1`로 이후 같은 ID의 등록도 차단합니다. 단순 404만으로 정리하지 않습니다.
+
+SSE는 `job.queued`, `job.started`, `job.progress`, `job.completed`, `job.failed`, `job.cancelled`, `worker.status`를 보냅니다. 재연결은 마지막으로 처리한 `Last-Event-ID`와 `stream_id`를 함께 사용합니다. `resync_required`가 오면 스트림 기준 번호를 확보한 뒤 REST로 전체 상태를 재조회합니다. 이벤트는 변경 알림으로 사용하고 실제 상태는 REST의 최신 값으로 반영합니다. 기본 SSE 접속 상한은 Feeder 백엔드 1개입니다.
+
+설정 API는 동시 작업 수(1~2)와 제한된 Rclone 실행 옵션을 지원합니다. 현재 전체 설정을 읽어 버전을 올려 제출하며 대기·실행 작업이 있으면 409로 거부합니다. `WORKER_MAX_CONCURRENT_JOBS`는 최초 DB 생성용으로, 이후 변경은 설정 API를 사용합니다. 기존 리모트 의미나 인증 파일을 이 API로 바꾸지 않습니다.
+
 #### YAML 섹션별 필드 설명
 
 ##### `GLOBAL` (피드 공통 필터)
@@ -357,6 +493,7 @@ GDRIVE_ACCOUNTS:
 | `use_proxy`, `proxy_url` | 프록시 사용 여부와 단일/복수 주소. 개별 주소가 비어 있으면 기본 프록시 주소를 사용합니다. |
 | `use_flaresolverr`, `use_selenium`, `use_torrent_info` | 이 수집기에서 사용할 우회·브라우저·메타데이터 옵션. 서비스 주소와 메타데이터 조회 방식은 CRAWL 기본 설정에 지정합니다. |
 
+<br>
 ##### `FEEDS` (피드)
 
 | 필드 | 설명 |
@@ -369,8 +506,10 @@ GDRIVE_ACCOUNTS:
 | `rss_file_items`, `rss_file_days` | XML 최대 항목 수·보관 기간. 미입력 시 FEED 기본 설정(100개·14일). DB 항목을 삭제하거나 동기화 범위를 줄이는 값으로 사용하지 않습니다. |
 | `use_proxy`, `proxy_url` | 외부 RSS 요청의 프록시. 개별 사용 여부가 명시되면 우선 적용하고, 주소가 비어 있으면 FEED 기본 주소를 사용합니다. |
 
+<br>
 XML 정기 생성에는 FEED 기본 설정의 **공유용 RSS XML 파일 별도 생성**도 켜고 저장 경로를 지정해야 합니다. DB 보관 기간은 **자동 & DB정리**의 별도 설정입니다.
 
+<br>
 ##### `DOWNLOADERS` (다운로더 엔진 설정)
 * `name`: 프로필 우선순위 체인에서 참조할 고유 영문 식별명.
 * `engine_type`: 엔진 타입 (`qbittorrent`, `cd2`, `alldebrid` 또는 `feeder_custom/engines`에 등록된 커스텀 엔진 ID).
@@ -406,6 +545,7 @@ XML 정기 생성에는 FEED 기본 설정의 **공유용 RSS XML 파일 별도 
 
 아래 값은 YAML의 `GLOBAL`에 옮겨 적는 항목이 아니라 각 모듈의 **기본 설정 / 자동 & DB정리** 화면에서 관리하는 값입니다.
 
+<br>
 | 설정 | 기본값 | 용도 |
 | :--- | :--- | :--- |
 | `crawl_interval`, `feed_interval`, `download_interval` | `10`, `10`, `5` | 모듈별 정기 실행 주기(분). Cron 형식도 지원. 자동 시작 기본 OFF. |
@@ -417,8 +557,8 @@ XML 정기 생성에는 FEED 기본 설정의 **공유용 RSS XML 파일 별도 
 | `feed_make_rss_file`, `feed_rss_file_path` | OFF, 빈 값 | 정적 XML 정기 생성 스위치와 기본 저장 경로. |
 | `feed_rss_file_items`, `feed_rss_file_days` | `100`, `14` | XML 최대 항목 수와 출력 대상 기간(일). |
 | `download_feed_sync_hours` | `72` | 다운로드 큐에 새로 등록할 FEED 항목의 기간(시간). |
-| `download_use_local_staging`, `download_max_staging_items` | ON, `10` | 전역 스테이징 사용 여부와 최대 보관 작업 수. |
-| `download_staging_workers`, `download_upload_workers` | `2`, `2` | 스테이징·Google Drive 업로드 병렬도. |
+| `download_use_local_staging`, `download_max_staging_items` | ON, `10` | 전역 스테이징 사용 여부와 Google Drive 업로드 최대 큐. 기존 최대 보관 수 설정 키·저장값은 그대로 사용합니다. |
+| `download_upload_workers` | `2` | Google Drive 업로드와 로컬 스테이징에 공통으로 적용하는 동시 전송 수. 이전 `download_staging_workers` 값은 더 이상 사용하지 않습니다. |
 | `download_rclone_conf_path`, `download_rclone_upload_remote_name` | 빈 값, 빈 값 | FF/워커가 읽을 설정 파일의 경로와 기본 업로드 리모트명. |
 | `download_rclone_chunk_size`, `download_rclone_extra_options` | `256M`, `--timeout 30m` | Google Drive 업로드 청크 크기와 지원 경로에 적용할 추가 옵션. |
 | `download_use_gdrive_pool`, `download_gdrive_use_impersonate` | OFF, OFF | 계정 풀 사용과 도메인 위임 사용 여부. |
@@ -427,6 +567,7 @@ XML 정기 생성에는 FEED 기본 설정의 **공유용 RSS XML 파일 별도 
 | `download_shared_drive_quota_reset_time` | `16:00` | 공유 드라이브 쿼터 차단 해제 시각(Asia/Seoul). |
 | `crawl_db_auto_delete`, `feed_db_auto_delete`, `download_db_auto_delete` | 모두 OFF | 각 DB 자동 정리. `*_db_delete_day` 기본값은 30일. |
 
+<br>
 일부 Rclone 경로·옵션은 YAML의 소문자 `rclone` 섹션도 호환 경로로 읽지만, 새 설정은 우선 UI의 필드와 개별 프로필을 사용하세요. 모든 설정이 동일한 우선순위를 공유하는 구조는 아닙니다.
 
 
@@ -488,8 +629,9 @@ Google Drive 업로드 후 이동/정리 실패 → move_failed
 
 * 스테이징 사용 여부는 **프로필(현재 엔진의 목적지 override 포함) → 엔진 → DOWNLOAD 기본 설정 → 코드 기본값** 순으로 해석합니다. CD2는 엔진 설정에서 기본 OFF를 제공하며, 프로필에서 명시적으로 변경할 수 있습니다.
 * 스테이징 경로는 `스테이징 루트 / staging_path / 출력폴더명`입니다. `staging_path`가 비어 있으면 프로필 이름 또는 `default`를 사용합니다. 루트 미설정 시 `{path_data}/tmp/feeder/staging`을 사용합니다.
-* 최대 보관 수에는 스테이징 이후 **업로드 대기·실패 등으로 디스크에 남은 작업**도 포함합니다. 최대 보관 수는 작업 수 기준이며 디스크 여유 바이트를 직접 예약하는 기능은 아닙니다.
-* 스테이징과 Google Drive 업로드 워커는 각각 기본 2개입니다. 동시 실행 수와 보관 개수 제한은 별도로 적용합니다.
+* `Google Drive 업로드 최대 큐`는 스테이징 중·업로드 대기·업로드 진행 작업과 **실패 등으로 로컬 버퍼에 남은 작업**을 ID 기준으로 한 번씩 계산합니다. 직접 업로드도 같은 큐를 사용합니다. 한도에 도달하면 새 스테이징·직접 업로드 큐 진입·새 슬롯이 필요한 이동 실패 재시도를 보류하며, 이미 슬롯을 차지한 작업의 업로드는 계속 진행합니다. 기존 큐가 변경한 한도를 초과해도 작업을 삭제하지 않고 처리하면서 줄입니다. 이 값은 작업 수 기준이며 디스크 여유 바이트를 직접 예약하지 않습니다.
+* 대시보드의 `업로드` 카드는 `현재 큐 / 전체`로 표시합니다. 앞 숫자는 위 제한과 같은 집계이며 진행 중인 작업을 포함합니다. 뒤 숫자는 스테이징·업로드·이송 진입 대기와 진행 중 릴레이를 더한 전체 작업 수입니다. 예를 들어 `50 / 113`은 현재 큐 50개와 큐 밖 대기 63개를 뜻합니다. 기존 초과 작업이 남아 있다면 앞 숫자도 설정 한도보다 클 수 있습니다.
+* 스테이징과 Google Drive 업로드 워커는 모두 `Google Drive 업로드 동시 전송 수`를 따릅니다(기본 2개). 동시 실행 수와 큐 개수 제한은 별도로 적용합니다.
 * 대량 수집·피드 동기화·큐 순회·디렉터리 용량 계산·SSE 목록 구성 중에는 실행 컨텍스트별로 약 20ms마다 1ms씩 양보합니다. gevent 활성 환경에서는 gevent에, 일반 워커에서는 OS 스케줄러에 실행 기회를 주며 기존 수집 딜레이와 재시도 간격은 그대로 적용합니다.
 * Rclone 추가 옵션 기본값은 `--timeout 30m`, Google Drive 청크 크기는 `256M`입니다. 전송 제외 패턴은 스테이징과 Google Drive 업로드 명령에 적용합니다.
 * 스테이징·Google Drive 전송률은 `--stats-one-line` 출력을 파싱해 IPC API로 웹 프로세스에 전달합니다. SSE는 약 3초 주기이며 원격 엔진 상태는 약 6초, 24시간 집계는 약 30초 간격으로 갱신합니다. 실제 주기는 엔진 응답 시간에 따라 길어질 수 있습니다.
@@ -511,6 +653,7 @@ Google Drive 업로드 후 이동/정리 실패 → move_failed
 | `failed` | 체인 소진, 원격 누락 유예 초과, 이송 실패 또는 수동 실패. |
 | `cancelled` | 사용자 삭제/취소로 재등록 방지 이력을 유지하는 상태. |
 
+<br>
 * **원격 누락:** 전체 목록을 정상 조회했는데도 작업이 계속 없으면 `missing_timeout_hours`(기본 24시간) 후 해당 엔진에서 실패 처리합니다. 다음 엔진으로 자동 전환하지 않습니다. 조회 오류·CD2의 부분 목록은 누락 유예를 초기화하고, 다시 발견한 경우에도 초기화합니다.
 * **CD2 조회 제한:** `cd2_max_pages` 기본값은 1입니다. 긴 115 히스토리를 매번 전체 조회하지 않도록 유지하는 보호 설정입니다. 범위 밖으로 밀린 작업을 찾기 위해 자동으로 추가 페이지를 조회하지 않습니다.
 * **지연 타임아웃:** `stalled_timeout_hours`는 엔진 추가 시점 기준 경과 시간으로 판정하며, 전송 속도가 0인 시간만 누적하는 방식은 아닙니다. 초과 시 다음 엔진을 시도합니다.
@@ -520,6 +663,7 @@ Google Drive 업로드 후 이동/정리 실패 → move_failed
 
 #### 4) 설정 반영·재시작·DB 보관
 
+* **작업 중단 예약:** 다운로드 큐 및 대시보드에서 `작업 중단 예약`을 누르면 새 작업 배정을 멈추고 이미 시작한 업로드의 최종 이동·소스 정리와 진행 중인 이송·스테이징을 마칩니다. 화면에 `작업 중단됨`이 표시된 뒤 FF를 재시작하세요. 이미 외부 다운로더에 등록한 다운로드와 원격 릴레이는 외부에서 계속 진행할 수 있습니다. 중단 상태는 DB에 저장되어 재시작 후에도 자동·수동 실행을 보류하며, `작업 재개`로 해제합니다. 종료 대기 중에는 `중단 예약 취소`로 계속 처리할 수 있습니다.
 * 활성 큐에는 현재 피드에 매칭되는 프로필과 엔진별 목적지 override를 다시 적용합니다. `feeds`의 `*`와 구체 피드가 겹치면 순서에 영향을 받으므로 프로필 적용 범위를 구분해 설정하세요.
 * 재시작 시 `local_staging`, `uploading`, `relay_transferring`를 각 대기 상태로 되돌립니다. 업로드 단계 기록(`upload_state`)이 있으면 완료한 복사를 반복하지 않고 후처리를 재개할 수 있습니다. `move_failed`로 전환된 작업에는 앞 절의 소스 유무 재시도 정책을 적용합니다.
 * `source_file_name`, `output_folder_name`, `remote_missing_since`, `upload_state` 등 필요한 컬럼·인덱스는 로드 시 추가합니다.
@@ -652,6 +796,7 @@ class CustomTransporter(BaseTransporter):
 
 아래 경로의 `/feeder`는 플러그인 패키지 경로입니다. RSS·첨부파일·SSE 요청은 FF의 API 인증 설정을 따르며, 릴레이 선점/보고는 시스템 API Key를 별도로 확인합니다. 피드 이름 등 쿼리 값은 URL 인코딩해서 전달하세요.
 
+<br>
 #### 1) 피드 및 첨부파일 API
 
 * **RSS 피드 발행 (XML):**
@@ -663,6 +808,7 @@ class CustomTransporter(BaseTransporter):
 
   FEED DB에 동기화된 항목을 반환합니다. 피드의 `feed_count` 또는 FEED 기본 최대 수를 적용하며, 한 DB 항목이 여러 마그넷/첨부파일로 펼쳐져도 실제 RSS `<item>` 수가 상한을 넘지 않습니다. 피드가 없으면 404, 식별자 누락은 400입니다. GET 요청이 수집기를 실행하거나 외부 RSS를 새로 수집하지는 않습니다.
 
+<br>
 * **첨부파일 다운로드:**
 
   ```text
@@ -672,6 +818,7 @@ class CustomTransporter(BaseTransporter):
 
   `FILE_INDEX`는 0부터 시작합니다. CRAWL과 FEED는 서로 다른 DB 항목 ID를 사용하므로 각 경로에 해당하는 ID를 전달해야 합니다. FEED RSS의 첨부파일 링크는 `/api/feed/download`를 사용합니다.
 
+<br>
 * **사이트 규칙 업데이트:**
 
   ```text
@@ -682,6 +829,7 @@ class CustomTransporter(BaseTransporter):
 
   JSON의 `NAME`으로 사이트를 추가하거나 기존 규칙을 갱신합니다. 수집기·피드·프로필 설정을 함께 갱신하는 API는 아닙니다.
 
+<br>
 #### 2) 다운로드 및 릴레이 API
 
 * **대시보드 SSE:**
@@ -692,6 +840,7 @@ class CustomTransporter(BaseTransporter):
 
   `text/event-stream`의 `data:` JSON으로 `timestamp`, `counts`, `total_upload_24h`, `total_download_24h`, `active_list`를 전달합니다. 활성 항목에는 진행률·속도·ETA가 포함될 수 있고, 원격에만 남은 작업은 `engine_unmanaged`로 표시합니다. `counts.completed`는 소스 없음으로 성공 종료한 `move_failed`도 포함합니다.
 
+<br>
 * **원격 릴레이 작업 선점 (Claim):**
 
   ```text
@@ -702,6 +851,7 @@ class CustomTransporter(BaseTransporter):
 
   `pending_relay` 한 건을 `relay_transferring`으로 바꾸고 반환합니다. 대기 작업이 없으면 `has_task: false`입니다. 반환 필드는 `ret`, `has_task`, `item`, `rclone_conf`, `sa_files`이며 `item`에는 다음 값이 포함됩니다.
 
+<br>
   | 필드 | 의미 |
   | :--- | :--- |
   | `id`, `title`, `file_name`, `file_size` | 작업 식별·표시·용량 정보. |
@@ -713,6 +863,7 @@ class CustomTransporter(BaseTransporter):
 
   `rclone_conf`와 `sa_files`는 FF에서 읽을 수 있는 설정 및 서비스 계정 파일을 워커용으로 전달하는 값입니다. API만으로 워커를 생성하지 않으며, 실제 전송과 아래 결과 보고를 구현해야 합니다.
 
+<br>
 * **원격 릴레이 결과 보고 (Report):**
 
   ```text
@@ -732,6 +883,7 @@ class CustomTransporter(BaseTransporter):
 
   JSON boolean을 권장하며, 폼 전송의 `true`/`false`, `1`/`0`, `on`/`off`, `yes`/`no`도 처리합니다. 허용되지 않는 `success` 값은 400입니다. 성공 시 `completed`와 완료 시각을 기록하고 원격 다운로더 작업을 정리하며, 실패 시 `failed`와 오류 메시지를 기록합니다.
 
+<br>
 * **Rclone 진행률 보고 (IPC):**
 
   ```text
@@ -756,6 +908,7 @@ class CustomTransporter(BaseTransporter):
 
   `action: clear`는 저장한 진행률을 지웁니다. 이 API는 화면용 진행률만 갱신하며 작업 완료 상태는 릴레이 결과 보고 또는 파이프라인이 처리합니다.
 
+<br>
 #### 3) 웹 UI의 작업 제어 요청
 
 FF 웹 UI가 사용하는 AJAX 경로입니다. 웹 UI와 동일한 로그인·접근 설정에서 호출합니다.
@@ -792,7 +945,7 @@ id={TASK_ID}&action={ACTION}
 | **엔진 작업이 원격 목록 누락으로 실패함** | `missing_timeout_hours` 동안 전체 조회 성공 후에도 계속 매칭되지 않은 경우입니다. 해당 엔진의 실제 작업 ID·해시·원격 삭제 여부를 확인하세요. 자동으로 다음 엔진에 넘기지 않습니다. |
 | **`waiting_transporter`에서 대기함** | 프로필의 목적지 타입, 커스텀 이송 스크립트의 ID·파일·로드 로그를 확인하세요. 복구 시 다음 실행에서 다시 이송합니다. 목록에서 수동 완료·실패·삭제도 가능합니다. |
 | **동일 제목 작업의 출력 폴더명에 해시가 붙음** | DB에 같은 폴더명 이력이 있으면 적용하는 정상 동작입니다. 실제 파일을 삭제해도 DB 이력이 남아 있으면 이름을 분리합니다. `source_file_name`과 `output_folder_name`을 구분하세요. |
-| **스테이징 한도 도달로 대기함** | 완료 대기뿐 아니라 업로드 보류·실패 후 남은 로컬 경로도 보관 수에 포함됩니다. 해당 파일의 업로드·정리 상태를 확인하세요. 워커 수를 늘리는 것과 보관 한도를 늘리는 것은 별개입니다. |
+| **Google Drive 업로드 최대 큐 도달로 대기함** | 스테이징 중·직접 업로드를 포함한 업로드 대기/진행·실패 후 남은 로컬 버퍼가 같은 큐를 차지합니다. 기존 작업의 업로드·정리 상태를 확인하세요. 동시 전송 수와 큐 한도는 별개입니다. |
 | **Google Drive 이동 실패 / `directory not found`** | 작업에 기록된 MyDrive·공유 드라이브 임시/최종 경로, 리모트와 권한을 확인하세요. `move_failed`는 소스가 있으면 재업로드하고, 소스가 없으면 상태 이력을 남겨 성공 종료합니다. 리모트 잔여 파일은 최종 경로로 이동해 보존합니다. |
 | **`move_failed`가 완료 필터·성공 통계에 함께 보임** | 소스 없음으로 성공 종료하면서 원래 이동 실패 이력을 보존한 작업입니다. 완료 시각과 설명, 별도의 원격 파일 복구 결과를 확인하세요. |
 | **계정 풀 OFF인데 Google Drive 업로드가 안 됨** | 계정 목록 대신 기본 업로드 리모트·공유 드라이브 ID·Rclone 설정 경로를 확인하세요. 풀 OFF 경로는 공유 드라이브 직행입니다. |

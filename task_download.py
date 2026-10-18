@@ -18,6 +18,7 @@ from .util_base import FeederUtil
 from .util_feed import FeedUtil
 from .util_download import DownloadUtil
 from .util_upload import UploadUtil
+from .util_remote_worker import RemoteWorker
 
 
 class TaskDownloadBase:
@@ -49,6 +50,10 @@ class TaskDownload:
 
     @staticmethod
     def run_pipeline(manual: bool = False):
+        with F.app.app_context():
+            if FeederUtil.is_download_paused():
+                logger.info('[DownloadPipeline] 사용자 중단 상태이므로 실행을 보류합니다.')
+                return
         if not TaskDownload._run_mutex.acquire(blocking=False):
             logger.info("[DownloadPipeline] 이미 실행 중인 다운로드 파이프라인이 있어 중복 실행을 건너뜁니다.")
             return
@@ -61,6 +66,8 @@ class TaskDownload:
                 db_lock_acquired = FeederUtil.acquire_runtime_lock('download_pipeline', owner, stale_after=21600)
                 if not db_lock_acquired:
                     logger.info("[DownloadPipeline] 다른 Celery 워커가 실행 중이어서 중복 실행을 건너뜁니다.")
+                    return
+                if FeederUtil.is_download_paused():
                     return
                 P.ModelSetting.set('download_is_running', 'True')
                 P.ModelSetting.set('download_running_start_time', str(int(time.time())))
@@ -78,6 +85,8 @@ class TaskDownload:
     def _run_pipeline_locked(manual: bool = False):
         with F.app.app_context():
             try:
+                if FeederUtil.is_download_paused():
+                    return
                 mode_str = "수동 실행" if manual else "스케쥴러 자동 실행"
                 logger.info(f"[DownloadPipeline] 다운로드 파이프라인 가동 ({mode_str})")
 
@@ -102,11 +111,18 @@ class TaskDownload:
 
                 # SA 내 드라이브 잔여 파일을 먼저 복구한 뒤 새 업로드를 시작한다.
                 if not UploadUtil.drain_all_sa_mydrives():
-                    logger.warning("[DownloadPipeline] 원격 잔여 파일 복구 미완료: 새 업로드를 보류하고 다음 주기에 재확인합니다.")
+                    if not FeederUtil.is_download_paused():
+                        logger.warning("[DownloadPipeline] 원격 잔여 파일 복구 미완료: 새 업로드를 보류하고 다음 주기에 재확인합니다.")
+                    return
+
+                if FeederUtil.is_download_paused():
                     return
 
                 # 피드 최신 데이터 동기화 및 큐 등록
                 TaskDownload.sync_feed_items(profiles)
+
+                if FeederUtil.is_download_paused():
+                    return
 
                 # 활성 큐 작업들에 대해 현재 설정된 최신 프로필 동적 동기화
                 TaskDownload.sync_active_items_with_profiles()
@@ -118,6 +134,8 @@ class TaskDownload:
                 max_cascade_passes = 3
                 for cascade_pass in range(1, max_cascade_passes + 1):
                     FeederUtil.cooperate()
+                    if FeederUtil.is_download_paused():
+                        return
                     pass_start_time = time.time()
                     pending_cnt = db.session.query(ModelDownload).filter(ModelDownload.status == 'pending').count()
                     downloading_cnt = db.session.query(ModelDownload).filter(ModelDownload.status == 'downloading').count()
@@ -132,24 +150,17 @@ class TaskDownload:
 
                     logger.info(f"[DownloadPipeline] === 연쇄 패스 {cascade_pass}/{max_cascade_passes} 시작 (활성 작업: {total_active_before}개) ===")
 
-                    # 다운로더 큐 디스패치
-                    if pending_cnt > 0:
-                        logger.info(f"[DownloadPipeline] 다운로더 큐 디스패치 시작 (대기: {pending_cnt}건)")
-                        TaskDownload.dispatch_pending_downloads()
-
-                    # 활성 다운로드 엔진 상태 점검
-                    if downloading_cnt > 0:
-                        logger.info(f"[DownloadPipeline] 활성 다운로드 엔진 상태 점검 (진행: {downloading_cnt}건)")
-                    TaskDownload.poll_active_downloads()
-
-                    # 로컬 스테이징 (대기 항목 존재 시 내부에서 실시간 쿼리하여 처리)
-                    TaskDownload.process_local_staging()
-
-                    # 다운로드 완료 항목 이송 라우팅 (로컬 스테이징 완료 또는 다이렉트 전송 대기 항목)
-                    TaskDownload.route_completed_downloads()
-
-                    # Google Drive 업로드 파이프라인 (pending_upload 실시간 쿼리하여 즉시 전송)
-                    TaskDownload.process_uploads()
+                    for stage in (
+                        TaskDownload.dispatch_pending_downloads if pending_cnt > 0 else None,
+                        TaskDownload.poll_active_downloads,
+                        TaskDownload.process_local_staging,
+                        TaskDownload.route_completed_downloads,
+                        TaskDownload.process_uploads,
+                    ):
+                        if FeederUtil.is_download_paused():
+                            return
+                        if stage is not None:
+                            stage()
 
                     # 해당 패스에서 실제 상태 전이가 발생했는지 판별
                     staging_after = db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_local_staging', 'local_staging'])).count()
@@ -164,9 +175,13 @@ class TaskDownload:
                     if (staging_after + downloaded_after + uploading_after) == 0:
                         break
 
+                if FeederUtil.is_download_paused():
+                    return
                 # 이전 실패 항목 재시도
                 TaskDownload.retry_move_failed()
 
+                if FeederUtil.is_download_paused():
+                    return
                 # 대기 중인 원격 릴레이(Colab 등) 작업 점검 및 워커 트리거
                 TaskDownload.check_pending_relays()
 
@@ -175,6 +190,40 @@ class TaskDownload:
             except Exception as e:
                 logger.error(f"[DownloadPipeline] 파이프라인 처리 중 오류: {e}")
                 logger.error(traceback.format_exc())
+
+    @staticmethod
+    def _worker_results(worker, item_ids, max_workers):
+        """실행 슬롯만 배정하고 중단 요청 이후에는 다음 작업을 시작하지 않는다."""
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+
+        def guarded_worker(item_id):
+            with F.app.app_context():
+                try:
+                    if not FeederUtil.is_download_paused():
+                        return worker(item_id)
+                finally:
+                    db.session.remove()
+
+        remaining = iter(item_ids)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            active = {}
+            exhausted = False
+            while active or not exhausted:
+                while not exhausted and len(active) < max_workers:
+                    if FeederUtil.is_download_paused():
+                        exhausted = True
+                        break
+                    try:
+                        item_id = next(remaining)
+                    except StopIteration:
+                        exhausted = True
+                        break
+                    active[executor.submit(guarded_worker, item_id)] = item_id
+                if not active:
+                    break
+                done, _ = wait(active, return_when=FIRST_COMPLETED)
+                for future in done:
+                    yield active.pop(future), future
 
     @staticmethod
     def sync_feed_items(profiles: list[dict]):
@@ -188,6 +237,8 @@ class TaskDownload:
 
         for profile in profiles:
             FeederUtil.cooperate()
+            if FeederUtil.is_download_paused():
+                return
             target_feed_names = profile.get('feeds', [])
             priority_chain = profile.get('priority_chain', [])
             if not priority_chain:
@@ -198,6 +249,8 @@ class TaskDownload:
 
             for feed in all_feeds:
                 FeederUtil.cooperate()
+                if FeederUtil.is_download_paused():
+                    return
                 f_name = feed.get('name')
                 if '*' not in target_feed_names and f_name not in target_feed_names:
                     continue
@@ -244,6 +297,8 @@ class TaskDownload:
 
                 for feed_item in candidates:
                     FeederUtil.cooperate()
+                    if FeederUtil.is_download_paused():
+                        return
                     feed_dict = feed_item.as_dict()
                     magnets = feed_dict.get('magnet', [])
                     if not magnets:
@@ -260,6 +315,8 @@ class TaskDownload:
                         target_mag = magnets[0]
 
                     infohash = FeederUtil.extract_info_hash(target_mag)
+                    if ModelDownload.is_blocked(infohash, target_mag):
+                        continue
 
                     existing = None
                     if infohash:
@@ -313,6 +370,9 @@ class TaskDownload:
         for item in items:
             # 메모리 캐시에서 프로필 매핑 O(1) 고속 검색
             FeederUtil.cooperate()
+            if (item.upload_state or {}).get('worker'):
+                # 저장한 원격 작업이 끝나기 전에는 프로필 변경으로 소유권을 옮기지 않는다.
+                continue
             profile = None
             target_feed = str(item.feed_name or '').strip().lower()
             for p in all_profiles:
@@ -367,6 +427,8 @@ class TaskDownload:
                 True
             )
             use_local_staging = str(use_local_staging).lower() in ['true', 'on', '1']
+            if transporter and getattr(transporter, 'FORCE_REMOTE_SOURCE', False):
+                use_local_staging = False
 
             # 목적지 변경 또는 스테이징 옵션(On/Off) 변경에 따른 동적 상태 리라우팅
             if not is_relay_dest and item.status in ['pending_relay', 'relay_transferring']:
@@ -479,6 +541,8 @@ class TaskDownload:
 
         for snapshot in pending_snapshots:
             FeederUtil.cooperate()
+            if FeederUtil.is_download_paused():
+                return
             item_id = snapshot['id']
             chain = snapshot['priority_chain']
             curr_idx = snapshot['current_engine_index']
@@ -589,13 +653,21 @@ class TaskDownload:
             dest_cfg = FeederUtil.get_profile_destination(profile, engine_name)
             current_upload_path = (snapshot['gdrive_upload_path'] or dest_cfg.get('upload_path') or '').strip('/')
 
+            from .util_block import DownloadBlock
+            if DownloadBlock.stopped(item_id):
+                continue
             success, task_id, err = DownloadUtil.add_magnet(
                 engine,
                 snapshot['magnet'],
                 title=snapshot['title'],
                 upload_path=current_upload_path
             )
+            db.session.expire_all()
             item = db.session.query(ModelDownload).filter_by(id=item_id).first()
+            if DownloadBlock.stopped(item_id):
+                if success and task_id:
+                    engine.delete_task(task_id)
+                continue
             if not item:
                 continue
             if success:
@@ -655,6 +727,9 @@ class TaskDownload:
 
         for downloader_cfg in enabled_downloaders:
             FeederUtil.cooperate()
+            if FeederUtil.is_download_paused():
+                db.session.commit()
+                return
             engine_name = downloader_cfg.get('name')
             if not engine_name:
                 continue
@@ -763,6 +838,9 @@ class TaskDownload:
 
             for it in engine_items:
                 FeederUtil.cooperate()
+                if FeederUtil.is_download_paused():
+                    db.session.commit()
+                    return
                 if it.status != 'downloading':
                     continue
                 matched_status = status_map_by_tid.get(str(it.engine_task_id))
@@ -904,6 +982,8 @@ class TaskDownload:
                         True
                     )
                     use_local_staging = str(use_local_staging).lower() in ['true', 'on', '1']
+                    if transporter and getattr(transporter, 'FORCE_REMOTE_SOURCE', False):
+                        use_local_staging = False
 
                     if is_relay_dest:
                         it.status = 'pending_relay'
@@ -967,7 +1047,30 @@ class TaskDownload:
         db.session.commit()
 
     @staticmethod
+    def _get_upload_queue_state(staging_root=None):
+        """스테이징·업로드 상태와 잔여 로컬 버퍼를 작업 ID 기준으로 합산한다."""
+        try:
+            limit = max(0, P.ModelSetting.get_int('download_max_staging_items'))
+        except Exception:
+            limit = 10
+        occupied = {item_id for (item_id,) in db.session.query(ModelDownload.id).filter(
+            ModelDownload.status.in_(['local_staging', 'pending_upload', 'uploading'])
+        ).all()}
+        if staging_root is None:
+            staging_root = P.ModelSetting.get('download_local_staging_path') or FeederUtil.get_global().get('local_staging_path') or os.path.join(FeederUtil.get_tmp_dir(), 'staging')
+        root_prefix = os.path.abspath(staging_root).rstrip(os.sep) + os.sep
+        for item_id, path in db.session.query(ModelDownload.id, ModelDownload.local_path).filter(
+            ModelDownload.local_path.startswith(root_prefix, autoescape=True)
+        ).all():
+            FeederUtil.cooperate()
+            if os.path.exists(path):
+                occupied.add(item_id)
+        return limit, occupied
+
+    @staticmethod
     def process_local_staging():
+        if FeederUtil.is_download_paused():
+            return
         # 이전 비정상 종료로 멈춘 고아 local_staging 작업을 pending_local_staging으로 자동 복구
         stuck_staging = db.session.query(ModelDownload).filter_by(status='local_staging').all()
         if stuck_staging:
@@ -982,36 +1085,25 @@ class TaskDownload:
         staging_root = os.path.abspath(staging_root)
         os.makedirs(staging_root, exist_ok=True)
 
-        # 로컬 스토리지 보호: 현재 로컬 디스크를 점유 중인 작업 수 점검 (0은 무제한)
-        try:
-            max_staging_items = max(0, P.ModelSetting.get_int('download_max_staging_items'))
-        except Exception:
-            max_staging_items = 10
-
-        current_local_count = 0
-        if max_staging_items > 0:
-            # 업로드 대기/실패 등 상태와 무관하게 실제 남아 있는 스테이징 경로를 센다.
-            # 경로 경계를 포함해 비슷한 이름의 다른 루트 디렉터리는 제외한다.
-            root_prefix = os.path.abspath(staging_root).rstrip(os.sep) + os.sep
-            local_paths = db.session.query(ModelDownload.local_path).filter(
-                ModelDownload.local_path.startswith(root_prefix, autoescape=True)
-            ).all()
-            current_local_count = len({path for (path,) in local_paths if os.path.exists(path)})
-
-            if current_local_count >= max_staging_items:
-                logger.info(f"[LocalStaging] 로컬 스테이징 보관 한도({max_staging_items}건) 도달 (현재: {current_local_count}건). 업로드 완료 시까지 신규 스테이징을 대기합니다.")
-                return
+        queue_limit, occupied = TaskDownload._get_upload_queue_state(staging_root)
+        if queue_limit > 0 and len(occupied) >= queue_limit:
+            logger.info(f"[LocalStaging] Google Drive 업로드 최대 큐({queue_limit}건) 도달 (현재: {len(occupied)}건). 신규 스테이징을 대기합니다.")
+            return
 
         # 현재 세션 실패 항목을 제외하고, 로컬 디스크 허용 잔여 슬롯만큼만 정밀 조회
         query = db.session.query(ModelDownload).filter(ModelDownload.status == 'pending_local_staging')
         if TaskDownload.failed_ids_in_session:
             query = query.filter(~ModelDownload.id.in_(list(TaskDownload.failed_ids_in_session)))
 
-        if max_staging_items > 0:
-            slots_available = max_staging_items - current_local_count
+        if queue_limit > 0:
+            slots_available = queue_limit - len(occupied)
             items = query.order_by(ModelDownload.id.asc()).limit(slots_available).all()
         else:
             items = query.order_by(ModelDownload.id.asc()).all()
+
+        if RemoteWorker.reserves_ad():
+            # 같은 AD 계정의 파일 데이터를 홈 서버와 원격 서버에서 동시에 받지 않는다.
+            items = [item for item in items if not RemoteWorker.is_ad(item)]
 
         if not items:
             return
@@ -1020,7 +1112,7 @@ class TaskDownload:
         db.session.remove()
 
         try:
-            staging_workers = max(1, P.ModelSetting.get_int('download_staging_workers'))
+            staging_workers = max(1, P.ModelSetting.get_int('download_upload_workers'))
         except Exception:
             staging_workers = 2
 
@@ -1029,7 +1121,7 @@ class TaskDownload:
         def _staging_worker(item_id):
             with F.app.app_context():
                 target_item = db.session.query(ModelDownload).filter_by(id=item_id).first()
-                if not target_item:
+                if not target_item or target_item.status != 'pending_local_staging':
                     return
                 target_item.status = 'local_staging'
                 db.session.commit()
@@ -1051,6 +1143,8 @@ class TaskDownload:
                     staging_path = profile_name
 
                 item_staging_dir = os.path.join(staging_root, staging_path, target_folder_name)
+                target_item.upload_state = dict(target_item.upload_state or {}, staging_local_path=item_staging_dir)
+                db.session.commit()
                 if os.path.exists(item_staging_dir):
                     shutil.rmtree(item_staging_dir, ignore_errors=True)
                 os.makedirs(item_staging_dir, exist_ok=True)
@@ -1098,7 +1192,10 @@ class TaskDownload:
                 # 다운로드 종료 후 다시 세션을 열어 최종 상태만 원자적으로 갱신하고 즉시 닫기
                 with F.app.app_context():
                     it_update = db.session.query(ModelDownload).filter_by(id=target_item_id).first()
-                    if it_update:
+                    if it_update and it_update.status == 'blocked':
+                        from .util_block import DownloadBlock
+                        DownloadBlock.remove_staging(item_staging_dir)
+                    elif it_update and it_update.status == 'local_staging':
                         if success and os.path.exists(item_staging_dir):
                             downloader_cfg = FeederUtil.get_downloader_by_name(current_engine_name)
                             if downloader_cfg:
@@ -1121,30 +1218,26 @@ class TaskDownload:
                         db.session.commit()
                     db.session.remove()
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=staging_workers) as executor:
-            futures = {
-                executor.submit(_staging_worker, item_id): item_id
-                for item_id in item_ids
-            }
-            for future in as_completed(futures):
-                FeederUtil.cooperate()
-                try:
-                    future.result()
-                except Exception as th_err:
-                    item_id = futures[future]
-                    logger.error(f"[LocalStaging] 워커 스레드 예외 (ID: {item_id}): {th_err}")
-                    with F.app.app_context():
-                        failed_item = db.session.query(ModelDownload).filter_by(id=item_id).first()
-                        if failed_item and failed_item.status == 'local_staging':
-                            failed_item.status = 'pending_local_staging'
-                            failed_item.error_message = f"로컬 스테이징 워커 예외: {str(th_err)[:150]}"
-                            TaskDownload.failed_ids_in_session.add(item_id)
-                            db.session.commit()
-                        db.session.remove()
+        for item_id, future in TaskDownload._worker_results(_staging_worker, item_ids, staging_workers):
+            FeederUtil.cooperate()
+            try:
+                future.result()
+            except Exception as th_err:
+                logger.error(f"[LocalStaging] 워커 스레드 예외 (ID: {item_id}): {th_err}")
+                with F.app.app_context():
+                    failed_item = db.session.query(ModelDownload).filter_by(id=item_id).first()
+                    if failed_item and failed_item.status == 'local_staging':
+                        failed_item.status = 'pending_local_staging'
+                        failed_item.error_message = f"로컬 스테이징 워커 예외: {str(th_err)[:150]}"
+                        TaskDownload.failed_ids_in_session.add(item_id)
+                        db.session.commit()
+                    db.session.remove()
 
     @staticmethod
     def route_completed_downloads():
+        if FeederUtil.is_download_paused():
+            return
+        queue_limit, occupied = TaskDownload._get_upload_queue_state()
         items = ModelDownload.get_list_by_status(['downloaded', 'waiting_transporter'])
         if not items:
             return
@@ -1156,6 +1249,8 @@ class TaskDownload:
 
         for item_id in item_ids:
             FeederUtil.cooperate()
+            if FeederUtil.is_download_paused():
+                return
             item = db.session.query(ModelDownload).filter_by(id=item_id).first()
             if not item or item.status not in ['downloaded', 'waiting_transporter']:
                 continue
@@ -1163,6 +1258,11 @@ class TaskDownload:
             dest_cfg = FeederUtil.get_profile_destination(profile, item.current_engine_name)
             dest_type = dest_cfg.get('type') or item.destination_type or 'local'
             source_path = item.local_path
+            if (dest_type in ('gdrive_rotation', 'remote_worker') and queue_limit > 0
+                    and item_id not in occupied and len(occupied) >= queue_limit):
+                db.session.rollback()
+                logger.debug(f'[RouteComplete] Google Drive 업로드 최대 큐({queue_limit}건) 도달: {item.title}')
+                continue
             DownloadUtil.reserve_output_folder(item)
             title = item.title
 
@@ -1197,13 +1297,14 @@ class TaskDownload:
                 db.session.commit()
 
             # 구글 드라이브 계정 풀의 경우 멀티스레드 업로드 큐(pending_upload)로 넘겨 process_uploads에서 전담 처리
-            if dest_type == 'gdrive_rotation':
+            if dest_type in ('gdrive_rotation', 'remote_worker'):
                 item.destination_type = dest_type
                 item.gdrive_upload_path = dest_cfg.get('upload_path', '')
                 item.gdrive_complete_path = dest_cfg.get('complete_path', '')
                 item.gdrive_remote_id = dest_cfg.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
                 item.status = 'pending_upload'
                 db.session.commit()
+                occupied.add(item_id)
                 continue
 
             db.session.refresh(item)
@@ -1223,6 +1324,7 @@ class TaskDownload:
                 if next_status == 'completed':
                     item.completed_time = now
                     item.error_message = None
+                    item.upload_state = None
                     logger.info(f"[RouteComplete] 최종 완료 확정: {title} ({msg})")
                 elif next_status == 'failed':
                     item.error_message = msg
@@ -1244,6 +1346,8 @@ class TaskDownload:
 
     @staticmethod
     def process_uploads():
+        if FeederUtil.is_download_paused():
+            return
         # 이전 비정상 종료로 멈춘 uploading 작업을 pending_upload로 자동 복구
         stuck_uploads = db.session.query(ModelDownload).filter_by(status='uploading').all()
         if stuck_uploads:
@@ -1260,6 +1364,8 @@ class TaskDownload:
 
         # 최근 실패한 작업은 뒤로 미루고, 한 번도 실패하지 않은 대기 작업을 1순위로 조회
         items = query.order_by(ModelDownload.last_status_time.asc().nullsfirst(), ModelDownload.id.asc()).all()
+        if RemoteWorker.reserves_ad():
+            items = [item for item in items if item.destination_type == 'remote_worker' or not RemoteWorker.is_ad(item)]
         if not items:
             return
         item_ids = [item.id for item in items]
@@ -1281,23 +1387,25 @@ class TaskDownload:
                 if not target_item:
                     return
                 file_name = target_item.file_name
-                success = UploadUtil.execute_upload(target_item, manager)
+                if target_item.destination_type == 'remote_worker' or (target_item.upload_state or {}).get('worker'):
+                    success = RemoteWorker.execute(target_item, manager)
+                else:
+                    success = UploadUtil.execute_upload(target_item, manager)
                 if not success:
                     TaskDownload.failed_ids_in_session.add(item_id)
                     logger.warning(f"[UploadUtil] {file_name} 업로드 실패 -> 이번 세션 제외 후 다음 턴 재시도")
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=upload_workers) as executor:
-            futures = [executor.submit(_upload_worker, item_id) for item_id in item_ids]
-            for future in as_completed(futures):
-                FeederUtil.cooperate()
-                try:
-                    future.result()
-                except Exception as th_err:
-                    logger.error(f"[UploadUtil] 업로드 워커 스레드 예외: {th_err}")
+        for item_id, future in TaskDownload._worker_results(_upload_worker, item_ids, upload_workers):
+            FeederUtil.cooperate()
+            try:
+                future.result()
+            except Exception as th_err:
+                logger.error(f"[UploadUtil] 업로드 워커 스레드 예외: {th_err}")
 
     @staticmethod
     def retry_move_failed():
+        if FeederUtil.is_download_paused():
+            return
         one_hour_ago = datetime.now() - timedelta(hours=1)
         items = (
             db.session.query(ModelDownload)
@@ -1317,9 +1425,16 @@ class TaskDownload:
         db.session.remove()
         for item_id in item_ids:
             FeederUtil.cooperate()
+            if FeederUtil.is_download_paused():
+                return
             target = db.session.query(ModelDownload).filter_by(id=item_id, status='move_failed').first()
             if not target:
                 db.session.remove()
+                continue
+            queue_limit, occupied = TaskDownload._get_upload_queue_state()
+            if queue_limit > 0 and item_id not in occupied and len(occupied) >= queue_limit:
+                db.session.remove()
+                logger.debug(f'[UploadUtil] Google Drive 업로드 최대 큐({queue_limit}건) 도달: 이동 실패 작업 {item_id} 재시도 보류')
                 continue
             target.last_move_attempt_time = datetime.now()
             db.session.commit()
@@ -1331,6 +1446,8 @@ class TaskDownload:
     @staticmethod
     def check_pending_relays():
         """큐에 방치된 pending_relay 항목이 있고 현재 가동 중인 워커가 없다면 자동 재기동"""
+        if FeederUtil.is_download_paused():
+            return
         try:
             busy_count = db.session.query(ModelDownload).filter_by(status='relay_transferring').count()
             pending_items = db.session.query(ModelDownload).filter_by(status='pending_relay').all()
@@ -1347,6 +1464,8 @@ class TaskDownload:
             triggered_dest_types = set()
             for it in pending_items:
                 FeederUtil.cooperate()
+                if FeederUtil.is_download_paused():
+                    return
                 dest_type = it.destination_type
                 if not dest_type or dest_type in triggered_dest_types:
                     continue

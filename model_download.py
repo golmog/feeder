@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime
+import hashlib
+import base64
 from sqlalchemy import desc, or_, and_, case
 
 from .setup import *
@@ -50,6 +52,11 @@ class ModelDownload(ModelBase):
     last_move_attempt_time = db.Column(db.DateTime, nullable=True)
 
     error_message = db.Column(db.Text, nullable=True)
+
+    @staticmethod
+    def is_blocked(infohash=None, magnet=None):
+        return db.session.query(ModelDownloadBlock).filter_by(
+            content_key=ModelDownloadBlock.key(infohash, magnet)).first() is not None
 
     def __init__(self, feed_name, title, magnet, infohash=None):
         self.created_time = datetime.now()
@@ -185,6 +192,31 @@ class ModelDownload(ModelBase):
                 db.session.remove()
             except Exception:
                 pass
+
+
+class ModelDownloadBlock(ModelBase):
+    """다운로드 행을 삭제해도 유지되는 콘텐츠 차단 및 임시 파일 정리 기록."""
+    P = P
+    __tablename__ = f'{PACKAGE_NAME}_download_block'
+    __table_args__ = {'mysql_collate': 'utf8_general_ci'}
+    __bind_key__ = PACKAGE_NAME
+
+    content_key = db.Column(db.String(64), primary_key=True)
+    title = db.Column(db.String)
+    created_time = db.Column(db.DateTime, default=datetime.now)
+    cleanup = db.Column(db.JSON, nullable=True)
+    error_message = db.Column(db.Text, nullable=True)
+
+    @staticmethod
+    def key(infohash=None, magnet=None):
+        value = FeederUtil.extract_info_hash(magnet or '') or (infohash or '').lower()
+        if len(value) == 32 and not (magnet or '').lower().startswith('ed2k:'):
+            try:
+                value = base64.b32decode(value.upper()).hex()
+            except ValueError:
+                pass
+        identity = f'hash:{value}' if value else f'link:{(magnet or "").strip()}'
+        return hashlib.sha256(identity.encode('utf-8')).hexdigest()
 
 
 class ModelDownloadStat(ModelBase):

@@ -112,6 +112,10 @@ class UploadUtil:
         deadline_timer = None
         execution_expired = threading.Event()
         try:
+            if item_id:
+                from .util_block import DownloadBlock
+                if DownloadBlock.stopped(item_id):
+                    return False, '차단 또는 취소된 작업입니다.'
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -135,6 +139,10 @@ class UploadUtil:
 
             if item_id:
                 UploadUtil.register_rclone_pid(item_id, proc.pid)
+                if DownloadBlock.stopped(item_id):
+                    proc.kill()
+                    proc.communicate()
+                    return False, '차단 또는 취소된 작업입니다.'
 
             # 무전송 감시 타이머 (로컬 스테이징 등 지정된 경우에만 가동, 대용량 업로드 해싱 지연 보호)
             transfer_started = threading.Event()
@@ -425,11 +433,15 @@ class UploadUtil:
     @classmethod
     def drain_all_sa_mydrives(cls) -> bool:
         """새 업로드 전에 잔여 파일을 최종 경로로 복구하며 실패 시 업로드를 보류한다."""
+        if FeederUtil.is_download_paused():
+            return False
         failed_ids = [row_id for (row_id,) in db.session.query(ModelDownload.id).filter_by(status='move_failed').all()]
         db.session.remove()
         all_ok = True
         for item_id in failed_ids:
             FeederUtil.cooperate()
+            if FeederUtil.is_download_paused():
+                return False
             if not cls.recover_failed_remote_files(item_id):
                 all_ok = False
         config = FeederUtil.load_yaml()
@@ -443,12 +455,12 @@ class UploadUtil:
             default_remote = P.ModelSetting.get('download_rclone_upload_remote_name') or P.ModelSetting.get('download_gdrive_mydrive_remote_name') or rclone.get('mydrive_remote_name') or 'gdrive_sa'
             accounts.append({'username': 'Default_Account', 'remote_name': default_remote})
         protected = {account for (account,) in db.session.query(ModelDownload.gdrive_account).filter(
-            ModelDownload.status.in_(['uploading', 'pending_upload']),
+            ModelDownload.status.in_(['uploading', 'pending_upload', 'blocked']),
             ModelDownload.gdrive_account.isnot(None)
         ).all()}
         protected_shared_paths = set()
         for item in db.session.query(ModelDownload).filter(
-            ModelDownload.status.in_(['uploading', 'pending_upload']),
+            ModelDownload.status.in_(['uploading', 'pending_upload', 'blocked']),
             ModelDownload.gdrive_account.isnot(None)
         ).all():
             FeederUtil.cooperate()
@@ -506,6 +518,8 @@ class UploadUtil:
         cleanups = []
         for index, entry in enumerate(drives, 1):
             FeederUtil.cooperate()
+            if FeederUtil.is_download_paused():
+                return False
             root, conf_args = entry['root'], entry['args']
             blocked = set()
             for path in protected_shared_paths:
@@ -541,6 +555,8 @@ class UploadUtil:
                 continue
             for upload, target in entry['routes'].items():
                 FeederUtil.cooperate()
+                if FeederUtil.is_download_paused():
+                    return False
                 matched = {path for path in files if path.startswith(upload + '/')}
                 if not matched:
                     continue
@@ -573,6 +589,8 @@ class UploadUtil:
         # 이동이 모두 끝난 뒤 rmdirs로 빈 폴더만 제거한다.
         for parent, conf_args in cleanups:
             FeederUtil.cooperate()
+            if FeederUtil.is_download_paused():
+                return False
             logger.info(f'[UploadUtil] 원격 빈 폴더 정리: {parent}')
             success, out = cls.run_rclone(
                 ['rclone', 'rmdirs', parent, '--drive-use-trash=false'] + conf_args,
@@ -586,8 +604,8 @@ class UploadUtil:
         return all_ok
 
     @classmethod
-    def _remote_path_exists(cls, path: str, conf_args: list, execution_timeout: float = None) -> bool | None:
-        success, out = cls.run_rclone(['rclone', 'lsjson', path, '--stat'] + conf_args, log_output=False, execution_timeout=execution_timeout)
+    def _remote_path_exists(cls, path: str, conf_args: list, execution_timeout: float = None, item_id=None) -> bool | None:
+        success, out = cls.run_rclone(['rclone', 'lsjson', path, '--stat'] + conf_args, log_output=False, execution_timeout=execution_timeout, item_id=item_id)
         if success:
             try:
                 return bool(json.loads(out))
@@ -643,7 +661,7 @@ class UploadUtil:
         moved_any = False
         for source in dict.fromkeys(path for path in candidates if path and path != final_path):
             FeederUtil.cooperate()
-            exists = cls._remote_path_exists(source, conf_args, execution_timeout=60)
+            exists = cls._remote_path_exists(source, conf_args, execution_timeout=60, item_id=item_id)
             if exists is None:
                 all_ok = False
                 continue
@@ -651,7 +669,7 @@ class UploadUtil:
                 continue
             cmd = ['rclone', 'move', source, final_path, '--delete-empty-src-dirs',
                    '--drive-server-side-across-configs', '--drive-use-trash=false'] + conf_args
-            success, out = cls.run_rclone(cmd, f'이동 실패 잔여 파일 최종 경로 복구: {folder}', execution_timeout=60)
+            success, out = cls.run_rclone(cmd, f'이동 실패 잔여 파일 최종 경로 복구: {folder}', execution_timeout=60, item_id=item_id)
             if not success:
                 logger.warning(f'[UploadUtil] 원격 잔여 파일 복구 실패: {out[:200]}')
                 all_ok = False
@@ -708,9 +726,12 @@ class UploadUtil:
     @classmethod
     def execute_upload(cls, item: ModelDownload, manager: AccountManager) -> bool:
         """소스를 업로드하고, 영속화한 체크포인트부터 원격 이동과 정리를 수행한다."""
+        if item.destination_type == 'remote_worker' or (item.upload_state or {}).get('worker'):
+            from .util_remote_worker import RemoteWorker
+            return RemoteWorker.execute(item, manager)
         if item.status == 'completed':
             return True
-        if item.status == 'cancelled':
+        if item.status in ['cancelled', 'blocked']:
             return False
         if item.status == 'move_failed':
             return cls.retry_failed_upload(item, manager)
@@ -774,7 +795,7 @@ class UploadUtil:
             dest_incoming = f"{effective_remote}:{{{acc.get('mydrive_rclone_id')}}}/{up_path}/{folder_name}" if mode == 'mydrive' else shared_incoming
             dst_parent = f"{effective_remote}:{{{target_drive_id}}}/{comp_path}"
             state = {
-                'phase': 'uploaded', 'mode': mode, 'uses_pool': use_pool,
+                'phase': 'copying', 'mode': mode, 'uses_pool': use_pool,
                 'account': acc_name, 'remote': effective_remote,
                 'rclone_conf': rclone_conf, 'impersonate_arg': impersonate_arg,
                 'incoming': dest_incoming, 'shared_incoming': shared_incoming,
@@ -785,15 +806,16 @@ class UploadUtil:
             item_id = item.id
             item.status = 'uploading'
             item.gdrive_account = acc_name
+            item.upload_state = dict(state)
             db.session.commit()
             manager.add_usage(acc_name, fsize)
             db.session.remove()
 
             clean_chk = ['rclone', 'lsjson', dest_incoming, '--stat', '--config', rclone_conf] + impersonate_arg
-            csuc, cout = cls.run_rclone(clean_chk, log_output=False)
+            csuc, cout = cls.run_rclone(clean_chk, log_output=False, item_id=item_id)
             if csuc and cout.strip() and cout.strip() not in ['{}', '[]']:
                 clean_cmd = ['rclone', 'move', dest_incoming, f'{dst_parent}/{folder_name}', '--delete-empty-src-dirs', '--drive-server-side-across-configs', '--drive-use-trash=false', '--config', rclone_conf] + impersonate_arg
-                cleaned, clean_error = cls.run_rclone(clean_cmd, log_output=False)
+                cleaned, clean_error = cls.run_rclone(clean_cmd, log_output=False, item_id=item_id)
                 if not cleaned:
                     cls._mark_move_failure(item_id, f'incoming 초기화 실패: {clean_error}', status='pending_upload')
                     return False
@@ -824,6 +846,7 @@ class UploadUtil:
                 cls._mark_move_failure(item_id, f'업로드 실패 (다음 주기에 재시도): {out.strip()[:150]}', status='pending_upload')
                 return False
 
+            state['phase'] = 'uploaded'
             item.upload_state = state
             db.session.commit()
             db.session.remove()
@@ -836,7 +859,7 @@ class UploadUtil:
     @classmethod
     def _mark_move_failure(cls, item_id, message: str, status: str = 'move_failed'):
         item = db.session.query(ModelDownload).filter_by(id=item_id).first()
-        if item and item.status not in ['cancelled', 'completed']:
+        if item and item.status not in ['cancelled', 'completed', 'blocked']:
             item.status = status
             item.error_message = message
             item.last_move_attempt_time = datetime.now()
@@ -849,7 +872,7 @@ class UploadUtil:
         """완료된 업로드는 다시 복사/과금하지 않고 원격 이동 또는 원본 정리만 재개한다."""
         item_id = item if isinstance(item, int) else item.id
         item = db.session.query(ModelDownload).filter_by(id=item_id).first()
-        if not item or item.status in ['cancelled', 'failed']:
+        if not item or item.status in ['cancelled', 'failed', 'blocked']:
             db.session.remove()
             return False
         if item.status == 'completed':
@@ -868,7 +891,7 @@ class UploadUtil:
 
         def save_phase(phase):
             target = db.session.query(ModelDownload).filter_by(id=item_id).first()
-            if not target or target.status in ['cancelled', 'failed', 'completed']:
+            if not target or target.status in ['cancelled', 'failed', 'completed', 'blocked']:
                 db.session.remove()
                 return False
             state['phase'] = phase
@@ -887,7 +910,7 @@ class UploadUtil:
                         move_cmd = ['rclone', 'move', state['incoming'], state['shared_incoming'],
                                     '--delete-empty-src-dirs', '--drive-server-side-across-configs',
                                     '--drive-use-trash=false', '--stats-one-line', '--log-level', 'NOTICE'] + conf_args
-                        success, out = cls.run_rclone(move_cmd, f"MyDrive 이동 {state['folder_name']}")
+                        success, out = cls.run_rclone(move_cmd, f"MyDrive 이동 {state['folder_name']}", item_id=item_id)
                         if not success:
                             if attempt < 3:
                                 time.sleep(attempt * 3)
@@ -895,9 +918,9 @@ class UploadUtil:
                         if not save_phase('shared_incoming'):
                             return False
                     mkdir_cmd = ['rclone', 'mkdir', state['dest_parent']] + conf_args
-                    cls.run_rclone(mkdir_cmd, log_output=False)
+                    cls.run_rclone(mkdir_cmd, log_output=False, item_id=item_id)
                     chpar_cmd = ['rclone', 'backend', 'chpar', state['shared_incoming'], state['dest_parent'], '--log-level', 'NOTICE'] + conf_args
-                    moved, out = cls.run_rclone(chpar_cmd, f"원자적 부모폴더 변경 {state['folder_name']}")
+                    moved, out = cls.run_rclone(chpar_cmd, f"원자적 부모폴더 변경 {state['folder_name']}", item_id=item_id)
                     if moved:
                         if not save_phase('moved'):
                             return False
@@ -933,7 +956,7 @@ class UploadUtil:
                 cls.run_rclone(['rclone', 'cleanup', f"{state['remote']}:", '--log-level', 'NOTICE'] + conf_args, log_output=False)
 
             item = db.session.query(ModelDownload).filter_by(id=item_id).first()
-            if not item or item.status in ['cancelled', 'failed', 'completed']:
+            if not item or item.status in ['cancelled', 'failed', 'completed', 'blocked']:
                 return bool(item and item.status == 'completed')
             item.status = 'completed'
             item.completed_time = datetime.now()

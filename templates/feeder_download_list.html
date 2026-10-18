@@ -10,6 +10,7 @@
       <option value="completed">최종 완료 (Completed)</option>
       <option value="active">진행 중 (Active)</option>
       <option value="cancelled">삭제/취소 (Cancelled)</option>
+      <option value="blocked">콘텐츠 차단</option>
       <option value="move_failed">이동 실패 (Move Failed)</option>
       <option value="waiting_transporter">이송 핸들러 복구 대기</option>
       <option value="failed">최종 실패 (Failed)</option>
@@ -30,6 +31,7 @@
       </div>
     </div>
     <button id="reset_btn" class="btn btn-sm btn-outline-secondary" type="button">리셋</button>
+    <button type="button" class="btn btn-sm btn-outline-danger ml-1 blacklist_open_btn">콘텐츠 차단 목록</button>
   </div>
 </form>
 
@@ -88,6 +90,8 @@
     </div>
   </div>
 </div>
+
+{% include "feeder_download_blacklist.html" %}
 
 <script type="text/javascript">
 var package_name = "{{ arg['package_name'] }}";

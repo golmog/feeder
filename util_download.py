@@ -699,19 +699,33 @@ class RcloneSimpleTransporter(BaseTransporter):
 
         logger.info(f"[RcloneTransporter] 임시 업로드 시작 ({'원격 다이렉트' if is_remote_source else '로컬'}): {folder_name} -> {temp_full}")
         try:
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3600)
-            if res.returncode == 0:
+            from .util_upload import UploadUtil
+            from .util_block import DownloadBlock
+            target = db.session.get(ModelDownload, item.id)
+            if not target or DownloadBlock.stopped(item.id):
+                return False, 'blocked', '차단 또는 취소된 작업입니다.'
+            target.upload_state = dict(target.upload_state or {}, incoming=temp_full,
+                dest_parent=f'{remote_name}:{complete_path}', folder_name=folder_name,
+                rclone_conf=rclone_conf, impersonate_arg=[])
+            db.session.commit()
+            db.session.remove()
+            success, output = UploadUtil.run_rclone(cmd, f'업로드 {folder_name}',
+                item_id=item.id, execution_timeout=3600)
+            if success:
                 move_cmd = ["rclone", "move", temp_full, final_full, "--delete-empty-src-dirs"]
                 if rclone_conf:
                     move_cmd.extend(["--config", rclone_conf])
                 move_cmd.extend(FeederUtil.get_rclone_extra_options())
-                move_res = subprocess.run(move_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3600)
-                if move_res.returncode != 0:
-                    err = move_res.stderr.strip() or "최종 완료 경로 이동 실패"
+                moved, output = UploadUtil.run_rclone(move_cmd, f'최종 이동 {folder_name}',
+                    item_id=item.id, execution_timeout=3600)
+                if not moved:
+                    err = output.strip() or "최종 완료 경로 이동 실패"
                     logger.error(f"[RcloneTransporter] 최종 이동 오류: {err}")
                     return False, "failed", f"Rclone 최종 이동 실패: {err[:120]}"
 
                 logger.info(f"[RcloneTransporter] 최종 이동 완료: {final_full}")
+                if DownloadBlock.stopped(item.id):
+                    return False, 'blocked', '차단 또는 취소된 작업입니다.'
                 if is_remote_source:
                     downloader_cfg = FeederUtil.get_downloader_by_name(item.current_engine_name)
                     if downloader_cfg and item.engine_task_id:
@@ -728,7 +742,7 @@ class RcloneSimpleTransporter(BaseTransporter):
                         os.remove(source_path)
                 return True, "completed", f"Rclone 업로드 및 최종 이동 완료 ({final_full})"
             else:
-                err = res.stderr.strip() or "알 수 없는 Rclone 오류"
+                err = output.strip() or "알 수 없는 Rclone 오류"
                 logger.error(f"[RcloneTransporter] Rclone 오류: {err}")
                 return False, "failed", f"Rclone 실패: {err[:120]}"
         except Exception as ex:
@@ -764,6 +778,27 @@ class GDrivePoolTransporter(BaseTransporter):
 # ==============================================================================
 # 단일 통합 관리자: DownloadUtil
 # ==============================================================================
+class RemoteWorkerTransporter(BaseTransporter):
+    TRANSPORTER_ID = 'remote_worker'
+    TRANSPORTER_NAME = '원격 워커'
+    FORCE_REMOTE_SOURCE = True
+    CONFIG_SCHEMA = [
+        {'name': 'remote_name', 'label': 'Drive 리모트명', 'type': 'text', 'placeholder': 'in',
+         'desc': '원격 서버와 로컬 Rclone에 같은 이름으로 구성된 Drive 리모트입니다. 계정 풀 로테이션은 사용하지 않습니다.'},
+        {'name': 'shared_drive_id', 'label': '목적지 드라이브 ID', 'type': 'text',
+         'desc': '미입력 시 기본 목적지 공유 드라이브 ID를 사용합니다.'},
+        {'name': 'upload_path', 'label': '임시 업로드 경로', 'type': 'text', 'placeholder': 'feeder-worker-incoming/my-profile',
+         'desc': 'feeder-worker-incoming/ 아래로 지정합니다. 로컬 스테이징을 사용하지 않습니다.'},
+        {'name': 'complete_path', 'label': '최종 완료 경로', 'type': 'text', 'placeholder': 'uploads/my-profile',
+         'desc': '원격 서버에서 복사를 완료한 뒤 Feeder가 서버 측 폴더 이동으로 정리합니다.'},
+    ]
+
+    def transport(self, item, source_path, dest_config):
+        item.destination_type = self.TRANSPORTER_ID
+        item.local_path = source_path
+        return True, 'pending_upload', '원격 워커 업로드 대기열에 등록했습니다.'
+
+
 class DownloadUtil:
     @staticmethod
     def is_single_file(name: str, source_path: str = '') -> bool:
@@ -924,6 +959,7 @@ class DownloadUtil:
             LocalTransporter.TRANSPORTER_ID: LocalTransporter,
             RcloneSimpleTransporter.TRANSPORTER_ID: RcloneSimpleTransporter,
             GDrivePoolTransporter.TRANSPORTER_ID: GDrivePoolTransporter,
+            RemoteWorkerTransporter.TRANSPORTER_ID: RemoteWorkerTransporter,
         }
 
         py_files = glob.glob(os.path.join(FeederUtil.TRANSPORTERS_DIR, "*.py"))
@@ -980,7 +1016,7 @@ class DownloadUtil:
             return None
 
     @classmethod
-    def delete_remote_tasks(cls, item) -> None:
+    def delete_remote_tasks(cls, item, strict=False) -> None:
         """작업 취소/삭제 시 연동된 모든 다운로더 엔진에서 해당 원격 작업을 확실히 선제 삭제"""
         target_hash = (item.infohash or FeederUtil.extract_info_hash(item.magnet) or '').lower()
         target_tid = str(item.engine_task_id or '')
@@ -999,25 +1035,39 @@ class DownloadUtil:
         for engine_name in engines_to_check:
             downloader_cfg = FeederUtil.get_downloader_by_name(engine_name)
             if not downloader_cfg:
+                if strict and engine_name == item.current_engine_name and target_tid:
+                    raise RuntimeError(f'{engine_name}: 다운로더 설정이 없어 원격 작업을 중단하지 못했습니다.')
                 continue
             engine = cls.create_engine(downloader_cfg)
             if not engine:
+                if strict and engine_name == item.current_engine_name and target_tid:
+                    raise RuntimeError(f'{engine_name}: 다운로더를 로드하지 못했습니다.')
                 continue
 
             try:
                 # 작업 ID로 직접 삭제 시도
                 if target_tid and str(item.current_engine_name) == str(engine_name):
-                    engine.delete_task(target_tid)
+                    deleted = engine.delete_task(target_tid)
+                    if strict and not deleted:
+                        statuses, error = engine.get_status()
+                        if error or any(str(s.get('task_id') or s.get('id')) == target_tid for s in statuses):
+                            raise RuntimeError(f'{engine_name}: 원격 작업 중단 실패')
 
                 # 원격 엔진 목록을 조회하여 동일 해시를 가진 잔여 작업 모두 삭제
                 if target_hash and hasattr(engine, 'get_status'):
                     status_list, err = engine.get_status()
+                    if strict and err:
+                        raise RuntimeError(f'{engine_name}: 원격 작업 목록 조회 실패: {err}')
                     if not err and status_list:
                         for s in status_list:
                             s_hash = (s.get('hash') or '').lower()
                             s_tid = str(s.get('task_id') or s.get('id') or '')
                             if (s_hash and s_hash == target_hash) or (s_tid and s_tid == target_tid):
-                                engine.delete_task(s_tid)
+                                deleted = engine.delete_task(s_tid)
+                                if strict and not deleted:
+                                    raise RuntimeError(f'{engine_name}: 원격 작업 삭제 실패 ({s_tid})')
                                 logger.info(f"[DownloadUtil] [{engine_name}] 원격 소스 작업 삭제 완료: ID={s_tid}, Title={item.title[:25]}")
             except Exception as ex:
+                if strict:
+                    raise
                 logger.debug(f"[DownloadUtil] [{engine_name}] 원격 소스 삭제 중 예외: {ex}")

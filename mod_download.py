@@ -10,13 +10,17 @@ from sqlalchemy import desc, func, case
 import sqlite3
 import shutil
 import subprocess
+import threading
 
 from .setup import *
-from .model_download import ModelDownload, ModelDownloadStat
+from .model_download import ModelDownload, ModelDownloadStat, ModelDownloadBlock
+from .util_block import DownloadBlock
 from .util_base import FeederUtil
 from .util_download import DownloadUtil
-from .task_download import TaskDownloadBase
+from .task_download import TaskDownload, TaskDownloadBase
 from .util_upload import UploadUtil
+from .util_remote_worker import RemoteWorker
+from .remote_worker_client import WorkerError
 
 name = 'download'
 
@@ -38,7 +42,6 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_use_local_staging": "True",
             f"{self.name}_local_staging_path": "",
             f"{self.name}_max_staging_items": "10",
-            f"{self.name}_staging_workers": "2",
             f"{self.name}_upload_workers": "2",
             f"{self.name}_exclude_pattern": "",
             f"{self.name}_enable_sse": "True",
@@ -56,12 +59,16 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_shared_drive_upload_limit": "3TB",
             f"{self.name}_shared_drive_quota_reset_time": "16:00",
             f"{self.name}_rclone_extra_options": "--timeout 30m",
+            f"{self.name}_worker_url": "",
+            f"{self.name}_worker_token": "",
+            f"{self.name}_worker_token_path": "",
         }
 
     def plugin_load(self):
         """플러그인 로드 시 이전 비정상 종료된 전송 중 작업을 직전 대기 상태로 일괄 초기화"""
         try:
             with F.app.app_context():
+                RemoteWorker.migrate_token()
                 # FF 재시작 후 남아 있을 수 있는 다운로드 파이프라인 런타임 락 초기화
                 FeederUtil.init_runtime_locks()
                 FeederUtil.reset_runtime_lock('download_pipeline')
@@ -69,6 +76,10 @@ class ModuleDownload(PluginModuleBase):
                 P.ModelSetting.set(f"{self.name}_running_start_time", "0")
                 FeederUtil.init_sqlite_concurrency()
                 FeederUtil.migrate_db()
+                DownloadBlock.initialize()
+                for block in db.session.query(ModelDownloadBlock).all():
+                    if any(s.get('pending') for s in (block.cleanup or [])):
+                        DownloadBlock.start_cleanup(block.content_key)
 
                 stg_cnt = db.session.query(ModelDownload).filter_by(status='local_staging').update({'status': 'pending_local_staging'})
                 up_cnt = db.session.query(ModelDownload).filter_by(status='uploading').update({'status': 'pending_upload'})
@@ -105,6 +116,8 @@ class ModuleDownload(PluginModuleBase):
     def process_menu(self, page_name, req):
         try:
             arg = P.ModelSetting.to_dict()
+            arg['download_worker_token_saved'] = bool(arg.pop('download_worker_token', ''))
+            arg.pop('download_worker_token_path', None)
             arg['package_name'] = P.package_name
             arg['sub'] = self.name
             arg['current_page'] = page_name
@@ -130,7 +143,27 @@ class ModuleDownload(PluginModuleBase):
         try:
             command = req.form.get('command') or sub
 
+            if command in ['pipeline_control_state', 'pause_pipeline', 'resume_pipeline']:
+                if command != 'pipeline_control_state':
+                    FeederUtil.set_download_paused(command == 'pause_pipeline')
+                control = FeederUtil.get_download_control_state()
+                if command == 'resume_pipeline' and not control['running']:
+                    # start_celery는 작업 완료까지 기다리므로 HTTP 요청에서 호출하지 않는다.
+                    if F.config.get('use_celery', False):
+                        TaskDownloadBase.start.apply_async(args=('default',))
+                    else:
+                        threading.Thread(
+                            target=TaskDownload.run_pipeline,
+                            name='feeder-download-resume', daemon=True
+                        ).start()
+                response = {'ret': 'success', 'control': control}
+                if command == 'pipeline_control_state':
+                    response['counts'] = self.get_upload_queue_counts()
+                return jsonify(response)
+
             if sub in ['one_execute', 'scheduler_once'] or command in ['one_execute', 'scheduler_once']:
+                if FeederUtil.is_download_paused():
+                    return jsonify({'ret': 'warning', 'msg': '중단 상태입니다. 다운로드 큐에서 작업을 재개하세요.'})
                 return self.one_execute()
 
             if sub == 'web_list' or command == 'web_list':
@@ -157,6 +190,30 @@ class ModuleDownload(PluginModuleBase):
                     return jsonify({'ret': 'fail', 'msg': f"엔진 인스턴스 생성 실패 ({item_data.get('engine_type')})"})
                 success, msg = engine.test_connection()
                 return jsonify({'ret': 'success' if success else 'fail', 'msg': msg})
+
+            elif command in ('test_remote_worker', 'save_remote_worker'):
+                try:
+                    endpoint = req.form.get('worker_url')
+                    token = req.form.get('worker_token', '').strip() or None
+                    client = RemoteWorker.client(endpoint=endpoint.strip() if endpoint is not None else None, token=token)
+                    if command == 'save_remote_worker':
+                        RemoteWorker._write_settings({
+                            'download_worker_token': token or P.ModelSetting.get('download_worker_token'),
+                            'download_worker_url': (endpoint if endpoint is not None else P.ModelSetting.get('download_worker_url')).strip(),
+                            'download_worker_token_path': '',
+                        })
+                        return jsonify({'ret': 'success', 'msg': '워커 연결 설정을 저장했습니다.'})
+                    health = client.health()
+                    configuration = client.configuration()
+                    version = tuple(int(part) for part in health.get('version', '').split('.'))
+                    if version < (0, 5, 0):
+                        raise WorkerError('워커 0.5.0 이상으로 업데이트해주세요.')
+                    return jsonify({'ret': 'success', 'msg': f"워커 {health['version']} 연결됨 · 실행 {health['active_jobs']} / 대기 {health['queued_jobs']} · 동시 {configuration['worker']['max_concurrent_jobs']}개"})
+                except WorkerError as exc:
+                    message = '인증에 실패했습니다. 워커 설치 시 안내된 토큰을 확인해주세요.' if exc.status == 401 else str(exc)
+                    return jsonify({'ret': 'fail', 'msg': message})
+                except (ValueError, KeyError, TypeError):
+                    return jsonify({'ret': 'fail', 'msg': '워커 응답 형식 또는 버전을 확인해주세요.'})
 
             elif command == 'delete_downloader':
                 target_name = req.form.get('name', '').strip()
@@ -339,6 +396,8 @@ class ModuleDownload(PluginModuleBase):
                 # 등록 일시를 현재 시각으로 초기화하여 타임아웃 조기 종료 방지
                 now = datetime.now()
                 target_mag = f"magnet:?xt=urn:btih:{thash}" if thash else f"engine:{engine_name}:{task_id}"
+                if ModelDownload.is_blocked(thash, target_mag):
+                    return jsonify({'ret': 'fail', 'msg': '차단된 콘텐츠입니다. 차단 목록에서 먼저 해제해주세요.'})
 
                 item = ModelDownload(
                     feed_name=selected_profile.get('feeds', ['*'])[0] if selected_profile.get('feeds') else 'ADOPTED',
@@ -397,6 +456,9 @@ class ModuleDownload(PluginModuleBase):
                     FeederUtil.cooperate()
                     infohash = FeederUtil.extract_info_hash(line)
                     target_mag = f"magnet:?xt=urn:btih:{infohash}" if infohash else line
+                    if ModelDownload.is_blocked(infohash, target_mag):
+                        skipped_count += 1
+                        continue
 
                     existing = ModelDownload.get_by_infohash(infohash) if infohash else ModelDownload.get_by_magnet(target_mag)
                     if existing:
@@ -455,6 +517,9 @@ class ModuleDownload(PluginModuleBase):
 
                         infohash = FeederUtil.extract_info_hash(raw_mag)
                         target_mag = f"magnet:?xt=urn:btih:{infohash}" if infohash else raw_mag
+                        if ModelDownload.is_blocked(infohash, target_mag):
+                            skipped_count += 1
+                            continue
 
                         existing = ModelDownload.get_by_infohash(infohash) if infohash else ModelDownload.get_by_magnet(target_mag)
                         if existing:
@@ -511,6 +576,46 @@ class ModuleDownload(PluginModuleBase):
                 )
                 return jsonify(res)
 
+            elif command == 'block_orphan':
+                engine_name = req.form.get('engine_name', '').strip()
+                task_id = req.form.get('task_id', '').strip()
+                infohash = req.form.get('hash', '').strip().lower() or None
+                if not task_id or not FeederUtil.get_downloader_by_name(engine_name):
+                    return jsonify({'ret': 'fail', 'msg': '원격 작업과 다운로더 설정을 확인해주세요.'})
+                magnet = f'magnet:?xt=urn:btih:{infohash}' if infohash else f'engine:{engine_name}:{task_id}'
+                item = db.session.query(ModelDownload).filter_by(
+                    current_engine_name=engine_name, engine_task_id=task_id).first()
+                if item is None:
+                    item = ModelDownload('REMOTE', req.form.get('title') or f'{engine_name}_{task_id}', magnet, infohash)
+                    item.status = 'blocked'
+                    item.current_engine_name = engine_name
+                    item.engine_task_id = task_id
+                    item.priority_chain = [engine_name]
+                    db.session.add(item)
+                    db.session.commit()
+                DownloadBlock.block(item)
+                return jsonify({'ret': 'success', 'msg': '원격 작업을 차단하고 중단·정리를 요청했습니다.'})
+
+            elif command == 'blacklist_list':
+                page = max(1, int(req.form.get('page', 1)))
+                query = db.session.query(ModelDownloadBlock)
+                total = query.count()
+                rows = query.order_by(ModelDownloadBlock.created_time.desc()).offset((page - 1) * 50).limit(50).all()
+                return jsonify({'ret': 'success', 'page': page, 'total': total, 'list': [{
+                    'key': row.content_key, 'title': row.title,
+                    'pending': any(s.get('pending') for s in (row.cleanup or [])),
+                    'error': row.error_message,
+                } for row in rows]})
+
+            elif command == 'blacklist_action':
+                key = req.form.get('key', '')
+                if req.form.get('action') == 'unblock':
+                    return jsonify(DownloadBlock.unblock(key))
+                if db.session.get(ModelDownloadBlock, key) is None:
+                    return jsonify({'ret': 'fail', 'msg': '차단 기록을 찾을 수 없습니다.'})
+                DownloadBlock.start_cleanup(key)
+                return jsonify({'ret': 'success', 'msg': '임시 파일 정리를 다시 요청했습니다.'})
+
             elif command == 'item_action':
                 action = req.form.get('action')
                 try:
@@ -521,6 +626,27 @@ class ModuleDownload(PluginModuleBase):
                 item = db.session.query(ModelDownload).filter_by(id=item_id).first()
                 if not item:
                     return jsonify({'ret': 'fail', 'msg': '항목을 찾을 수 없습니다.'})
+
+                if action == 'block':
+                    DownloadBlock.block(item)
+                    return jsonify({'ret': 'success', 'msg': '차단했습니다. 전송을 중단하고 임시 파일을 정리합니다.'})
+                if ModelDownload.is_blocked(item.infohash, item.magnet):
+                    if action == 'delete':
+                        key = ModelDownloadBlock.key(item.infohash, item.magnet)
+                        block = db.session.get(ModelDownloadBlock, key)
+                        if not any(s.get('pending') for s in (block.cleanup or [])):
+                            db.session.delete(item)
+                            db.session.commit()
+                            return jsonify({'ret': 'success', 'msg': '항목을 삭제했습니다. 콘텐츠 차단은 유지됩니다.'})
+                    return jsonify({'ret': 'fail', 'msg': '차단된 콘텐츠입니다. 차단 목록에서 해제하거나 정리 상태를 확인해주세요.'})
+
+                if action in ('retry', 'delete', 'force_fail', 'force_complete') and (item.upload_state or {}).get('worker'):
+                    try:
+                        resumed = RemoteWorker.prepare_action(item, action)
+                    except WorkerError as exc:
+                        return jsonify({'ret': 'fail', 'msg': str(exc)})
+                    if resumed:
+                        return jsonify({'ret': 'success', 'msg': '복사를 반복하지 않고 최종 이동을 다시 시도합니다.'})
 
                 if action == 'retry':
                     item.completed_time = None
@@ -908,6 +1034,15 @@ class ModuleDownload(PluginModuleBase):
         db.session.commit()
         return jsonify({'ret': 'success'})
 
+    def get_upload_queue_counts(self) -> dict:
+        """제한과 같은 현재 큐 집계에 큐 진입 전 대기 작업을 합산한다."""
+        _, occupied = TaskDownload._get_upload_queue_state()
+        waiting = {item_id for (item_id,) in db.session.query(ModelDownload.id).filter(
+            ModelDownload.status.in_(['pending_local_staging', 'downloaded', 'waiting_transporter', 'relay_transferring'])
+        ).all()}
+        total = len(occupied | waiting)
+        return {'uploading': total, 'upload_current': len(occupied), 'upload_total': total}
+
     def generate_sse_stream(self):
         """실시간 대시보드용 SSE 스트림 (통계 카운트 + 활성 작업 목록 동시 전송)"""
         sse_cycle = 0
@@ -942,7 +1077,7 @@ class ModuleDownload(PluginModuleBase):
                         'pending': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending', 'pending_relay'])).count(),
                         'downloading': db.session.query(ModelDownload).filter_by(status='downloading').count(),
                         'staging': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_local_staging', 'local_staging'])).count(),
-                        'uploading': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['downloaded', 'waiting_transporter', 'pending_upload', 'uploading', 'relay_transferring'])).count(),
+                        **self.get_upload_queue_counts(),
                         'completed': db.session.query(ModelDownload).filter(ModelDownload.success_filter()).count(),
                         'failed': db.session.query(ModelDownload).filter(ModelDownload.failure_filter()).count(),
                     }
@@ -1073,6 +1208,7 @@ class ModuleDownload(PluginModuleBase):
 
                     data_str = json.dumps({
                         'timestamp': int(time.time()),
+                        'control': FeederUtil.get_download_control_state(),
                         'counts': counts,
                         'total_upload_24h': cached_24h_upload_bytes,
                         'total_download_24h': cached_24h_download_bytes,
@@ -1127,6 +1263,14 @@ class ModuleDownload(PluginModuleBase):
         }
 
     def scheduler_function(self):
+        # FF의 정기 실행과 1회 실행 콜백은 요청 컨텍스트 없이 호출된다.
+        with F.app.app_context():
+            return self._scheduler_function()
+
+    def _scheduler_function(self):
+        if FeederUtil.is_download_paused():
+            logger.debug('[DownloadPipeline] 사용자 중단 상태: 정기 실행 보류')
+            return
         if P.ModelSetting.get_bool(f"{self.name}_db_auto_delete"):
             try:
                 day = P.ModelSetting.get_int(f"{self.name}_db_delete_day")
