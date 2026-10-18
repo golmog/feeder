@@ -35,16 +35,23 @@ if [[ -f "$WORKER_UNIT" ]]; then
 fi
 venv/bin/python - "$WORKER_ROOT" "$WORKER_UNIT" <<'PY'
 from pathlib import Path
+import subprocess
 import sys
+import tempfile
 root, destination = map(Path, sys.argv[1:])
 if any(c in str(root) for c in ('%', '\\', '"', '\n', '\r')):
     raise SystemExit('설치 경로에 %, 따옴표, 역슬래시, 줄바꿈은 사용할 수 없습니다.')
 text = (root / 'deploy/feeder-worker-user.service').read_text()
-text = text.replace('WorkingDirectory=%h/feeder-worker', f'WorkingDirectory="{root}"')
+text = text.replace('WorkingDirectory=%h/feeder-worker', f'WorkingDirectory={root}')
 text = text.replace('EnvironmentFile=%h/feeder-worker/.env', f'EnvironmentFile="{root}/.env"')
 text = text.replace('ExecStart=%h/feeder-worker/venv/bin/python', f'ExecStart="{root}/venv/bin/python"')
-destination.write_text(text)
-destination.chmod(0o600)
+with tempfile.TemporaryDirectory(prefix='feeder-unit-', dir=destination.parent) as temporary:
+    candidate = Path(temporary) / 'feeder-worker.service'
+    candidate.write_text(text)
+    candidate.chmod(0o600)
+    # 실제 systemd 파서 검증에 통과한 파일만 원자적으로 반영한다.
+    subprocess.run(['systemd-analyze', '--user', 'verify', str(candidate)], check=True)
+    candidate.replace(destination)
 PY
 systemctl --user daemon-reload
 systemctl --user enable --now feeder-worker.service

@@ -13,13 +13,13 @@ while (($#)); do
         --help)
             echo '사용법: bash install.sh [--install-dir 경로] [--bind Tailscale_IP] [--port 8000]'
             echo '  [--rclone-config 절대경로] [--rclone-binary 절대경로]'
-            echo '  [--source-remotes WebDAV리모트] [--destination-remotes Drive리모트]'
+            echo '  [--source-remotes 소스리모트] [--destination-remotes 목적지리모트]'
             echo '기존 Rclone과 리모트 인증은 먼저 준비해주세요. 토큰은 최초 설치 시 자동 생성합니다.'
             exit 0 ;;
         *) echo "알 수 없는 옵션: $1" >&2; exit 2 ;;
     esac
 done
-command -v python3 >/dev/null || { echo 'Python 3.10 이상과 python3-venv를 설치해주세요.' >&2; exit 1; }
+command -v python3 >/dev/null || { echo 'python3 명령이 없습니다. Python 3.10 이상을 설치한 뒤 다시 실행해주세요.' >&2; exit 1; }
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' || { echo 'Python 3.10 이상이 필요합니다.' >&2; exit 1; }
 if systemctl --user is-active --quiet feeder-worker.service 2>/dev/null || systemctl is-active --quiet feeder-worker.service 2>/dev/null; then
     echo '워커가 실행 중입니다. Feeder에서 작업 중단 후 현재 업로드 완료를 확인하고 워커 서비스를 중지한 뒤 다시 설치해주세요.' >&2

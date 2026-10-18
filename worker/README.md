@@ -1,6 +1,6 @@
 # Feeder Remote Worker
 
-별도 Linux 서버에서 Rclone 전송을 실행하는 Feeder 기본 이송 핸들러용 서비스입니다.
+별도 Linux 서버에서 Rclone 소스 리모트 → 목적지 리모트 복사를 실행하는 Feeder 기본 이송 핸들러용 서비스입니다.
 
 설치, 토큰 등록, 접속 테스트, 프로필 설정, 업데이트, 장애 대응과 API 사용법은 [Feeder README의 원격 워커 매뉴얼](https://github.com/golmog/feeder#원격-워커-설정)에 통합되어 있습니다.
 

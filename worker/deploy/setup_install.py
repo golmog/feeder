@@ -79,8 +79,8 @@ def configure(args):
             'WORKER_API_TOKEN': secrets.token_urlsafe(48),
             'WORKER_BIND': bind, 'WORKER_PORT': str(args.port or 8000),
             'WORKER_RCLONE_BINARY': str(binary), 'WORKER_RCLONE_CONFIG': str(config),
-            'WORKER_SOURCE_REMOTES': choose(args.source_remotes, sources, 'WebDAV 리모트 (--source-remotes)'),
-            'WORKER_DESTINATION_REMOTES': choose(args.destination_remotes, destinations, 'Drive 리모트 (--destination-remotes)'),
+            'WORKER_SOURCE_REMOTES': choose(args.source_remotes, sources, '소스 Rclone 리모트 (--source-remotes)'),
+            'WORKER_DESTINATION_REMOTES': choose(args.destination_remotes, destinations, '목적지 Rclone 리모트 (--destination-remotes)'),
         }
         # 저장 전에 경로·IP·리모트 종류를 검증하고 비밀 값을 오류에 포함하지 않는다.
         module.Settings.load(root, environ=values)

@@ -37,7 +37,7 @@
   * 프로토콜 미지원·작업 추가 실패·재시작 불가·지연 타임아웃에는 다음 엔진을 시도합니다. 비활성 엔진이나 큐 한도 도달은 대기하고, 원격 목록 누락 유예 초과는 해당 엔진 내 실패로 기록합니다.
   * `max_active_tasks`는 AllDebrid에만 적용합니다. 원격에 이미 존재하는 작업은 새로 등록하지 않고 연동할 수 있습니다.
 * **이송 핸들러:** `local`(로컬 이동), `rclone_simple`(일반 리모트 복사 후 최종 이동), `gdrive_rotation`(Google Drive 계정 풀/기본 리모트), `remote_worker`(원격 서버 복사)를 내장하며 커스텀 핸들러를 추가할 수 있습니다.
-* **원격 워커:** AD/WebDAV → Google Drive 복사를 별도 Linux 서버에서 실행하고 Feeder가 서버 측 폴더 이동으로 마무리합니다. 로컬 스테이징을 생략하며, 기존 업로드 큐·동시 전송 수·중단 예약·차단 정리에 연결됩니다. 작업 ID를 보존해 응답 유실이나 FF 재시작 뒤 중복 전송을 방지하고, SSE 알림과 REST 재조회로 진행률을 확인합니다. 특정 클라우드 서비스에 종속되지 않습니다.
+* **원격 워커:** Rclone 소스 리모트 → 목적지 리모트 복사를 별도 Linux 서버에서 실행하고 Feeder가 서버 측 폴더 이동으로 마무리합니다. 로컬 스테이징을 생략하며, 기존 업로드 큐·동시 전송 수·중단 예약·차단 정리에 연결됩니다. 작업 ID를 보존해 응답 유실이나 FF 재시작 뒤 중복 전송을 방지하고, SSE 알림과 REST 재조회로 진행률을 확인합니다. 특정 서버 제공업체에 종속되지 않습니다.
 * **로컬 스테이징과 다이렉트 전송:** 원격 소스를 로컬 버퍼로 먼저 받거나 Rclone으로 목적지에 직접 전송합니다. 다이렉트 모드도 별도 원격 워커를 사용하지 않으면 FF 호스트에서 전송 프로세스가 실행됩니다.
 * **DB 이력 기준 폴더명 분리:** 이전 DB 이력에 같은 이름이 있으면 파일이 사라졌더라도 `_[해시 앞 6자리]`를 붙입니다. 원본 파일명과 출력 폴더명을 별도 보존하며, 같은 이름을 이유로 다운로드를 대기시키지 않습니다.
 * **Google Drive 계정 풀:** 작은 작업은 설정 임계값(기본 14GB)에 따라 MyDrive를 경유하고 큰 작업은 공유 드라이브로 직행합니다. 계정 풀이 OFF면 계정 목록 없이 기본 업로드 리모트로 공유 드라이브에 직행합니다.
@@ -340,12 +340,13 @@ GDRIVE_ACCOUNTS:
 
 #### 원격 워커 설정
 
-별도 Linux 서버에서 AllDebrid WebDAV → Google Drive 복사를 실행합니다. 파일 데이터는 원격 서버에서 전송하며, FF는 작업 등록·상태 확인·최종 폴더 이동을 담당합니다. **Feeder Remote Worker 0.5.0 이상**, Python 3.10 이상, systemd 사용자 서비스와 Tailscale을 사용할 수 있는 서버가 필요합니다.
+별도 Linux 서버에서 **Rclone 소스 리모트 → 목적지 리모트** 복사를 실행합니다. 파일 데이터는 원격 서버에서 전송하며, FF는 작업 등록·상태 확인·최종 폴더 이동을 담당합니다. **Feeder Remote Worker 0.5.0 이상**, Python 3.10 이상, systemd 사용자 서비스와 Tailscale을 사용할 수 있는 서버가 필요합니다.
 
 ##### 설치 전 준비
 
-* 서버에 Python·venv·pip·curl과 Rclone을 설치하고, FF와 워커를 같은 Tailscale 네트워크에 연결합니다. Debian/Ubuntu에서 Python 준비 패키지는 `python3 python3-venv python3-pip curl`입니다.
-* 워커 서버의 Rclone에 WebDAV 소스와 Google Drive 목적지 리모트를 설정합니다. Feeder에서 사용하는 AllDebrid 계정과 일치해야 합니다. 기존 wiserain MOD를 사용 중이라면 그대로 유지합니다. 설치 프로그램은 Rclone이나 리모트 인증을 설치·교체하지 않습니다.
+* 이미 있는 Python·curl은 그대로 사용합니다. 아래 설치 명령 실행 시 명령을 찾지 못하거나 가상환경 생성 오류가 안내될 때 누락된 패키지만 설치하면 됩니다. Debian/Ubuntu의 관련 패키지는 `python3`, `python3-venv`, `curl`입니다. **시스템 pip는 별도로 설치할 필요가 없습니다.** 설치 프로그램이 가상환경을 만들고 그 안의 pip로 워커 패키지를 설치합니다.
+* FF와 워커를 같은 Tailscale 네트워크에 연결하고, 워커 서버의 Rclone에 실제 전송할 소스·목적지 리모트를 설정합니다. 소스 리모트는 Feeder 다운로드 엔진이 넘기는 원본 경로에 접근할 수 있어야 합니다. 기존 wiserain MOD를 사용 중이라면 그대로 유지합니다. 설치 프로그램은 Rclone이나 리모트 인증을 설치·교체하지 않습니다.
+* **현재 지원 범위:** 소스는 Rclone의 `webdav` 타입, 목적지는 `drive` 타입입니다. 설치 프로그램과 작업 API가 이 종류를 검증하므로 다른 타입의 리모트는 아직 사용할 수 없습니다.
 * FF에서도 최종 폴더 이동을 위해 같은 이름의 Drive 리모트가 필요합니다. 공유 드라이브와 `backend chpar`를 지원하는 Rclone 구성을 준비합니다.
 * TCP 8000을 공용 인터넷에 개방할 필요가 없습니다. Tailscale 정책에서 FF → 워커 접속을 허용합니다.
 
@@ -362,7 +363,7 @@ curl -fsSL https://raw.githubusercontent.com/golmog/feeder/main/worker/install.s
 ```bash
 curl -fsSL https://raw.githubusercontent.com/golmog/feeder/main/worker/install.sh | bash -s -- \
   --bind 100.64.0.10 --port 8000 \
-  --source-remotes ad --destination-remotes in \
+  --source-remotes source_remote --destination-remotes destination_remote \
   --rclone-config "$HOME/.config/rclone/rclone.conf" \
   --rclone-binary /usr/bin/rclone
 ```
@@ -388,25 +389,24 @@ cd "$HOME/feeder-worker"
 venv/bin/python deploy/setup_install.py --root "$PWD" --show-connection
 ```
 
-프로필의 기본 목적지 또는 AD 엔진별 목적지를 다음과 같이 지정합니다. 기존 프로필은 자동 변경하지 않습니다.
+프로필의 기본 목적지는 다음과 같이 지정합니다. `remote_name`에는 설치할 때 지정한 목적지 리모트 이름을 넣습니다. 엔진별 목적지를 쓰는 경우에는 같은 내용을 `destination_by_engine`의 해당 엔진 이름 아래에 지정하세요. 기존 프로필은 자동 변경하지 않습니다.
 
 ```yaml
-destination_by_engine:
-  ad:
-    type: remote_worker
-    remote_name: in
-    shared_drive_id: '목적지_드라이브_ID'
-    upload_path: 'feeder-worker-incoming/my-profile'
-    complete_path: 'uploads/my-profile'
+destination:
+  type: remote_worker
+  remote_name: destination_remote
+  shared_drive_id: '목적지_드라이브_ID'
+  upload_path: 'feeder-worker-incoming/my-profile'
+  complete_path: 'uploads/my-profile'
 ```
 
-* 원격 서버와 FF의 Rclone에 **같은 이름의 Drive 리모트**가 필요합니다. 리모트 이름을 변환하지 않습니다. 소스의 `ad:...`도 워커의 허용 WebDAV 리모트와 일치해야 합니다.
-* 워커의 AD 리모트와 Feeder의 AD 엔진은 같은 AllDebrid 계정을 사용해야 합니다. 리모트 인증 파일은 자동 동기화하지 않습니다.
+* 원격 서버와 FF의 Rclone에 **같은 이름의 목적지 리모트**가 필요합니다. 리모트 이름을 변환하지 않습니다. 원본 경로가 `source_remote:...`이면 워커에도 `source_remote`가 설정되어 있고 허용 소스 목록에 포함되어야 합니다.
+* 리모트의 계정·권한은 실제 원본과 목적지에 접근할 수 있게 구성합니다. 리모트 인증 파일은 자동 동기화하지 않습니다.
 * 임시 경로는 `feeder-worker-incoming/` 아래에 두며, 최종 경로는 이 영역 밖에 지정합니다. 기존 SA 잔여 파일 사전 정리와 진행 중 원격 복사가 서로 간섭하지 않도록 경로를 분리합니다.
 * 원격 핸들러는 프로필/전역 스테이징 옵션과 관계없이 로컬 스테이징을 생략합니다. 동일한 **Google Drive 업로드 최대 큐**를 소비하고, 워커에는 실제 실행 슬롯만큼만 제출합니다. 동시 실행 수는 Feeder 동시 전송 수와 Worker 설정의 상한을 함께 따릅니다.
-* 파일 데이터는 원격 서버와 AD/Drive 사이에서 흐릅니다. Feeder가 실행하는 최종 `backend chpar`는 서버 측 폴더 이동이며 홈 서버에서 파일을 다시 내려받지 않습니다. 이 단계가 실패하면 기존 `move_failed` 복구 흐름을 사용합니다.
+* 파일 데이터는 원격 서버와 소스·목적지 저장소 사이에서 흐릅니다. Feeder가 실행하는 최종 `backend chpar`는 서버 측 폴더 이동이며 홈 서버에서 파일을 다시 내려받지 않습니다. 이 단계가 실패하면 기존 `move_failed` 복구 흐름을 사용합니다.
 * 원격 서버에 설정된 고정 Drive 리모트를 사용합니다. Feeder의 Google 계정 풀 로테이션·계정별 impersonate는 원격 핸들러에 적용하지 않으며, 공유 드라이브 업로드 한도는 Feeder에서 확인합니다. 기존 청크/인증 설정을 유지하고 전송 제외 패턴만 작업 요청에 함께 보냅니다. 홈 서버의 임의 Rclone 추가 옵션을 워커에서 실행하지 않습니다.
-* Feeder에서 원격 AD 전송을 예약했거나 원격 종료가 미확인된 동안에는 홈 서버의 AD 스테이징·업로드를 보류합니다. 다른 플러그인이나 외부 프로그램의 AD 접속은 이 제어의 대상이 아닙니다.
+* **AllDebrid 사용 시:** Feeder에서 원격 전송을 예약했거나 원격 종료가 미확인된 동안에는 홈 서버의 같은 서비스 스테이징·업로드를 보류합니다. 다른 플러그인이나 외부 프로그램의 접속은 이 제어의 대상이 아닙니다.
 * 중단 예약은 현재 전송·최종 이동까지 마무리하고 다음 원격 등록을 막습니다. 즉시 차단·삭제·재시도는 원격 종료 확인을 먼저 수행합니다. 통신 장애로 종료를 확인하지 못하면 임시 파일/원본 삭제를 보류하며 차단 목록에서 정리를 재시도할 수 있습니다.
 * 원격 전송 실패는 스냅샷을 보존하고 항목을 실패로 표시합니다. 항목 재시도 시 종료 확인과 임시 파일 정리 후 새 시도 ID를 생성합니다. 이미 복사가 완료됐다면 다시 업로드하지 않고 최종 이동을 재개합니다.
 
