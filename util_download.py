@@ -651,7 +651,9 @@ class RcloneSimpleTransporter(BaseTransporter):
     TRANSPORTER_NAME = "일반 Rclone 리모트 단순 업로드"
 
     CONFIG_SCHEMA = [
-        {"name": "use_local_staging", "label": "로컬 스테이징 사용", "type": "checkbox", "default": True, "desc": "On: 다운로더 원격 소스를 로컬 임시 경로에 먼저 수신합니다. Off: 로컬 파일시스템을 거치지 않고 원격 임시 업로드 경로로 직접 전송합니다."},
+        {"name": "use_local_staging", "label": "로컬 스테이징 사용", "type": "radio", "allow_inherit": True,
+         "options": [{"value": "", "label": "상위 설정 사용"}, {"value": "true", "label": "사용"}, {"value": "false", "label": "사용 안 함"}],
+         "desc": "사용: 원격 소스를 로컬 임시 경로에 먼저 수신합니다. 사용 안 함: 로컬 디스크를 거치지 않고 직접 전송합니다."},
         {"name": "staging_path", "label": "임시 수신 경로", "type": "text", "placeholder": "예: profile-name", "desc": "전역 로컬 스테이징 루트 아래에 생성할 작업별 임시 수신 경로입니다."},
         {"name": "upload_path", "label": "임시 업로드 경로", "type": "text", "placeholder": "예: incoming/프로필명", "desc": "Rclone 리모트 안에서 업로드가 먼저 완료되는 임시 경로입니다."},
         {"name": "complete_path", "label": "최종 완료 이동 경로", "type": "text", "placeholder": "예: uploads/프로필명", "desc": "임시 업로드가 성공한 뒤 최종적으로 이동할 Rclone 리모트 경로입니다."},
@@ -755,8 +757,12 @@ class GDrivePoolTransporter(BaseTransporter):
     TRANSPORTER_NAME = "Google Drive 계정 풀 로테이션 (MyDrive 경유용)"
 
     CONFIG_SCHEMA = [
-        {"name": "use_impersonate", "label": "Impersonate 사용", "type": "checkbox", "desc": "On: 기본 MyDrive SA 리모트에 계정 이메일을 impersonate 대상으로 적용합니다. Off: 계정별 독립 Rclone 리모트를 사용합니다."},
-        {"name": "use_local_staging", "label": "로컬 스테이징 사용", "type": "checkbox", "default": True, "desc": "On: 다운로더 원격 소스를 로컬 임시 경로에 먼저 수신합니다. Off: 로컬 파일시스템을 거치지 않고 원격 임시 업로드 경로로 직접 전송합니다."},
+        {"name": "use_impersonate", "label": "Google Workspace 위임", "type": "radio", "allow_inherit": True,
+         "options": [{"value": "", "label": "상위 설정 사용"}, {"value": "true", "label": "위임 사용"}, {"value": "false", "label": "위임 사용 안 함"}],
+         "desc": "계정 풀 사용 시 적용합니다. 위임 사용: SA 리모트에서 계정 이메일로 위임합니다. 사용 안 함: 계정별 독립 리모트를 사용합니다."},
+        {"name": "use_local_staging", "label": "로컬 스테이징 사용", "type": "radio", "allow_inherit": True,
+         "options": [{"value": "", "label": "상위 설정 사용"}, {"value": "true", "label": "사용"}, {"value": "false", "label": "사용 안 함"}],
+         "desc": "사용: 원격 소스를 로컬 임시 경로에 먼저 수신합니다. 사용 안 함: 로컬 디스크를 거치지 않고 직접 전송합니다."},
         {"name": "staging_path", "label": "임시 수신 경로", "type": "text", "placeholder": "예: profile-name", "desc": "전역 로컬 스테이징 루트 아래에 생성할 작업별 임시 수신 경로입니다."},
         {"name": "upload_path", "label": "임시 업로드 경로", "type": "text", "placeholder": "예: incoming/프로필명", "desc": "Google Drive에서 업로드가 먼저 완료되는 임시 경로입니다."},
         {"name": "mydrive_remote_name", "label": "내 드라이브 SA 리모트명", "type": "text", "placeholder": "미입력 시 기본 설정값 사용"},
@@ -783,12 +789,19 @@ class RemoteWorkerTransporter(BaseTransporter):
     TRANSPORTER_NAME = '원격 워커'
     FORCE_REMOTE_SOURCE = True
     CONFIG_SCHEMA = [
-        {'name': 'remote_name', 'label': 'Drive 리모트명', 'type': 'text', 'placeholder': 'in',
-         'desc': '원격 서버와 로컬 Rclone에 같은 이름으로 구성된 Drive 리모트입니다. 계정 풀 로테이션은 사용하지 않습니다.'},
+        {"name": "use_gdrive_pool", "label": "계정 풀 로테이션", "type": "radio", "allow_inherit": True,
+         "options": [{"value": "", "label": "상위 설정 사용"}, {"value": "true", "label": "계정 풀 사용"}, {"value": "false", "label": "기본 리모트 사용"}],
+         "desc": "계정 풀을 사용하면 등록된 계정을 순환합니다. 계정 접근 방식은 아래 위임 설정에서 선택합니다."},
+        dict(GDrivePoolTransporter.CONFIG_SCHEMA[0], depends_on='use_gdrive_pool'),
+        {'name': 'remote_name', 'label': 'Drive 리모트명', 'type': 'text', 'placeholder': '비워두면 기본 업로드 리모트를 사용합니다',
+         'desc': '기본 리모트 방식에서 사용하며, 비워두면 전역 기본 업로드 리모트를 사용합니다. Feeder가 작업별로 리모트명을 전달하므로 원격 서버와 FF의 Rclone에 같은 이름으로 설정하세요.'},
+        {'name': 'mydrive_remote_name', 'label': '위임용 SA 리모트명', 'type': 'text',
+         'placeholder': '비워두면 Drive 리모트명 또는 전역 위임용 리모트를 사용합니다',
+         'desc': 'Workspace Impersonate 방식에서 사용합니다. 비우면 위 Drive 리모트명 또는 전역 위임용 리모트를 사용합니다. 워커와 FF 양쪽에 동일하게 설정하세요.'},
         {'name': 'shared_drive_id', 'label': '목적지 드라이브 ID', 'type': 'text',
          'desc': '미입력 시 기본 목적지 공유 드라이브 ID를 사용합니다.'},
-        {'name': 'upload_path', 'label': '임시 업로드 경로', 'type': 'text', 'placeholder': 'feeder-worker-incoming/my-profile',
-         'desc': 'feeder-worker-incoming/ 아래로 지정합니다. 로컬 스테이징을 사용하지 않습니다.'},
+        {'name': 'upload_path', 'label': '임시 업로드 경로', 'type': 'text', 'placeholder': '예: incoming/프로필명',
+         'desc': '설정한 리모트 내 임시 업로드 경로를 사용합니다. 로컬 스테이징을 사용하지 않습니다.'},
         {'name': 'complete_path', 'label': '최종 완료 경로', 'type': 'text', 'placeholder': 'uploads/my-profile',
          'desc': '원격 서버에서 복사를 완료한 뒤 Feeder가 서버 측 폴더 이동으로 정리합니다.'},
     ]

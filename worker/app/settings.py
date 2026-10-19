@@ -75,9 +75,6 @@ class Settings:
     threads: int
     max_request_bytes: int
     log_level: str
-    source_remotes: tuple[str, ...] = ('ad',)
-    destination_remotes: tuple[str, ...] = ('in',)
-    max_concurrent_jobs: int = 1
     event_retention: int = 2000
     sse_max_clients: int = 1
     sse_heartbeat_seconds: int = 15
@@ -111,9 +108,6 @@ class Settings:
             threads=_integer(values, 'WORKER_THREADS', 8, 2, 32),
             max_request_bytes=_integer(values, 'WORKER_MAX_REQUEST_BYTES', 65536, 1024, 1048576),
             log_level=log_level,
-            source_remotes=tuple(values.get('WORKER_SOURCE_REMOTES', 'ad').split(',')),
-            destination_remotes=tuple(values.get('WORKER_DESTINATION_REMOTES', 'in').split(',')),
-            max_concurrent_jobs=_integer(values, 'WORKER_MAX_CONCURRENT_JOBS', 1, 1, 2),
             event_retention=_integer(values, 'WORKER_EVENT_RETENTION', 2000, 100, 100000),
             sse_max_clients=_integer(values, 'WORKER_SSE_MAX_CLIENTS', 1, 1, 4),
             sse_heartbeat_seconds=_integer(values, 'WORKER_SSE_HEARTBEAT_SECONDS', 15, 5, 60),
@@ -124,18 +118,25 @@ class Settings:
         result.validate_remotes()
         return result
 
-    def validate_remotes(self) -> None:
+    @property
+    def source_remotes(self) -> tuple[str, ...]:
+        return self.validate_remotes()['source']
+
+    @property
+    def destination_remotes(self) -> tuple[str, ...]:
+        return self.validate_remotes()['destination']
+
+    def validate_remotes(self) -> dict[str, tuple[str, ...]]:
         config = configparser.RawConfigParser(interpolation=None)
         try:
             with self.rclone_config.open(encoding='utf-8') as stream:
                 config.read_file(stream)
         except (OSError, configparser.Error, UnicodeError):
-            raise ValueError('허용 리모트를 확인할 수 없습니다. 읽을 수 있는 Rclone INI 설정이 필요합니다.') from None
-        for names, kind in ((self.source_remotes, 'webdav'), (self.destination_remotes, 'drive')):
-            if not names or any(not re.fullmatch(r'[A-Za-z0-9_-]+', name) for name in names):
-                raise ValueError('허용 리모트는 실제 이름을 공백 없이 쉼표로 구분해주세요.')
-            if any(config.get(name, 'type', fallback='') != kind for name in names):
-                raise ValueError('허용 리모트가 없거나 종류가 맞지 않습니다. 소스는 WebDAV, 목적지는 Drive를 지정해주세요.')
+            raise ValueError('리모트를 확인할 수 없습니다. 읽을 수 있는 Rclone INI 설정이 필요합니다.') from None
+        # 작업에 지정된 이름을 실제 설정과 대조한다. 이전 환경변수의 고정 목록은 사용하지 않는다.
+        return {field: tuple(name for name in config.sections()
+                    if re.fullmatch(r'[A-Za-z0-9_-]+', name) and config.get(name, 'type', fallback='') == kind)
+                for field, kind in (('source', 'webdav'), ('destination', 'drive'))}
 
     def validate_paths(self) -> None:
         if not self.rclone_binary.is_file() or not os.access(self.rclone_binary, os.X_OK):

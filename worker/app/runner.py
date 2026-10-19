@@ -1,4 +1,4 @@
-"""SQLite 작업을 제한된 스레드에서 실행하고 Rclone 생명주기를 관리한다."""
+"""Feeder가 제출한 작업을 실행하고 Rclone 생명주기를 관리한다."""
 
 import fcntl
 import json
@@ -24,7 +24,9 @@ class Worker:
         self.settings, self.store = settings, store
         self._stop = threading.Event()
         self._wake = threading.Event()
-        self._threads = []
+        self._threads = set()
+        self._threads_lock = threading.Lock()
+        self._dispatcher = None
         self._lock = None
         self.started = False
         self.failure = False
@@ -44,11 +46,9 @@ class Worker:
             self._stop.clear()
             self.failure = False
             self.started = True
-            # 슬롯은 최대 두 개를 준비하고 실제 점유 상한은 DB 트랜잭션에서 적용한다.
-            for index in range(2):
-                thread = threading.Thread(target=self._loop, name=f'worker-job-{index}', daemon=True)
-                thread.start()
-                self._threads.append(thread)
+            # 동시 전송 수는 Feeder가 제어하고 워커는 접수한 작업마다 실행 스레드를 만든다.
+            self._dispatcher = threading.Thread(target=self._loop, name='worker-dispatcher', daemon=True)
+            self._dispatcher.start()
             self.store.worker_status(True)
         except Exception:
             self.stop()
@@ -61,13 +61,18 @@ class Worker:
         self._stop.set()
         self.notify()
         deadline = time.monotonic() + 15
-        for thread in self._threads:
+        if self._dispatcher is not None:
+            self._dispatcher.join(timeout=max(0, deadline-time.monotonic()))
+        with self._threads_lock:
+            threads = list(self._threads)
+        for thread in threads:
             thread.join(timeout=max(0, deadline-time.monotonic()))
-        if any(thread.is_alive() for thread in self._threads):
+        if (self._dispatcher is not None and self._dispatcher.is_alive()) or any(thread.is_alive() for thread in threads):
             # 스레드가 DB/프로세스를 소유하는 동안 실행 잠금을 해제하지 않는다.
             self.failure = True
             raise RuntimeError('실행 중인 워커가 종료되지 않았습니다.')
         self._threads.clear()
+        self._dispatcher = None
         try:
             if self.started:
                 self.store.worker_status(False, self.failure)
@@ -80,12 +85,21 @@ class Worker:
     def _loop(self):
         try:
             while not self._stop.is_set():
-                job = self.store.claim(respect_limit=True)
+                job = self.store.claim()
                 if job is None:
                     self._wake.wait(.5)
                     self._wake.clear()
                     continue
-                self._execute(job)
+                thread = threading.Thread(target=self._run_job, args=(job,), name='worker-job-' + job['job_id'], daemon=True)
+                with self._threads_lock:
+                    self._threads.add(thread)
+                try:
+                    thread.start()
+                except Exception:
+                    with self._threads_lock:
+                        self._threads.discard(thread)
+                    self.store.finish(job['job_id'], None, '작업 실행 스레드를 시작하지 못했습니다.')
+                    raise
         except Exception as exc:
             self.failure = True
             self._stop.set()
@@ -94,6 +108,22 @@ class Worker:
                 self.store.worker_status(False, True)
             except Exception:
                 logger.error('워커 중단 상태 이벤트를 기록하지 못했습니다.')
+
+    def _run_job(self, job):
+        try:
+            self._execute(job)
+        except Exception as exc:
+            self.failure = True
+            self._stop.set()
+            self.notify()
+            logger.error('작업 실행 중단: %s', type(exc).__name__)
+            try:
+                self.store.worker_status(False, True)
+            except Exception:
+                logger.error('워커 중단 상태 이벤트를 기록하지 못했습니다.')
+        finally:
+            with self._threads_lock:
+                self._threads.discard(threading.current_thread())
 
     @staticmethod
     def _terminate(process, force=False):
@@ -111,6 +141,7 @@ class Worker:
             '--contimeout', '10s', '--timeout', '2m', '--stats', f"{options['stats_interval_seconds']}s", '--stats-log-level', 'INFO',
             '--use-json-log', '--log-level', 'INFO',
             *[value for pattern in job.get('exclude_patterns', []) for value in ('--exclude', pattern)],
+            *(['--drive-impersonate', job['drive_impersonate']] if job.get('drive_impersonate') else []),
             '--', job['source'], job['destination']]
 
     def _execute(self, job):
@@ -139,7 +170,7 @@ class Worker:
                 pass
 
         try:
-            validate_payload({k: job[k] for k in ('job_id', 'source', 'destination', 'config_version', 'exclude_patterns')}, self.settings)
+            validate_payload({k: job[k] for k in ('job_id', 'source', 'destination', 'config_version', 'exclude_patterns', 'drive_impersonate')}, self.settings)
             current = self.store.get(job['job_id'])
             if self._stop.is_set() or current['cancel_requested']:
                 self.store.finish(job['job_id'], None, '서비스 종료로 전송 시작이 중단됐습니다.')

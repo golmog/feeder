@@ -9,6 +9,13 @@ var pipeline_control_changing = false;
 var pipeline_control_version = 0;
 var last_pipeline_control = null;
 var pipeline_control_sse_time = 0;
+var download_activity_source = null;
+var download_activity_timer = null;
+var download_activity_poll_timer = null;
+var download_activity_cursor = 0;
+var download_activity_last_time = 0;
+var download_activity_received = 0;
+var download_activity_loading = false;
 
 var current_downloaders = [];
 var current_profiles = [];
@@ -16,6 +23,7 @@ var current_accounts = [];
 var available_feeds = [];
 var modal_profile_feeds = [];
 var modal_profile_chain = [];
+var modal_profile_settings = {};
 var modal_engine_destinations = {};
 var available_engine_schemas = [];
 var available_transporter_schemas = [];
@@ -62,6 +70,7 @@ $(document).ready(function () {
 
   // Queue 대시보드 화면 진입 시
   if ($('#active_queue_tbody').length > 0) {
+    init_download_activity();
     refresh_pipeline_control();
     pipeline_control_timer = setInterval(refresh_pipeline_control, 3000);
     try {
@@ -148,6 +157,74 @@ $(document).ready(function () {
 // -----------------------------------------------------------------------------
 // [DOWNLOAD: QUEUE 대시보드 로직]
 // -----------------------------------------------------------------------------
+function format_download_activity_time(timestamp) {
+  var date = new Date(timestamp);
+  return [date.getHours(), date.getMinutes(), date.getSeconds()].map(function (value) {
+    return String(value).padStart(2, '0');
+  }).join(':');
+}
+
+function render_download_activity(data) {
+  if (!data || !Array.isArray(data.entries)) return;
+  download_activity_received = Date.now();
+  var container = document.getElementById('download_activity_logs');
+  if (!container) return;
+  data.entries.forEach(function (entry) {
+    if (entry.id <= download_activity_cursor) return;
+    download_activity_cursor = entry.id;
+    download_activity_last_time = entry.timestamp * 1000;
+    var row = document.createElement('div');
+    row.className = entry.level === 'error' ? 'text-danger' : (entry.level === 'warning' ? 'text-warning' : '');
+    row.textContent = format_download_activity_time(download_activity_last_time) +
+      ' [' + entry.stage + '] ' + entry.message;
+    container.appendChild(row);
+    while (container.children.length > 200) container.removeChild(container.firstChild);
+  });
+  if ($('#download_activity_follow').is(':checked')) container.scrollTop = container.scrollHeight;
+  update_download_activity_time();
+}
+
+function update_download_activity_time() {
+  var now = Date.now();
+  var activity = download_activity_last_time ? '마지막 작업 활동 ' + Math.max(0, Math.floor((now - download_activity_last_time) / 1000)) + '초 전' : '아직 기록된 작업 활동이 없습니다.';
+  var received = download_activity_received ? ' · 마지막 수신 ' + Math.max(0, Math.floor((now - download_activity_received) / 1000)) + '초 전' : '';
+  $('#download_activity_summary').text(activity + received);
+}
+
+function init_download_activity() {
+  var url = '/' + package_name + '/api/' + sub + '/activity' + (apikey ? '?apikey=' + encodeURIComponent(apikey) : '');
+  download_activity_timer = setInterval(update_download_activity_time, 1000);
+  if (typeof enable_sse !== 'undefined' && enable_sse && window.EventSource) {
+    download_activity_source = new EventSource(url);
+    download_activity_source.onopen = function () { $('#download_activity_connection').text('SSE 연결됨'); };
+    download_activity_source.onmessage = function (event) {
+      try {
+        render_download_activity(JSON.parse(event.data));
+        $('#download_activity_connection').text('SSE 연결됨');
+      } catch (err) { $('#download_activity_connection').text('수신 데이터 확인 실패'); }
+    };
+    download_activity_source.onerror = function () { $('#download_activity_connection').text('SSE 재연결 중...'); };
+    download_activity_source.addEventListener('activity_error', function () {
+      $('#download_activity_connection').text('활동 기록 조회 재시도 중...');
+    });
+  } else {
+    var poll = function () {
+      if (download_activity_loading) return;
+      download_activity_loading = true;
+      $.ajax({url: url, data: {snapshot: '1', after: download_activity_cursor}, dataType: 'json', global: false, timeout: 10000})
+        .done(function (data) { render_download_activity(data); $('#download_activity_connection').text('폴링 수신 · SSE 사용 안 함'); })
+        .fail(function () { $('#download_activity_connection').text('활동 기록 연결 실패'); })
+        .always(function () { download_activity_loading = false; });
+    };
+    poll();
+    download_activity_poll_timer = setInterval(poll, 3000);
+  }
+}
+
+$(document).on('click', '#download_activity_clear', function () {
+  $('#download_activity_logs').empty();
+});
+
 function init_sse_listener() {
   if (window.EventSource) {
     if (sse_source) {
@@ -210,6 +287,9 @@ function init_sse_listener() {
 }
 
 window.addEventListener('pagehide', function () {
+  if (download_activity_source) { download_activity_source.close(); download_activity_source = null; }
+  if (download_activity_timer) { clearInterval(download_activity_timer); download_activity_timer = null; }
+  if (download_activity_poll_timer) { clearInterval(download_activity_poll_timer); download_activity_poll_timer = null; }
   if (pipeline_control_timer) {
     clearInterval(pipeline_control_timer);
     pipeline_control_timer = null;
@@ -1454,6 +1534,78 @@ function update_profile_dest_type_dropdown(selected_type) {
   }
 }
 
+function normalize_profile_transfer_config(values) {
+  var result = Object.assign({}, values || {});
+  var modes = {direct: [false, false], rotation: [true, false], impersonate: [true, true]};
+  var mode = modes[result.gdrive_mode];
+  if (mode) {
+    if (result.use_gdrive_pool == null) result.use_gdrive_pool = mode[0];
+    if (result.use_impersonate == null) result.use_impersonate = mode[1];
+    delete result.gdrive_mode;
+  }
+  return result;
+}
+
+function profile_field_value(field, values) {
+  values = normalize_profile_transfer_config(values);
+  var value = values[field.name];
+  if (field.allow_inherit) {
+    return value === undefined || value === null || value === '' ? '' : (/^(true|on|1)$/i.test(String(value)) ? 'true' : 'false');
+  }
+  return value === undefined || value === null ? (field.default !== undefined ? field.default : '') : value;
+}
+
+function profile_radio_html(field, id, value, attributes) {
+  var html = '<div id="' + id + '" class="d-flex flex-wrap">';
+  (field.options || []).forEach(function (option, index) {
+    html += '<label class="form-check form-check-inline mb-1" for="' + id + '_' + index + '">' +
+      '<input type="radio" class="form-check-input ' + (attributes ? 'profile-engine-dest-field' : '') + '"' +
+      ' id="' + id + '_' + index + '" name="' + id + '" value="' + option.value + '"' +
+      (String(value) === option.value ? ' checked' : '') + (field.allow_inherit ? ' data-inherit-boolean="true"' : '') + (attributes || '') + '>' +
+      '<span class="form-check-label">' + option.label + '</span></label>';
+  });
+  return html + '</div>';
+}
+
+function profile_boolean_options(value) {
+  return [{value: '', label: '상위 설정 사용'}, {value: 'true', label: '사용'}, {value: 'false', label: '사용 안 함'}].map(function (option) {
+    return '<option value="' + option.value + '"' + (String(value) === option.value ? ' selected' : '') + '>' + option.label + '</option>';
+  }).join('');
+}
+
+function profile_pool_enabled(values, inherited) {
+  if (values && values.type === 'gdrive_rotation') return true;
+  var value = profile_field_value({name: 'use_gdrive_pool', allow_inherit: true}, values);
+  return value === '' ? inherited : value === 'true';
+}
+
+function profile_inherited_pool(engineName) {
+  var enabled = $('#download_use_gdrive_pool').is(':checked');
+  var engine = current_downloaders.find(function (d) {
+    return String(d.name).toLowerCase() === String(engineName || '').toLowerCase();
+  });
+  enabled = profile_pool_enabled(engine, enabled);
+  return profile_pool_enabled(modal_profile_settings, enabled);
+}
+
+function profile_destination_pool(engineName) {
+  if ($('#profile_dest_type').val() === 'gdrive_rotation') return true;
+  var value = $('#dest_field_use_gdrive_pool input:checked').val();
+  return value === 'true' || (value !== 'false' && profile_inherited_pool(engineName));
+}
+
+function toggle_profile_impersonation() {
+  var engines = modal_profile_chain.length ? modal_profile_chain : [''];
+  var enabled = engines.some(function (engineName) { return profile_destination_pool(engineName); });
+  $('#profile_dynamic_dest_fields .dest-field-row-use_impersonate').toggle(
+    $('#profile_dest_type').val() === 'gdrive_rotation' || enabled);
+}
+
+$(document).on('change', '#dest_field_use_gdrive_pool input', function () {
+  toggle_profile_impersonation();
+  render_engine_destinations();
+});
+
 function render_dynamic_dest_fields(transporter_id, current_values) {
   var container = $('#profile_dynamic_dest_fields');
   container.empty();
@@ -1469,15 +1621,19 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
 
   for (var i = 0; i < fields.length; i++) {
     var f = fields[i];
-    var val = (current_values && current_values[f.name] !== undefined) ? current_values[f.name] : (f.default !== undefined ? f.default : '');
+    var val = profile_field_value(f, current_values);
     var ph = f.placeholder || '';
     var descHtml = f.desc ? '<small class="form-text text-muted">' + f.desc + '</small>' : '';
 
     html += '<div class="form-group row mb-2 dest-field-row-' + f.name + '">';
-    html += '  <label class="col-sm-3 col-form-label text-right font-weight-bold">' + f.label + '</label>';
-    html += '  <div class="col-sm-9">';
+    html += '  <label class="col-sm-3 col-form-label text-right font-weight-bold">' + (f.depends_on ? '↳ ' : '') + f.label + '</label>';
+    html += '  <div class="col-sm-9' + (f.depends_on ? ' border-left pl-3' : '') + '">';
 
-    if (f.type === 'checkbox') {
+    if (f.type === 'radio') {
+      html += profile_radio_html(f, 'dest_field_' + f.name, val);
+    } else if (f.allow_inherit && f.type === 'checkbox') {
+      html += '<select id="dest_field_' + f.name + '" class="form-control form-control-sm">' + profile_boolean_options(val) + '</select>';
+    } else if (f.type === 'checkbox') {
       var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
       html += '    <div><input type="checkbox" id="dest_field_' + f.name + '" data-toggle="toggle" data-on="On" data-off="Off" data-size="small" ' + isChk + '></div>';
     } else if (f.type === 'number') {
@@ -1493,6 +1649,7 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
     html += '</div>';
   }
   container.html(html);
+  toggle_profile_impersonation();
 
   try {
     container.find('input[data-toggle="toggle"]').bootstrapToggle();
@@ -1501,7 +1658,8 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
   function toggleStagingPathField() {
     var stagingChk = $('#dest_field_use_local_staging');
     if (stagingChk.length > 0) {
-      if (stagingChk.is(':checked')) {
+      var stagingValue = stagingChk.is('select') ? stagingChk.val() : stagingChk.find('input:checked').val();
+      if (stagingChk.is(':checkbox') ? stagingChk.is(':checked') : stagingValue !== 'false') {
         $('.dest-field-row-staging_path').show();
       } else {
         $('.dest-field-row-staging_path').hide();
@@ -1510,7 +1668,7 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
   }
 
   toggleStagingPathField();
-  $('#dest_field_use_local_staging').change(function () {
+  $('#dest_field_use_local_staging').on('change', function () {
     toggleStagingPathField();
   });
 }
@@ -1664,6 +1822,7 @@ function render_chain_table() {
 }
 
 function render_engine_destinations() {
+  toggle_profile_impersonation();
   var container = $('#profile_engine_destinations');
   if (!container.length) return;
   container.empty();
@@ -1678,6 +1837,8 @@ function render_engine_destinations() {
     var engineName = modal_profile_chain[i];
     var selectedConfig = modal_engine_destinations[engineName] || {};
     if (typeof selectedConfig === 'string') selectedConfig = { type: selectedConfig };
+    selectedConfig = normalize_profile_transfer_config(selectedConfig);
+    if (modal_engine_destinations[engineName]) modal_engine_destinations[engineName] = selectedConfig;
     var selected = selectedConfig.type || '';
     var fieldPrefix = 'dest_override_' + String(engineName).replace(/[^a-zA-Z0-9_-]/g, '_');
     html += '<tr><td class="font-weight-bold" style="min-width: 80px; white-space: nowrap;">' + engineName + '</td><td>' +
@@ -1698,11 +1859,16 @@ function render_engine_destinations() {
           html += '<div class="mt-2 pl-2 border-left">';
           for (var k = 0; k < selectedSchema.config_schema.length; k++) {
             var f = selectedSchema.config_schema[k];
-            var value = selectedConfig[f.name] !== undefined ? selectedConfig[f.name] : (f.default !== undefined ? f.default : '');
+            var value = profile_field_value(f, selectedConfig);
             var inputId = fieldPrefix + '_' + f.name;
-            html += '<div class="form-group mb-1">';
-            html += '<label class="small mb-1">' + f.label + '</label>';
-            if (f.type === 'checkbox') {
+            var hidden = f.depends_on === 'use_gdrive_pool' && !profile_pool_enabled(selectedConfig, profile_destination_pool(engineName));
+            html += '<div class="form-group mb-1' + (f.depends_on ? ' pl-3 border-left' : '') + '"' + (hidden ? ' style="display:none"' : '') + '>';
+            html += '<label class="small mb-1">' + (f.depends_on ? '↳ ' : '') + f.label + '</label>';
+            if (f.type === 'radio') {
+              html += profile_radio_html(f, inputId, value, ' data-engine="' + engineName + '" data-field="' + f.name + '"');
+            } else if (f.allow_inherit && f.type === 'checkbox') {
+              html += '<select class="form-control form-control-sm profile-engine-dest-field" id="' + inputId + '" data-engine="' + engineName + '" data-field="' + f.name + '" data-inherit-boolean="true">' + profile_boolean_options(value) + '</select>';
+            } else if (f.type === 'checkbox') {
               var checked = (value === true || value === 'true' || value === 'On' || value === 'on') ? ' checked' : '';
               html += '<div><input type="checkbox" class="profile-engine-dest-field" id="' + inputId + '" data-engine="' + engineName + '" data-field="' + f.name + '"' + checked + '></div>';
             } else {
@@ -1733,7 +1899,14 @@ $(document).on('change input', '.profile-engine-dest-field', function () {
   var fieldName = $(this).data('field');
   if (!modal_engine_destinations[engineName]) return;
   var value = $(this).is(':checkbox') ? $(this).is(':checked') : $(this).val();
-  modal_engine_destinations[engineName][fieldName] = value;
+  if ($(this).is('[data-inherit-boolean]')) value = value === '' ? undefined : value === 'true';
+  if ($(this).is(':radio') && value === '') value = undefined;
+  if (value === undefined) {
+    delete modal_engine_destinations[engineName][fieldName];
+  } else {
+    modal_engine_destinations[engineName][fieldName] = value;
+  }
+  if (fieldName === 'use_gdrive_pool') render_engine_destinations();
 });
 
 $(document).on('click', '#btn_add_profile_feed', function (e) {
@@ -1804,6 +1977,7 @@ $(document).on('click', '#profile_add_btn', function (e) {
   $('#profile_name').val('').prop('readonly', false);
   $('#profile_sync_hours').val('');
   $('#profile_append_hash_on_conflict').prop('checked', true);
+  modal_profile_settings = {};
 
   var default_trans = available_transporter_schemas.length > 0 ? available_transporter_schemas[0].transporter_id : '';
   update_profile_dest_type_dropdown(default_trans);
@@ -1830,6 +2004,7 @@ $(document).on('click', '.edit_profile_btn', function (e) {
   e.preventDefault();
   var idx = $(this).data('index');
   var p = current_profiles[idx];
+  modal_profile_settings = p;
 
   $('#profile_modal_title').text('다운로드 프로필 수정: ' + p.name);
   $('#profile_mode').val('edit');
@@ -1882,7 +2057,12 @@ $(document).on('click', '#profile_save_btn', function (e) {
     for (var i = 0; i < schemaObj.config_schema.length; i++) {
       var f = schemaObj.config_schema[i];
       var el = $('#dest_field_' + f.name);
-      if (f.type === 'checkbox') destObj[f.name] = el.is(':checked');
+      if (f.type === 'radio') {
+        var selected = el.find('input:checked').val();
+        if (selected) destObj[f.name] = f.allow_inherit ? selected === 'true' : selected;
+      } else if (f.allow_inherit && f.type === 'checkbox') {
+        if (el.val() !== '') destObj[f.name] = el.val() === 'true';
+      } else if (f.type === 'checkbox') destObj[f.name] = el.is(':checked');
       else if (f.type === 'number') destObj[f.name] = parseInt(el.val()) || 0;
       else destObj[f.name] = el.val().trim();
     }

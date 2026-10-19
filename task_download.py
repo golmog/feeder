@@ -19,6 +19,7 @@ from .util_feed import FeedUtil
 from .util_download import DownloadUtil
 from .util_upload import UploadUtil
 from .util_remote_worker import RemoteWorker
+from .util_download_activity import DownloadActivity
 
 
 class TaskDownloadBase:
@@ -89,6 +90,7 @@ class TaskDownload:
                     return
                 mode_str = "수동 실행" if manual else "스케쥴러 자동 실행"
                 logger.info(f"[DownloadPipeline] 다운로드 파이프라인 가동 ({mode_str})")
+                DownloadActivity.record('실행', f'다운로드 작업 시작 · {mode_str}')
 
                 # 현재 큐 현황 집계 및 요약 최우선 출력
                 q_counts = {
@@ -107,12 +109,15 @@ class TaskDownload:
                 profiles = FeederUtil.get_download_profiles()
                 if not profiles:
                     logger.debug("[DownloadPipeline] 등록된 다운로드 프로필(DOWNLOAD_PROFILES)이 없습니다.")
+                    DownloadActivity.record('실행', '등록된 다운로드 프로필이 없어 작업을 종료합니다.')
                     return
 
                 # SA 내 드라이브 잔여 파일을 먼저 복구한 뒤 새 업로드를 시작한다.
+                DownloadActivity.record('사전 정리', '새 업로드에 앞서 원격 잔여 파일 복구를 시작합니다.')
                 if not UploadUtil.drain_all_sa_mydrives():
                     if not FeederUtil.is_download_paused():
                         logger.warning("[DownloadPipeline] 원격 잔여 파일 복구 미완료: 새 업로드를 보류하고 다음 주기에 재확인합니다.")
+                        DownloadActivity.record('사전 정리', '원격 복구가 완료되지 않아 새 업로드를 보류합니다. 상세 원인은 플랫폼 로그를 확인하세요.', 'warning')
                     return
 
                 if FeederUtil.is_download_paused():
@@ -125,7 +130,9 @@ class TaskDownload:
                     return
 
                 # 활성 큐 작업들에 대해 현재 설정된 최신 프로필 동적 동기화
+                DownloadActivity.record('프로필 반영', '활성 큐에 최신 다운로드 프로필을 반영합니다.')
                 TaskDownload.sync_active_items_with_profiles()
+                DownloadActivity.record('프로필 반영', '활성 큐 프로필 반영 완료')
 
                 # 현재 실행 세션 실패 목록 초기화
                 TaskDownload.failed_ids_in_session.clear()
@@ -150,17 +157,20 @@ class TaskDownload:
 
                     logger.info(f"[DownloadPipeline] === 연쇄 패스 {cascade_pass}/{max_cascade_passes} 시작 (활성 작업: {total_active_before}개) ===")
 
-                    for stage in (
-                        TaskDownload.dispatch_pending_downloads if pending_cnt > 0 else None,
-                        TaskDownload.poll_active_downloads,
-                        TaskDownload.process_local_staging,
-                        TaskDownload.route_completed_downloads,
-                        TaskDownload.process_uploads,
+                    for stage_label, stage in (
+                        ('다운로드 작업 등록', TaskDownload.dispatch_pending_downloads if pending_cnt > 0 else None),
+                        ('다운로더 상태 확인', TaskDownload.poll_active_downloads),
+                        ('로컬 스테이징', TaskDownload.process_local_staging),
+                        ('완료 항목 이송', TaskDownload.route_completed_downloads),
+                        ('업로드', TaskDownload.process_uploads),
                     ):
                         if FeederUtil.is_download_paused():
                             return
                         if stage is not None:
+                            DownloadActivity.record(stage_label, f'처리 시작 · {cascade_pass}/{max_cascade_passes}차 순회')
+                            stage_started = time.monotonic()
                             stage()
+                            DownloadActivity.record(stage_label, f'단계 처리 종료 · {time.monotonic() - stage_started:.1f}초 소요')
 
                     # 해당 패스에서 실제 상태 전이가 발생했는지 판별
                     staging_after = db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_local_staging', 'local_staging'])).count()
@@ -178,21 +188,31 @@ class TaskDownload:
                 if FeederUtil.is_download_paused():
                     return
                 # 이전 실패 항목 재시도
+                DownloadActivity.record('이동 복구', '이동 실패 항목을 확인합니다.')
                 TaskDownload.retry_move_failed()
 
                 if FeederUtil.is_download_paused():
                     return
                 # 대기 중인 원격 릴레이(Colab 등) 작업 점검 및 워커 트리거
+                DownloadActivity.record('릴레이', '릴레이 대기 작업을 확인합니다.')
                 TaskDownload.check_pending_relays()
 
                 logger.info(f"[DownloadPipeline] 다운로드 파이프라인 주기 완료 ({mode_str})")
+                DownloadActivity.record('완료', '다운로드 작업 주기 완료 · 다음 실행을 기다립니다.')
 
             except Exception as e:
+                DownloadActivity.record('오류', '다운로드 작업 중 오류가 발생했습니다. 상세 원인은 플랫폼 로그를 확인하세요.', 'error')
                 logger.error(f"[DownloadPipeline] 파이프라인 처리 중 오류: {e}")
                 logger.error(traceback.format_exc())
+            finally:
+                try:
+                    if FeederUtil.is_download_paused():
+                        DownloadActivity.record('중단', '작업 중단 상태입니다. 작업 재개 전까지 새 작업을 시작하지 않습니다.')
+                except Exception:
+                    pass
 
     @staticmethod
-    def _worker_results(worker, item_ids, max_workers):
+    def _worker_results(worker, item_ids, max_workers, activity_stage=None):
         """실행 슬롯만 배정하고 중단 요청 이후에는 다음 작업을 시작하지 않는다."""
         from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
@@ -205,6 +225,8 @@ class TaskDownload:
                     db.session.remove()
 
         remaining = iter(item_ids)
+        finished = 0
+        last_report = time.monotonic()
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             active = {}
             exhausted = False
@@ -221,9 +243,15 @@ class TaskDownload:
                     active[executor.submit(guarded_worker, item_id)] = item_id
                 if not active:
                     break
-                done, _ = wait(active, return_when=FIRST_COMPLETED)
+                done, _ = wait(active, timeout=3, return_when=FIRST_COMPLETED)
                 for future in done:
+                    finished += 1
                     yield active.pop(future), future
+                if activity_stage and (finished == len(item_ids) or time.monotonic() - last_report >= 3):
+                    DownloadActivity.record(activity_stage, f'처리 종료 {finished}/{len(item_ids)}건 · 진행 중 {len(active)}건 · 미배정 {len(item_ids) - finished - len(active)}건')
+                    last_report = time.monotonic()
+        if activity_stage and finished < len(item_ids):
+            DownloadActivity.record(activity_stage, f'처리 종료 {finished}/{len(item_ids)}건 · 남은 {len(item_ids) - finished}건은 대기 유지')
 
     @staticmethod
     def sync_feed_items(profiles: list[dict]):
@@ -234,8 +262,10 @@ class TaskDownload:
         all_feeds = FeederUtil.get_feeds()
         new_items_count = 0
         logger.info(f"[DownloadPipeline] 피드 동기화 및 신규 다운로드 작업 검토 시작 (대상 피드: {len(all_feeds)}개, 프로필: {len(profiles)}개)")
+        DownloadActivity.record('피드 검토', f'피드 동기화 시작 · 피드 {len(all_feeds)}개, 프로필 {len(profiles)}개')
+        last_activity = time.monotonic()
 
-        for profile in profiles:
+        for profile_index, profile in enumerate(profiles, 1):
             FeederUtil.cooperate()
             if FeederUtil.is_download_paused():
                 return
@@ -247,10 +277,13 @@ class TaskDownload:
             destination_cfg = profile.get('destination', {})
             dest_type = destination_cfg.get('type', 'local')
 
-            for feed in all_feeds:
+            for feed_index, feed in enumerate(all_feeds, 1):
                 FeederUtil.cooperate()
                 if FeederUtil.is_download_paused():
                     return
+                if time.monotonic() - last_activity >= 3:
+                    DownloadActivity.record('피드 검토', f'프로필 {profile_index}/{len(profiles)} · 피드 {feed_index}/{len(all_feeds)} 검토 중 · 신규 {new_items_count}건')
+                    last_activity = time.monotonic()
                 f_name = feed.get('name')
                 if '*' not in target_feed_names and f_name not in target_feed_names:
                     continue
@@ -295,10 +328,13 @@ class TaskDownload:
 
                 candidates = query.order_by(ModelFeedItem.id.desc()).all()
 
-                for feed_item in candidates:
+                for candidate_index, feed_item in enumerate(candidates, 1):
                     FeederUtil.cooperate()
                     if FeederUtil.is_download_paused():
                         return
+                    if time.monotonic() - last_activity >= 3:
+                        DownloadActivity.record('피드 검토', f'프로필 {profile_index}/{len(profiles)} · 피드 {feed_index}/{len(all_feeds)} · 항목 {candidate_index}/{len(candidates)} · 신규 {new_items_count}건')
+                        last_activity = time.monotonic()
                     feed_dict = feed_item.as_dict()
                     magnets = feed_dict.get('magnet', [])
                     if not magnets:
@@ -344,6 +380,7 @@ class TaskDownload:
                     new_items_count += 1
 
         elapsed = time.time() - start_time
+        DownloadActivity.record('피드 검토', f'피드 동기화 완료 · 신규 {new_items_count}건 · {elapsed:.1f}초 소요')
         if new_items_count > 0:
             logger.info(f"[DownloadPipeline] 피드 동기화 완료: 신규 {new_items_count}건 큐 등록 (소요시간: {elapsed:.1f}초)")
 
@@ -367,7 +404,7 @@ class TaskDownload:
         shared_drive_default_id = P.ModelSetting.get('download_shared_drive_id') or ''
 
         updated_count = 0
-        for item in items:
+        for item in DownloadActivity.track('프로필 반영', items):
             # 메모리 캐시에서 프로필 매핑 O(1) 고속 검색
             FeederUtil.cooperate()
             if (item.upload_state or {}).get('worker'):
@@ -470,6 +507,9 @@ class TaskDownload:
         items = ModelDownload.get_list_by_status(['pending'])
         if not items:
             return
+        total_items = len(items)
+        registered_count = linked_count = 0
+        DownloadActivity.record('다운로드 작업 등록', f'등록 검토 시작 · 대상 {total_items}건')
         pending_snapshots = []
         for item in items:
             FeederUtil.cooperate()
@@ -490,7 +530,8 @@ class TaskDownload:
         engine_instances = {}
         engine_status_maps = {}
 
-        for dl in FeederUtil.get_downloaders():
+        downloaders = FeederUtil.get_downloaders()
+        for engine_index, dl in enumerate(downloaders, 1):
             FeederUtil.cooperate()
             e_name = dl.get('name')
             if not e_name or not dl.get('enabled', True):
@@ -506,6 +547,7 @@ class TaskDownload:
             # 모든 엔진 공통: 원격 작업 목록을 1회 사전 조회하여 infohash 맵 구성
             if hasattr(engine_inst, 'get_status'):
                 try:
+                    DownloadActivity.record('다운로드 작업 등록', f'엔진 목록 사전 조회 {engine_index}/{len(downloaders)} · 항목 검토 0/{total_items}건')
                     remote_tasks, status_error = engine_inst.get_status()
                     if not status_error:
                         task_map = {}
@@ -539,10 +581,14 @@ class TaskDownload:
                     engine_in_progress_counts[r[0]] = int(r[1])
             db.session.rollback()
 
-        for snapshot in pending_snapshots:
+        last_activity = time.monotonic()
+        for item_index, snapshot in enumerate(pending_snapshots, 1):
             FeederUtil.cooperate()
             if FeederUtil.is_download_paused():
                 return
+            if item_index == 1 or time.monotonic() - last_activity >= 3:
+                DownloadActivity.record('다운로드 작업 등록', f'검토 {item_index - 1}/{total_items}건 · 신규 등록 {registered_count}건 · 기존 연동 {linked_count}건 · 현재 작업 #{snapshot["id"]}')
+                last_activity = time.monotonic()
             item_id = snapshot['id']
             chain = snapshot['priority_chain']
             curr_idx = snapshot['current_engine_index']
@@ -631,6 +677,7 @@ class TaskDownload:
 
                     # 원격 조회에서 이미 집계된 작업의 연동은 신규 큐 슬롯을 소비하지 않는다.
                     db.session.commit()
+                    linked_count += 1
                 continue
 
             if engine_name in full_engines or (engine_limit > 0 and current_count >= engine_limit):
@@ -689,6 +736,7 @@ class TaskDownload:
                 engine_in_progress_counts[engine_name] = current_count + 1
 
                 db.session.commit()
+                registered_count += 1
                 logger.info(f"[DownloadDispatch] [{engine_name}] 작업 추가 성공: {snapshot['title']} (TaskID: {task_id})")
             else:
                 err_str = str(err)
@@ -717,6 +765,7 @@ class TaskDownload:
                     logger.warning(f"[DownloadDispatch] [{engine_name}] 마그넷 추가 불가 ({err_str}) -> 다음 엔진 폴백: {snapshot['title']}")
 
         db.session.commit()
+        DownloadActivity.record('다운로드 작업 등록', f'검토 완료 · {total_items}/{total_items}건 · 신규 등록 {registered_count}건 · 기존 연동 {linked_count}건')
 
     @staticmethod
     def poll_active_downloads():
@@ -725,7 +774,7 @@ class TaskDownload:
         if not enabled_downloaders:
             return
 
-        for downloader_cfg in enabled_downloaders:
+        for downloader_cfg in DownloadActivity.track('다운로더 상태 확인', enabled_downloaders, '엔진'):
             FeederUtil.cooperate()
             if FeederUtil.is_download_paused():
                 db.session.commit()
@@ -748,7 +797,9 @@ class TaskDownload:
 
             # 원격 상태 조회가 DB의 활성 읽기 트랜잭션을 기다리지 않도록 조회 종료
             db.session.rollback()
+            DownloadActivity.record('다운로더 상태 확인', f'{engine_name} 원격 목록 조회 중 · 할당된 작업 {len(engine_items)}건')
             status_list, err = engine.get_status()
+            DownloadActivity.record('다운로더 상태 확인', f'{engine_name} 원격 목록 조회 ' + ('실패' if err else f'완료 · 수신 {len(status_list)}건'), 'warning' if err else 'info')
             if err:
                 logger.warning(f"[DownloadPoll] [{engine_name}] 상태 조회 실패: {err}")
                 for it in engine_items:
@@ -761,7 +812,7 @@ class TaskDownload:
             if (engine_name == 'cd2' or getattr(engine, 'OUTPUT_TYPE', '') == 'cloud_storage') and hasattr(engine, 'refresh_cache'):
                 if any(s.get('status') == 'completed' for s in status_list):
                     refreshed_vpaths = set()
-                    for it_chk in engine_items:
+                    for it_chk in DownloadActivity.track('다운로더 상태 확인', engine_items, '캐시 검토', engine_name):
                         FeederUtil.cooperate()
                         p_chk = FeederUtil.get_download_profile_by_feed(it_chk.feed_name) or {}
                         d_chk = FeederUtil.get_profile_destination(p_chk, engine_name)
@@ -769,6 +820,7 @@ class TaskDownload:
                         target_vpath = f"{engine.vpath}/{u_sub}".rstrip('/') if u_sub else engine.vpath
                         if target_vpath not in refreshed_vpaths:
                             refreshed_vpaths.add(target_vpath)
+                            DownloadActivity.record('다운로더 상태 확인', f'{engine_name} 완료 작업 폴더 캐시 갱신 중 · {len(refreshed_vpaths)}번째 경로')
                             engine.refresh_cache(path=target_vpath)
 
             status_map_by_tid = {str(s.get('task_id')): s for s in status_list if s.get('task_id')}
@@ -817,10 +869,11 @@ class TaskDownload:
 
                 if cleanup_targets:
                     db.session.rollback()
+                    DownloadActivity.record('다운로더 상태 확인', f'{engine_name} 원격 히스토리 정리 중 · 대상 {len(cleanup_targets)}건')
                     if hasattr(engine, 'delete_tasks'):
                         engine.delete_tasks(list(cleanup_targets))
                     elif hasattr(engine, 'delete_task'):
-                        for tid in cleanup_targets:
+                        for tid in DownloadActivity.track('다운로더 상태 확인', list(cleanup_targets), '원격 정리 항목', engine_name):
                             FeederUtil.cooperate()
                             try:
                                 engine.delete_task(tid)
@@ -836,7 +889,7 @@ class TaskDownload:
             except Exception:
                 stalled_hours = 24
 
-            for it in engine_items:
+            for it in DownloadActivity.track('다운로더 상태 확인', engine_items, '항목', engine_name):
                 FeederUtil.cooperate()
                 if FeederUtil.is_download_paused():
                     db.session.commit()
@@ -1059,9 +1112,10 @@ class TaskDownload:
         if staging_root is None:
             staging_root = P.ModelSetting.get('download_local_staging_path') or FeederUtil.get_global().get('local_staging_path') or os.path.join(FeederUtil.get_tmp_dir(), 'staging')
         root_prefix = os.path.abspath(staging_root).rstrip(os.sep) + os.sep
-        for item_id, path in db.session.query(ModelDownload.id, ModelDownload.local_path).filter(
+        staging_paths = db.session.query(ModelDownload.id, ModelDownload.local_path).filter(
             ModelDownload.local_path.startswith(root_prefix, autoescape=True)
-        ).all():
+        ).all()
+        for item_id, path in DownloadActivity.track('큐 점검', staging_paths, '스테이징 경로', report_start=False):
             FeederUtil.cooperate()
             if os.path.exists(path):
                 occupied.add(item_id)
@@ -1088,6 +1142,7 @@ class TaskDownload:
         queue_limit, occupied = TaskDownload._get_upload_queue_state(staging_root)
         if queue_limit > 0 and len(occupied) >= queue_limit:
             logger.info(f"[LocalStaging] Google Drive 업로드 최대 큐({queue_limit}건) 도달 (현재: {len(occupied)}건). 신규 스테이징을 대기합니다.")
+            DownloadActivity.record('로컬 스테이징', f'업로드 최대 큐 {len(occupied)}/{queue_limit}건 · 새 스테이징 대기')
             return
 
         # 현재 세션 실패 항목을 제외하고, 로컬 디스크 허용 잔여 슬롯만큼만 정밀 조회
@@ -1117,6 +1172,7 @@ class TaskDownload:
             staging_workers = 2
 
         logger.info(f"[LocalStaging] 로컬 스테이징 Rclone 다운로드 병렬 실행 (대상: {len(items)}건, 동시 워커: {staging_workers}개)")
+        DownloadActivity.record('로컬 스테이징', f'전송 준비 · 대상 {len(item_ids)}건, 동시 {staging_workers}개')
 
         def _staging_worker(item_id):
             with F.app.app_context():
@@ -1218,7 +1274,7 @@ class TaskDownload:
                         db.session.commit()
                     db.session.remove()
 
-        for item_id, future in TaskDownload._worker_results(_staging_worker, item_ids, staging_workers):
+        for item_id, future in TaskDownload._worker_results(_staging_worker, item_ids, staging_workers, activity_stage='로컬 스테이징'):
             FeederUtil.cooperate()
             try:
                 future.result()
@@ -1247,7 +1303,7 @@ class TaskDownload:
 
         now = datetime.now()
 
-        for item_id in item_ids:
+        for item_index, item_id in enumerate(DownloadActivity.track('완료 항목 이송', item_ids), 1):
             FeederUtil.cooperate()
             if FeederUtil.is_download_paused():
                 return
@@ -1310,6 +1366,7 @@ class TaskDownload:
             db.session.refresh(item)
             db.session.remove()
             logger.info(f"[RouteComplete] 이송 핸들러 [{dest_type}] 호출 시작: {title}")
+            DownloadActivity.record('완료 항목 이송', f'작업 #{item_id} 이송 처리 중 · {item_index}/{len(item_ids)}번째 항목')
             try:
                 success, next_status, msg = transporter.transport(item, source_path, dest_cfg)
                 moved_path = getattr(item, 'local_path', source_path)
@@ -1378,6 +1435,8 @@ class TaskDownload:
             upload_workers = 2
 
         logger.info(f"[UploadUtil] Google Drive 업로드 병렬 실행 (대기: {len(items)}건, 동시 워커: {upload_workers}개)")
+        DownloadActivity.record('업로드', f'업로드 처리 시작 · 대기 {len(items)}건, 동시 전송 {upload_workers}개')
+        DownloadActivity.record('업로드', '업로드 계정 및 사용량 확인 중')
         manager = UploadUtil.get_account_manager()
         db.session.remove()
 
@@ -1387,19 +1446,22 @@ class TaskDownload:
                 if not target_item:
                     return
                 file_name = target_item.file_name
+                DownloadActivity.record('업로드', f'작업 #{item_id} 업로드 처리 시작')
                 if target_item.destination_type == 'remote_worker' or (target_item.upload_state or {}).get('worker'):
                     success = RemoteWorker.execute(target_item, manager)
                 else:
                     success = UploadUtil.execute_upload(target_item, manager)
+                DownloadActivity.record('업로드', f'작업 #{item_id} 업로드 처리 ' + ('완료' if success else '보류 또는 실패 · 큐 상태를 확인하세요.'), 'info' if success else 'warning')
                 if not success:
                     TaskDownload.failed_ids_in_session.add(item_id)
                     logger.warning(f"[UploadUtil] {file_name} 업로드 실패 -> 이번 세션 제외 후 다음 턴 재시도")
 
-        for item_id, future in TaskDownload._worker_results(_upload_worker, item_ids, upload_workers):
+        for item_id, future in TaskDownload._worker_results(_upload_worker, item_ids, upload_workers, activity_stage='업로드'):
             FeederUtil.cooperate()
             try:
                 future.result()
             except Exception as th_err:
+                DownloadActivity.record('업로드', f'작업 #{item_id} 처리 중 오류가 발생했습니다. 플랫폼 로그를 확인하세요.', 'error')
                 logger.error(f"[UploadUtil] 업로드 워커 스레드 예외: {th_err}")
 
     @staticmethod
@@ -1423,7 +1485,7 @@ class TaskDownload:
         db.session.remove()
         manager = UploadUtil.get_account_manager()
         db.session.remove()
-        for item_id in item_ids:
+        for item_id in DownloadActivity.track('이동 복구', item_ids):
             FeederUtil.cooperate()
             if FeederUtil.is_download_paused():
                 return
@@ -1441,6 +1503,7 @@ class TaskDownload:
             db.session.remove()
             target = db.session.query(ModelDownload).filter_by(id=item_id, status='move_failed').first()
             if target:
+                DownloadActivity.record('이동 복구', f'작업 #{item_id} 이동 복구 또는 재업로드 처리 중')
                 UploadUtil.retry_failed_upload(target, manager)
 
     @staticmethod
@@ -1457,12 +1520,13 @@ class TaskDownload:
 
             if busy_count > 0:
                 logger.info(f"[DownloadPipeline] 현재 릴레이 전송 진행 중인 작업({busy_count}건)이 있어 대기합니다. (대기열: {len(pending_items)}건)")
+                DownloadActivity.record('릴레이 점검', f'진행 중 {busy_count}건 · 대기 {len(pending_items)}건 · 기존 전송 완료 대기')
                 return
 
             logger.info(f"[DownloadPipeline] 미완료 릴레이 대기 작업 {len(pending_items)}건 감지 ➔ 워커 자동 기동 호출")
 
             triggered_dest_types = set()
-            for it in pending_items:
+            for it in DownloadActivity.track('릴레이 점검', pending_items):
                 FeederUtil.cooperate()
                 if FeederUtil.is_download_paused():
                     return
@@ -1475,6 +1539,7 @@ class TaskDownload:
                 transporter = DownloadUtil.get_transporter(dest_type)
 
                 if transporter and hasattr(transporter, 'resume_relay'):
+                    DownloadActivity.record('릴레이 점검', f'작업 #{it.id}의 릴레이 워커 기동 요청 중')
                     transporter.resume_relay(dest_cfg)
                     triggered_dest_types.add(dest_type)
 

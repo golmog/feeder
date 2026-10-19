@@ -14,11 +14,13 @@ def validate_configuration(payload):
     if type(version) is not int or not 1 <= version <= 2**31-1:
         raise ValueError('config_version은 1~2147483647의 정수여야 합니다.')
     groups = {
-        'worker': {'max_concurrent_jobs': (1, 2)},
         'rclone': {'transfers': (1, 1), 'checkers': (1, 4), 'buffer_size_mib': (0, 16),
                    'multi_thread_streams': (0, 0), 'stats_interval_seconds': (1, 30)},
     }
-    result = {'config_version': version}
+    # 이전 버전 DB의 동시 작업 상한은 읽기 호환만 유지하고 실행에는 적용하지 않는다.
+    if not isinstance(payload['worker'], dict) or set(payload['worker']) - {'max_concurrent_jobs'}:
+        raise ValueError('worker에는 별도 실행 제한을 지정할 수 없습니다.')
+    result = {'config_version': version, 'worker': {}}
     for group, fields in groups.items():
         values = payload[group]
         if not isinstance(values, dict) or set(values) != set(fields):
@@ -53,7 +55,7 @@ class Configurations:
         with closing(self.database.connect()) as connection:
             connection.execute('BEGIN IMMEDIATE')
             if connection.execute('SELECT count(*) FROM configurations').fetchone()[0] == 0:
-                payload = {'config_version': 1, 'worker': {'max_concurrent_jobs': settings.max_concurrent_jobs},
+                payload = {'config_version': 1, 'worker': {},
                     'rclone': {'transfers': 1, 'checkers': 2, 'buffer_size_mib': 8,
                                'multi_thread_streams': 0, 'stats_interval_seconds': 1}}
                 self.insert(connection, payload)

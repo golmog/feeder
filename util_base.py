@@ -1023,6 +1023,31 @@ class FeederUtil:
         return destination
 
     @classmethod
+    def get_upload_options(cls, profile: dict | None, engine_name: str = '') -> dict:
+        """목적지 > 프로필 > 엔진 > 전역 순서로 전송 스위치를 해석한다."""
+        profile = profile or {}
+        engine = cls.get_downloader_by_name(engine_name) or {}
+        keys = {'use_gdrive_pool': 'download_use_gdrive_pool',
+                'use_impersonate': 'download_gdrive_use_impersonate',
+                'use_local_staging': 'download_use_local_staging'}
+        options = {key: P.ModelSetting.get_bool(global_key) for key, global_key in keys.items()}
+        override = next((value for name, value in (profile.get('destination_by_engine') or {}).items()
+                         if str(name).strip().lower() == str(engine_name or '').strip().lower()
+                         and isinstance(value, dict)), {})
+        modes = {'direct': (False, False), 'rotation': (True, False), 'impersonate': (True, True)}
+        for layer in (engine, profile, profile.get('destination') or {}, override):
+            if layer.get('gdrive_mode') in modes:
+                options['use_gdrive_pool'], options['use_impersonate'] = modes[layer['gdrive_mode']]
+            for key in keys:
+                if layer.get(key) is not None:
+                    options[key] = str(layer[key]).lower() in ('true', 'on', '1')
+            if layer.get('type') == 'gdrive_rotation':
+                options['use_gdrive_pool'] = True
+        if cls.get_profile_destination(profile, engine_name).get('type') == 'gdrive_rotation':
+            options['use_gdrive_pool'] = True
+        return options
+
+    @classmethod
     def save_download_profile(cls, item: dict) -> str:
         data = cls.load_yaml()
         profiles = data.get('DOWNLOAD_PROFILES', [])

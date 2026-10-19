@@ -7,7 +7,7 @@ import sqlite3
 import uuid
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class Database:
@@ -63,6 +63,8 @@ class Database:
                     connection.execute('ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0')
                 if 'exclude_patterns' not in columns:
                     connection.execute("ALTER TABLE jobs ADD COLUMN exclude_patterns TEXT NOT NULL DEFAULT '[]'")
+                if 'drive_impersonate' not in columns:
+                    connection.execute("ALTER TABLE jobs ADD COLUMN drive_impersonate TEXT NOT NULL DEFAULT ''")
                 connection.execute('''CREATE TABLE IF NOT EXISTS job_logs (
                     id INTEGER PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(job_id),
                     timestamp TEXT NOT NULL, message TEXT NOT NULL

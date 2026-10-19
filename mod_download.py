@@ -21,6 +21,7 @@ from .task_download import TaskDownload, TaskDownloadBase
 from .util_upload import UploadUtil
 from .util_remote_worker import RemoteWorker
 from .remote_worker_client import WorkerError
+from .util_download_activity import DownloadActivity
 
 name = 'download'
 
@@ -206,9 +207,10 @@ class ModuleDownload(PluginModuleBase):
                     health = client.health()
                     configuration = client.configuration()
                     version = tuple(int(part) for part in health.get('version', '').split('.'))
-                    if version < (0, 5, 0):
-                        raise WorkerError('워커 0.5.0 이상으로 업데이트해주세요.')
-                    return jsonify({'ret': 'success', 'msg': f"워커 {health['version']} 연결됨 · 실행 {health['active_jobs']} / 대기 {health['queued_jobs']} · 동시 {configuration['worker']['max_concurrent_jobs']}개"})
+                    if version < (0, 7, 0):
+                        raise WorkerError('워커 0.7.0 이상으로 업데이트해주세요.')
+                    limit = max(1, P.ModelSetting.get_int('download_upload_workers'))
+                    return jsonify({'ret': 'success', 'msg': f"워커 {health['version']} 연결됨 · 실행 {health['active_jobs']} / 대기 {health['queued_jobs']} · Feeder 동시 전송 설정 {limit}개"})
                 except WorkerError as exc:
                     message = '인증에 실패했습니다. 워커 설치 시 안내된 토큰을 확인해주세요.' if exc.status == 401 else str(exc)
                     return jsonify({'ret': 'fail', 'msg': message})
@@ -801,7 +803,18 @@ class ModuleDownload(PluginModuleBase):
 
     def process_api(self, sub, req):
         try:
-            if sub == 'sse':
+            if sub == 'activity':
+                try:
+                    cursor = max(0, int(req.headers.get('Last-Event-ID') or req.args.get('after', 0)))
+                except (TypeError, ValueError):
+                    cursor = 0
+                if req.args.get('snapshot') == '1':
+                    return jsonify({'entries': DownloadActivity.read(cursor), 'timestamp': time.time()})
+                response = Response(stream_with_context(self.generate_activity_stream(cursor)), mimetype='text/event-stream')
+                response.headers['Cache-Control'] = 'no-cache'
+                response.headers['X-Accel-Buffering'] = 'no'
+                return response
+            elif sub == 'sse':
                 response = Response(
                     stream_with_context(self.generate_sse_stream()),
                     mimetype='text/event-stream'
@@ -1042,6 +1055,22 @@ class ModuleDownload(PluginModuleBase):
         ).all()}
         total = len(occupied | waiting)
         return {'uploading': total, 'upload_current': len(occupied), 'upload_total': total}
+
+    def generate_activity_stream(self, cursor=0):
+        """엔진 상태 조회와 독립적으로 작업 활동과 수신 확인 신호를 전송한다."""
+        yield 'retry: 3000\n\n'
+        while True:
+            try:
+                entries = DownloadActivity.read(cursor)
+                data = json.dumps({'entries': entries, 'timestamp': time.time()}, ensure_ascii=False)
+                if entries:
+                    cursor = entries[-1]['id']
+                    yield f'id: {cursor}\ndata: {data}\n\n'
+                else:
+                    yield f'data: {data}\n\n'
+            except (OSError, sqlite3.Error):
+                yield 'event: activity_error\ndata: {}\n\n'
+            time.sleep(3)
 
     def generate_sse_stream(self):
         """실시간 대시보드용 SSE 스트림 (통계 카운트 + 활성 작업 목록 동시 전송)"""

@@ -20,19 +20,19 @@ class ConflictError(ValueError):
 
 
 def validate_payload(payload, settings) -> dict:
-    if not isinstance(payload, dict) or set(payload) - {'job_id', 'source', 'destination', 'config_version', 'exclude_patterns'}:
-        raise ValueError('job_id, source, destination, config_version, exclude_patterns만 지정할 수 있습니다.')
+    if not isinstance(payload, dict) or set(payload) - {'job_id', 'source', 'destination', 'config_version', 'exclude_patterns', 'drive_impersonate'}:
+        raise ValueError('job_id, source, destination, config_version, exclude_patterns, drive_impersonate만 지정할 수 있습니다.')
     job_id = payload.get('job_id')
     if not isinstance(job_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', job_id):
         raise ValueError('job_id는 영문·숫자로 시작하는 1~128자의 영문·숫자·점·밑줄·하이픈이어야 합니다.')
-    settings.validate_remotes()
-    for field, allowed in (('source', settings.source_remotes), ('destination', settings.destination_remotes)):
+    remotes = settings.validate_remotes()
+    for field, allowed in remotes.items():
         value = payload.get(field)
         if not isinstance(value, str) or not 1 <= len(value) <= 4096 or any(ord(c) < 32 or ord(c) == 127 for c in value):
             raise ValueError(f'{field}의 경로가 유효하지 않습니다.')
         match = re.fullmatch(r'([A-Za-z0-9_-]+):(.+)', value)
         if not match or match[1] not in allowed:
-            raise ValueError(f'{field}에는 허용된 리모트의 비어 있지 않은 경로를 지정해주세요.')
+            raise ValueError(f'{field}에는 워커 Rclone 설정에 정의된 지원 타입의 리모트 경로를 지정해주세요.')
         decoded = match[2]
         for _ in range(3):
             decoded = unquote(decoded)
@@ -46,6 +46,12 @@ def validate_payload(payload, settings) -> dict:
     if type(version) is not int or version < 1:
         raise ValueError('config_version은 양의 정수여야 합니다.')
     result = {**{key: payload[key] for key in ('job_id', 'source', 'destination')}, 'config_version': version}
+    if 'drive_impersonate' in payload:
+        email = payload['drive_impersonate']
+        if (not isinstance(email, str) or len(email) > 254 or
+                (email and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._%+-]{0,63}@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', email))):
+            raise ValueError('drive_impersonate에는 위임할 계정 이메일을 지정해주세요.')
+        result['drive_impersonate'] = email
     if 'exclude_patterns' in payload:
         patterns = payload['exclude_patterns']
         if (not isinstance(patterns, list) or len(patterns) > 128 or
@@ -111,6 +117,8 @@ class JobStore:
                         raise ConflictError('동일 job_id에 다른 작업 내용이 등록되어 있습니다.')
                     if json.loads(row['exclude_patterns']) != data.get('exclude_patterns', []):
                         raise ConflictError('동일 job_id의 전송 제외 패턴이 다릅니다.')
+                    if row['drive_impersonate'] != data.get('drive_impersonate', ''):
+                        raise ConflictError('동일 job_id의 위임 계정이 다릅니다.')
                     return as_dict(row)
                 if connection.execute('SELECT 1 FROM cancelled_job_ids WHERE job_id=?', (data['job_id'],)).fetchone():
                     raise ConflictError('등록 전에 취소된 작업 ID입니다.')
@@ -121,6 +129,8 @@ class JobStore:
                                    (data['job_id'], data['source'], data['destination'], now(), data['config_version']))
                 connection.execute('UPDATE jobs SET exclude_patterns=? WHERE job_id=?',
                     (json.dumps(data.get('exclude_patterns', [])), data['job_id']))
+                connection.execute('UPDATE jobs SET drive_impersonate=? WHERE job_id=?',
+                    (data.get('drive_impersonate', ''), data['job_id']))
                 self.log(connection, data['job_id'], '작업 등록')
                 self.event(connection, data['job_id'], 'job.queued')
                 self.commit(connection)
@@ -176,12 +186,6 @@ class JobStore:
     def claim(self, respect_limit=True):
         with closing(self.database.connect()) as connection:
             connection.execute('BEGIN IMMEDIATE')
-            if respect_limit:
-                from .configuration import Configurations
-                limit = Configurations.read(connection)['worker']['max_concurrent_jobs']
-                running = connection.execute("SELECT count(*) FROM jobs WHERE status='running'").fetchone()[0]
-                if running >= limit:
-                    return None
             row = connection.execute("SELECT * FROM jobs WHERE status='queued' ORDER BY created_at,rowid LIMIT 1").fetchone()
             if row is None:
                 return None

@@ -14,7 +14,7 @@ from .events import Events
 from .configuration import Configurations
 
 
-VERSION = '0.5.0'
+VERSION = '0.7.0'
 
 
 def create_app(settings: Settings | None = None) -> Flask:

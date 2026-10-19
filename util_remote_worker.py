@@ -89,12 +89,28 @@ class RemoteWorker:
         return value
 
     @classmethod
-    def prepare(cls, item, client, configuration):
+    def prepare(cls, item, client, configuration, allocation=None):
         from .util_download import DownloadUtil
         from .util_block import DownloadBlock
         profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
         dest = FeederUtil.get_profile_destination(profile, item.current_engine_name)
-        remote = str(dest.get('remote_name') or '').strip()
+        options = FeederUtil.get_upload_options(profile, item.current_engine_name)
+        mode, account = allocation if allocation is not None else ('shareddrive', None)
+        impersonate = []
+        if options['use_gdrive_pool'] and allocation is not None:
+            if not account or not account.get('username'):
+                raise WorkerError('업로드에 사용할 계정 풀 항목이 없습니다.')
+            if options['use_impersonate']:
+                remote = dest.get('mydrive_remote_name') or dest.get('remote_name') or P.ModelSetting.get('download_gdrive_mydrive_remote_name')
+                email = account['username']
+                if len(email) > 254 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._%+-]{0,63}@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', email):
+                    raise WorkerError('계정 풀의 위임 이메일을 확인해주세요.')
+                impersonate = ['--drive-impersonate', account['username']]
+            else:
+                remote = account.get('remote_name')
+        else:
+            remote = dest.get('remote_name') or P.ModelSetting.get('download_rclone_upload_remote_name')
+        remote = str(remote or '').strip()
         drive = str(dest.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or '').strip()
         if not re.fullmatch(r'[A-Za-z0-9_-]+', remote) or not re.fullmatch(r'[A-Za-z0-9_-]+', drive):
             raise WorkerError('원격 서버와 로컬에 동일한 Drive 리모트명과 목적지 드라이브 ID가 필요합니다.')
@@ -103,8 +119,8 @@ class RemoteWorker:
             raise WorkerError('원격 워커는 WebDAV 리모트 소스만 전송할 수 있습니다.')
         incoming = cls._relative(dest.get('upload_path'))
         final = cls._relative(dest.get('complete_path'))
-        if not incoming.startswith('feeder-worker-incoming/') or final.split('/')[0] == 'feeder-worker-incoming':
-            raise WorkerError('임시 경로는 feeder-worker-incoming/ 아래, 최종 경로는 그 밖으로 지정해주세요.')
+        if incoming == final or incoming.startswith(final + '/') or final.startswith(incoming + '/'):
+            raise WorkerError('임시 업로드 경로와 최종 완료 경로가 서로 겹치지 않도록 지정해주세요.')
         conf = P.ModelSetting.get('download_rclone_conf_path') or FeederUtil.load_yaml().get('rclone', {}).get('conf_path', '')
         parsed = configparser.RawConfigParser()
         try:
@@ -117,23 +133,36 @@ class RemoteWorker:
         if not folder or folder in ('.', '..') or any(char in folder for char in '/\\'):
             raise WorkerError('안전한 작업 폴더명을 확인하지 못했습니다.')
         prefix = f'{remote}:{{{drive}}}'
-        target = f'{prefix}/{incoming}/{folder}'
+        shared_target = f'{prefix}/{incoming}/{folder}'
+        if mode == 'mydrive':
+            account_drive = str((account or {}).get('mydrive_rclone_id') or '')
+            if not re.fullmatch(r'[A-Za-z0-9_-]+', account_drive):
+                raise WorkerError('선택한 계정의 MyDrive 폴더 ID를 확인해주세요.')
+            target = f'{remote}:{{{account_drive}}}/{incoming}/{folder}'
+        else:
+            target = shared_target
         payload = {'job_id': f'feeder-{item.id}-{uuid.uuid4().hex}', 'source': source,
                    'destination': target, 'config_version': configuration['config_version'],
                    'exclude_patterns': FeederUtil.get_rclone_exclude_options()[1::2]}
-        state = {'phase': 'copying', 'mode': 'shareddrive', 'uses_pool': False,
-                 'account': 'RemoteWorker', 'remote': remote, 'rclone_conf': conf, 'impersonate_arg': [],
-                 'incoming': target, 'shared_incoming': target, 'dest_parent': f'{prefix}/{final}',
+        if impersonate:
+            payload['drive_impersonate'] = impersonate[1]
+        account_name = account['username'] if account else 'RemoteWorker'
+        state = {'phase': 'copying', 'mode': mode, 'uses_pool': bool(account),
+                 'account': account_name, 'remote': remote, 'rclone_conf': conf, 'impersonate_arg': impersonate,
+                 'incoming': target, 'shared_incoming': shared_target, 'dest_parent': f'{prefix}/{final}',
                  'folder_name': folder, 'local_path': source, 'is_remote_source': True,
                  'engine_name': item.current_engine_name, 'engine_task_id': item.engine_task_id,
                  'worker': {'endpoint': client.endpoint, 'job_id': payload['job_id'], 'payload': payload, 'settled': False}}
         if DownloadBlock.stopped(item.id): raise WorkerError('차단 또는 취소된 작업입니다.')
         item.file_name = folder
-        item.gdrive_account = 'RemoteWorker'
+        item.gdrive_account = account_name
         item.status = 'uploading'
         item.upload_state = state
         db.session.add(ModelDownloadStat(stat_type='gdrive_usage', stat_key='SHARED_DRIVE_UPLOAD',
             stat_value=float(item.file_size or 0), timestamp=int(time.time())))
+        if account:
+            db.session.add(ModelDownloadStat(stat_type='gdrive_usage', stat_key=account_name,
+                stat_value=float(item.file_size or 0), timestamp=int(time.time())))
         db.session.commit()
         return state
 
@@ -179,10 +208,14 @@ class RemoteWorker:
             return True
         if action in ('retry', 'delete') and state.get('phase') == 'copying':
             folder, path = state.get('folder_name'), state.get('incoming', '')
-            if not folder or '/feeder-worker-incoming/' not in path or not path.endswith('/'+folder):
+            relative = re.fullmatch(r'[A-Za-z0-9_-]+:\{[A-Za-z0-9_-]+\}/(.+)', path)
+            destination = (state.get('worker', {}).get('payload') or {}).get('destination')
+            if (not folder or folder in ('.', '..') or any(char in folder for char in '/\\') or
+                    not relative or path != destination or not path.endswith('/' + folder) or
+                    '/' not in cls._relative(relative.group(1))):
                 raise WorkerError('원격 작업의 안전한 임시 경로를 확인하지 못했습니다.')
             success, output = UploadUtil.run_rclone(['rclone', 'purge', path, '--config', state['rclone_conf'],
-                '--drive-use-trash=false'], '원격 작업 임시 파일 정리', execution_timeout=60)
+                '--drive-use-trash=false'] + state.get('impersonate_arg', []), '원격 작업 임시 파일 정리', execution_timeout=60)
             if not success and not any(word in output.lower() for word in ('directory not found', 'object not found', "doesn't exist")):
                 raise WorkerError('원격 임시 파일 정리가 끝나지 않았습니다. 다시 시도해주세요.')
             item.upload_state = None
@@ -207,7 +240,7 @@ class RemoteWorker:
     def execute(cls, item, manager):
         from .util_upload import UploadUtil
         from .util_block import DownloadBlock
-        item_id, hub = item.id, None
+        item_id, hub, held_account = item.id, None, None
         try:
             state = dict(item.upload_state or {})
             if state.get('worker') and state.get('phase') in ('uploaded', 'shared_incoming', 'moved'):
@@ -218,18 +251,26 @@ class RemoteWorker:
                     while True:
                         if FeederUtil.is_download_paused() or DownloadBlock.stopped(item_id): return False
                         health, configuration = client.health(), client.configuration()
-                        if tuple(int(n) for n in health.get('version', '0').split('.')[:3]) < (0, 5, 0):
-                            raise WorkerError('원격 워커 0.5.0 이상이 필요합니다.')
-                        if health['active_jobs'] + health['queued_jobs'] < configuration['worker']['max_concurrent_jobs']:
+                        if tuple(int(n) for n in health.get('version', '0').split('.')[:3]) < (0, 7, 0):
+                            raise WorkerError('Feeder 동시 전송 설정을 적용하려면 원격 워커 0.7.0 이상이 필요합니다.')
+                        limit = max(1, P.ModelSetting.get_int('download_upload_workers'))
+                        if health['active_jobs'] + health['queued_jobs'] < limit:
                             break
                         db.session.remove()
                         time.sleep(1)
                     target = db.session.get(ModelDownload, item_id)
                     if not target or DownloadBlock.stopped(item_id): return False
-                    mode, _, reason = manager.allocate_account(target.file_size or 0, use_pool=False)
+                    profile = FeederUtil.get_download_profile_by_feed(target.feed_name) or {}
+                    options = FeederUtil.get_upload_options(profile, target.current_engine_name)
+                    mode, account, reason = manager.allocate_account(target.file_size or 0, use_pool=options['use_gdrive_pool'])
                     if mode in ('wait', 'skip'):
-                        return cls.defer(item_id, '공유 드라이브 업로드 한도 대기: ' + reason)
-                    state = cls.prepare(target, client, configuration)
+                        return cls.defer(item_id, '업로드 계정·한도 대기: ' + reason)
+                    held_account = account.get('username') if account else None
+                    state = cls.prepare(target, client, configuration, (mode, account))
+                elif state.get('uses_pool'):
+                    if not manager.reserve_existing_account(state['account']):
+                        return cls.defer(item_id, '이전 원격 작업의 계정 사용권을 기다립니다.')
+                    held_account = state['account']
                 remote = state['worker']
                 if remote.get('settled'):
                     raise WorkerError('종료된 원격 작업입니다. 항목의 재시도를 실행해주세요.')
@@ -242,8 +283,8 @@ class RemoteWorker:
                         cls.cancel_snapshot(state)
                         return False
                     health, configuration = client.health(), client.configuration()
-                    if health['active_jobs'] + health['queued_jobs'] >= configuration['worker']['max_concurrent_jobs']:
-                        return cls.defer(item_id, '워커의 실행 슬롯이 비기를 기다립니다.')
+                    if health['active_jobs'] + health['queued_jobs'] >= max(1, P.ModelSetting.get_int('download_upload_workers')):
+                        return cls.defer(item_id, 'Feeder 동시 전송 설정에 따라 기존 원격 작업의 완료를 기다립니다.')
                     job = client.submit(remote['payload'])
                 target = db.session.get(ModelDownload, item_id)
                 if (not target or DownloadBlock.stopped(item_id) or
@@ -264,6 +305,8 @@ class RemoteWorker:
                     raise WorkerError('등록했던 원격 작업이 없습니다. 같은 작업 ID를 유지하고 복구를 기다립니다.')
                 if job.get('source') != remote['payload']['source'] or job.get('destination') != remote['payload']['destination']:
                     raise WorkerError('원격 작업의 소스/목적지가 저장된 요청과 일치하지 않습니다.')
+                if job.get('drive_impersonate', '') != remote['payload'].get('drive_impersonate', ''):
+                    raise WorkerError('원격 작업의 위임 계정이 저장된 요청과 일치하지 않습니다.')
                 cls._progress(item_id, job)
                 status = job.get('status')
                 if status in ('completed', 'failed', 'cancelled'):
@@ -276,7 +319,7 @@ class RemoteWorker:
                         state['phase'] = 'uploaded'
                         target.upload_state = state
                         db.session.commit(); db.session.remove()
-                        return UploadUtil.resume_upload(item_id, manager)
+                        return UploadUtil.resume_upload(item_id, manager, account_reserved=bool(held_account))
                     target.upload_state = state
                     target.status = 'failed'
                     target.error_message = '원격 전송 실패: 항목 재시도 가능' if status == 'failed' else '원격 전송이 취소됐습니다.'
@@ -293,6 +336,7 @@ class RemoteWorker:
             return cls.defer(item_id, message)
         finally:
             if hub: hub.release()
+            if held_account: manager.release_account(held_account)
             FeederUtil.report_rclone_progress(item_id, {}, action='clear')
             db.session.remove()
 

@@ -68,6 +68,22 @@
   </div>
 </div>
 
+<div class="card mb-3">
+  <div class="card-header py-2 d-flex align-items-center justify-content-between flex-wrap">
+    <strong><i class="fa fa-list-alt mr-1"></i>작업 활동 로그</strong>
+    <div class="d-flex align-items-center my-1">
+      <span id="download_activity_connection" class="small text-muted mr-3">연결 중...</span>
+      <label class="small mb-0 mr-2"><input id="download_activity_follow" type="checkbox" checked> 자동 스크롤</label>
+      <button id="download_activity_clear" type="button" class="btn btn-sm btn-outline-secondary">화면 비우기</button>
+    </div>
+  </div>
+  <div class="card-body p-2">
+    <div id="download_activity_summary" class="small text-muted mb-1">최근 작업 기록을 불러오는 중입니다.</div>
+    <div id="download_activity_logs" class="small text-monospace" role="log" aria-live="polite" aria-relevant="additions" style="height: 160px; overflow-y: auto; overflow-wrap: anywhere; white-space: pre-wrap;"></div>
+    <div class="small text-muted mt-1">최근 200개 기록을 표시합니다. 사전 정리·피드 검토를 마친 뒤 업로드가 시작됩니다. 활동 시각과 SSE 수신 시각은 별개입니다.</div>
+  </div>
+</div>
+
 <div class="d-flex justify-content-between align-items-center mb-3">
   <div class="d-flex align-items-center flex-wrap">
     <h5 class="mb-0 font-weight-bold mr-2"><i class="fa fa-tasks mr-1"></i>실시간 활성 작업 큐 (Active Queue)</h5>

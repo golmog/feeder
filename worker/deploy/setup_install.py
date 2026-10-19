@@ -58,16 +58,11 @@ def configure(args):
     environment = root / '.env'
     if environment.exists():
         module.Settings.load(root, environ={})
-        if any(getattr(args, key) is not None for key in ('bind', 'port', 'rclone_config', 'rclone_binary', 'source_remotes', 'destination_remotes')):
+        if any(getattr(args, key) is not None for key in ('bind', 'port', 'rclone_config', 'rclone_binary')):
             raise ValueError('기존 .env를 보존합니다. 설정을 변경하려면 서비스를 중지하고 .env를 직접 수정해주세요.')
     else:
         binary = Path(args.rclone_binary or shutil.which('rclone') or '/usr/bin/rclone').expanduser()
         config = Path(args.rclone_config or Path.home() / '.config/rclone/rclone.conf').expanduser()
-        parser = configparser.RawConfigParser(interpolation=None)
-        with config.open(encoding='utf-8') as stream:
-            parser.read_file(stream)
-        sources = [name for name in parser.sections() if parser.get(name, 'type', fallback='') == 'webdav']
-        destinations = [name for name in parser.sections() if parser.get(name, 'type', fallback='') == 'drive']
         bind = args.bind
         if not bind:
             try:
@@ -79,8 +74,6 @@ def configure(args):
             'WORKER_API_TOKEN': secrets.token_urlsafe(48),
             'WORKER_BIND': bind, 'WORKER_PORT': str(args.port or 8000),
             'WORKER_RCLONE_BINARY': str(binary), 'WORKER_RCLONE_CONFIG': str(config),
-            'WORKER_SOURCE_REMOTES': choose(args.source_remotes, sources, '소스 Rclone 리모트 (--source-remotes)'),
-            'WORKER_DESTINATION_REMOTES': choose(args.destination_remotes, destinations, '목적지 Rclone 리모트 (--destination-remotes)'),
         }
         # 저장 전에 경로·IP·리모트 종류를 검증하고 비밀 값을 오류에 포함하지 않는다.
         module.Settings.load(root, environ=values)
@@ -140,7 +133,7 @@ def main():
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--source', type=Path)
     parser.add_argument('--show-connection', action='store_true')
-    for name in ('bind', 'port', 'rclone-config', 'rclone-binary', 'source-remotes', 'destination-remotes'):
+    for name in ('bind', 'port', 'rclone-config', 'rclone-binary'):
         parser.add_argument('--' + name)
     args = parser.parse_args()
     try:
@@ -158,7 +151,7 @@ def main():
         return 1
     except (OSError, configparser.Error):
         # 설정 내용과 인증 정보가 포함된 원시 예외는 출력하지 않는다.
-        print('설치 설정을 확인하지 못했습니다. IP·절대 경로·리모트 종류·기존 .env·파일 권한을 확인해주세요. 비대화형 설치라면 --bind와 리모트 옵션을 지정하세요.', file=sys.stderr)
+        print('설치 설정을 확인하지 못했습니다. IP·절대 경로·리모트 종류·기존 .env·파일 권한을 확인해주세요. 비대화형 설치라면 --bind, --rclone-config, --rclone-binary를 지정하세요.', file=sys.stderr)
         return 1
     return 0
 

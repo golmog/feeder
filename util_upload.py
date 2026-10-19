@@ -14,6 +14,7 @@ from sqlalchemy import func
 from .setup import *
 from .model_download import ModelDownload, ModelDownloadStat
 from .util_base import FeederUtil
+from .util_download_activity import DownloadActivity
 
 
 class UploadUtil:
@@ -309,7 +310,7 @@ class UploadUtil:
             )
             return {r[0]: int(r[1]) for r in rows if r[0]}
 
-        def allocate_account(self, file_size: int, use_pool: bool = True) -> tuple[str, dict | None, str]:
+        def allocate_account(self, file_size: int, use_pool: bool = True, exclude_accounts=None) -> tuple[str, dict | None, str]:
             with self.lock:
                 # 공유 드라이브 403 쿼터 차단 및 일일 한도 체크
                 if 'SHARED_DRIVE_UPLOAD' in self.blocked_accounts:
@@ -322,11 +323,23 @@ class UploadUtil:
                     return 'shareddrive', None, "기본 리모트 공유 드라이브 직행"
 
                 is_direct_shared = (file_size > self.threshold)
+                excluded = set(exclude_accounts or ())
+                # 통신 장애로 실행 스레드가 종료돼도 미확인 원격 작업의 계정은 재할당하지 않는다.
+                for (checkpoint,) in db.session.query(ModelDownload.upload_state).filter(
+                        ModelDownload.status != 'completed', ModelDownload.upload_state.isnot(None)).all():
+                    FeederUtil.cooperate()
+                    checkpoint = checkpoint or {}
+                    worker = checkpoint.get('worker')
+                    if checkpoint.get('uses_pool') and worker and (not worker.get('settled') or
+                            checkpoint.get('phase') in ('uploaded', 'shared_incoming')):
+                        excluded.add(checkpoint.get('account'))
 
                 # 계정 풀에서 24시간 사용량이 가장 적은 계정 선점 (직행 여부와 무관하게 항상 계정 할당)
                 sorted_accs = sorted(self.accounts, key=lambda x: self.usage_map.get(x.get('username'), 0))
                 for acc in sorted_accs:
                     uname = acc.get('username')
+                    if uname in excluded:
+                        continue
                     if uname in self.blocked_accounts:
                         continue
                     if uname not in self.busy_accounts:
@@ -341,6 +354,8 @@ class UploadUtil:
 
                 for acc in self.accounts:
                     uname = acc.get('username')
+                    if uname in excluded:
+                        continue
                     if uname not in self.blocked_accounts and self.usage_map.get(uname, 0) + file_size < self.limit_user:
                         return 'wait', None, "모든 가용 계정 작업 중 (대기)"
 
@@ -438,7 +453,7 @@ class UploadUtil:
         failed_ids = [row_id for (row_id,) in db.session.query(ModelDownload.id).filter_by(status='move_failed').all()]
         db.session.remove()
         all_ok = True
-        for item_id in failed_ids:
+        for item_id in DownloadActivity.track('사전 정리', failed_ids, '이동 실패 복구'):
             FeederUtil.cooperate()
             if FeederUtil.is_download_paused():
                 return False
@@ -448,72 +463,94 @@ class UploadUtil:
         rclone = config.get('rclone', {})
         conf = P.ModelSetting.get('download_rclone_conf_path') or rclone.get('conf_path', '')
         default_drive = P.ModelSetting.get('download_shared_drive_id') or rclone.get('shared_drive_id', '')
-        if not conf or not default_drive:
+        if not conf:
             return all_ok
         accounts = list(FeederUtil.get_gdrive_accounts())
-        if not P.ModelSetting.get_bool('download_use_gdrive_pool'):
-            default_remote = P.ModelSetting.get('download_rclone_upload_remote_name') or P.ModelSetting.get('download_gdrive_mydrive_remote_name') or rclone.get('mydrive_remote_name') or 'gdrive_sa'
-            accounts.append({'username': 'Default_Account', 'remote_name': default_remote})
-        protected = {account for (account,) in db.session.query(ModelDownload.gdrive_account).filter(
-            ModelDownload.status.in_(['uploading', 'pending_upload', 'blocked']),
-            ModelDownload.gdrive_account.isnot(None)
-        ).all()}
+        accounts.append({'username': 'Default_Account'})
+        protected = set()
         protected_shared_paths = set()
         for item in db.session.query(ModelDownload).filter(
-            ModelDownload.status.in_(['uploading', 'pending_upload', 'blocked']),
-            ModelDownload.gdrive_account.isnot(None)
+            ModelDownload.status.in_(['uploading', 'pending_upload', 'blocked']) |
+            ((ModelDownload.status != 'completed') & ModelDownload.upload_state.isnot(None))
         ).all():
             FeederUtil.cooperate()
             state = item.upload_state or {}
+            worker = state.get('worker') or {}
+            remote_pending = worker and (not worker.get('settled') or state.get('phase') in ('uploaded', 'shared_incoming'))
+            if item.status not in ('uploading', 'pending_upload', 'blocked') and not remote_pending:
+                continue
+            if item.gdrive_account:
+                protected.add(item.gdrive_account)
+            if worker and state.get('incoming'):
+                protected_shared_paths.add(state['incoming'].rstrip('/'))
             if state.get('shared_incoming'):
                 protected_shared_paths.add(state['shared_incoming'].rstrip('/'))
             elif item.gdrive_upload_path:
                 drive_id = item.gdrive_remote_id or default_drive
                 protected_shared_paths.add(f":{{{drive_id}}}/{item.gdrive_upload_path.strip('/')}")
         db.session.remove()
-        routes = [('incoming/default', 'uploads/default', default_drive)]
-        for profile in FeederUtil.get_download_profiles():
+        base_remote = P.ModelSetting.get('download_gdrive_mydrive_remote_name') or rclone.get('mydrive_remote_name') or 'gdrive_sa'
+        default_remote = P.ModelSetting.get('download_rclone_upload_remote_name') or base_remote
+        default_options = FeederUtil.get_upload_options(None)
+        routes = [('incoming/default', 'uploads/default', default_drive,
+                   default_options, base_remote if default_options['use_gdrive_pool'] else default_remote)] if default_drive else []
+        for profile in DownloadActivity.track('사전 정리', FeederUtil.get_download_profiles(), '프로필'):
             FeederUtil.cooperate()
             for engine_name in [''] + list((profile.get('destination_by_engine') or {}).keys()):
                 FeederUtil.cooperate()
                 dest = FeederUtil.get_profile_destination(profile, engine_name)
-                if dest.get('type') != 'gdrive_rotation':
+                if dest.get('type') not in ('gdrive_rotation', 'remote_worker'):
                     continue
+                options = FeederUtil.get_upload_options(profile, engine_name)
+                if not options['use_gdrive_pool']:
+                    route_remote = dest.get('remote_name') or default_remote
+                else:
+                    route_remote = dest.get('mydrive_remote_name') or (dest.get('remote_name') if dest.get('type') == 'remote_worker' else '') or base_remote
                 routes.append(((dest.get('upload_path') or 'incoming/default').strip('/'),
                                (dest.get('complete_path') or 'uploads/default').strip('/'),
-                               dest.get('shared_drive_id') or default_drive))
-        base_remote = P.ModelSetting.get('download_gdrive_mydrive_remote_name') or rclone.get('mydrive_remote_name') or 'gdrive_sa'
-        impersonate = P.ModelSetting.get_bool('download_gdrive_use_impersonate')
+                               dest.get('shared_drive_id') or default_drive,
+                               options, route_remote))
         drives = {}
 
-        def add_route(remote, drive_id, conf_args, upload, target):
+        def add_route(remote, drive_id, conf_args, upload, target, preserve_root=False):
             root = f'{remote}:{{{drive_id}}}' if drive_id else f'{remote}:'
             # 명시적인 드라이브 ID가 있으면 인증 계정이 달라도 같은 드라이브다.
             key = (remote, drive_id, conf) if drive_id else (root, tuple(conf_args))
-            entry = drives.setdefault(key, {'root': root, 'args': conf_args, 'routes': {}})
+            entry = drives.setdefault(key, {'root': root, 'args': conf_args, 'routes': {}, 'preserve_roots': set()})
             source = f'{root}/{upload}'
             if source != target:
                 entry['routes'].setdefault(upload, target)
+                if preserve_root:
+                    entry['preserve_roots'].add(upload)
 
-        for account in accounts:
+        for upload, complete, drive, options, route_remote in DownloadActivity.track('사전 정리', routes, '경로 구성'):
             FeederUtil.cooperate()
-            username = account.get('username')
-            if not username or username in protected:
+            if not drive:
                 continue
-            use_identity = impersonate and username != 'Default_Account'
-            remote = base_remote if use_identity else account.get('remote_name') or base_remote
-            identity = ['--drive-impersonate', username] if use_identity else []
-            conf_args = ['--config', conf] + identity
-            for upload, complete, drive in routes:
+            for account in accounts:
                 FeederUtil.cooperate()
+                username = account.get('username')
+                if not username or username in protected:
+                    continue
+                if username == 'Default_Account':
+                    if options['use_gdrive_pool']:
+                        continue
+                    remote = route_remote
+                    identity = []
+                else:
+                    use_identity = options['use_impersonate']
+                    remote = route_remote if use_identity else account.get('remote_name') or route_remote
+                    identity = ['--drive-impersonate', username] if use_identity else []
+                conf_args = ['--config', conf] + identity
                 target = f'{remote}:{{{drive}}}/{complete}'
                 add_route(remote, account.get('mydrive_rclone_id'), conf_args, upload, target)
-                add_route(remote, drive, conf_args, upload, target)
+                add_route(remote, drive, conf_args, upload, target, preserve_root=True)
 
         drives = [entry for entry in drives.values() if entry['routes']]
         if not drives:
             return all_ok
         logger.info(f'[UploadUtil] 업로드 전 원격 잔여 파일 확인 시작 (중복 제거 후 드라이브: {len(drives)}개)')
+        DownloadActivity.record('사전 정리', f'원격 잔여 파일 확인 · 드라이브 {len(drives)}개')
         moved = cleaned = 0
         cleanups = []
         for index, entry in enumerate(drives, 1):
@@ -535,6 +572,7 @@ class UploadUtil:
             for parent in sorted(parents):
                 filters += ['--include', f'/{parent}/**']
             logger.info(f'[UploadUtil] 잔여 파일 목록 조회 ({index}/{len(drives)}): {root}')
+            DownloadActivity.record('사전 정리', f'드라이브 {index}/{len(drives)} 잔여 파일 조회 중')
             success, out = cls.run_rclone(
                 ['rclone', 'lsjson', root, '--recursive', '--disable', 'ListR', '--no-mimetype', '--no-modtime'] + filters + conf_args,
                 log_output=False, execution_timeout=60)
@@ -542,6 +580,7 @@ class UploadUtil:
                 if 'directory not found' not in out.lower():
                     all_ok = False
                     logger.warning(f'[UploadUtil] 잔여 파일 목록 조회 실패: {root}: {out[:300]}')
+                    DownloadActivity.record('사전 정리', f'드라이브 {index}/{len(drives)} 목록 조회 실패 · 새 업로드를 보류합니다.', 'warning')
                 continue
             try:
                 rows = json.loads(out)
@@ -553,7 +592,7 @@ class UploadUtil:
                 all_ok = False
                 logger.warning(f'[UploadUtil] 잔여 파일 목록 해석 실패: {root}: {ex}')
                 continue
-            for upload, target in entry['routes'].items():
+            for upload, target in DownloadActivity.track('사전 정리', list(entry['routes'].items()), '이동 경로', f'드라이브 {index}/{len(drives)}'):
                 FeederUtil.cooperate()
                 if FeederUtil.is_download_paused():
                     return False
@@ -564,9 +603,12 @@ class UploadUtil:
                     logger.info(f'[UploadUtil] 대기/진행 중인 업로드 경로 보호: {root}/{upload}')
                     continue
                 source = f'{root}/{upload}'
+                # 공유 드라이브의 프로필 폴더 자체는 이동하거나 삭제하지 않는다.
+                move_options = ['--disable', 'DirMove'] if upload in entry['preserve_roots'] else ['--delete-empty-src-dirs']
                 logger.info(f'[UploadUtil] 잔여 파일 최종 경로 이동: {source}')
+                DownloadActivity.record('사전 정리', f'드라이브 {index}/{len(drives)} 잔여 파일 {len(matched)}개를 최종 경로로 이동 중')
                 success, out = cls.run_rclone(
-                    ['rclone', 'move', source, target, '--delete-empty-src-dirs',
+                    ['rclone', 'move', source, target] + move_options + [
                      '--drive-server-side-across-configs', '--drive-use-trash=false'] + conf_args,
                     '리모트 잔여 파일 최종 경로 복구', execution_timeout=60)
                 if not success:
@@ -575,25 +617,35 @@ class UploadUtil:
                 else:
                     moved += 1
                     files.difference_update(matched)
+            preserve_roots = entry['preserve_roots']
+            cleanup_paths = [(upload, True) for upload in sorted(preserve_roots)]
             for parent in sorted(parents):
-                # 최상위 스테이징 경로만 한 번 정리한다.
-                if any(parent.startswith(other + '/') for other in parents):
+                # MyDrive는 최상위 임시 경로를 정리하되 공유 드라이브의 프로필 경로는 보호한다.
+                if any(parent.startswith(other + '/') for other in parents) or any(
+                        path == parent or path.startswith(parent + '/') or parent.startswith(path + '/')
+                        for path in preserve_roots):
+                    continue
+                cleanup_paths.append((parent, False))
+            for parent, leave_root in cleanup_paths:
+                # 중첩된 프로필 경로가 있으면 상위 경로의 일괄 정리를 피한다.
+                if any(path.startswith(parent + '/') for path in preserve_roots):
                     continue
                 if any(path == parent or path.startswith(parent + '/') or parent.startswith(path + '/') for path in blocked):
                     continue
                 if any(path == parent or path.startswith(parent + '/') for path in files):
                     continue
                 if any(path == parent or path.startswith(parent + '/') for path in directories):
-                    cleanups.append((f'{root}/{parent}', conf_args))
+                    cleanups.append((f'{root}/{parent}', conf_args, leave_root))
 
         # 이동이 모두 끝난 뒤 rmdirs로 빈 폴더만 제거한다.
-        for parent, conf_args in cleanups:
+        for parent, conf_args, leave_root in DownloadActivity.track('사전 정리', cleanups, '빈 폴더 정리 경로'):
             FeederUtil.cooperate()
             if FeederUtil.is_download_paused():
                 return False
             logger.info(f'[UploadUtil] 원격 빈 폴더 정리: {parent}')
+            DownloadActivity.record('사전 정리', '파일 이동 후 빈 작업 폴더 정리 중')
             success, out = cls.run_rclone(
-                ['rclone', 'rmdirs', parent, '--drive-use-trash=false'] + conf_args,
+                ['rclone', 'rmdirs', parent, '--drive-use-trash=false'] + (['--leave-root'] if leave_root else []) + conf_args,
                 '원격 스테이징 빈 폴더 정리', execution_timeout=60)
             if not success and 'directory not found' not in out.lower():
                 all_ok = False
@@ -601,6 +653,7 @@ class UploadUtil:
             else:
                 cleaned += 1
         logger.info(f'[UploadUtil] 업로드 전 원격 복구 종료 (드라이브: {len(drives)}개, 이동: {moved}개, 빈 경로 정리: {cleaned}개, 완료: {all_ok})')
+        DownloadActivity.record('사전 정리', f'원격 복구 {"완료" if all_ok else "미완료"} · 이동 경로 {moved}개, 빈 경로 정리 {cleaned}개', 'info' if all_ok else 'warning')
         return all_ok
 
     @classmethod
@@ -627,12 +680,13 @@ class UploadUtil:
             return True
         profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
         dest = FeederUtil.get_profile_destination(profile, item.current_engine_name)
+        options = FeederUtil.get_upload_options(profile, item.current_engine_name)
         cfg = FeederUtil.load_yaml().get('rclone', {})
         account = next((a for a in FeederUtil.get_gdrive_accounts() if a.get('username') == item.gdrive_account), {})
         base_remote = dest.get('mydrive_remote_name') or P.ModelSetting.get('download_gdrive_mydrive_remote_name') or cfg.get('mydrive_remote_name') or 'gdrive_sa'
-        if item.gdrive_account == 'Default_Account' or not P.ModelSetting.get_bool('download_use_gdrive_pool'):
+        if item.gdrive_account == 'Default_Account' or not state.get('uses_pool', options['use_gdrive_pool']):
             selected_remote = P.ModelSetting.get('download_rclone_upload_remote_name') or base_remote
-        elif P.ModelSetting.get_bool('download_gdrive_use_impersonate'):
+        elif options['use_impersonate']:
             selected_remote = base_remote
         else:
             selected_remote = account.get('remote_name') or base_remote
@@ -648,7 +702,7 @@ class UploadUtil:
         conf = state.get('rclone_conf') or P.ModelSetting.get('download_rclone_conf_path') or cfg.get('conf_path', '')
         impersonate = state.get('impersonate_arg')
         if impersonate is None:
-            impersonate = ['--drive-impersonate', item.gdrive_account] if P.ModelSetting.get_bool('download_gdrive_use_impersonate') and item.gdrive_account and item.gdrive_account != 'Default_Account' else []
+            impersonate = ['--drive-impersonate', item.gdrive_account] if options['use_impersonate'] and item.gdrive_account and item.gdrive_account != 'Default_Account' else []
         conf_args = ['--config', conf] + impersonate
         candidates = [state.get('incoming'), state.get('shared_incoming')]
         if account.get('mydrive_rclone_id'):
@@ -762,7 +816,8 @@ class UploadUtil:
 
         profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
         dest_cfg = FeederUtil.get_profile_destination(profile, item.current_engine_name)
-        use_pool = P.ModelSetting.get_bool('download_use_gdrive_pool')
+        options = FeederUtil.get_upload_options(profile, item.current_engine_name)
+        use_pool = options['use_gdrive_pool']
         remote_sa = dest_cfg.get('mydrive_remote_name') or P.ModelSetting.get('download_gdrive_mydrive_remote_name') or rclone_cfg.get('mydrive_remote_name') or 'gdrive_sa'
         target_drive_id = dest_cfg.get('shared_drive_id') or item.gdrive_remote_id or P.ModelSetting.get('download_shared_drive_id') or rclone_cfg.get('shared_drive_id', '')
         if not target_drive_id:
@@ -780,7 +835,7 @@ class UploadUtil:
         acc_name = acc.get('username') if acc else 'Default_Account'
 
         try:
-            use_impersonate = P.ModelSetting.get_bool('download_gdrive_use_impersonate')
+            use_impersonate = options['use_impersonate']
             if not use_pool:
                 effective_remote = P.ModelSetting.get('download_rclone_upload_remote_name') or remote_sa
                 impersonate_arg = []
