@@ -32,7 +32,7 @@ class DownloadActivity:
 
     @classmethod
     def record(cls, stage, message, level='info'):
-        """인증 정보나 원본 오류 대신 화면에 공개할 진행 설명만 전달한다."""
+        """진행 설명과 인증 정보를 제거한 오류를 화면에 전달한다."""
         try:
             connection = cls._connect()
             try:

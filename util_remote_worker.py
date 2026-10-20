@@ -11,6 +11,8 @@ from .setup import *
 from .util_base import FeederUtil
 from .model_download import ModelDownload, ModelDownloadStat
 from .remote_worker_client import WorkerClient, WorkerError, WorkerEvents
+from .worker.rclone_logging import redact_log
+from .util_download_activity import DownloadActivity
 
 
 class RemoteWorker:
@@ -322,7 +324,17 @@ class RemoteWorker:
                         return UploadUtil.resume_upload(item_id, manager, account_reserved=bool(held_account))
                     target.upload_state = state
                     target.status = 'failed'
-                    target.error_message = '원격 전송 실패: 항목 재시도 가능' if status == 'failed' else '원격 전송이 취소됐습니다.'
+                    if status == 'failed':
+                        details = [redact_log(line, (P.ModelSetting.get('download_worker_token'),))
+                                   for line in str(job.get('error_message') or '상세 오류 없음').splitlines()[-9:]]
+                        message = f"원격 전송 실패 (종료 코드: {job.get('rclone_exit_code')})"
+                        target.error_message = message + '\n' + '\n'.join(details)
+                        logger.error('[RemoteWorker] 작업 %s: %s', item_id, target.error_message)
+                        DownloadActivity.record('원격 전송 오류', f'작업 {item_id} · {message}', 'error')
+                        for line in details:
+                            DownloadActivity.record('원격 전송 오류', f'작업 {item_id} · {line}', 'error')
+                    else:
+                        target.error_message = '원격 전송이 취소됐습니다.'
                     db.session.commit()
                     return False
                 if status not in ('queued', 'running'):

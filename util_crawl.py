@@ -195,6 +195,75 @@ class CrawlUtil:
         has_token = bool(cf_data.get('cf_clearance'))
         return has_token and (time.time() - timestamp < cls.CF_COOKIE_EXPIRY)
 
+    @staticmethod
+    def _is_challenge_html(source: str) -> bool:
+        """일반 페이지의 Turnstile 위젯과 브라우저 차단 화면을 구분한다."""
+        source = (source or '').lower()
+        title_match = re.search(r'<title\b[^>]*>(.*?)</title>', source, re.S)
+        title = unescape(re.sub(r'<[^>]+>', '', title_match.group(1))).strip() if title_match else source.strip()
+        if title in ('just a moment...', 'just a moment…', 'ddos-guard', 'attention required! | cloudflare', 'access denied'):
+            return True
+        return bool(re.search(r'''\bid\s*=\s*["'](?:cf-challenge-running|cf-please-wait|challenge-spinner|turnstile-wrapper|cf-error-details)["']''', source) or
+                    ('_cf_chl_opt' in source and 'challenge-platform' in source))
+
+    @classmethod
+    def _read_flaresolverr_solution(cls, response, host: str, require_html=True):
+        """API 응답·해결 메시지·반환 본문을 함께 확인하고 쿠키 유무와 별도로 판정한다."""
+        try:
+            data = response.json()
+        except ValueError:
+            logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 응답 형식 오류 (API HTTP {response.status_code}, JSON 아님)')
+            return None
+        if not isinstance(data, dict):
+            logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 응답 형식 오류 (API HTTP {response.status_code})')
+            return None
+        message = str(data.get('message') or '').replace('\n', ' ')[:300]
+        if response.status_code != 200 or data.get('status') != 'ok':
+            logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 처리 실패 (API HTTP {response.status_code}, status={data.get("status")}): {message or "원인 메시지 없음"}')
+            return None
+        solution = data.get('solution')
+        if not isinstance(solution, dict):
+            logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 응답 형식 오류: solution 없음')
+            return None
+        source = solution.get('response') or ''
+        if not isinstance(source, str):
+            logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 응답 형식 오류: HTML이 문자열이 아님')
+            return None
+        cookies = solution.get('cookies') or []
+        if not isinstance(cookies, list):
+            logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 응답 형식 오류: 쿠키 목록 확인 불가')
+            return None
+        cookies = [c for c in cookies if isinstance(c, dict) and isinstance(c.get('name'), str) and c['name'] and isinstance(c.get('value'), str)]
+        has_clearance = any(c['name'] == 'cf_clearance' and c['value'] for c in cookies)
+        if cls._is_challenge_html(source):
+            logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 반환 본문에 챌린지/차단 화면이 남아 있습니다 (응답 메시지: {message or "없음"})')
+            return None
+        try:
+            status = int(solution.get('status') or 200)
+        except (TypeError, ValueError):
+            status = 0
+        if status < 200 or status >= 400:
+            logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 대상 페이지 오류 응답 (solution.status={solution.get("status")})')
+            return None
+        if not source.strip() and (require_html or not has_clearance):
+            logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 정상 페이지 확인 불가: 반환 HTML 없음 (응답 메시지: {message or "없음"})')
+            return None
+        if source.strip():
+            try:
+                html.fromstring(source)
+            except (ValueError, html.etree.ParserError):
+                logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 반환 HTML 해석 실패')
+                return None
+        outcome = message.lower().strip().rstrip('!.')
+        if outcome == 'challenge not detected':
+            description = ('챌린지 미감지 · 쿠키 발급 없이 정상 페이지 수신' if not cookies else '챌린지 미감지 · 정상 페이지 수신') if source.strip() else '챌린지 미감지 · 인가 쿠키 수신'
+        elif outcome == 'challenge solved':
+            description = '챌린지 해결 응답 · 정상 페이지 수신' if source.strip() else '챌린지 해결 응답 · 인가 쿠키 수신'
+        else:
+            description = '페이지 수신 · 챌린지 감지 여부는 응답에서 확인 불가' if source.strip() else '인가 쿠키 수신 · 챌린지 감지 여부는 응답에서 확인 불가'
+        logger.info(f'[CrawlUtil] [{host}] FlareSolverr {description} (쿠키 {len(cookies)}개, cf_clearance {"있음" if has_clearance else "없음"})')
+        return dict(solution, cookies=cookies)
+
     @classmethod
     def _sync_clearance_to_sessions(cls, host: str):
         cookies = cls._cf_cookies.get(host, {})
@@ -285,17 +354,17 @@ class CrawlUtil:
             return None
 
         if use_fs and not cls._has_valid_clearance(host):
-            logger.info(f"[CrawlUtil] [{host}] Cloudflare 사이트 감지 -> FlareSolverr 최우선 인가 요청: {url}")
+            logger.info(f"[CrawlUtil] [{host}] 유효한 인가 쿠키 캐시 없음 -> 설정에 따라 FlareSolverr 우선 페이지 요청: {url}")
             for fs_try in range(1, effective_retries + 1):
                 tree, fs_html = cls.get_by_flaresolverr(url, proxies=proxies)
-                if fs_html and 'Just a moment...' not in fs_html and 'cf-turnstile' not in fs_html:
-                    logger.info(f"[CrawlUtil] [{host}] FlareSolverr 인가 및 1차 페이지 수신 완료")
+                if fs_html and not cls._is_challenge_html(fs_html):
+                    logger.info(f"[CrawlUtil] [{host}] FlareSolverr 1차 페이지 수신 완료")
                     return fs_html
                 if fs_try < effective_retries:
-                    logger.debug(f"[CrawlUtil] [{host}] FlareSolverr 초기 인가 재시도 ({fs_try}/{effective_retries})...")
+                    logger.debug(f"[CrawlUtil] [{host}] FlareSolverr 페이지 요청 재시도 ({fs_try}/{effective_retries})...")
                     time.sleep(retry_interval)
 
-            logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 초기 인가 {effective_retries}회 실패, HTTP 세션으로 폴백 시도")
+            logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 페이지 요청 {effective_retries}회 실패, HTTP 세션으로 폴백 시도")
 
         headers = cls.DEFAULT_HEADERS.copy()
         if host in cls._cf_user_agents:
@@ -330,7 +399,8 @@ class CrawlUtil:
                     cls._sync_clearance_to_sessions(host)
                     res = cffi_session.get(url, headers=headers, proxies=proxies, impersonate="chrome", timeout=25)
                     if res.status_code == 200:
-                        if 'Just a moment...' not in res.text and 'cf-turnstile' not in res.text:
+                        if not cls._is_challenge_html(res.text):
+                            logger.debug(f'[CrawlUtil] [{host}] 일반 HTTP 페이지 수신 성공 (curl_cffi)')
                             return res.text
                         logger.warning(f"[CrawlUtil] [{host}] Cloudflare 챌린지 감지 (HTTP 200 Turnstile) -> 인가 갱신 시도")
                     else:
@@ -347,7 +417,8 @@ class CrawlUtil:
                     cls._requests_sessions[host] = req_session
                 cls._sync_clearance_to_sessions(host)
                 res = req_session.get(url, headers=headers, proxies=proxies, timeout=25)
-                if res.status_code == 200 and 'Just a moment...' not in res.text and 'cf-turnstile' not in res.text:
+                if res.status_code == 200 and not cls._is_challenge_html(res.text):
+                    logger.debug(f'[CrawlUtil] [{host}] 일반 HTTP 페이지 수신 성공 (requests)')
                     return res.text
             except Exception as e:
                 logger.debug(f"[CrawlUtil] requests 폴백 실패 ({proxy_display} / {url}): {e}")
@@ -376,7 +447,7 @@ class CrawlUtil:
                 cls._cf_cookies.pop(host, None)
                 logger.warning(f"[CrawlUtil] [{host}] Cloudflare 재인가 시도 (새 프록시: {proxies.get('http') if proxies else 'Direct'}): {url}")
                 tree, source = cls.get_by_flaresolverr(url, proxies=proxies)
-                if source and 'Just a moment...' not in source and 'cf-turnstile' not in source:
+                if source and not cls._is_challenge_html(source):
                     logger.info(f"[CrawlUtil] [{host}] 새 프록시로 FlareSolverr 인가 및 페이지 수신 성공")
                     return source
 
@@ -389,6 +460,7 @@ class CrawlUtil:
     def get_by_flaresolverr(cls, url: str, proxies=None):
         fs_url = (P.ModelSetting.get('crawl_flaresolverr_url') or '').rstrip('/')
         if not fs_url:
+            logger.warning('[CrawlUtil] FlareSolverr 주소가 없어 페이지 요청을 실행하지 못했습니다.')
             return None, None
 
         parsed = urlparse(url)
@@ -424,30 +496,19 @@ class CrawlUtil:
 
         try:
             res = requests.post(f"{fs_url}/v1", json=payload, headers={'Content-Type': 'application/json'}, timeout=35)
-            if res.status_code == 200:
-                data = res.json()
-                if data.get('status') == 'ok':
-                    solution = data.get('solution', {})
-                    html_source = solution.get('response', '')
-                    tree = html.fromstring(html_source) if html_source else None
-
-                    ua = solution.get('userAgent')
-                    if ua:
-                        cls._cf_user_agents[host] = ua
-
-                    sol_cookies = solution.get('cookies') or []
-                    if sol_cookies:
-                        if host not in cls._cf_cookies:
-                            cls._cf_cookies[host] = {}
-                        for c in sol_cookies:
-                            cls._cf_cookies[host][c['name']] = c['value']
-                        cls._cf_cookies[host]['_timestamp'] = time.time()
-                        logger.info(f"[CrawlUtil] [{host}] FlareSolverr 쿠키 {len(sol_cookies)}개 동기화 완료")
-
-                    cls._sync_clearance_to_sessions(host)
-                    return tree, html_source
-                else:
-                    logger.warning(f"[CrawlUtil] FlareSolverr 오류 응답: {data.get('message')}")
+            solution = cls._read_flaresolverr_solution(res, host)
+            if solution is not None:
+                html_source = solution.get('response', '')
+                tree = html.fromstring(html_source)
+                ua = solution.get('userAgent')
+                if ua:
+                    cls._cf_user_agents[host] = ua
+                sol_cookies = solution['cookies']
+                if sol_cookies:
+                    cls._cf_cookies.setdefault(host, {}).update({c['name']: c['value'] for c in sol_cookies})
+                    cls._cf_cookies[host]['_timestamp'] = time.time()
+                cls._sync_clearance_to_sessions(host)
+                return tree, html_source
         except Exception as e:
             logger.warning(f"[CrawlUtil] FlareSolverr 통신 실패 ({url}): {e}")
             try:
@@ -459,9 +520,16 @@ class CrawlUtil:
 
     @classmethod
     def get_flaresolverr_clearance(cls, url: str, scheduler_instance=None, max_retries: int = None, retry_interval: float = None) -> tuple[list[dict], str]:
+        cookies, user_agent, _ = cls._get_flaresolverr_clearance_result(url, scheduler_instance, max_retries, retry_interval)
+        return cookies, user_agent
+
+    @classmethod
+    def _get_flaresolverr_clearance_result(cls, url: str, scheduler_instance=None, max_retries: int = None, retry_interval: float = None):
+        """쿠키가 필요 없었던 정상 응답도 성공으로 구분한다. 기존 공개 반환 형식은 유지한다."""
         fs_url = (P.ModelSetting.get('crawl_flaresolverr_url') or '').rstrip('/')
         if not fs_url:
-            return [], ""
+            logger.warning('[CrawlUtil] FlareSolverr 주소가 없어 인가/페이지 요청을 실행하지 못했습니다.')
+            return [], "", False
 
         parsed = urlparse(url)
         host = parsed.hostname or ''
@@ -508,32 +576,17 @@ class CrawlUtil:
 
             try:
                 res = requests.post(fs_endpoint, json=req_payload, headers={'Content-Type': 'application/json'}, timeout=55)
-                if res.status_code == 200:
-                    data = res.json()
-                    if data.get('status') == 'ok':
-                        solution = data.get('solution', {})
-                        sol_cookies = solution.get('cookies') or []
-                        user_agent = solution.get('userAgent') or ''
-                        html_resp = solution.get('response') or ''
-                        has_clearance = any(c.get('name') == 'cf_clearance' and c.get('value') for c in sol_cookies)
-                        is_challenge = any(k in html_resp for k in ["Just a moment...", "cf-turnstile", "challenge-platform"])
-
-                        if has_clearance or (not is_challenge and len(sol_cookies) > 0):
-                            if host not in cls._cf_cookies:
-                                cls._cf_cookies[host] = {}
-                            for c in sol_cookies:
-                                cls._cf_cookies[host][c['name']] = c['value']
-                            cls._cf_cookies[host]['_timestamp'] = time.time()
-                            if user_agent:
-                                cls._cf_user_agents[host] = user_agent
-
-                            cls._sync_clearance_to_sessions(host)
-                            logger.info(f"[CrawlUtil] [{host}] FlareSolverr 인가 성공 (쿠키 {len(sol_cookies)}개)")
-                            return sol_cookies, user_agent
-
-                        logger.warning(f"[CrawlUtil] [{host}] 챌린지 미해결 감지 -> 다음 프록시 전환")
-                    else:
-                        logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 응답 오류: {data.get('message')}")
+                solution = cls._read_flaresolverr_solution(res, host, require_html=False)
+                if solution is not None:
+                    sol_cookies = solution['cookies']
+                    user_agent = solution.get('userAgent') or ''
+                    if sol_cookies:
+                        cls._cf_cookies.setdefault(host, {}).update({c['name']: c['value'] for c in sol_cookies})
+                        cls._cf_cookies[host]['_timestamp'] = time.time()
+                    if user_agent:
+                        cls._cf_user_agents[host] = user_agent
+                    cls._sync_clearance_to_sessions(host)
+                    return sol_cookies, user_agent, True
             except Exception as e:
                 logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 통신 실패: {e}")
 
@@ -541,7 +594,7 @@ class CrawlUtil:
                 cls.rotate_proxy(scheduler_instance=scheduler_instance, reason="FlareSolverr 인가 실패 대응")
                 time.sleep(retry_interval)
 
-        return [], ""
+        return [], "", False
 
     @classmethod
     def solve_turnstile_checkbox(cls, driver, max_wait: int = 6) -> bool:
@@ -662,8 +715,8 @@ class CrawlUtil:
 
         raw_cf_cookies, cf_user_agent = [], ""
         if use_fs:
-            raw_cf_cookies, cf_user_agent = cls.get_flaresolverr_clearance(site_url, scheduler_instance=scheduler_instance)
-            if not raw_cf_cookies and not cf_user_agent:
+            raw_cf_cookies, cf_user_agent, fs_succeeded = cls._get_flaresolverr_clearance_result(site_url, scheduler_instance=scheduler_instance)
+            if not fs_succeeded:
                 logger.error(f"[CrawlUtil] [{host}] FlareSolverr 인가 실패로 Selenium 기동 중단")
                 return None
 

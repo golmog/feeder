@@ -40,6 +40,9 @@ class TaskDownloadBase:
             logger.warning(f"[DownloadTask] [{job_type}] 이전 세션 비정상 종료로 재전송된 고아 태스크 실행 취소")
             return
 
+        if len(args) == 3 and args[0] == 'single':
+            TaskDownload.run_single_item(int(args[1]), args[2])
+            return
         TaskDownload.run_pipeline()
 
 
@@ -48,6 +51,80 @@ class TaskDownload:
     # 현재 실행 세션 내 실패/중단된 작업 ID 집합 (현재 주기 내 즉시 재시도 차단용)
     failed_ids_in_session = set()
     _run_mutex = threading.Lock()
+    SINGLE_STATUSES = ('pending', 'downloading', 'pending_local_staging', 'downloaded',
+                       'waiting_transporter', 'pending_upload', 'move_failed')
+
+    @staticmethod
+    def _selected_query(query):
+        item_id = FeederUtil.single_download_id()
+        return query.filter(ModelDownload.id == item_id) if item_id is not None else query
+
+    @staticmethod
+    def reserve_single_item(item_id):
+        """요청 시 실행 잠금을 예약하여 중복 클릭과 전체 실행을 함께 막는다."""
+        control = FeederUtil.get_download_control_state()
+        if not control['pause_requested'] or control['running']:
+            raise ValueError('전체 작업이 완전히 중단된 상태에서 개별 실행할 수 있습니다.')
+        item = db.session.get(ModelDownload, item_id)
+        if not item or item.status not in TaskDownload.SINGLE_STATUSES:
+            raise ValueError('실행 가능한 대기 항목이 아닙니다. 실패 항목은 먼저 재시도해주세요.')
+        if ModelDownload.is_blocked(item.infohash, item.magnet):
+            raise ValueError('차단된 항목은 실행할 수 없습니다.')
+        db.session.rollback()
+        owner = f'single:{item_id}:{uuid.uuid4().hex}'
+        FeederUtil.init_runtime_locks()
+        if not FeederUtil.acquire_runtime_lock('download_pipeline', owner, stale_after=21600):
+            raise ValueError('다른 작업이 실행 중입니다. 종료 후 다시 시도해주세요.')
+        return owner
+
+    @staticmethod
+    def run_single_item(item_id, owner):
+        """전체 중단을 유지하고 선택 항목의 현재 단계와 후속 단계만 실행한다."""
+        with F.app.app_context():
+            acquired = False
+            try:
+                # 지연 전달된 요청이 새 실행의 잠금을 사용하지 못하게 소유권을 확인한다.
+                engine = db.engines.get(P.package_name)
+                if engine is None:
+                    engine = db.engine
+                with engine.connect() as connection:
+                    actual_owner = connection.execute(db.text(f"SELECT owner FROM {P.package_name}_runtime_lock WHERE lock_name='download_pipeline'")).scalar()
+                if actual_owner != owner:
+                    return
+                acquired = TaskDownload._run_mutex.acquire(blocking=False)
+                if not acquired or not FeederUtil.is_download_paused():
+                    return
+                item = db.session.get(ModelDownload, item_id)
+                if not item or item.status not in TaskDownload.SINGLE_STATUSES or ModelDownload.is_blocked(item.infohash, item.magnet):
+                    return
+                db.session.remove()
+                with FeederUtil.single_download_scope(item_id):
+                    TaskDownload.failed_ids_in_session.clear()
+                    DownloadActivity.record('개별 실행', f'작업 #{item_id} 실행 시작 · 전체 중단 유지')
+                    TaskDownload.sync_active_items_with_profiles()
+                    if not UploadUtil.drain_all_sa_mydrives():
+                        DownloadActivity.record('개별 실행', f'작업 #{item_id} 사전 정리 미완료 · 실행 보류', 'warning')
+                        return
+                    for stage in (TaskDownload.dispatch_pending_downloads, TaskDownload.poll_active_downloads,
+                                  TaskDownload.process_local_staging, TaskDownload.route_completed_downloads,
+                                  TaskDownload.process_uploads, TaskDownload.retry_move_failed):
+                        from .util_block import DownloadBlock
+                        if DownloadBlock.stopped(item_id):
+                            break
+                        stage()
+                        db.session.remove()
+                    item = db.session.get(ModelDownload, item_id)
+                    status = item.status if item else '삭제됨'
+                    DownloadActivity.record('개별 실행', f'작업 #{item_id} 실행 종료 · 상태: {status} · 전체 중단 유지')
+            except Exception:
+                db.session.rollback()
+                logger.exception('[DownloadPipeline] 작업 #%s 개별 실행 오류', item_id)
+                DownloadActivity.record('개별 실행', f'작업 #{item_id} 실행 오류 · 플랫폼 로그를 확인하세요.', 'error')
+            finally:
+                FeederUtil.release_runtime_lock('download_pipeline', owner)
+                if acquired:
+                    TaskDownload._run_mutex.release()
+                db.session.remove()
 
     @staticmethod
     def run_pipeline(manual: bool = False):
@@ -215,10 +292,13 @@ class TaskDownload:
     def _worker_results(worker, item_ids, max_workers, activity_stage=None):
         """실행 슬롯만 배정하고 중단 요청 이후에는 다음 작업을 시작하지 않는다."""
         from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+        selected_id = FeederUtil.single_download_id()
 
         def guarded_worker(item_id):
-            with F.app.app_context():
+            with F.app.app_context(), FeederUtil.single_download_scope(selected_id):
                 try:
+                    if selected_id is not None and selected_id != item_id:
+                        return
                     if not FeederUtil.is_download_paused():
                         return worker(item_id)
                 finally:
@@ -227,6 +307,7 @@ class TaskDownload:
         remaining = iter(item_ids)
         finished = 0
         last_report = time.monotonic()
+        last_activity_counts = None
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             active = {}
             exhausted = False
@@ -248,7 +329,10 @@ class TaskDownload:
                     finished += 1
                     yield active.pop(future), future
                 if activity_stage and (finished == len(item_ids) or time.monotonic() - last_report >= 3):
-                    DownloadActivity.record(activity_stage, f'처리 종료 {finished}/{len(item_ids)}건 · 진행 중 {len(active)}건 · 미배정 {len(item_ids) - finished - len(active)}건')
+                    activity_counts = (finished, len(active), len(item_ids) - finished - len(active))
+                    if activity_counts != last_activity_counts:
+                        DownloadActivity.record(activity_stage, f'처리 종료 {finished}/{len(item_ids)}건 · 진행 중 {activity_counts[1]}건 · 미배정 {activity_counts[2]}건')
+                        last_activity_counts = activity_counts
                     last_report = time.monotonic()
         if activity_stage and finished < len(item_ids):
             DownloadActivity.record(activity_stage, f'처리 종료 {finished}/{len(item_ids)}건 · 남은 {len(item_ids) - finished}건은 대기 유지')
@@ -391,7 +475,7 @@ class TaskDownload:
             'pending', 'downloading', 'pending_local_staging', 'local_staging',
             'downloaded', 'waiting_transporter', 'pending_upload', 'uploading', 'pending_relay', 'relay_transferring'
         ]
-        items = db.session.query(ModelDownload).filter(ModelDownload.status.in_(active_statuses)).all()
+        items = TaskDownload._selected_query(db.session.query(ModelDownload)).filter(ModelDownload.status.in_(active_statuses)).all()
         if not items:
             return
 
@@ -504,7 +588,7 @@ class TaskDownload:
 
     @staticmethod
     def dispatch_pending_downloads():
-        items = ModelDownload.get_list_by_status(['pending'])
+        items = TaskDownload._selected_query(db.session.query(ModelDownload)).filter_by(status='pending').order_by(ModelDownload.id.asc()).all()
         if not items:
             return
         total_items = len(items)
@@ -771,6 +855,9 @@ class TaskDownload:
     def poll_active_downloads():
         now = datetime.now()
         enabled_downloaders = [d for d in FeederUtil.get_downloaders() if d.get('enabled', True)]
+        if FeederUtil.single_download_id() is not None:
+            selected = db.session.get(ModelDownload, FeederUtil.single_download_id())
+            enabled_downloaders = [d for d in enabled_downloaders if selected and d.get('name') == selected.current_engine_name]
         if not enabled_downloaders:
             return
 
@@ -789,7 +876,7 @@ class TaskDownload:
 
             # 해당 엔진에 할당된 downloading 작업 조회 (엔진별 독립 조회)
             engine_items = (
-                db.session.query(ModelDownload)
+                TaskDownload._selected_query(db.session.query(ModelDownload))
                 .filter_by(status='downloading', current_engine_name=engine_name)
                 .order_by(ModelDownload.id.asc())
                 .all()
@@ -797,6 +884,8 @@ class TaskDownload:
 
             # 원격 상태 조회가 DB의 활성 읽기 트랜잭션을 기다리지 않도록 조회 종료
             db.session.rollback()
+            if FeederUtil.single_download_id() is not None and not engine_items:
+                continue
             DownloadActivity.record('다운로더 상태 확인', f'{engine_name} 원격 목록 조회 중 · 할당된 작업 {len(engine_items)}건')
             status_list, err = engine.get_status()
             DownloadActivity.record('다운로더 상태 확인', f'{engine_name} 원격 목록 조회 ' + ('실패' if err else f'완료 · 수신 {len(status_list)}건'), 'warning' if err else 'info')
@@ -832,7 +921,7 @@ class TaskDownload:
             all_remote_hashes = [s.get('hash').lower() for s in status_list if s.get('hash')]
             all_remote_tids = [str(s.get('task_id')) for s in status_list if s.get('task_id')]
 
-            if all_remote_hashes or all_remote_tids:
+            if FeederUtil.single_download_id() is None and (all_remote_hashes or all_remote_tids):
                 done_or_migrated_rows = db.session.query(
                     ModelDownload.infohash,
                     ModelDownload.engine_task_id,
@@ -1126,7 +1215,7 @@ class TaskDownload:
         if FeederUtil.is_download_paused():
             return
         # 이전 비정상 종료로 멈춘 고아 local_staging 작업을 pending_local_staging으로 자동 복구
-        stuck_staging = db.session.query(ModelDownload).filter_by(status='local_staging').all()
+        stuck_staging = TaskDownload._selected_query(db.session.query(ModelDownload)).filter_by(status='local_staging').all()
         if stuck_staging:
             for s_it in stuck_staging:
                 FeederUtil.cooperate()
@@ -1146,7 +1235,7 @@ class TaskDownload:
             return
 
         # 현재 세션 실패 항목을 제외하고, 로컬 디스크 허용 잔여 슬롯만큼만 정밀 조회
-        query = db.session.query(ModelDownload).filter(ModelDownload.status == 'pending_local_staging')
+        query = TaskDownload._selected_query(db.session.query(ModelDownload)).filter(ModelDownload.status == 'pending_local_staging')
         if TaskDownload.failed_ids_in_session:
             query = query.filter(~ModelDownload.id.in_(list(TaskDownload.failed_ids_in_session)))
 
@@ -1294,7 +1383,7 @@ class TaskDownload:
         if FeederUtil.is_download_paused():
             return
         queue_limit, occupied = TaskDownload._get_upload_queue_state()
-        items = ModelDownload.get_list_by_status(['downloaded', 'waiting_transporter'])
+        items = TaskDownload._selected_query(db.session.query(ModelDownload)).filter(ModelDownload.status.in_(['downloaded', 'waiting_transporter'])).order_by(ModelDownload.id.asc()).all()
         if not items:
             return
         item_ids = [item.id for item in items]
@@ -1406,7 +1495,7 @@ class TaskDownload:
         if FeederUtil.is_download_paused():
             return
         # 이전 비정상 종료로 멈춘 uploading 작업을 pending_upload로 자동 복구
-        stuck_uploads = db.session.query(ModelDownload).filter_by(status='uploading').all()
+        stuck_uploads = TaskDownload._selected_query(db.session.query(ModelDownload)).filter_by(status='uploading').all()
         if stuck_uploads:
             for u_it in stuck_uploads:
                 FeederUtil.cooperate()
@@ -1415,7 +1504,7 @@ class TaskDownload:
             logger.info(f"[UploadUtil] 멈춰있던 업로드 작업 {len(stuck_uploads)}건을 대기열(pending_upload)로 자동 복구했습니다.")
 
         # 현재 세션에서 실패한 항목은 쿼리에서 안전하게 제외하고, 미시도 작업을 우선 정렬
-        query = db.session.query(ModelDownload).filter(ModelDownload.status == 'pending_upload')
+        query = TaskDownload._selected_query(db.session.query(ModelDownload)).filter(ModelDownload.status == 'pending_upload')
         if TaskDownload.failed_ids_in_session:
             query = query.filter(~ModelDownload.id.in_(list(TaskDownload.failed_ids_in_session)))
 
@@ -1470,11 +1559,12 @@ class TaskDownload:
             return
         one_hour_ago = datetime.now() - timedelta(hours=1)
         items = (
-            db.session.query(ModelDownload)
+            TaskDownload._selected_query(db.session.query(ModelDownload))
             .filter(
                 ModelDownload.status == 'move_failed',
                 ModelDownload.completed_time.is_(None),
-                (ModelDownload.last_move_attempt_time.is_(None) | (ModelDownload.last_move_attempt_time < one_hour_ago))
+                or_(ModelDownload.last_move_attempt_time.is_(None), ModelDownload.last_move_attempt_time < one_hour_ago,
+                    FeederUtil.single_download_id() is not None)
             )
             .all()
         )

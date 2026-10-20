@@ -222,5 +222,7 @@ class JobStore:
             connection.execute('UPDATE jobs SET status=?,finished_at=?,speed=0,eta=NULL,rclone_exit_code=?,error_message=? WHERE job_id=?',
                                (status, now(), exit_code, message, job_id))
             self.log(connection, job_id, f'전송 종료: {status}')
+            if message:
+                self.log(connection, job_id, message)
             self.event(connection, job_id, 'job.'+status)
             self.commit(connection)

@@ -199,6 +199,40 @@
   margin-top: 0.25rem;
 }
 
+#download_queue_table {
+  width: 100%;
+  table-layout: fixed;
+}
+
+#download_queue_table td {
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
+
+#download_queue_table code,
+#download_queue_table .badge {
+  white-space: normal;
+  word-break: break-all;
+}
+
+#download_queue_table .queue-file-location,
+#download_queue_table .queue-file-location > span {
+  min-width: 0;
+  max-width: 100%;
+}
+
+#download_queue_table .queue-item-actions {
+  border-top: 1px dotted rgba(128, 128, 128, 0.4);
+}
+
+#download_queue_table .queue-item-buttons {
+  min-width: 0;
+}
+
+#download_queue_table .queue-item-actions .btn {
+  margin: 0.15rem 0.25rem 0.15rem 0;
+}
+
 .skeleton-box {
   display: inline-block;
   height: 1em;

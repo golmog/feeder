@@ -315,10 +315,13 @@ function render_pipeline_control(control) {
     stopping: '중단 예약됨 · 진행 중인 작업이 끝나면 중단합니다',
     paused: '작업 중단됨 · Feeder 업로드가 종료되어 FF를 재시작할 수 있습니다'
   };
-  $('#pipeline_control_status').text(labels[control.state] || '작업 상태 확인 중...');
+  $('#pipeline_control_status').text(control.single_item_id
+    ? '작업 #' + control.single_item_id + ' 개별 실행 중 · 전체 중단 유지'
+    : (labels[control.state] || '작업 상태 확인 중...'));
+  $('.queue_action_btn[data-action="execute_single"]').prop('disabled', control.state !== 'paused');
   $('#pipeline_pause_btn').toggle(!control.pause_requested).prop('disabled', pipeline_control_changing);
   $('#pipeline_resume_btn').toggle(!!control.pause_requested).prop('disabled', pipeline_control_changing)
-    .html('<i class="fa fa-play mr-1"></i>' + (control.state === 'stopping' ? '중단 예약 취소' : '작업 재개'));
+    .html('<i class="fa fa-play mr-1"></i>' + (control.state === 'stopping' && !control.single_item_id ? '중단 예약 취소' : '작업 재개'));
 }
 
 function refresh_pipeline_control() {
@@ -343,6 +346,7 @@ function refresh_pipeline_control() {
 function pipeline_control_unavailable() {
   $('#pipeline_control_status').text('작업 상태를 확인할 수 없습니다. 연결을 확인하세요.');
   $('#pipeline_pause_btn, #pipeline_resume_btn').prop('disabled', true);
+  $('.queue_action_btn[data-action="execute_single"]').prop('disabled', true);
 }
 
 $('#pipeline_pause_btn, #pipeline_resume_btn').click(function () {
@@ -401,11 +405,17 @@ function request_active_queue() {
   });
 }
 
+function queue_progress_percent(value) {
+  var percent = Number(value);
+  if (!Number.isFinite(percent)) return 0;
+  return Math.round(Math.max(0, Math.min(100, percent)) * 10) / 10;
+}
+
 function render_queue_rows(list) {
   var tbody = $('#active_queue_tbody');
   if (!tbody.length) return;
   if (!list || list.length === 0) {
-    tbody.html('<tr><td colspan="4" class="py-4 text-muted">현재 진행 중인 활성 작업이 없습니다.</td></tr>');
+    tbody.html('<tr><td colspan="3" class="py-4 text-muted">현재 진행 중인 활성 작업이 없습니다.</td></tr>');
     return;
   }
 
@@ -565,23 +575,22 @@ function render_queue_rows(list) {
     detailHtml += '  <strong style="font-size: 0.95rem;">' + it.title + '</strong>';
     detailHtml += '</div>';
 
-    // 2행: 파일명 (용량) + 저장 경로 + [우측: 시각] (한 줄 통합 배치)
+    // 2행: 파일명 (용량)과 저장 경로
     var fsizeText = it.file_size ? ' (' + format_bytes(it.file_size) + ')' : '';
     var nameAndSize = it.file_name
       ? '<span class="font-weight-bold text-info mr-2"><i class="fa fa-folder-open-o mr-1"></i>' + it.file_name + fsizeText + '</span>'
       : (fsizeText ? '<span class="badge badge-secondary mr-2"><i class="fa fa-database mr-1"></i>' + format_bytes(it.file_size) + '</span>' : '');
 
     detailHtml += '<div class="small text-muted d-flex justify-content-between align-items-center flex-wrap" style="line-height: 1.5;">';
-    detailHtml += '  <div class="d-inline-flex align-items-center flex-wrap mr-2">';
+    detailHtml += '  <div class="queue-file-location d-inline-flex align-items-center flex-wrap mr-2">';
     detailHtml +=      nameAndSize;
     detailHtml += '    <span class="mr-2"><i class="fa fa-hdd-o mr-1"></i>' + pathDisplay + '</span>';
     detailHtml += '  </div>';
-    detailHtml += '  <span class="text-muted ml-auto"><i class="fa fa-clock-o mr-1"></i>' + timeStr + '</span>';
     detailHtml += '</div>';
 
     // 3행: 진행 상태별 게이지 바 (다운로드 중 / 로컬 스테이징 / 업로드 실시간 노출)
     if (it.status === 'downloading') {
-      var progVal = (it.progress !== undefined && it.progress !== null) ? it.progress : 0;
+      var progVal = queue_progress_percent(it.progress);
       var speedStr = it.download_speed ? format_bytes(it.download_speed) + '/s' : (it.speed_str || '0 B/s');
       var dlBytesStr = it.downloaded_bytes ? format_bytes(it.downloaded_bytes) : '0 B';
       var totalBytesStr = it.file_size ? format_bytes(it.file_size) : '확인 중';
@@ -598,7 +607,7 @@ function render_queue_rows(list) {
       detailHtml += '  </div>';
       detailHtml += '</div>';
     } else if (it.status === 'local_staging') {
-      var progVal = (it.progress !== undefined && it.progress !== null) ? it.progress : 0;
+      var progVal = queue_progress_percent(it.progress);
       var speedStr = it.speed_str || (it.download_speed ? format_bytes(it.download_speed) + '/s' : '전송 준비중');
       var dlBytesStr = it.downloaded_bytes ? format_bytes(it.downloaded_bytes) : '0 B';
       var totalBytesStr = it.file_size ? format_bytes(it.file_size) : '확인 중';
@@ -614,7 +623,7 @@ function render_queue_rows(list) {
       detailHtml += '  </div>';
       detailHtml += '</div>';
     } else if (it.status === 'uploading') {
-      var progVal = (it.progress !== undefined && it.progress !== null) ? it.progress : 0;
+      var progVal = queue_progress_percent(it.progress);
       var speedStr = it.speed_str || (it.download_speed ? format_bytes(it.download_speed) + '/s' : '전송 준비중');
       var dlBytesStr = it.downloaded_bytes ? format_bytes(it.downloaded_bytes) : '0 B';
       var totalBytesStr = it.file_size ? format_bytes(it.file_size) : '확인 중';
@@ -658,8 +667,9 @@ function render_queue_rows(list) {
     str += '<tr data-queue-id="' + it.id + '">';
     str += '  <td class="font-weight-bold">' + it.id + '</td>';
     str += '  <td>' + statusBadge + engineInfo + '</td>';
-    str += '  <td class="text-left">' + detailHtml + '</td>';
-    str += '  <td>';
+    str += '  <td class="text-left">' + detailHtml;
+    str += '    <div class="queue-item-actions d-flex flex-wrap align-items-center mt-2 pt-1">';
+    str += '      <div class="queue-item-buttons d-flex flex-wrap mr-2">';
     if (it.status === 'engine_unmanaged' || it.status === 'ad_unmanaged' || String(it.id).startsWith('EXT-') || String(it.id).startsWith('AD-')) {
       str += '    <button type="button" class="btn btn-xs btn-outline-info adopt_orphan_btn" ' +
              ' data-id="' + it.id + '"' +
@@ -673,14 +683,19 @@ function render_queue_rows(list) {
              ' data-raw-status="' + (it.raw_status || '') + '">작업 흡수</button>';
       str += ' <button type="button" class="btn btn-xs btn-outline-danger block_orphan_btn" data-task-id="' + clean_title_attr(String(it.task_id || it.id)) + '" data-engine="' + clean_title_attr(it.current_engine_name || '') + '" data-hash="' + clean_title_attr(it.hash || '') + '" data-title="' + clean_title_attr(it.title || '') + '">중단·차단</button>';
     } else {
-      str += '    <div class="btn-group btn-group-sm">';
-      str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold queue_action_btn" data-action="retry" data-id="' + it.id + '">재시도</button>';
-      str += '      <button type="button" class="btn btn-success text-white queue_action_btn" data-action="force_complete" data-id="' + it.id + '">완료</button>';
-      str += '      <button type="button" class="btn btn-secondary text-white queue_action_btn" data-action="force_fail" data-id="' + it.id + '">실패</button>';
-      str += '      <button type="button" class="btn btn-danger text-white queue_action_btn" data-action="delete" data-id="' + it.id + '">삭제</button>';
-      str += '      <button type="button" class="btn btn-outline-danger queue_action_btn" data-action="block" data-id="' + it.id + '">중단·차단</button>';
-      str += '    </div>';
+      if (['pending', 'downloading', 'pending_local_staging', 'downloaded', 'waiting_transporter', 'pending_upload', 'move_failed'].indexOf(it.status) !== -1) {
+        var singleDisabled = !last_pipeline_control || last_pipeline_control.state !== 'paused';
+        str += '      <button type="button" class="btn btn-sm btn-outline-primary queue_action_btn" data-action="execute_single" data-id="' + it.id + '"' + (singleDisabled ? ' disabled' : '') + ' title="전체 작업이 완전히 중단된 상태에서 이 항목만 실행합니다.">개별 실행</button>';
+      }
+      str += '      <button type="button" class="btn btn-sm btn-warning text-dark font-weight-bold queue_action_btn" data-action="retry" data-id="' + it.id + '">재시도</button>';
+      str += '      <button type="button" class="btn btn-sm btn-success text-white queue_action_btn" data-action="force_complete" data-id="' + it.id + '">완료</button>';
+      str += '      <button type="button" class="btn btn-sm btn-secondary text-white queue_action_btn" data-action="force_fail" data-id="' + it.id + '">실패</button>';
+      str += '      <button type="button" class="btn btn-sm btn-danger text-white queue_action_btn" data-action="delete" data-id="' + it.id + '">삭제</button>';
+      str += '      <button type="button" class="btn btn-sm btn-outline-danger queue_action_btn" data-action="block" data-id="' + it.id + '">중단·차단</button>';
     }
+    str += '      </div>';
+    str += '      <span class="small text-muted text-nowrap ml-auto"><i class="fa fa-clock-o mr-1"></i>' + timeStr + '</span>';
+    str += '    </div>';
     str += '  </td>';
     str += '</tr>';
   }
@@ -732,6 +747,7 @@ $(document).on('click', '.queue_action_btn', function (e) {
   var targetRow = $(this).closest('tr');
 
   if (act === 'block' && !confirm('전송을 즉시 중단하고 이 콘텐츠를 차단하시겠습니까?\n로컬 스테이징과 원격 임시 업로드 파일도 삭제합니다.')) return;
+  if (act === 'execute_single') $('.queue_action_btn[data-action="execute_single"]').prop('disabled', true);
 
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/item_action',
@@ -740,6 +756,7 @@ $(document).on('click', '.queue_action_btn', function (e) {
     dataType: 'json',
     success: function (data) {
       if (data.ret === 'success') {
+        if (data.control) render_pipeline_control(data.control);
         notify(data.msg || '작업이 처리되었습니다.', 'info');
         if (act === 'delete' && targetRow.length > 0) {
           targetRow.fadeOut(200, function () {
@@ -751,7 +768,12 @@ $(document).on('click', '.queue_action_btn', function (e) {
         }
       } else {
         notify(data.msg || '실패', 'warning');
+        if (act === 'execute_single') refresh_pipeline_control();
       }
+    },
+    error: function () {
+      notify('작업 요청 결과를 확인하지 못했습니다. 상태를 다시 확인하세요.', 'warning');
+      if (act === 'execute_single') refresh_pipeline_control();
     }
   });
 });
@@ -1616,7 +1638,7 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
     return;
   }
 
-  var html = '<hr><h6 class="text-info font-weight-bold mb-3"><i class="fa fa-folder-open mr-1"></i>' + schemaObj.transporter_name + ' 세부 설정</h6>';
+  var html = '<hr><h6 class="text-info text-center font-weight-bold mb-3"><i class="fa fa-folder-open mr-1"></i>' + schemaObj.transporter_name + ' 세부 설정</h6>';
   var fields = schemaObj.config_schema;
 
   for (var i = 0; i < fields.length; i++) {
@@ -1724,19 +1746,17 @@ function render_profiles(data) {
 
     var dest = p.destination || {};
     var destInfo = '<span class="badge badge-dark">' + (dest.type || 'local') + '</span>';
-    if (dest.type === 'rclone_simple') {
-      if (dest.upload_path) destInfo += '<br><small class="text-muted">임시: ' + dest.upload_path + '</small>';
-      if (dest.complete_path) destInfo += '<br><small class="text-muted">완료: ' + dest.complete_path + '</small>';
+    if (dest.type === 'rclone_simple' || dest.type === 'remote_worker') {
+      if (dest.type === 'remote_worker') destInfo = '<span class="badge badge-primary">원격 워커</span>';
     } else if (dest.type === 'gdrive_rotation') {
       destInfo = '<span class="badge badge-success">GDrive 계정 풀</span>';
-      if (dest.complete_path) destInfo += '<br><small class="text-muted">' + dest.complete_path + '</small>';
     } else if (dest.type && dest.type.indexOf('relay') !== -1) {
       destInfo = '<span class="badge badge-primary">원격 릴레이</span>';
-      if (dest.remote_name) destInfo += '<br><small class="text-muted">' + dest.remote_name + ' (' + (dest.buffer_limit_gb || 50) + 'GB 버퍼)</small>';
     } else {
       // 커스텀 트랜스포터 기본 표기
       if (dest.type) destInfo = '<span class="badge badge-info">' + dest.type + '</span>';
     }
+    if (dest.complete_path) destInfo += '<br><small class="text-muted">' + dest.complete_path + '</small>';
 
     str += '<tr>';
     str += '  <td class="font-weight-bold">' + p.name + '</td>';

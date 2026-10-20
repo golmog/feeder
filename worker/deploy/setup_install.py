@@ -84,7 +84,8 @@ def configure(args):
     environment.chmod(0o600)
     files = [p for folder in ('app', 'deploy') for p in (source / folder).rglob('*')
              if p.is_file() and '__pycache__' not in p.parts and p.suffix != '.pyc']
-    files += [source / 'requirements.txt', source / '.env.example', source / 'install.sh', source / 'README.md']
+    files += [source / 'requirements.txt', source / '.env.example', source / 'install.sh', source / 'README.md',
+              source / 'rclone_logging.py']
     for path in files:
         if path.is_symlink():
             raise ValueError('배포 소스의 심볼릭 링크는 허용하지 않습니다.')

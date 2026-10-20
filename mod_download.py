@@ -629,6 +629,23 @@ class ModuleDownload(PluginModuleBase):
                 if not item:
                     return jsonify({'ret': 'fail', 'msg': '항목을 찾을 수 없습니다.'})
 
+                if action == 'execute_single':
+                    try:
+                        owner = TaskDownload.reserve_single_item(item_id)
+                    except ValueError as exc:
+                        return jsonify({'ret': 'fail', 'msg': str(exc)})
+                    try:
+                        if F.config.get('use_celery', False):
+                            TaskDownloadBase.start.apply_async(args=('single', item_id, owner))
+                        else:
+                            threading.Thread(target=TaskDownload.run_single_item, args=(item_id, owner),
+                                name=f'feeder-download-single-{item_id}', daemon=True).start()
+                    except Exception:
+                        FeederUtil.release_runtime_lock('download_pipeline', owner)
+                        raise
+                    return jsonify({'ret': 'success', 'msg': f'작업 #{item_id}만 실행합니다. 전체 작업 중단은 유지됩니다.',
+                                    'control': FeederUtil.get_download_control_state()})
+
                 if action == 'block':
                     DownloadBlock.block(item)
                     return jsonify({'ret': 'success', 'msg': '차단했습니다. 전송을 중단하고 임시 파일을 정리합니다.'})

@@ -11,6 +11,9 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
+
+from rclone_logging import redact_log
 
 from .jobs import validate_payload
 from .configuration import Configurations
@@ -151,21 +154,30 @@ class Worker:
         tail = bytearray()
         termination = None
         forced = False
-        error_flags = set()
+        errors = deque(maxlen=8)
+
+        def remember(message):
+            message = redact_log(message, (self.settings.api_token,))
+            if message and (not errors or errors[-1] != message):
+                errors.append(message)
 
         def consume(line):
             try:
-                log = json.loads(line)
+                try:
+                    log = json.loads(line)
+                except ValueError:
+                    text = line.decode('utf-8', errors='replace') if isinstance(line, (bytes, bytearray)) else line
+                    if any(word in text.lower() for word in ('error', 'failed', 'fatal')):
+                        remember(text)
+                    return
                 if not isinstance(log, dict):
                     return
                 if isinstance(log.get('stats'), dict):
                     self.store.progress(job['job_id'], log['stats'])
+                    if log['stats'].get('lastError'):
+                        remember(log['stats']['lastError'])
                 if log.get('level') in ('error', 'critical'):
-                    message = str(log.get('msg', '')).lower()
-                    # 원문 로그에는 인증 URL이 섞일 수 있어 분류명만 보관한다.
-                    for word in ('403', '429', 'quota', 'permission', 'timeout', 'not found'):
-                        if word in message:
-                            error_flags.add(word)
+                    remember(' · '.join(str(log[key]) for key in ('object', 'msg', 'error') if log.get(key)))
             except (ValueError, TypeError, OverflowError):
                 pass
 
@@ -217,8 +229,8 @@ class Worker:
                     break
             if process.returncode and error is None:
                 error = f'Rclone 종료 코드 {process.returncode}'
-                if error_flags:
-                    error += ' (' + ', '.join(sorted(error_flags)) + ')'
+                if errors:
+                    error += '\n' + '\n'.join(errors)
         except Exception as exc:
             error = f'전송 실행 실패: {type(exc).__name__}'
         finally:
@@ -228,4 +240,6 @@ class Worker:
                 process.wait()
                 process.stderr.close()
             selector.close()
+        if error:
+            logger.error('작업 %s: %s', job['job_id'], error)
         self.store.finish(job['job_id'], process.returncode if process is not None else None, error)

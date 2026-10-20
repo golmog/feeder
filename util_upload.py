@@ -15,10 +15,13 @@ from .setup import *
 from .model_download import ModelDownload, ModelDownloadStat
 from .util_base import FeederUtil
 from .util_download_activity import DownloadActivity
+from .worker.rclone_logging import redact_log
 
 
 class UploadUtil:
     """Rclone 커맨드 실행, Google Drive SA 풀 쿼터 관리 및 업로드 핸들러 통합 관리자"""
+
+    _CLEANUP_WORKERS = 4
 
     # --------------------------------------------------------------------------
     # 바이트 및 포맷 헬퍼
@@ -105,10 +108,21 @@ class UploadUtil:
     def run_rclone(cmd: list[str], description: str = "", log_output: bool = True, item_id=None, file_size=None, watchdog_timeout: int = None, execution_timeout: float = None) -> tuple[bool, str]:
         """Rclone 서브프로세스 실행 및 실시간 출력/전송률 캡처"""
         env = os.environ.copy()
+        safe_description = redact_log(description)
+
+        def report_failure(message, lines=()):
+            summary = f'작업 {item_id} · ' if item_id else ''
+            summary += f'{safe_description}: {redact_log(message)}'
+            logger.error('[Rclone] %s', summary)
+            DownloadActivity.record('Rclone 오류', summary, 'error')
+            for line in list(dict.fromkeys(lines))[-8:]:
+                safe_line = redact_log(line)
+                logger.error('[Rclone Error] %s: %s', safe_description, safe_line)
+                DownloadActivity.record('Rclone 오류', f'작업 {item_id} · {safe_line}' if item_id else safe_line, 'error')
 
         if log_output and description:
             size_text = f" ({UploadUtil.format_bytes(file_size)})" if file_size else ""
-            logger.info(f"[Rclone] 시작: {description}{size_text}")
+            logger.info(f"[Rclone] 시작: {safe_description}{size_text}")
 
         deadline_timer = None
         execution_expired = threading.Event()
@@ -123,6 +137,7 @@ class UploadUtil:
                 stderr=subprocess.STDOUT,
                 text=True,
                 encoding='utf-8',
+                errors='replace',
                 env=env
             )
 
@@ -182,9 +197,9 @@ class UploadUtil:
                     ))
                     is_progress_line = bool(re.search(r'\d+(?:\.\d+)?\s*[kmgt]?ib\s*/', line_lower))
                     if (has_error_level or has_failure_phrase) and not is_progress_line and 'directory not found' not in line_lower:
-                        logger.error(f"[Rclone Error] {description}: {line}")
+                        logger.error('[Rclone Error] %s: %s', safe_description, redact_log(line))
                     elif re.match(r'^\s*(?:warning|notice)\s*:', line_lower):
-                        logger.info(f"[Rclone Log] {description}: {line}")
+                        logger.info('[Rclone Log] %s: %s', safe_description, redact_log(line))
 
                 # Rclone --stats-one-line 실시간 전송률 정밀 파싱
                 if "%" in line:
@@ -219,27 +234,31 @@ class UploadUtil:
             full_output = '\n'.join(output_lines)
 
             if execution_expired.is_set():
+                if log_output:
+                    report_failure('원격 유지보수 실행 시간 만료', output_lines[-8:])
                 return False, "원격 유지보수 실행 시간 만료 (다음 주기에 재확인)"
 
             if killed_by_watchdog[0]:
                 err_msg = f"{watchdog_timeout}초간 데이터 전송 시작 불가 (무반응 타임아웃 강제 종료)"
                 if log_output:
-                    logger.error(f"[Rclone] 실패 ({description}): {err_msg}")
+                    report_failure(err_msg, output_lines[-8:])
                 return False, err_msg
 
             if proc.returncode == 0:
                 if log_output and description:
-                    logger.info(f"[Rclone] 성공: {description}")
+                    logger.info(f"[Rclone] 성공: {safe_description}")
                 return True, full_output
 
-            filtered = [l for l in output_lines if not ("Transferred:" in l or "ETA" in l or "%" in l)]
-            err_msg = '\n'.join(filtered) if filtered else "알 수 없는 Rclone 오류"
+            filtered = [line for line in output_lines if re.search(
+                r'\b(?:error|critical|fatal|notice|failed)\b', line, re.IGNORECASE)]
             if log_output:
-                logger.error(f"[Rclone] 실패 ({description}):\n{err_msg}")
+                report_failure(f'종료 코드 {proc.returncode}', filtered or output_lines[-8:])
             return False, full_output
         except Exception as ex:
-            logger.error(f"[Rclone] 실행 예외 ({description}): {ex}")
-            return False, str(ex)
+            message = redact_log(ex)
+            if log_output:
+                report_failure(f'실행 예외: {message}')
+            return False, message
         finally:
             if deadline_timer is not None:
                 deadline_timer.cancel()
@@ -445,6 +464,48 @@ class UploadUtil:
     # --------------------------------------------------------------------------
     # SA 내 드라이브 고아 파일 드레인 및 업로드 실행
     # --------------------------------------------------------------------------
+    @staticmethod
+    def _cleanup_results(worker, jobs, max_workers, label):
+        """정리 명령만 제한된 슬롯에 배정하고 중단 후에는 다음 명령을 시작하지 않는다."""
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+        selected_id = FeederUtil.single_download_id()
+
+        def guarded(job):
+            with F.app.app_context(), FeederUtil.single_download_scope(selected_id):
+                try:
+                    if FeederUtil.is_download_paused():
+                        return None
+                    return worker(job)
+                finally:
+                    db.session.remove()
+
+        remaining = iter(jobs)
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            active = {}
+            exhausted = False
+            while active or not exhausted:
+                while not exhausted and len(active) < max_workers:
+                    if FeederUtil.is_download_paused():
+                        exhausted = True
+                        break
+                    try:
+                        job = next(remaining)
+                    except StopIteration:
+                        exhausted = True
+                        break
+                    active[executor.submit(guarded, job)] = job
+                if not active:
+                    break
+                done, _ = wait(active, timeout=3, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+                for future in done:
+                    completed += 1
+                    job = active.pop(future)
+                    DownloadActivity.record('사전 정리', f'{label} 종료 {completed}/{len(jobs)}건')
+                    yield job, future
+
     @classmethod
     def drain_all_sa_mydrives(cls) -> bool:
         """새 업로드 전에 잔여 파일을 최종 경로로 복구하며 실패 시 업로드를 보류한다."""
@@ -551,9 +612,27 @@ class UploadUtil:
             return all_ok
         logger.info(f'[UploadUtil] 업로드 전 원격 잔여 파일 확인 시작 (중복 제거 후 드라이브: {len(drives)}개)')
         DownloadActivity.record('사전 정리', f'원격 잔여 파일 확인 · 드라이브 {len(drives)}개')
+        cleanup_workers = cls._CLEANUP_WORKERS
+        logger.info('[UploadUtil] 드라이브 목록 조회 및 빈 폴더 정리 병렬 수: %s', cleanup_workers)
         moved = cleaned = 0
         cleanups = []
-        for index, entry in enumerate(drives, 1):
+
+        def list_drive(job):
+            index, entry = job
+            root = entry['root']
+            parents = {upload.rpartition('/')[0] or upload for upload in entry['routes']}
+            filters = []
+            for parent in sorted(parents):
+                filters += ['--include', f'/{parent}/**']
+            logger.info(f'[UploadUtil] 잔여 파일 목록 조회 ({index}/{len(drives)}): {root}')
+            DownloadActivity.record('사전 정리', f'드라이브 {index}/{len(drives)} 잔여 파일 조회 중')
+            return cls.run_rclone(
+                ['rclone', 'lsjson', root, '--recursive', '--disable', 'ListR', '--no-mimetype', '--no-modtime'] + filters + entry['args'],
+                log_output=False, execution_timeout=60)
+
+        listed = 0
+        for (index, entry), future in cls._cleanup_results(list_drive, list(enumerate(drives, 1)), cleanup_workers, '드라이브 조회'):
+            listed += 1
             FeederUtil.cooperate()
             if FeederUtil.is_download_paused():
                 return False
@@ -566,16 +645,16 @@ class UploadUtil:
                 if suffix.startswith(root_suffix + '/'):
                     blocked.add(suffix[len(root_suffix) + 1:])
             parents = {upload.rpartition('/')[0] or upload for upload in entry['routes']}
-            # 같은 드라이브의 여러 스테이징 경로를 한 명령에서 조회한다.
-            # 필터로 완료 경로 등 스테이징 외 영역의 재귀 탐색을 제외한다.
-            filters = []
-            for parent in sorted(parents):
-                filters += ['--include', f'/{parent}/**']
-            logger.info(f'[UploadUtil] 잔여 파일 목록 조회 ({index}/{len(drives)}): {root}')
-            DownloadActivity.record('사전 정리', f'드라이브 {index}/{len(drives)} 잔여 파일 조회 중')
-            success, out = cls.run_rclone(
-                ['rclone', 'lsjson', root, '--recursive', '--disable', 'ListR', '--no-mimetype', '--no-modtime'] + filters + conf_args,
-                log_output=False, execution_timeout=60)
+            try:
+                result = future.result()
+                if result is None:
+                    all_ok = False
+                    continue
+                success, out = result
+            except Exception:
+                all_ok = False
+                logger.exception('[UploadUtil] 드라이브 목록 조회 워커 오류: %s', root)
+                continue
             if not success:
                 if 'directory not found' not in out.lower():
                     all_ok = False
@@ -634,24 +713,42 @@ class UploadUtil:
                     continue
                 if any(path == parent or path.startswith(parent + '/') for path in files):
                     continue
-                if any(path == parent or path.startswith(parent + '/') for path in directories):
+                if any(path.startswith(parent + '/') or (not leave_root and path == parent) for path in directories):
                     cleanups.append((f'{root}/{parent}', conf_args, leave_root))
 
+        if listed != len(drives):
+            return False
         # 이동이 모두 끝난 뒤 rmdirs로 빈 폴더만 제거한다.
-        for parent, conf_args, leave_root in DownloadActivity.track('사전 정리', cleanups, '빈 폴더 정리 경로'):
+        def clean_empty(job):
+            parent, conf_args, leave_root = job
+            logger.info(f'[UploadUtil] 원격 빈 폴더 정리: {parent}')
+            return cls.run_rclone(
+                ['rclone', 'rmdirs', parent, '--drive-use-trash=false'] + (['--leave-root'] if leave_root else []) + conf_args,
+                '원격 스테이징 빈 폴더 정리', execution_timeout=60)
+
+        checked = 0
+        for (parent, conf_args, leave_root), future in cls._cleanup_results(clean_empty, cleanups, cleanup_workers, '빈 폴더 정리'):
+            checked += 1
             FeederUtil.cooperate()
             if FeederUtil.is_download_paused():
                 return False
-            logger.info(f'[UploadUtil] 원격 빈 폴더 정리: {parent}')
-            DownloadActivity.record('사전 정리', '파일 이동 후 빈 작업 폴더 정리 중')
-            success, out = cls.run_rclone(
-                ['rclone', 'rmdirs', parent, '--drive-use-trash=false'] + (['--leave-root'] if leave_root else []) + conf_args,
-                '원격 스테이징 빈 폴더 정리', execution_timeout=60)
+            try:
+                result = future.result()
+                if result is None:
+                    all_ok = False
+                    continue
+                success, out = result
+            except Exception:
+                all_ok = False
+                logger.exception('[UploadUtil] 빈 폴더 정리 워커 오류: %s', parent)
+                continue
             if not success and 'directory not found' not in out.lower():
                 all_ok = False
                 logger.warning(f'[UploadUtil] 원격 빈 폴더 정리 실패: {parent}: {out[:300]}')
             else:
                 cleaned += 1
+        if checked != len(cleanups):
+            return False
         logger.info(f'[UploadUtil] 업로드 전 원격 복구 종료 (드라이브: {len(drives)}개, 이동: {moved}개, 빈 경로 정리: {cleaned}개, 완료: {all_ok})')
         DownloadActivity.record('사전 정리', f'원격 복구 {"완료" if all_ok else "미완료"} · 이동 경로 {moved}개, 빈 경로 정리 {cleaned}개', 'info' if all_ok else 'warning')
         return all_ok
@@ -916,7 +1013,7 @@ class UploadUtil:
         item = db.session.query(ModelDownload).filter_by(id=item_id).first()
         if item and item.status not in ['cancelled', 'completed', 'blocked']:
             item.status = status
-            item.error_message = message
+            item.error_message = redact_log(message, limit=3600)
             item.last_move_attempt_time = datetime.now()
             item.last_status_time = datetime.now()
             db.session.commit()

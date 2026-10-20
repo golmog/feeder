@@ -15,6 +15,7 @@ import subprocess
 import unicodedata
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from sqlalchemy import func
 
@@ -32,6 +33,22 @@ class FeederUtil:
     SITES_DIR = os.path.join(CUSTOM_DIR, 'sites')
 
     cooperate = staticmethod(cooperate)
+    _download_execution = threading.local()
+
+    @classmethod
+    def single_download_id(cls):
+        return getattr(cls._download_execution, 'item_id', None)
+
+    @classmethod
+    @contextmanager
+    def single_download_scope(cls, item_id):
+        """현재 실행 스레드의 지정 항목에만 중단 예외를 적용한다."""
+        previous = cls.single_download_id()
+        cls._download_execution.item_id = item_id
+        try:
+            yield
+        finally:
+            cls._download_execution.item_id = previous
 
     @classmethod
     def directory_size(cls, path: str) -> int:
@@ -622,6 +639,8 @@ class FeederUtil:
     @classmethod
     def is_download_paused(cls) -> bool:
         """FF/Celery 사이에서 캐시 없이 영속적인 중단 요청을 확인한다."""
+        if cls.single_download_id() is not None:
+            return False
         try:
             engine = db.get_engine(bind=P.package_name)
         except Exception:
@@ -658,8 +677,8 @@ class FeederUtil:
         except Exception:
             engine = db.engine
         with engine.connect() as conn:
-            locks = {row[0] for row in conn.execute(db.text(f"""
-                SELECT lock_name FROM {P.package_name}_runtime_lock
+            locks = {row[0]: row[1] for row in conn.execute(db.text(f"""
+                SELECT lock_name, owner FROM {P.package_name}_runtime_lock
                 WHERE lock_name IN ('download_pause', 'download_pipeline')
             """))}
             active_transfers = conn.execute(db.text(f"""
@@ -668,11 +687,14 @@ class FeederUtil:
             """)).scalar()
         paused = 'download_pause' in locks
         running = 'download_pipeline' in locks or bool(active_transfers)
+        pipeline_owner = locks.get('download_pipeline', '')
+        single_match = re.fullmatch(r'single:(\d+):[a-f0-9]+', pipeline_owner)
         return {
             'pause_requested': paused,
             'running': running,
             'state': ('stopping' if running else 'paused') if paused else ('running' if running else 'idle'),
             'active_transfers': active_transfers,
+            'single_item_id': int(single_match[1]) if single_match else None,
             'observed_at': time.time(),
         }
 
