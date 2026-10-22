@@ -1,6 +1,8 @@
 """Feeder의 전송 정책과 분리된 원격 워커 애플리케이션."""
 
 import subprocess
+import os
+from pathlib import Path
 from flask import Flask, jsonify
 from werkzeug.exceptions import HTTPException
 
@@ -12,9 +14,10 @@ from .jobs import JobStore
 from .runner import Worker
 from .events import Events
 from .configuration import Configurations
+from .updates import Updates
 
 
-VERSION = '0.7.2'
+VERSION = '0.9.0'
 
 
 def create_app(settings: Settings | None = None) -> Flask:
@@ -45,6 +48,8 @@ def create_app(settings: Settings | None = None) -> Flask:
     app.extensions['worker_configurations'] = configurations
     app.extensions['worker_jobs'] = JobStore(database, events)
     app.extensions['worker_runner'] = Worker(settings, app.extensions['worker_jobs'])
+    root = Path(os.environ.get('FEEDER_WORKER_ROOT') or Path(__file__).resolve().parents[1])
+    app.extensions['worker_updates'] = Updates(root, settings, database, VERSION)
     install_auth(app, settings.api_token)
     app.register_blueprint(api)
 

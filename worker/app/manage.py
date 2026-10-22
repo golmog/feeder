@@ -7,8 +7,12 @@ import json
 import os
 import sqlite3
 import uuid
+from pathlib import Path
+import sys
 
 from . import create_app
+from .settings import Settings
+from .updates import read_state, release_path
 
 
 def backup(database):
@@ -32,7 +36,18 @@ def main():
     parser = argparse.ArgumentParser(description='전송 없는 워커 점검과 일관된 SQLite 백업')
     parser.add_argument('command', choices=('check', 'backup'))
     args = parser.parse_args()
-    app = create_app()
+    root = Path(os.environ.get('FEEDER_WORKER_ROOT') or Path(__file__).resolve().parents[1])
+    state = read_state(root)
+    if state.get('pending'):
+        parser.error('워커 업데이트 적용 중입니다. 기동 결과 확인 후 다시 실행해주세요.')
+    if state.get('active'):
+        target = release_path(root, state['active'])
+        if target != Path(__file__).resolve().parents[1]:
+            os.environ['FEEDER_WORKER_ROOT'] = str(root)
+            os.environ['PYTHONPATH'] = str(target)
+            os.chdir(target)
+            os.execv(sys.executable, [sys.executable, '-B', '-m', 'app.manage', *sys.argv[1:]])
+    app = create_app(Settings.load(root))
     try:
         if args.command == 'backup':
             print(json.dumps({'backup': str(backup(app.extensions['worker_database']))}))

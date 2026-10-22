@@ -52,6 +52,9 @@ class ModelDownload(ModelBase):
     last_move_attempt_time = db.Column(db.DateTime, nullable=True)
 
     error_message = db.Column(db.Text, nullable=True)
+    transfer_error_type = db.Column(db.String, nullable=True)
+    source_unavailable_since = db.Column(db.DateTime, nullable=True)
+    upload_retry_after = db.Column(db.DateTime, nullable=True)
 
     @staticmethod
     def is_blocked(infohash=None, magnet=None):
@@ -78,6 +81,9 @@ class ModelDownload(ModelBase):
         ret['last_status_time'] = self.last_status_time.strftime('%Y-%m-%d %H:%M:%S') if self.last_status_time else ''
         ret['remote_missing_since'] = self.remote_missing_since.strftime('%Y-%m-%d %H:%M:%S') if self.remote_missing_since else ''
         ret['last_move_attempt_time'] = self.last_move_attempt_time.strftime('%Y-%m-%d %H:%M:%S') if self.last_move_attempt_time else ''
+        for key in ('source_unavailable_since', 'upload_retry_after'):
+            value = getattr(self, key)
+            ret[key] = value.strftime('%Y-%m-%d %H:%M:%S') if value else ''
         ret['successful'] = self.status == 'completed' or (self.status == 'move_failed' and self.completed_time is not None)
         return ret
 
@@ -230,9 +236,14 @@ class ModelDownloadStat(ModelBase):
     stat_key = db.Column(db.String, index=True)
     stat_value = db.Column(db.Float, default=0.0)
     timestamp = db.Column(db.BigInteger, index=True)
+    download_id = db.Column(db.Integer, nullable=True, index=True)
+    attempt_id = db.Column(db.String, nullable=True, index=True)
 
-    def __init__(self, stat_type: str, stat_key: str, stat_value: float, timestamp: int):
+    def __init__(self, stat_type: str, stat_key: str, stat_value: float, timestamp: int,
+                 download_id=None, attempt_id=None):
         self.stat_type = stat_type
         self.stat_key = stat_key
         self.stat_value = float(stat_value)
         self.timestamp = int(timestamp)
+        self.download_id = download_id
+        self.attempt_id = attempt_id

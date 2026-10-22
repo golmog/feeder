@@ -964,11 +964,15 @@ function request_board_test(site_id, board_id) {
     data: { site_id: site_id, board_id: board_id },
     dataType: 'json',
     success: function (data) {
-      if (data && data.ret === 'fail') {
+      if (data && (data.ret === 'fail' || data.ret === 'error')) {
         notify(data.log || '테스트 실패', 'warning');
         return;
       }
-      $('#test_modal_title').text('수집 테스트 결과 (전체 ' + data.length + '개)');
+      if (data && data.ret === 'partial') {
+        notify(data.log, 'warning');
+      }
+      var items = Array.isArray(data) ? data : (data.list || []);
+      $('#test_modal_title').text('수집 테스트 결과 (' + (data.ret === 'partial' ? '일부 성공 · ' : '') + '전체 ' + items.length + '개)');
       $('#test_modal_body').val(JSON.stringify(data, null, 2));
       $('#test_result_modal').modal('show');
     }

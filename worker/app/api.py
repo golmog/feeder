@@ -11,6 +11,15 @@ from .events import StreamLimitError
 api = Blueprint('api', __name__, url_prefix='/api/v1')
 
 
+@api.post('/update')
+def update_worker():
+    try:
+        result = current_app.extensions['worker_updates'].receive(request.get_json(silent=True))
+        return jsonify(result), 202
+    except ValueError as exc:
+        return jsonify(error={'code': 'invalid_update', 'message': str(exc)}), 400
+
+
 @api.get('/config')
 def get_configuration():
     version = request.args.get('version')
@@ -51,6 +60,8 @@ def health():
     healthy = available and database_available and not current_app.extensions['worker_runner'].failure
     return jsonify(
         status='ok' if healthy else 'degraded', version=current_app.config['WORKER_VERSION'],
+        self_update=bool(current_app.extensions['worker_updates'].callback),
+        update=current_app.extensions['worker_updates'].status(),
         rclone_available=available, database_available=database_available, **counts,
     ), 200 if healthy else 503
 
@@ -58,8 +69,12 @@ def health():
 @api.post('/jobs')
 def create_job():
     try:
-        data = validate_payload(request.get_json(silent=True), current_app.extensions['worker_settings'])
-        job = current_app.extensions['worker_jobs'].submit(data)
+        updates = current_app.extensions['worker_updates']
+        with updates.lock:
+            if updates.busy:
+                return jsonify(error={'code': 'updating', 'message': '워커 업데이트 중입니다. 기존 작업 종료 후 다시 등록해주세요.'}), 503
+            data = validate_payload(request.get_json(silent=True), current_app.extensions['worker_settings'])
+            job = current_app.extensions['worker_jobs'].submit(data)
     except ConflictError as exc:
         return jsonify(error={'code': 'conflict', 'message': str(exc)}), 409
     except ValueError as exc:

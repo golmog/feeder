@@ -42,6 +42,22 @@ class TaskCrawl:
     _run_mutex = threading.Lock()
 
     @staticmethod
+    def is_running():
+        """표시용 플래그 대신 실제 실행 잠금으로 중복 실행을 판단한다."""
+        if TaskCrawl._run_mutex.locked():
+            return True
+        with F.app.app_context():
+            FeederUtil.init_runtime_locks()
+            try:
+                engine = db.get_engine(bind=P.package_name)
+            except Exception:
+                engine = db.engine
+            with engine.connect() as connection:
+                return connection.execute(db.text(f'SELECT 1 FROM {P.package_name}_runtime_lock '
+                    'WHERE lock_name=:name AND acquired_at>=:oldest'),
+                    {'name': 'crawl_pipeline', 'oldest': time.time() - 86400}).first() is not None
+
+    @staticmethod
     def start(trigger_type: str = "scheduler", target_crawler_id: int = None):
         TaskCrawl.run_crawl(trigger_type=trigger_type, target_crawler_id=target_crawler_id)
 
@@ -83,9 +99,16 @@ class TaskCrawl:
         if not TaskCrawl._run_mutex.acquire(blocking=False):
             logger.info("[TaskCrawl] 이미 실행 중인 크롤링 작업이 있어 중복 실행을 건너뜁니다.")
             return
+        try:
+            return TaskCrawl._run_crawl_locked(trigger_type, target_crawler_id)
+        finally:
+            TaskCrawl._run_mutex.release()
 
+    @staticmethod
+    def _run_crawl_locked(trigger_type='scheduler', target_crawler_id=None):
         owner = uuid.uuid4().hex
         db_lock_acquired = False
+        scope = None
         with F.app.app_context():
             try:
                 FeederUtil.init_runtime_locks()
@@ -93,7 +116,8 @@ class TaskCrawl:
                 if not db_lock_acquired:
                     logger.info("[TaskCrawl] 다른 Celery 워커가 실행 중이어서 중복 실행을 건너뜁니다.")
                     return
-
+                scope = CrawlUtil.execution_scope(owner)
+                scope.__enter__()
                 P.ModelSetting.set('crawl_is_running', 'True')
                 P.ModelSetting.set('crawl_running_start_time', str(int(time.time())))
                 is_manual = (trigger_type == "manual")
@@ -233,12 +257,19 @@ class TaskCrawl:
                 logger.error(f"[TaskCrawl] 크롤링 수집 중 오류: {e}")
                 logger.error(traceback.format_exc())
             finally:
-                if db_lock_acquired:
-                    FeederUtil.release_runtime_lock('crawl_pipeline', owner)
-                    P.ModelSetting.set('crawl_is_running', 'False')
-                CrawlUtil.close_sessions()
-                TaskCrawl._run_mutex.release()
-                FeederUtil.db_checkpoint()
+                try:
+                    if scope is not None:
+                        try:
+                            CrawlUtil.finish_execution()
+                        finally:
+                            scope.__exit__(None, None, None)
+                finally:
+                    if db_lock_acquired:
+                        try:
+                            P.ModelSetting.set('crawl_is_running', 'False')
+                        finally:
+                            FeederUtil.release_runtime_lock('crawl_pipeline', owner)
+                    FeederUtil.db_checkpoint()
 
     @staticmethod
     def get_crawl_delay(site_info: dict = None, target_cfg=None) -> float:
@@ -262,7 +293,15 @@ class TaskCrawl:
 
     @staticmethod
     def execute_board_crawl(site_info: dict, board: str, max_page: int = 1, max_id: int = 0, is_test: bool = False, max_count: int = 0, target_cfg=None) -> list[dict]:
+        with CrawlUtil.execution_scope():
+            return TaskCrawl._execute_board_in_context(site_info, board, max_page, max_id, is_test, max_count, target_cfg)
+
+    @staticmethod
+    def _execute_board_in_context(site_info, board, max_page=1, max_id=0, is_test=False, max_count=0, target_cfg=None):
         bbs_list = []
+        received_pages = 0
+        failed_pages = 0
+        CrawlUtil._fs_scope.crawl_result = {'status': 'failed', 'received_pages': 0, 'failed_pages': 0}
         site_name = site_info.get('NAME', '')
         subcat_param = getattr(target_cfg, 'subcat_id', None) if target_cfg else None
         board_id, subcat_id, full_board_key = TaskCrawl.parse_board_info(board, subcat_param)
@@ -339,10 +378,12 @@ class TaskCrawl:
                 html_source = CrawlUtil.get_html(board_url, site_info=site_info, scheduler_instance=target_cfg, wait_tag=list_wait_tag)
 
                 if not html_source:
+                    failed_pages += 1
                     logger.warning(f"[TaskCrawl] [{log_tag}] 게시판 HTML 수신 실패: {board_url}")
                     break
 
                 tree = html.fromstring(html_source)
+                received_pages += 1
                 list_xpath = xpath_dict.get('XPATH', '')
                 base_xpath = list_xpath[:list_xpath.find('[%s]')] if '[%s]' in list_xpath else list_xpath
                 elements = tree.xpath(base_xpath)
@@ -463,9 +504,9 @@ class TaskCrawl:
 
                         item['torrent_info'] = CrawlUtil.get_torrent_info(item['magnet'], target_cfg)
                     else:
-                        item['magnet'] = []
-                        item['download'] = []
-                        item['torrent_info'] = None
+                        failed_pages += 1
+                        logger.warning('[TaskCrawl] [%s] 상세 페이지 수신 실패 · 이 항목을 정상 수집 결과에서 제외합니다.', log_tag)
+                        continue
 
                     if not is_test and not allow_duplicate_magnet and item.get('magnet'):
                         duplicate_magnet = ModelCrawlItem.is_exist_magnet(item['magnet'])
@@ -484,9 +525,15 @@ class TaskCrawl:
                 if stop_crawl:
                     break
         finally:
+            CrawlUtil._fs_scope.crawl_result = {
+                'status': 'partial' if failed_pages and received_pages else 'failed' if not received_pages else 'success',
+                'received_pages': received_pages, 'failed_pages': failed_pages}
+            if failed_pages:
+                logger.warning('[TaskCrawl] [%s] 수집 결과: %s · 정상 목록 %s페이지, 실패 요청 %s건, 보존 항목 %s개',
+                               log_tag, CrawlUtil._fs_scope.crawl_result['status'], received_pages, failed_pages, len(bbs_list))
             CrawlUtil.close_sessions()
 
-        return bbs_list
+        return bbs_list if received_pages else None
 
     @staticmethod
     def extract_magnets(page_html: str, tree, site_info: dict) -> list[str]:

@@ -101,6 +101,12 @@ def configure(args):
             temporary = Path(stream.name)
             stream.write(path.read_bytes())
         temporary.replace(destination)
+    # 설치 스크립트로 갱신한 기본 코드를 다음 기동에서 사용한다.
+    update_state = root / '.updates/state.json'
+    if update_state.exists():
+        backup.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(update_state, backup / 'update-state.json')
+        update_state.unlink()
     print('설치 파일 준비 완료. 기존 Rclone, 리모트 인증, 가상환경, 작업 DB와 토큰은 보존합니다.')
 
 

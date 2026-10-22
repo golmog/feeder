@@ -168,6 +168,9 @@ class DownloadBlock:
                     from .util_remote_worker import RemoteWorker
                     # 종료 확인과 등록 전 취소 예약 이후에만 원본/임시 파일을 정리한다.
                     RemoteWorker.cancel_snapshot(state)
+                    job = RemoteWorker.client(state['worker']['endpoint']).job(state['worker']['job_id'])
+                    if item := db.session.get(ModelDownload, item_id):
+                        UploadUtil.settle_usage(item, None, job.get('chargeable_bytes') if job else None)
                 failures = []
                 item = db.session.get(ModelDownload, item_id)
                 if item:

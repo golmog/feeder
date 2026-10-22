@@ -747,6 +747,9 @@ class TaskDownload:
                     item.current_engine_name = engine_name
                     item.engine_task_id = existing_tid
                     item.engine_added_time = datetime.now()
+                    item.source_unavailable_since = None
+                    item.upload_retry_after = None
+                    item.transfer_error_type = None
                     item.last_status_time = datetime.now()
                     item.remote_missing_since = None
                     item.error_message = None
@@ -806,6 +809,9 @@ class TaskDownload:
                 item.current_engine_name = engine_name
                 item.engine_task_id = str(task_id)
                 item.engine_added_time = datetime.now()
+                item.source_unavailable_since = None
+                item.upload_retry_after = None
+                item.transfer_error_type = None
                 item.last_status_time = datetime.now()
                 item.remote_missing_since = None
                 item.error_message = None
@@ -1228,6 +1234,9 @@ class TaskDownload:
         staging_root = os.path.abspath(staging_root)
         os.makedirs(staging_root, exist_ok=True)
 
+        query = TaskDownload._selected_query(db.session.query(ModelDownload)).filter(ModelDownload.status == 'pending_local_staging')
+        for item in query.all():
+            UploadUtil.expire_source_failure(item)
         queue_limit, occupied = TaskDownload._get_upload_queue_state(staging_root)
         if queue_limit > 0 and len(occupied) >= queue_limit:
             logger.info(f"[LocalStaging] Google Drive 업로드 최대 큐({queue_limit}건) 도달 (현재: {len(occupied)}건). 신규 스테이징을 대기합니다.")
@@ -1235,7 +1244,9 @@ class TaskDownload:
             return
 
         # 현재 세션 실패 항목을 제외하고, 로컬 디스크 허용 잔여 슬롯만큼만 정밀 조회
-        query = TaskDownload._selected_query(db.session.query(ModelDownload)).filter(ModelDownload.status == 'pending_local_staging')
+        if FeederUtil.single_download_id() is None:
+            query = query.filter(or_(ModelDownload.upload_retry_after.is_(None),
+                                     ModelDownload.upload_retry_after <= datetime.now()))
         if TaskDownload.failed_ids_in_session:
             query = query.filter(~ModelDownload.id.in_(list(TaskDownload.failed_ids_in_session)))
 
@@ -1314,7 +1325,7 @@ class TaskDownload:
                     cmd.extend(["--config", rclone_conf])
 
                 cmd.extend(FeederUtil.get_rclone_exclude_options())
-                cmd.extend(FeederUtil.get_rclone_extra_options())
+                cmd.extend(FeederUtil.get_rclone_transfer_options())
 
                 db.session.remove()
 
@@ -1346,20 +1357,28 @@ class TaskDownload:
                             if downloader_cfg:
                                 engine = DownloadUtil.create_engine(downloader_cfg)
                                 if engine and engine_task_id:
-                                    engine.delete_task(engine_task_id)
+                                    try:
+                                        if engine.delete_task(engine_task_id) is not True:
+                                            logger.warning('[LocalStaging] 작업 %s: 엔진 히스토리 삭제 미확인 · ID를 보존하고 업로드 후 다시 정리합니다.', target_item_id)
+                                    except Exception:
+                                        logger.warning('[LocalStaging] 작업 %s: 엔진 히스토리 삭제 실패 · 검증된 스테이징 결과와 ID를 보존합니다.', target_item_id)
 
                             it_update.local_path = item_staging_dir
                             it_update.file_name = target_folder_name
                             it_update.status = 'downloaded'
                             it_update.error_message = None
+                            it_update.transfer_error_type = None
+                            it_update.source_unavailable_since = None
+                            it_update.upload_retry_after = None
                             logger.info(f"[LocalStaging] 폴더 스테이징 완료: {staging_path}/{target_folder_name} -> downloaded 전환")
                         else:
                             if os.path.exists(item_staging_dir):
                                 shutil.rmtree(item_staging_dir, ignore_errors=True)
-                            it_update.status = 'pending_local_staging'
-                            it_update.error_message = f"로컬 스테이징 실패: {out.strip()[:150]}" if out else "로컬 스테이징 Rclone 전송 실패"
                             TaskDownload.failed_ids_in_session.add(it_update.id)
-                            logger.warning(f"[LocalStaging] {target_folder_name} 스테이징 중단 ({it_update.error_message}) -> 이번 세션 제외 후 다음 턴 재시도")
+                            UploadUtil.transfer_failed(it_update.id, out or '로컬 스테이징 Rclone 전송 실패',
+                                                       retry_status='pending_local_staging')
+                            it_update = db.session.get(ModelDownload, target_item_id)
+                            logger.warning('[LocalStaging] %s 스테이징 실패 처리 · 상태: %s', target_folder_name, it_update.status)
                         db.session.commit()
                     db.session.remove()
 
@@ -1505,6 +1524,11 @@ class TaskDownload:
 
         # 현재 세션에서 실패한 항목은 쿼리에서 안전하게 제외하고, 미시도 작업을 우선 정렬
         query = TaskDownload._selected_query(db.session.query(ModelDownload)).filter(ModelDownload.status == 'pending_upload')
+        for item in query.all():
+            UploadUtil.expire_source_failure(item)
+        if FeederUtil.single_download_id() is None:
+            query = query.filter(or_(ModelDownload.upload_retry_after.is_(None),
+                                     ModelDownload.upload_retry_after <= datetime.now()))
         if TaskDownload.failed_ids_in_session:
             query = query.filter(~ModelDownload.id.in_(list(TaskDownload.failed_ids_in_session)))
 
@@ -1540,10 +1564,26 @@ class TaskDownload:
                     success = RemoteWorker.execute(target_item, manager)
                 else:
                     success = UploadUtil.execute_upload(target_item, manager)
-                DownloadActivity.record('업로드', f'작업 #{item_id} 업로드 처리 ' + ('완료' if success else '보류 또는 실패 · 큐 상태를 확인하세요.'), 'info' if success else 'warning')
+                current = db.session.get(ModelDownload, item_id)
+                outcome = ('완료' if success else '최종 실패' if current and current.status == 'failed'
+                           else '원격 작업 실패' if current and current.status == 'move_failed'
+                           else '보류 · 다음 실행에서 재확인')
+                if success or not (current and current.upload_retry_after and current.destination_type == 'remote_worker'):
+                    DownloadActivity.record('업로드', f'작업 #{item_id} 업로드 처리 {outcome}', 'info' if success else 'warning')
                 if not success:
                     TaskDownload.failed_ids_in_session.add(item_id)
-                    logger.warning(f"[UploadUtil] {file_name} 업로드 실패 -> 이번 세션 제외 후 다음 턴 재시도")
+                    db.session.remove()
+                    current = db.session.get(ModelDownload, item_id)
+                    state = current.status if current else 'deleted'
+                    if state == 'pending_upload':
+                        if current.destination_type == 'remote_worker' or (current.upload_state or {}).get('worker'):
+                            logger.debug('[UploadUtil] 원격 작업 %s 일시 대기: %s', item_id, current.error_message or '다음 실행에서 재확인')
+                        else:
+                            logger.warning('[UploadUtil] %s 업로드 보류 -> 다음 실행에서 재확인 (%s)', file_name,
+                                           current.transfer_error_type or '설정·계정 대기')
+                    else:
+                        logger.warning('[UploadUtil] %s 업로드 미완료 -> 현재 상태: %s', file_name, state)
+                    db.session.remove()
 
         for item_id, future in TaskDownload._worker_results(_upload_worker, item_ids, upload_workers, activity_stage='업로드'):
             FeederUtil.cooperate()

@@ -13,7 +13,7 @@ import threading
 import time
 from collections import deque
 
-from rclone_logging import redact_log
+from rclone_logging import redact_log, FileQuota
 
 from .jobs import validate_payload
 from .configuration import Configurations
@@ -139,7 +139,7 @@ class Worker:
         options = Configurations(self.store.database, self.store.events).get(job['config_version'])['rclone']
         # 옵션은 고정하고 원본과 목적지는 -- 뒤에 넣어 옵션 해석을 차단한다.
         return [str(self.settings.rclone_binary), '--config', str(self.settings.rclone_config),
-            'copy', '--transfers', '1', '--checkers', str(options['checkers']), '--buffer-size', f"{options['buffer_size_mib']}Mi",
+            'copy', '--transfers', str(job.get('rclone_transfers', options['transfers'])), '--checkers', str(options['checkers']), '--buffer-size', f"{options['buffer_size_mib']}Mi",
             '--multi-thread-streams', '0', '--retries', '1', '--low-level-retries', '1',
             '--contimeout', '10s', '--timeout', '2m', '--stats', f"{options['stats_interval_seconds']}s", '--stats-log-level', 'INFO',
             '--use-json-log', '--log-level', 'INFO',
@@ -155,6 +155,7 @@ class Worker:
         termination = None
         forced = False
         errors = deque(maxlen=8)
+        quota = FileQuota()
 
         def remember(message):
             message = redact_log(message, (self.settings.api_token,))
@@ -172,7 +173,9 @@ class Worker:
                     return
                 if not isinstance(log, dict):
                     return
+                quota.observe(log)
                 if isinstance(log.get('stats'), dict):
+                    self.store.accounting(job['job_id'], quota.charged_bytes())
                     self.store.progress(job['job_id'], log['stats'])
                     if log['stats'].get('lastError'):
                         remember(log['stats']['lastError'])
@@ -182,10 +185,22 @@ class Worker:
                 pass
 
         try:
-            validate_payload({k: job[k] for k in ('job_id', 'source', 'destination', 'config_version', 'exclude_patterns', 'drive_impersonate')}, self.settings)
+            validate_payload({k: job[k] for k in ('job_id', 'source', 'destination', 'config_version', 'exclude_patterns', 'drive_impersonate', 'rclone_transfers') if k in job}, self.settings)
             current = self.store.get(job['job_id'])
             if self._stop.is_set() or current['cancel_requested']:
                 self.store.finish(job['job_id'], None, '서비스 종료로 전송 시작이 중단됐습니다.')
+                return
+            # 전송 전 목록은 파일별 쿼터 계산에만 사용하며 실패해도 복사는 계속한다.
+            quota = FileQuota.inspect_source([
+                str(self.settings.rclone_binary), '--config', str(self.settings.rclone_config),
+                'lsjson', '--recursive', '--files-only', '--no-modtime', '--no-mimetype',
+                '--contimeout', '10s', '--timeout', '15s', '--retries', '1', '--low-level-retries', '1',
+                *[value for pattern in job.get('exclude_patterns', []) for value in ('--exclude', pattern)],
+                '--', job['source']], stopped=lambda: self._stop.is_set() or self.store.get(job['job_id'])['cancel_requested'])
+            current = self.store.get(job['job_id'])
+            if self._stop.is_set() or current['cancel_requested']:
+                self.store.accounting(job['job_id'], 0)
+                self.store.finish(job['job_id'], None, '전송 전 목록 조회 중 작업이 중단됐습니다.')
                 return
             process = subprocess.Popen(
                 [sys.executable, '-B', '-m', 'app.child', str(os.getpid())] + self.command(job),
@@ -242,4 +257,5 @@ class Worker:
             selector.close()
         if error:
             logger.error('작업 %s: %s', job['job_id'], error)
+        self.store.accounting(job['job_id'], quota.charged_bytes() if process is not None else 0)
         self.store.finish(job['job_id'], process.returncode if process is not None else None, error)

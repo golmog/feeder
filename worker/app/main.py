@@ -2,18 +2,25 @@
 
 import logging
 import signal
+import os
+from pathlib import Path
 from waitress import create_server
 
 from . import VERSION, create_app
 from .settings import Settings
+from .updates import bootstrap
 
 
 def main() -> None:
-    settings = Settings.load()
+    root = Path(os.environ.get('FEEDER_WORKER_ROOT') or Path(__file__).resolve().parents[1])
+    settings = Settings.load(root)
+    bootstrap(root, settings)
     logging.basicConfig(level=settings.log_level, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     app = create_app(settings)
     logging.getLogger(__name__).info('Feeder Remote Worker %s 시작 (%s:%s)', VERSION, settings.bind, settings.port)
     worker = app.extensions['worker_runner']
+    updates = app.extensions['worker_updates']
+    updates.callback = lambda: os.kill(os.getpid(), signal.SIGTERM)
     previous = {kind: signal.getsignal(kind) for kind in (signal.SIGTERM, signal.SIGINT)}
     def terminate(signum, frame):
         app.extensions['worker_events'].close()
@@ -32,7 +39,11 @@ def main() -> None:
             channel_request_lookahead=1,
         )
         worker.start()
+        updates.confirm_started()
         server.run()
+    except KeyboardInterrupt:
+        if not updates.ready:
+            raise
     finally:
         try:
             app.extensions['worker_events'].close()
@@ -45,6 +56,8 @@ def main() -> None:
             finally:
                 for kind, handler in previous.items():
                     signal.signal(kind, handler)
+    if updates.ready:
+        updates.activate()
 
 
 if __name__ == '__main__':

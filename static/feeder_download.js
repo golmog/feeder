@@ -1213,6 +1213,10 @@ function render_downloaders(data) {
     var statusBadge = isEnabled ? '<span class="badge badge-success">활성</span>' : '<span class="badge badge-secondary">중지</span>';
     var rawTimeout = (item.stalled_timeout_hours !== undefined && item.stalled_timeout_hours !== null && item.stalled_timeout_hours !== '') ? parseInt(item.stalled_timeout_hours) : 24;
     var timeoutStr = (rawTimeout <= 0) ? '<span class="text-info font-weight-bold">타임아웃 무제한</span>' : rawTimeout + '시간 타임아웃';
+    if (item.engine_type === 'alldebrid') {
+      var webdavHours = item.webdav_failure_timeout_hours === undefined ? 24 : Number(item.webdav_failure_timeout_hours);
+      timeoutStr += '<br>WebDAV 실패 유예: ' + (webdavHours === 0 ? '무제한' : webdavHours + '시간');
+    }
 
     var connDetail = '';
     if (item.engine_type === 'qbittorrent') {
@@ -1222,7 +1226,7 @@ function render_downloaders(data) {
     } else {
       // 커스텀 엔진(AllDebrid, PikPak 등): 식별용 주요 설정값 동적 표시
       var keys = Object.keys(item).filter(function (k) {
-        return ['name', 'engine_type', 'enabled', 'stalled_timeout_hours', 'missing_timeout_hours'].indexOf(k) === -1;
+        return ['name', 'engine_type', 'enabled', 'stalled_timeout_hours', 'missing_timeout_hours', 'webdav_failure_timeout_hours'].indexOf(k) === -1 && !/key|token|secret|password|credential/i.test(k);
       });
       connDetail = keys.slice(0, 3).map(function (k) {
         var val = item[k];
@@ -1291,7 +1295,7 @@ function render_dynamic_engine_fields(engine_id, current_values) {
       var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
       html += '    <input type="checkbox" id="dl_field_' + f.name + '" class="mt-2" ' + isChk + '>';
     } else if (f.type === 'number') {
-      html += '    <input type="number" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+      html += '    <input type="number" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '"' + (f.min !== undefined ? ' min="' + f.min + '"' : '') + (f.max !== undefined ? ' max="' + f.max + '"' : '') + (f.step !== undefined ? ' step="' + f.step + '"' : '') + '>';
     } else if (f.type === 'password') {
       html += '    <input type="password" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
     } else {
@@ -1356,7 +1360,7 @@ $(document).on('click', '#downloader_test_btn', function (e) {
       var f = schemaObj.config_schema[i];
       var el = $('#dl_field_' + f.name);
       if (f.type === 'checkbox') cfg[f.name] = el.is(':checked');
-      else if (f.type === 'number') cfg[f.name] = parseInt(el.val()) || 0;
+      else if (f.type === 'number') cfg[f.name] = f.name === 'webdav_failure_timeout_hours' ? el.val() : (parseInt(el.val()) || 0);
       else cfg[f.name] = el.val().trim();
     }
   }
@@ -1382,6 +1386,8 @@ $(document).on('click', '#downloader_test_btn', function (e) {
 
 $(document).on('click', '#downloader_save_btn', function (e) {
   e.preventDefault();
+  var button = $(this);
+  if (button.prop('disabled')) return;
   var name = $('#dl_name').val().trim();
   var e_type = $('#dl_engine_type').val();
   if (!name) { notify('식별명을 입력하세요.', 'warning'); return; }
@@ -1399,21 +1405,39 @@ $(document).on('click', '#downloader_save_btn', function (e) {
       var f = schemaObj.config_schema[i];
       var el = $('#dl_field_' + f.name);
       if (f.type === 'checkbox') cfg[f.name] = el.is(':checked');
-      else if (f.type === 'number') cfg[f.name] = parseInt(el.val()) || 0;
+      else if (f.type === 'number') cfg[f.name] = f.name === 'webdav_failure_timeout_hours' ? el.val() : (parseInt(el.val()) || 0);
       else cfg[f.name] = el.val().trim();
     }
   }
 
+  button.prop('disabled', true);
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/save_downloader',
     type: 'POST',
     data: { downloader_json: JSON.stringify(cfg) },
     dataType: 'json',
     success: function (data) {
+      var result = data && typeof data.ret === 'string' ? data.ret : '';
+      if ((result !== 'success' && result !== 'success_update') || !Array.isArray(data.downloaders)) {
+        // 검증된 고정 문구만 표시하여 서버 응답에 섞인 인증 값의 노출을 막는다.
+        var errors = {
+          empty_name: '식별명을 입력하세요.',
+          'WebDAV 실패 유예는 0~8760 사이의 정수 시간이어야 합니다.': 'WebDAV 실패 유예는 0~8760 사이의 정수 시간이어야 합니다.'
+        };
+        var message = Object.prototype.hasOwnProperty.call(errors, result) ? errors[result] : '다운로더 설정을 저장하지 못했습니다. 입력값을 확인하고 다시 시도하세요.';
+        notify(message, 'warning');
+        return;
+      }
       notify('다운로더 설정이 저장되었습니다.', 'success');
       $('#downloader_modal').modal('hide');
       current_downloaders = data.downloaders || [];
       render_downloaders(current_downloaders);
+    },
+    error: function () {
+      notify('다운로더 설정 저장 중 통신 오류가 발생했습니다. 입력값은 유지됩니다.', 'danger');
+    },
+    complete: function () {
+      button.prop('disabled', false);
     }
   });
 });

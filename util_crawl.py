@@ -13,6 +13,10 @@ from html import unescape
 from lxml import html
 
 import json
+import threading
+import uuid
+import hashlib
+from contextlib import contextmanager
 
 from .setup import *
 from .model_crawl import ModelCrawlSite
@@ -59,6 +63,140 @@ class CrawlUtil:
     _cffi_sessions = {}
     _requests_sessions = {}
     _proxy_index = 0
+    _http_ready = {}
+    _fs_locks = {}
+    _fs_lock_guard = threading.Lock()
+    _fs_sessions = {}
+    _fs_owned = set()
+    _network_context = {}
+    _fs_scope = threading.local()
+    _execution_lock = threading.RLock()
+    _executions = {}
+    _cookie_records = {}
+    _configured_cookies = {}
+    _selenium_context = None
+    _cleanup_failures = []
+
+    @classmethod
+    @contextmanager
+    def execution_scope(cls, owner=None):
+        """기존 훅의 클래스 속성을 유지하면서 실행별 자원을 격리한다."""
+        active = getattr(cls._fs_scope, 'owner', None)
+        pid = os.getpid()
+        if active and getattr(cls._fs_scope, 'pid', None) == pid and (owner is None or owner == active):
+            yield active
+            return
+        if owner is None:
+            implicit = getattr(cls._fs_scope, 'implicit', None)
+            if not implicit or implicit[0] != pid:
+                implicit = (pid, uuid.uuid4().hex)
+                cls._fs_scope.implicit = implicit
+            owner = implicit[1]
+        names = ('_cf_cookies', '_cf_user_agents', '_cookie_records', '_configured_cookies', '_requests_sessions',
+                 '_cffi_sessions', '_http_ready', '_network_context', '_fs_sessions', '_fs_owned',
+                 '_selenium_driver', '_selenium_context')
+        # 레거시 훅이 클래스 속성의 드라이버를 읽으므로 바인딩하는 동안 직렬화한다.
+        with cls._execution_lock:
+            saved = {name: getattr(cls, name) for name in names}
+            state = cls._executions.setdefault((pid, owner), {name:
+                (set() if name == '_fs_owned' else None if name in ('_selenium_driver', '_selenium_context') else {}) for name in names})
+            previous_pid = getattr(cls._fs_scope, 'pid', None)
+            local_names = ('auth', 'user_cookie', 'clearance_proxy')
+            local_saved = {name: getattr(cls._fs_scope, name, None) for name in local_names}
+            for name in local_names:
+                setattr(cls._fs_scope, name, None)
+            for name, value in state.items():
+                setattr(cls, name, value)
+            cls._fs_scope.owner, cls._fs_scope.pid = owner, pid
+            try:
+                yield owner
+            finally:
+                state.update({name: getattr(cls, name) for name in names})
+                for name, value in saved.items():
+                    setattr(cls, name, value)
+                cls._fs_scope.owner, cls._fs_scope.pid = active, previous_pid
+                for name, value in local_saved.items():
+                    setattr(cls._fs_scope, name, value)
+
+    @classmethod
+    def finish_execution(cls):
+        with cls.execution_scope():
+            cls._finish_execution_current()
+
+    @classmethod
+    def _finish_execution_current(cls):
+        for cleanup in (cls.close_flaresolverr_sessions, cls.close_sessions):
+            try:
+                cleanup()
+            except Exception as exc:
+                logger.warning('[CrawlUtil] 실행 자원 정리 실패: %s', cls._safe_network_log(exc))
+        key = (os.getpid(), getattr(cls._fs_scope, 'owner', None))
+        if cls._selenium_driver is not None:
+            cls._cleanup_failures.append({'owner': key, 'kind': 'selenium',
+                'session': getattr(cls._selenium_driver, 'session_id', None)})
+        if cls._fs_owned:
+            cls._cleanup_failures.extend({'owner': key, 'endpoint': endpoint, 'host': host,
+                'session': cls._fs_sessions.get((endpoint, host), {}).get('id')}
+                for endpoint, host in cls._fs_owned)
+            logger.warning('[CrawlUtil] 실행 종료: 원격 세션 정리 미확인 %s개 · 다른 실행에서 인수하지 않습니다.', len(cls._fs_owned))
+        cls._cleanup_failures[:] = cls._cleanup_failures[-64:]
+        cls._executions.pop(key, None)
+
+    @staticmethod
+    def normalize_cookies(cookies, url):
+        parsed = urlparse(url)
+        host = parsed.hostname or ''
+        result = []
+        for raw in cookies or []:
+            if not isinstance(raw, dict) or not isinstance(raw.get('name'), str) or not isinstance(raw.get('value'), str):
+                continue
+            domain = str(raw.get('domain') or host).lower()
+            bare = domain.lstrip('.')
+            if not bare or (bare != host and ('.' not in bare or not host.endswith('.' + bare))):
+                continue
+            path = raw.get('path') or parsed.path.rpartition('/')[0] or '/'
+            if not isinstance(path, str) or not path.startswith('/'):
+                continue
+            cookie = {key: raw[key] for key in ('name', 'value', 'secure', 'httpOnly') if key in raw}
+            cookie.update(domain=domain, path=path)
+            expiry = raw.get('expires', raw.get('expiry'))
+            if type(expiry) in (int, float) and expiry >= 0:
+                cookie['expires'] = float(expiry)
+            result.append(cookie)
+        return result
+
+    @classmethod
+    def _store_solution(cls, host, solution, url):
+        now = time.time()
+        records = cls._cookie_records.setdefault(host, {})
+        cookies = cls.normalize_cookies(solution.get('cookies'), url)
+        clearance_seen = False
+        for cookie in cookies:
+            key = (cookie['name'], cookie['domain'], cookie['path'])
+            old = records.get(key)
+            deadline = min(now + cls.CF_COOKIE_EXPIRY, cookie.get('expires', now + cls.CF_COOKIE_EXPIRY))
+            if old and old['cookie']['value'] == cookie['value']:
+                deadline = min(deadline, old['until'])
+            records[key] = {'cookie': cookie, 'until': deadline, 'observed': now}
+            clearance_seen |= cookie['name'] == 'cf_clearance' and bool(cookie['value'])
+        if not clearance_seen:
+            for record in records.values():
+                if record['cookie']['name'] == 'cf_clearance':
+                    record['until'] = min(record['until'], now)
+        cls._cf_cookies[host] = {c['name']: c['value'] for c in cls._cached_cookies(host, url)}
+        if solution.get('userAgent'):
+            cls._cf_user_agents[host] = solution['userAgent']
+
+    @classmethod
+    def _cached_cookies(cls, host, url=None):
+        parsed = urlparse(url or ('https://' + host + '/'))
+        path = parsed.path or '/'
+        return [r['cookie'] for r in cls._cookie_records.get(host, {}).values()
+                if r['until'] > time.time() and
+                ((parsed.hostname or '') == r['cookie']['domain'].lstrip('.') or
+                 (r['cookie']['domain'].startswith('.') and (parsed.hostname or '').endswith('.' + r['cookie']['domain'].lstrip('.')))) and
+                (path == r['cookie']['path'] or path.startswith(r['cookie']['path'].rstrip('/') + '/')) and
+                (not r['cookie'].get('secure') or parsed.scheme == 'https')]
 
     DEFAULT_HEADERS = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -175,7 +313,7 @@ class CrawlUtil:
         if len(p_list) > 1:
             cls._proxy_index = (cls._proxy_index + 1) % len(p_list)
             active_proxy = p_list[cls._proxy_index]
-            logger.info(f"[CrawlUtil] 프록시 로테이션 ({reason}) -> {active_proxy} ({cls._proxy_index + 1}/{len(p_list)}번)")
+            logger.info(f"[CrawlUtil] 프록시 로테이션 ({reason}) -> {cls._proxy_index + 1}/{len(p_list)}번")
             return active_proxy
         return p_list[0]
 
@@ -187,13 +325,125 @@ class CrawlUtil:
         return None
 
     @classmethod
-    def _has_valid_clearance(cls, host: str) -> bool:
-        cf_data = cls._cf_cookies.get(host, {})
-        if not cf_data:
+    def _site_lock(cls, host):
+        with cls._fs_lock_guard:
+            return cls._fs_locks.setdefault(host, threading.RLock())
+
+    @staticmethod
+    def _safe_network_log(value):
+        text = re.sub(r'(?i)\b(?:https?|socks[45]h?)://[^\s<>\"\']+', '[URL 숨김]', str(value))
+        text = re.sub(r'''(?i)["']?\b(?:set-cookie|cookies?|authorization)["']?\s*[:=]\s*[^\r\n]+''', '[인증 정보 숨김]', text)
+        text = re.sub(r'(?i)\b(?:Bearer|Basic)\s+[^\s,;]+', '[인증 정보 숨김]', text)
+        return re.sub(r'(?i)\b(password|passwd|token|api[_-]?key|cf_clearance)\s*[:=]\s*[^\s,;]+',
+                      r'\1=[인증 정보 숨김]', text).replace('\n', ' ')[:300]
+
+    @classmethod
+    def _clear_network_state(cls, host):
+        cls._cookie_records.pop(host, None)
+        cls._cf_cookies.pop(host, None)
+        cls._cf_user_agents.pop(host, None)
+        cls._http_ready = {key: stamp for key, stamp in cls._http_ready.items() if key[0] != host}
+        for sessions in (cls._requests_sessions, cls._cffi_sessions):
+            session = sessions.pop(host, None)
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+    @classmethod
+    def _activate_network_context(cls, host, proxies):
+        endpoint = (P.ModelSetting.get('crawl_flaresolverr_url') or '').rstrip('/')
+        context = (endpoint, (proxies or {}).get('http', ''), getattr(cls._fs_scope, 'auth', ''))
+        if host in cls._network_context and cls._network_context[host] != context:
+            cls._clear_network_state(host)
+            for (server, site), record in cls._fs_sessions.items():
+                if site == host:
+                    record['state'] = 'unknown'
+        cls._network_context[host] = context
+
+    @classmethod
+    def _fs_command(cls, endpoint, payload, timeout=10, missing_ok=False):
+        try:
+            response = requests.post(f'{endpoint}/v1', json=payload, timeout=timeout)
+            data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError('JSON 객체가 아님')
+            message = str(data.get('message') or '')
+            absent = 'session' in message.lower() and any(word in message.lower()
+                for word in ('not found', 'does not exist', 'doesn\'t exist', 'not exist', 'already removed'))
+            if missing_ok and absent and response.status_code in (200, 400, 404, 500):
+                return {}
+            if response.status_code != 200 or data.get('status') != 'ok':
+                logger.warning('[CrawlUtil] FlareSolverr %s 실패 (HTTP %s): %s',
+                               payload['cmd'], response.status_code, cls._safe_network_log(message))
+                return None
+            return data
+        except Exception as exc:
+            logger.warning('[CrawlUtil] FlareSolverr %s 통신/응답 오류: %s', payload['cmd'], cls._safe_network_log(exc))
+            return None
+
+    @classmethod
+    def _destroy_fs_session(cls, endpoint, host):
+        key = (endpoint, host)
+        if key not in cls._fs_owned:
+            return True
+        record = cls._fs_sessions.get(key)
+        if not record:
             return False
-        timestamp = cf_data.get('_timestamp', 0)
-        has_token = bool(cf_data.get('cf_clearance'))
-        return has_token and (time.time() - timestamp < cls.CF_COOKIE_EXPIRY)
+        name = record['id']
+        if cls._fs_command(endpoint, {'cmd': 'sessions.destroy', 'session': name}, timeout=5, missing_ok=True) is None:
+            return False
+        cls._fs_sessions.pop(key, None)
+        cls._fs_owned.discard(key)
+        logger.info('[CrawlUtil] [%s] 기존 FlareSolverr 세션 정리', host)
+        return True
+
+    @classmethod
+    def _create_fs_session(cls, endpoint, host, proxies):
+        name = 'feeder_' + hashlib.sha256(str(getattr(cls._fs_scope, 'owner', os.getpid())).encode()).hexdigest()[:12] + '_' + uuid.uuid4().hex
+        payload = {'cmd': 'sessions.create', 'session': name}
+        if (proxies or {}).get('http'):
+            payload['proxy'] = {'url': proxies['http']}
+        # 생성 응답이 유실되면 소유 ID만 기록하고 정상 세션으로 사용하지 않는다.
+        cls._fs_sessions[(endpoint, host)] = {'id': name, 'proxy': (proxies or {}).get('http', ''), 'state': 'unknown'}
+        cls._fs_owned.add((endpoint, host))
+        data = cls._fs_command(endpoint, payload, timeout=20)
+        if data is None:
+            return False
+        if 'already exists' in str(data.get('message', '')).lower():
+            # 충돌 응답은 소유권의 증거가 아니다. 해당 원격 세션을 정리하지 않는다.
+            cls._fs_owned.discard((endpoint, host))
+            cls._fs_sessions.pop((endpoint, host), None)
+            logger.warning('[CrawlUtil] [%s] 생성 ID 충돌 · 기존 원격 세션을 인수하지 않습니다.', host)
+            return False
+        if data.get('session') != name:
+            logger.warning('[CrawlUtil] [%s] FlareSolverr 세션 생성 응답의 ID가 일치하지 않습니다.', host)
+            return False
+        cls._fs_sessions[(endpoint, host)]['state'] = 'ready'
+        return True
+
+    @classmethod
+    def _replace_fs_session(cls, endpoint, host, proxies, budget, recovery=True):
+        if recovery and budget['recoveries'] >= 1:
+            budget['blocked'] = True
+            logger.warning('[CrawlUtil] [%s] FlareSolverr 세션 복구 1회 소진 · 이번 페이지의 추가 복구 중단', host)
+            return False
+        if recovery:
+            budget['recoveries'] += 1
+        cls._clear_network_state(host)
+        if not cls._destroy_fs_session(endpoint, host) or not cls._create_fs_session(endpoint, host, proxies):
+            budget['blocked'] = True
+            return False
+        logger.info('[CrawlUtil] [%s] FlareSolverr 세션 재생성 완료', host)
+        return True
+
+    @classmethod
+    def _has_valid_clearance(cls, host: str, url=None) -> bool:
+        if url is not None:
+            return any(c['name'] == 'cf_clearance' and c['value'] for c in cls._cached_cookies(host, url))
+        return any(record['until'] > time.time() and record['cookie']['name'] == 'cf_clearance'
+                   and record['cookie']['value'] for record in cls._cookie_records.get(host, {}).values())
 
     @staticmethod
     def _is_challenge_html(source: str) -> bool:
@@ -217,7 +467,7 @@ class CrawlUtil:
         if not isinstance(data, dict):
             logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 응답 형식 오류 (API HTTP {response.status_code})')
             return None
-        message = str(data.get('message') or '').replace('\n', ' ')[:300]
+        message = cls._safe_network_log(data.get('message') or '')
         if response.status_code != 200 or data.get('status') != 'ok':
             logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 처리 실패 (API HTTP {response.status_code}, status={data.get("status")}): {message or "원인 메시지 없음"}')
             return None
@@ -261,39 +511,70 @@ class CrawlUtil:
             description = '챌린지 해결 응답 · 정상 페이지 수신' if source.strip() else '챌린지 해결 응답 · 인가 쿠키 수신'
         else:
             description = '페이지 수신 · 챌린지 감지 여부는 응답에서 확인 불가' if source.strip() else '인가 쿠키 수신 · 챌린지 감지 여부는 응답에서 확인 불가'
-        logger.info(f'[CrawlUtil] [{host}] FlareSolverr {description} (쿠키 {len(cookies)}개, cf_clearance {"있음" if has_clearance else "없음"})')
+        logger.debug(f'[CrawlUtil] [{host}] FlareSolverr {description} (쿠키 {len(cookies)}개, cf_clearance {"있음" if has_clearance else "없음"})')
         return dict(solution, cookies=cookies)
 
     @classmethod
     def _sync_clearance_to_sessions(cls, host: str):
-        cookies = cls._cf_cookies.get(host, {})
+        # 요청별 헤더에서 jar와 캐시를 합치므로 정상 HTTP 쿠키는 지우지 않는다.
         ua = cls._cf_user_agents.get(host)
+        for sessions in (cls._requests_sessions, cls._cffi_sessions):
+            session = sessions.get(host)
+            if session is not None and ua:
+                session.headers['User-Agent'] = ua
 
-        req_sess = cls._requests_sessions.get(host)
-        if req_sess:
-            if ua:
-                req_sess.headers['User-Agent'] = ua
-            for k, v in cookies.items():
-                if not k.startswith('_'):
-                    req_sess.cookies.set(k, v, domain=host)
-
-        cffi_sess = cls._cffi_sessions.get(host)
-        if cffi_sess:
-            if ua:
-                cffi_sess.headers['User-Agent'] = ua
-            for k, v in cookies.items():
-                if not k.startswith('_'):
-                    cffi_sess.cookies.set(k, v, domain=host)
+    @classmethod
+    def _http_cookie_header(cls, host, url, explicit='', session=None):
+        merged = {}
+        parsed = urlparse(url)
+        jar = getattr(session, 'cookies', ())
+        jar = getattr(jar, 'jar', jar)
+        try:
+            for cookie in jar:
+                domain = cookie.domain.lstrip('.')
+                path = cookie.path or '/'
+                matching = ((parsed.hostname == domain or
+                            (cookie.domain_initial_dot and (parsed.hostname or '').endswith('.' + domain))) and
+                            (parsed.path == path or (parsed.path or '/').startswith(path.rstrip('/') + '/')) and
+                            (not cookie.secure or parsed.scheme == 'https'))
+                records = [r for r in cls._cookie_records.get(host, {}).values() if r['cookie']['name'] == cookie.name]
+                expired_cache = records and all(r['until'] <= time.time() for r in records)
+                if matching and not cookie.is_expired() and not expired_cache:
+                    merged[cookie.name] = cookie.value
+        except (TypeError, AttributeError):
+            pass
+        merged.update({c['name']: c['value'] for c in cls._cached_cookies(host, url)})
+        for part in (explicit or '').split(';'):
+            if '=' in part:
+                name, value = part.strip().split('=', 1)
+                merged[name] = value
+        return '; '.join(f'{name}={value}' for name, value in merged.items())
 
     # --------------------------------------------------------------------------
     # 웹 스크래핑 엔진
     # --------------------------------------------------------------------------
     @classmethod
     def get_html(cls, url: str, site_info: dict = None, scheduler_instance=None, referer: str = None, max_retries: int = None, retry_interval: float = None, wait_tag: str = None) -> str | None:
+        previous = getattr(cls._fs_scope, 'request', None)
+        cls._fs_scope.request = {'recoveries': 0, 'blocked': False}
+        try:
+            with cls.execution_scope(), cls._site_lock(urlparse(url).hostname or ''):
+                return cls._get_html_in_context(url, site_info, scheduler_instance, referer, max_retries, retry_interval, wait_tag)
+        finally:
+            cls._fs_scope.request = previous
+
+    @classmethod
+    def _get_html_in_context(cls, url: str, site_info: dict = None, scheduler_instance=None, referer: str = None, max_retries: int = None, retry_interval: float = None, wait_tag: str = None) -> str | None:
         extra = site_info.get('EXTRA', []) if site_info else []
         cookie = site_info.get('COOKIE') if site_info else None
         proxies = cls.get_proxies(scheduler_instance)
         host = urlparse(url).hostname or ''
+        cls._fs_scope.auth = hashlib.sha256(str(((site_info or {}).get('NAME', ''), cookie, (site_info or {}).get('USER_AGENT', ''))).encode()).hexdigest()
+        cls._fs_scope.user_cookie = (host, cookie or '')
+        cls._configured_cookies[host] = cookie or ''
+        cls._activate_network_context(host, proxies)
+        ready_key = (host, (proxies or {}).get('http', ''), cookie or '', (site_info or {}).get('USER_AGENT', ''))
+        http_ready = time.time() - cls._http_ready.get(ready_key, 0) < cls.CF_COOKIE_EXPIRY
 
         try:
             if max_retries is None:
@@ -353,40 +634,38 @@ class CrawlUtil:
                     time.sleep(retry_interval)
             return None
 
-        if use_fs and not cls._has_valid_clearance(host):
-            logger.info(f"[CrawlUtil] [{host}] 유효한 인가 쿠키 캐시 없음 -> 설정에 따라 FlareSolverr 우선 페이지 요청: {url}")
+        if use_fs and not cls._has_valid_clearance(host, url) and not http_ready:
+            logger.debug(f"[CrawlUtil] [{host}] 유효한 인가 쿠키 캐시 없음 -> 설정에 따라 FlareSolverr 우선 페이지 요청")
+            fs_attempts = 0
             for fs_try in range(1, effective_retries + 1):
+                if cls._fs_scope.request['blocked']:
+                    break
+                fs_attempts += 1
                 tree, fs_html = cls.get_by_flaresolverr(url, proxies=proxies)
                 if fs_html and not cls._is_challenge_html(fs_html):
-                    logger.info(f"[CrawlUtil] [{host}] FlareSolverr 1차 페이지 수신 완료")
+                    logger.debug(f"[CrawlUtil] [{host}] FlareSolverr 1차 페이지 수신 완료")
+                    cls._http_ready[ready_key] = time.time()
                     return fs_html
+                if cls._fs_scope.request['blocked']:
+                    break
                 if fs_try < effective_retries:
                     logger.debug(f"[CrawlUtil] [{host}] FlareSolverr 페이지 요청 재시도 ({fs_try}/{effective_retries})...")
                     time.sleep(retry_interval)
 
-            logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 페이지 요청 {effective_retries}회 실패, HTTP 세션으로 폴백 시도")
+            logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 페이지 요청 {fs_attempts}회 실패, HTTP 세션으로 폴백 시도")
 
         headers = cls.DEFAULT_HEADERS.copy()
-        if host in cls._cf_user_agents:
-            headers['User-Agent'] = cls._cf_user_agents[host]
-        elif site_info and site_info.get('USER_AGENT'):
-            headers['User-Agent'] = site_info['USER_AGENT']
-
         if referer:
             headers['Referer'] = referer
-        if cookie:
-            headers['Cookie'] = cookie
-
-        domain_cf = cls._cf_cookies.get(host, {})
-        if domain_cf and (time.time() - domain_cf.get('_timestamp', 0) < cls.CF_COOKIE_EXPIRY):
-            injected = "; ".join([f"{k}={v}" for k, v in domain_cf.items() if not k.startswith('_')])
-            if injected:
-                current_cookie_str = headers.get('Cookie', '')
-                headers['Cookie'] = f"{current_cookie_str}; {injected}".strip('; ')
 
         for attempt in range(1, effective_retries + 1):
             proxies = cls.get_proxies(scheduler_instance)
-            proxy_display = proxies.get('http') if (proxies and 'http' in proxies) else 'Direct'
+            cls._activate_network_context(host, proxies)
+            # 재시도에서 프록시가 바뀌면 이전 Cookie/User-Agent 헤더를 다시 사용하지 않는다.
+            headers.pop('Cookie', None)
+            headers['User-Agent'] = cls._cf_user_agents.get(host) or (site_info or {}).get('USER_AGENT') or cls.DEFAULT_HEADERS['User-Agent']
+            ready_key = (host, (proxies or {}).get('http', ''), cookie or '', (site_info or {}).get('USER_AGENT', ''))
+            proxy_display = '프록시 사용' if proxies else 'Direct'
 
             if _CURL_CFFI_AVAILABLE:
                 try:
@@ -397,17 +676,20 @@ class CrawlUtil:
                         logger.debug(f"[CrawlUtil] curl_cffi 세션 생성 ({proxy_display}): {host}")
 
                     cls._sync_clearance_to_sessions(host)
+                    value = cls._http_cookie_header(host, url, cookie, cffi_session)
+                    headers['Cookie'] = value
                     res = cffi_session.get(url, headers=headers, proxies=proxies, impersonate="chrome", timeout=25)
                     if res.status_code == 200:
                         if not cls._is_challenge_html(res.text):
                             logger.debug(f'[CrawlUtil] [{host}] 일반 HTTP 페이지 수신 성공 (curl_cffi)')
+                            cls._http_ready[ready_key] = time.time()
                             return res.text
                         logger.warning(f"[CrawlUtil] [{host}] Cloudflare 챌린지 감지 (HTTP 200 Turnstile) -> 인가 갱신 시도")
                     else:
                         logger.debug(f"[CrawlUtil] curl_cffi 응답 코드: {res.status_code} ({url})")
 
                 except Exception as e:
-                    err_msg = str(e)
+                    err_msg = cls._safe_network_log(e)
                     logger.debug(f"[CrawlUtil] curl_cffi 요청 실패 ({proxy_display} / {url}): {err_msg}")
 
             try:
@@ -416,14 +698,18 @@ class CrawlUtil:
                     req_session = requests.Session()
                     cls._requests_sessions[host] = req_session
                 cls._sync_clearance_to_sessions(host)
+                value = cls._http_cookie_header(host, url, cookie, req_session)
+                headers['Cookie'] = value
                 res = req_session.get(url, headers=headers, proxies=proxies, timeout=25)
                 if res.status_code == 200 and not cls._is_challenge_html(res.text):
                     logger.debug(f'[CrawlUtil] [{host}] 일반 HTTP 페이지 수신 성공 (requests)')
+                    cls._http_ready[ready_key] = time.time()
                     return res.text
             except Exception as e:
-                logger.debug(f"[CrawlUtil] requests 폴백 실패 ({proxy_display} / {url}): {e}")
+                logger.debug(f"[CrawlUtil] requests 폴백 실패 ({proxy_display} / {url}): {cls._safe_network_log(e)}")
 
             # 차단(403, 429), 서버오류(503), SSL/TLS 연결 단절 감지 시 즉시 세션 파기 및 프록시 로테이션
+            cls._http_ready.pop(ready_key, None)
             if host in cls._cffi_sessions:
                 try:
                     cls._cffi_sessions[host].close()
@@ -443,12 +729,14 @@ class CrawlUtil:
                 proxies = cls.get_proxies(scheduler_instance)
 
             # Cloudflare 사이트의 경우 FlareSolverr 재인가 수행
-            if use_fs:
+            if use_fs and not cls._fs_scope.request['blocked']:
                 cls._cf_cookies.pop(host, None)
-                logger.warning(f"[CrawlUtil] [{host}] Cloudflare 재인가 시도 (새 프록시: {proxies.get('http') if proxies else 'Direct'}): {url}")
+                logger.warning(f"[CrawlUtil] [{host}] Cloudflare 재인가 시도 (프록시 {'사용' if proxies else '미사용'}): {url}")
                 tree, source = cls.get_by_flaresolverr(url, proxies=proxies)
                 if source and not cls._is_challenge_html(source):
                     logger.info(f"[CrawlUtil] [{host}] 새 프록시로 FlareSolverr 인가 및 페이지 수신 성공")
+                    ready_key = (host, (proxies or {}).get('http', ''), cookie or '', (site_info or {}).get('USER_AGENT', ''))
+                    cls._http_ready[ready_key] = time.time()
                     return source
 
             if attempt < effective_retries:
@@ -458,64 +746,113 @@ class CrawlUtil:
 
     @classmethod
     def get_by_flaresolverr(cls, url: str, proxies=None):
+        host = urlparse(url).hostname or ''
+        proxies = dict(proxies or {})
+        previous = getattr(cls._fs_scope, 'request', None)
+        if previous is None:
+            cls._fs_scope.request = {'recoveries': 0, 'blocked': False}
+        try:
+            with cls.execution_scope(), cls._site_lock(host):
+                return cls._get_by_flaresolverr_locked(url, proxies)
+        finally:
+            cls._fs_scope.request = previous
+
+    @classmethod
+    def _get_by_flaresolverr_locked(cls, url: str, proxies=None, clearance=False):
         fs_url = (P.ModelSetting.get('crawl_flaresolverr_url') or '').rstrip('/')
         if not fs_url:
             logger.warning('[CrawlUtil] FlareSolverr 주소가 없어 페이지 요청을 실행하지 못했습니다.')
             return None, None
 
-        parsed = urlparse(url)
-        host = parsed.hostname or ''
-        session_name = f"feeder_{host.replace('.', '_')}"
+        host = urlparse(url).hostname or ''
+        proxies = dict(proxies or {})
+        budget = cls._fs_scope.request
+        if budget['blocked']:
+            return None, None
+        cls._activate_network_context(host, proxies)
+        # 서버 주소가 바뀌면 이전 서버에 이 사이트가 만든 세션도 정리한다.
+        if (fs_url, host) not in cls._fs_owned:
+            for endpoint, owned_host in list(cls._fs_owned):
+                if owned_host == host and endpoint != fs_url:
+                    if not cls._destroy_fs_session(endpoint, host):
+                        budget['blocked'] = True
+                        return None, None
+        data = cls._fs_command(fs_url, {'cmd': 'sessions.list'})
+        if data is None or not isinstance(data.get('sessions'), list):
+            if data is not None:
+                logger.warning('[CrawlUtil] [%s] FlareSolverr 세션 목록 응답 형식 오류', host)
+            budget['blocked'] = True
+            return None, None
+        key = (fs_url, host)
+        record = cls._fs_sessions.get(key)
+        if record and (record['state'] != 'ready' or record['proxy'] != proxies.get('http', '')):
+            if not cls._replace_fs_session(fs_url, host, proxies, budget, recovery=False):
+                return None, None
+        elif record and record['id'] not in data['sessions']:
+            if not cls._replace_fs_session(fs_url, host, proxies, budget):
+                return None, None
+        elif not record:
+            if record:
+                cls._fs_owned.discard(key)
+                cls._fs_sessions.pop(key, None)
+            if not cls._create_fs_session(fs_url, host, proxies):
+                budget['blocked'] = True
+                return None, None
 
-        try:
-            list_res = requests.post(f"{fs_url}/v1", json={"cmd": "sessions.list"}, timeout=10)
-            sessions = list_res.json().get('sessions', []) if list_res.status_code == 200 else []
-            if session_name not in sessions:
-                create_payload = {"cmd": "sessions.create", "session": session_name}
-                if proxies and 'http' in proxies:
-                    create_payload["proxy"] = {"url": proxies['http']}
-                requests.post(f"{fs_url}/v1", json=create_payload, timeout=20)
-        except Exception as sess_err:
-            logger.debug(f"[CrawlUtil] FlareSolverr 세션 준비 예외 (무시): {sess_err}")
-
-        payload = {
-            "cmd": "request.get",
-            "url": url,
-            "session": session_name,
-            "maxTimeout": 25000,
-        }
-        if proxies and 'http' in proxies:
-            payload["proxy"] = {"url": proxies['http']}
-
-        domain_cf = cls._cf_cookies.get(host, {})
-        if domain_cf and (time.time() - domain_cf.get('_timestamp', 0) < cls.CF_COOKIE_EXPIRY):
-            payload["cookies"] = [
-                {"name": k, "value": v, "domain": host}
-                for k, v in domain_cf.items() if not k.startswith('_')
-            ]
-
-        try:
-            res = requests.post(f"{fs_url}/v1", json=payload, headers={'Content-Type': 'application/json'}, timeout=35)
-            solution = cls._read_flaresolverr_solution(res, host)
-            if solution is not None:
-                html_source = solution.get('response', '')
-                tree = html.fromstring(html_source)
-                ua = solution.get('userAgent')
-                if ua:
-                    cls._cf_user_agents[host] = ua
-                sol_cookies = solution['cookies']
-                if sol_cookies:
-                    cls._cf_cookies.setdefault(host, {}).update({c['name']: c['value'] for c in sol_cookies})
-                    cls._cf_cookies[host]['_timestamp'] = time.time()
-                cls._sync_clearance_to_sessions(host)
-                return tree, html_source
-        except Exception as e:
-            logger.warning(f"[CrawlUtil] FlareSolverr 통신 실패 ({url}): {e}")
+        for attempt in range(2):
+            session_name = cls._fs_sessions[key]['id']
+            logger.debug('[CrawlUtil] [%s] FlareSolverr 요청 · owner=%s session=%s 복구=%s',
+                         host, getattr(cls._fs_scope, 'owner', ''), session_name, budget['recoveries'])
+            payload = {'cmd': 'request.get', 'url': url, 'session': session_name, 'maxTimeout': 45000 if clearance else 25000}
+            if proxies.get('http'):
+                payload['proxy'] = {'url': proxies['http']}
+            # 정상 브라우저의 전체 쿠키를 캐시로 덮어쓰지 않는다.
+            record = cls._fs_sessions[key]
+            explicit = getattr(cls._fs_scope, 'user_cookie', None)
+            if explicit and explicit[0] == host and explicit[1] and not record.get('seeded'):
+                seeds = []
+                for part in explicit[1].split(';'):
+                    if '=' in part:
+                        name, value = part.strip().split('=', 1)
+                        seeds.append({'name': name, 'value': value, 'path': '/', 'domain': host})
+                payload['cookies'] = cls.normalize_cookies(seeds, url)
             try:
-                requests.post(f"{fs_url}/v1", json={"cmd": "sessions.destroy", "session": session_name}, timeout=5)
-            except Exception:
-                pass
-
+                res = requests.post(f'{fs_url}/v1', json=payload, headers={'Content-Type': 'application/json'}, timeout=55 if clearance else 35)
+                try:
+                    result = res.json()
+                    message = str(result.get('message') or '').lower()
+                    api_failed = res.status_code != 200 or result.get('status') != 'ok'
+                except (ValueError, AttributeError):
+                    message = ''
+                    api_failed = True
+                broken = (api_failed and 'session' in message and any(word in message for word in (
+                    'bound to a different proxy', 'stuck', 'invalid', 'not found', 'not exist', 'closed')))
+                if broken:
+                    if attempt == 0:
+                        logger.warning('[CrawlUtil] [%s] FlareSolverr 세션 오류 감지: %s', host, cls._safe_network_log(message))
+                    if not cls._replace_fs_session(fs_url, host, proxies, budget):
+                        return None, None
+                    logger.info('[CrawlUtil] [%s] FlareSolverr 세션 복구 후 요청 재시도', host)
+                    continue
+                solution = cls._read_flaresolverr_solution(res, host, require_html=not clearance)
+                if solution is None:
+                    if 'cookies' in payload:
+                        # 전송 시도만으로 적용을 확정하지 않고, 같은 세션의 재주입도 막는다.
+                        record['state'] = 'unknown'
+                        budget['blocked'] = True
+                    return None, None
+                html_source = solution.get('response') or ''
+                tree = solution if clearance else html.fromstring(html_source)
+                cls._store_solution(host, solution, url)
+                cls._sync_clearance_to_sessions(host)
+                if 'cookies' in payload:
+                    record['seeded'] = True
+                return tree, html_source
+            except Exception as exc:
+                cls._fs_sessions[key]['state'] = 'unknown'
+                budget['blocked'] = True
+                logger.warning('[CrawlUtil] [%s] FlareSolverr 통신/응답 실패: %s', host, cls._safe_network_log(exc))
+                return None, None
         return None, None
 
     @classmethod
@@ -525,6 +862,18 @@ class CrawlUtil:
 
     @classmethod
     def _get_flaresolverr_clearance_result(cls, url: str, scheduler_instance=None, max_retries: int = None, retry_interval: float = None):
+        cls._fs_scope.clearance_proxy = None
+        previous = getattr(cls._fs_scope, 'request', None)
+        if previous is None:
+            cls._fs_scope.request = {'recoveries': 0, 'blocked': False}
+        try:
+            with cls.execution_scope(), cls._site_lock(urlparse(url).hostname or ''):
+                return cls._get_clearance_in_context(url, scheduler_instance, max_retries, retry_interval)
+        finally:
+            cls._fs_scope.request = previous
+
+    @classmethod
+    def _get_clearance_in_context(cls, url: str, scheduler_instance=None, max_retries: int = None, retry_interval: float = None):
         """쿠키가 필요 없었던 정상 응답도 성공으로 구분한다. 기존 공개 반환 형식은 유지한다."""
         fs_url = (P.ModelSetting.get('crawl_flaresolverr_url') or '').rstrip('/')
         if not fs_url:
@@ -533,7 +882,6 @@ class CrawlUtil:
 
         parsed = urlparse(url)
         host = parsed.hostname or ''
-        fs_endpoint = f"{fs_url}/v1"
 
         try:
             if max_retries is None:
@@ -561,34 +909,24 @@ class CrawlUtil:
         total_tries = max(len(p_list), max_retries) if p_list else max_retries
 
         for attempt in range(1, total_tries + 1):
-            proxies = cls.get_proxies(scheduler_instance)
-            proxy_str = proxies.get('http') if (proxies and 'http' in proxies) else '미사용'
+            if cls._fs_scope.request['blocked']:
+                break
+            proxies = dict(cls.get_proxies(scheduler_instance) or {})
+            cls._activate_network_context(host, proxies)
+            proxy_str = '사용' if proxies else '미사용'
 
-            req_payload = {
-                "cmd": "request.get",
-                "url": url,
-                "maxTimeout": 45000,
-            }
-            if proxies and 'http' in proxies:
-                req_payload["proxy"] = {"url": proxies['http']}
-
-            logger.info(f"[CrawlUtil] [{host}] FlareSolverr 인가 요청 ({attempt}/{total_tries}, Proxy: {proxy_str}): {url}")
-
+            logger.debug(f"[CrawlUtil] [{host}] FlareSolverr 인가 요청 ({attempt}/{total_tries}, Proxy: {proxy_str})")
             try:
-                res = requests.post(fs_endpoint, json=req_payload, headers={'Content-Type': 'application/json'}, timeout=55)
-                solution = cls._read_flaresolverr_solution(res, host, require_html=False)
+                solution, _ = cls._get_by_flaresolverr_locked(url, proxies, clearance=True)
                 if solution is not None:
-                    sol_cookies = solution['cookies']
+                    sol_cookies = cls.normalize_cookies(solution['cookies'], url)
                     user_agent = solution.get('userAgent') or ''
-                    if sol_cookies:
-                        cls._cf_cookies.setdefault(host, {}).update({c['name']: c['value'] for c in sol_cookies})
-                        cls._cf_cookies[host]['_timestamp'] = time.time()
-                    if user_agent:
-                        cls._cf_user_agents[host] = user_agent
+                    cls._store_solution(host, solution, url)
                     cls._sync_clearance_to_sessions(host)
+                    cls._fs_scope.clearance_proxy = (host, dict(proxies or {}))
                     return sol_cookies, user_agent, True
             except Exception as e:
-                logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 통신 실패: {e}")
+                logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 통신 실패: {cls._safe_network_log(e)}")
 
             if attempt < total_tries:
                 cls.rotate_proxy(scheduler_instance=scheduler_instance, reason="FlareSolverr 인가 실패 대응")
@@ -603,8 +941,7 @@ class CrawlUtil:
 
         start_time = time.time()
         while time.time() - start_time < max_wait:
-            title = driver.title or ""
-            if not any(k in title for k in ["Just a moment", "Cloudflare", "Attention Required"]):
+            if driver.page_source and not cls._is_challenge_html(driver.page_source):
                 return True
             try:
                 iframes = driver.find_elements(By.TAG_NAME, "iframe")
@@ -630,25 +967,27 @@ class CrawlUtil:
 
     @classmethod
     def reinit_session(cls, site_info: dict, scheduler_instance=None):
+        with cls.execution_scope():
+            return cls._reinit_in_context(site_info, scheduler_instance)
+
+    @classmethod
+    def _reinit_in_context(cls, site_info, scheduler_instance=None):
         site_url = (site_info.get('TORRENT_SITE_URL') if site_info else '').rstrip('/')
         parsed_url = urlparse(site_url)
         host = parsed_url.hostname or ''
+        cls._fs_scope.auth = hashlib.sha256(str((site_info.get('NAME', ''), site_info.get('COOKIE'), site_info.get('USER_AGENT', ''))).encode()).hexdigest()
+        cls._fs_scope.user_cookie = (host, site_info.get('COOKIE', ''))
+        cls._configured_cookies[host] = site_info.get('COOKIE', '')
 
         cls.rotate_proxy(scheduler_instance=scheduler_instance, reason="지속적 차단 대응")
         logger.warning(f"[CrawlUtil] [{host}] 지속적 차단 감지 -> 브라우저/토큰 캐시 파기 후 재초기화")
 
         cls.close_sessions()
+        cls._http_ready = {key: stamp for key, stamp in cls._http_ready.items() if key[0] != host}
         if host in cls._cf_cookies:
             cls._cf_cookies.pop(host, None)
         if host in cls._cf_user_agents:
             cls._cf_user_agents.pop(host, None)
-
-        use_fs = getattr(scheduler_instance, 'use_flaresolverr', False) if scheduler_instance else P.ModelSetting.get_bool('crawl_use_flaresolverr')
-        if site_info and ('USE_FLARESOLVERR' in site_info.get('EXTRA', []) or site_info.get('USE_FLARESOLVERR')):
-            use_fs = True
-
-        if use_fs and site_url:
-            cls.get_flaresolverr_clearance(site_url, scheduler_instance=scheduler_instance)
 
         driver = cls.init_stealth_selenium(site_info or {}, scheduler_instance=scheduler_instance)
 
@@ -666,12 +1005,21 @@ class CrawlUtil:
 
     @classmethod
     def handle_turnstile_challenge(cls, driver, url: str, site_info: dict = None, scheduler_instance=None) -> bool:
+        with cls.execution_scope():
+            return cls._handle_challenge_in_context(driver, url, site_info, scheduler_instance)
+
+    @classmethod
+    def _handle_challenge_in_context(cls, driver, url, site_info=None, scheduler_instance=None):
+        if not driver:
+            return False
         page_title = driver.title or ""
-        if not any(k in page_title for k in ["Just a moment", "Cloudflare", "Attention Required"]):
+        if not driver.page_source:
+            return False
+        if not cls._is_challenge_html(driver.page_source):
             return True
 
         logger.info(f"[CrawlUtil] Cloudflare 챌린지 화면 감지 ('{page_title}') -> 해결 시도: {url}")
-        if cls.solve_turnstile_checkbox(driver, max_wait=4):
+        if cls.solve_turnstile_checkbox(driver, max_wait=4) and not cls._is_challenge_html(driver.page_source):
             return True
 
         new_driver = cls.reinit_session(site_info or {}, scheduler_instance=scheduler_instance)
@@ -680,11 +1028,16 @@ class CrawlUtil:
             time.sleep(2)
             cls.solve_turnstile_checkbox(new_driver, max_wait=4)
 
-        current_title = (cls._selenium_driver.title if cls._selenium_driver else "") or ""
-        return not any(k in current_title for k in ["Just a moment", "Cloudflare", "Attention Required"])
+        return bool(new_driver and cls._selenium_driver is new_driver
+                    and not cls._is_challenge_html(new_driver.page_source))
 
     @classmethod
     def init_stealth_selenium(cls, site_info: dict, scheduler_instance=None):
+        with cls.execution_scope():
+            return cls._init_selenium_in_context(site_info, scheduler_instance)
+
+    @classmethod
+    def _init_selenium_in_context(cls, site_info: dict, scheduler_instance=None):
         if not _SELENIUM_AVAILABLE:
             logger.error("[CrawlUtil] selenium 패키지가 설치되어 있지 않아 원격 브라우저를 구동할 수 없습니다.")
             return None
@@ -694,13 +1047,22 @@ class CrawlUtil:
         proxies = cls.get_proxies(scheduler_instance)
         parsed_url = urlparse(site_url)
         host = parsed_url.hostname or ''
+        cls._fs_scope.auth = hashlib.sha256(str((site_info.get('NAME', ''), site_info.get('COOKIE'), site_info.get('USER_AGENT', ''))).encode()).hexdigest()
+        cls._fs_scope.user_cookie = (host, site_info.get('COOKIE', ''))
+        context = (host, site_info.get('NAME', ''), remote_url, (proxies or {}).get('http', ''),
+                   site_info.get('COOKIE', ''), site_info.get('USER_AGENT', ''),
+                   P.ModelSetting.get('crawl_flaresolverr_url'))
+        cls._configured_cookies[host] = site_info.get('COOKIE', '')
 
         if cls._selenium_driver:
             try:
+                if cls._selenium_context != context:
+                    raise ValueError('브라우저 요청 컨텍스트 변경')
                 _ = cls._selenium_driver.current_url
                 return cls._selenium_driver
             except Exception:
-                cls._selenium_driver = None
+                if not cls.close_selenium_driver():
+                    return None
 
         try:
             selenium_timeout = int((site_info.get('SELENIUM_TIMEOUT') if site_info else None) or P.ModelSetting.get('crawl_selenium_timeout', '20'))
@@ -719,6 +1081,12 @@ class CrawlUtil:
             if not fs_succeeded:
                 logger.error(f"[CrawlUtil] [{host}] FlareSolverr 인가 실패로 Selenium 기동 중단")
                 return None
+            used_proxy = getattr(cls._fs_scope, 'clearance_proxy', None)
+            if used_proxy and used_proxy[0] == host:
+                proxies = dict(used_proxy[1])
+                context = (host, site_info.get('NAME', ''), remote_url, proxies.get('http', ''),
+                           site_info.get('COOKIE', ''), site_info.get('USER_AGENT', ''),
+                           P.ModelSetting.get('crawl_flaresolverr_url'))
 
         options = webdriver.ChromeOptions()
         options.add_argument('--headless=new')
@@ -737,15 +1105,32 @@ class CrawlUtil:
 
         if proxies and 'http' in proxies:
             options.add_argument(f'--proxy-server={proxies["http"]}')
-            logger.info(f"[CrawlUtil] Selenium 프록시 적용: {proxies['http']}")
+            logger.info('[CrawlUtil] Selenium 프록시 적용')
 
+        driver = None
         try:
             driver = webdriver.Remote(command_executor=remote_url, options=options)
             driver.set_page_load_timeout(selenium_timeout)
+            cls._configure_selenium_driver(driver, site_info, parsed_url, raw_cf_cookies)
         except Exception as e:
-            logger.error(f"[CrawlUtil] Remote Selenium 연결 실패 ({remote_url}): {e}")
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    logger.warning('[CrawlUtil] 초기화에 실패한 Selenium 브라우저 종료 미확인 · 원격 서비스 상태를 확인해주세요.')
+            logger.error(f"[CrawlUtil] Remote Selenium 연결 실패: {cls._safe_network_log(e)}")
             return None
 
+        cls._selenium_driver = driver
+        cls._selenium_context = context
+        cls._activate_network_context(host, proxies)
+        cls._cf_user_agents[host] = target_ua
+        return driver
+
+    @classmethod
+    def _configure_selenium_driver(cls, driver, site_info, parsed_url, raw_cf_cookies):
+        site_url = site_info.get('TORRENT_SITE_URL', '')
+        host = parsed_url.hostname or ''
         try:
             driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
                 'source': '''
@@ -767,6 +1152,10 @@ class CrawlUtil:
         if raw_cf_cookies:
             for c in raw_cf_cookies:
                 cookie_dict = {'name': c['name'], 'value': c['value'], 'path': c.get('path', '/')}
+                cookie_dict.update({key: c[key] for key in ('secure', 'httpOnly') if key in c})
+                expiry = c.get('expires', c.get('expiry'))
+                if type(expiry) in (int, float) and expiry > time.time():
+                    cookie_dict['expiry'] = int(expiry)
                 dom = c.get('domain', '')
                 if dom:
                     cookie_dict['domain'] = dom.lstrip('.')
@@ -774,11 +1163,7 @@ class CrawlUtil:
                     driver.add_cookie(cookie_dict)
                     injected_count += 1
                 except Exception:
-                    try:
-                        driver.add_cookie({'name': c['name'], 'value': c['value'], 'path': '/'})
-                        injected_count += 1
-                    except Exception:
-                        pass
+                    raise RuntimeError('인가 쿠키를 브라우저에 적용하지 못했습니다.') from None
             logger.info(f"[CrawlUtil] [{host}] Selenium에 clearance 쿠키 {injected_count}개 주입 완료")
 
         if site_info and site_info.get('COOKIE'):
@@ -786,18 +1171,18 @@ class CrawlUtil:
                 if '=' in part:
                     k, v = part.strip().split('=', 1)
                     k_clean = k.strip()
-                    if k_clean in ['cf_clearance', '__cf_bm', '_cfuvid']:
-                        continue
                     try:
                         driver.add_cookie({'name': k_clean, 'value': v.strip(), 'path': '/'})
                     except Exception:
-                        pass
-
-        cls._selenium_driver = driver
-        return driver
+                        raise RuntimeError('사용자 쿠키를 브라우저에 적용하지 못했습니다.') from None
 
     @classmethod
     def get_by_remote_selenium(cls, url: str, wait_tag: str = 'body', scheduler_instance=None, site_info: dict = None) -> str | None:
+        with cls.execution_scope():
+            return cls._get_selenium_in_context(url, wait_tag, scheduler_instance, site_info)
+
+    @classmethod
+    def _get_selenium_in_context(cls, url, wait_tag='body', scheduler_instance=None, site_info=None):
         if not _SELENIUM_AVAILABLE:
             logger.error(f"[CrawlUtil] selenium 모듈 미설치로 원격 렌더링을 수행할 수 없습니다: {url}")
             return None
@@ -817,8 +1202,9 @@ class CrawlUtil:
             logger.debug(f"[CrawlUtil] Selenium 페이지 로드: {url}")
             driver.get(url)
 
-            cls.handle_turnstile_challenge(driver, url, site_info=site_info, scheduler_instance=scheduler_instance)
-            driver = cls._selenium_driver or driver
+            if not cls.handle_turnstile_challenge(driver, url, site_info=site_info, scheduler_instance=scheduler_instance):
+                return None
+            driver = cls._selenium_driver
 
             if site_info:
                 try:
@@ -828,7 +1214,7 @@ class CrawlUtil:
                 except Exception:
                     pass
 
-            driver = cls._selenium_driver or driver
+            driver = cls._selenium_driver
             if not driver:
                 return None
 
@@ -841,37 +1227,63 @@ class CrawlUtil:
                     if any(k in curr_title for k in ["Just a moment", "Cloudflare", "Attention Required"]):
                         logger.warning(f"[CrawlUtil] 태그 대기 중 Cloudflare 재차단 확인 ('{curr_title}') -> 세션 재초기화: {url}")
                         driver = cls.reinit_session(site_info or {}, scheduler_instance=scheduler_instance)
-                        driver = cls._selenium_driver or driver
+                        driver = cls._selenium_driver
                         if driver:
                             driver.get(url)
                             try:
                                 WebDriverWait(driver, selenium_timeout).until(EC.presence_of_element_located((By.XPATH, effective_wait_tag)))
                             except Exception as retry_wait_ex:
-                                logger.warning(f"[CrawlUtil] 세션 재초기화 후 태그 대기 타임아웃 ({effective_wait_tag}): {retry_wait_ex}")
+                                logger.warning(f"[CrawlUtil] 세션 재초기화 후 태그 대기 타임아웃 ({effective_wait_tag}): {cls._safe_network_log(retry_wait_ex)}")
+                                return None
+                        else:
+                            return None
                     else:
-                        logger.warning(f"[CrawlUtil] 태그 대기 타임아웃 ({effective_wait_tag}): {wait_ex}")
+                        logger.warning(f"[CrawlUtil] 태그 대기 타임아웃 ({effective_wait_tag}): {cls._safe_network_log(wait_ex)}")
+                        return None
 
             if not driver:
                 return None
 
-            return driver.page_source
+            source = driver.page_source
+            if not source or cls._is_challenge_html(source):
+                return None
+            try:
+                host = urlparse(url).hostname or ''
+                cls._store_solution(host, {'cookies': driver.get_cookies()}, url)
+            except Exception as exc:
+                logger.debug('[CrawlUtil] 브라우저 쿠키 상태 조회 미확인: %s', cls._safe_network_log(exc))
+            return source
         except Exception as e:
-            logger.error(f"[CrawlUtil] Remote Selenium 로딩 에러 ({url}): {e}")
+            logger.error(f"[CrawlUtil] Remote Selenium 로딩 에러 ({url}): {cls._safe_network_log(e)}")
             cls.close_selenium_driver()
             return None
 
     @classmethod
     def close_selenium_driver(cls):
+        with cls.execution_scope():
+            return cls._close_selenium_current()
+
+    @classmethod
+    def _close_selenium_current(cls):
         if cls._selenium_driver:
             try:
                 cls._selenium_driver.quit()
                 logger.debug("[CrawlUtil] Selenium 드라이버 정상 종료")
             except Exception:
-                pass
+                cls._selenium_context = None
+                logger.warning('[CrawlUtil] Selenium 종료 미확인 · 같은 실행에서 새 브라우저 생성을 보류합니다.')
+                return False
             cls._selenium_driver = None
+        cls._selenium_context = None
+        return True
 
     @classmethod
     def close_sessions(cls):
+        with cls.execution_scope():
+            cls._close_sessions_current()
+
+    @classmethod
+    def _close_sessions_current(cls):
         """활성 브라우저 및 HTTP 세션 정리"""
         cls.close_selenium_driver()
         for host, sess in list(cls._cffi_sessions.items()):
@@ -890,10 +1302,32 @@ class CrawlUtil:
         logger.debug("[CrawlUtil] HTTP 활성 세션 정리 완료")
 
     @classmethod
+    def close_flaresolverr_sessions(cls, host=None):
+        with cls.execution_scope():
+            cls._close_flaresolverr_current(host)
+
+    @classmethod
+    def _close_flaresolverr_current(cls, host=None):
+        """전체 수집 종료 때 이 프로세스가 사용한 원격 세션만 정리한다."""
+        for endpoint, owned_host in list(cls._fs_owned):
+            if host is None or host == owned_host:
+                with cls._site_lock(owned_host):
+                    if cls._destroy_fs_session(endpoint, owned_host):
+                        cls._clear_network_state(owned_host)
+
+    @classmethod
     def download_file_stream(cls, download_url: str, referer: str = None, scheduler_instance=None):
+        with cls.execution_scope():
+            return cls._download_stream_in_context(download_url, referer, scheduler_instance)
+
+    @classmethod
+    def _download_stream_in_context(cls, download_url, referer=None, scheduler_instance=None):
         """첨부파일 스트림 다운로드"""
-        proxies = cls.get_proxies(scheduler_instance)
         host = urlparse(download_url).hostname or ''
+        origin = urlparse(referer or download_url).hostname or ''
+        saved_context = cls._network_context.get(origin)
+        proxy = saved_context[1] if saved_context else cls.get_current_proxy_url(scheduler_instance)
+        proxies = {'http': proxy, 'https': proxy} if proxy else None
         headers = cls.DEFAULT_HEADERS.copy()
 
         if host in cls._cf_user_agents:
@@ -901,29 +1335,34 @@ class CrawlUtil:
         if referer:
             headers['Referer'] = referer
 
-        domain_cf = cls._cf_cookies.get(host, {})
-        if domain_cf and (time.time() - domain_cf.get('_timestamp', 0) < cls.CF_COOKIE_EXPIRY):
-            injected = "; ".join([f"{k}={v}" for k, v in domain_cf.items() if not k.startswith('_')])
-            if injected:
-                headers['Cookie'] = injected
+        explicit = cls._configured_cookies.get(origin, '') if host == origin else ''
+        page_session = cls._requests_sessions.get(origin) or cls._cffi_sessions.get(origin)
+        injected = cls._http_cookie_header(origin, download_url, explicit, page_session)
+        if injected:
+            headers['Cookie'] = injected
 
         session = requests.Session()
-        session.headers.update(headers)
-        if proxies:
-            session.proxies.update(proxies)
-
-        logger.debug(f"[CrawlUtil] 파일 스트림 다운로드: {download_url}")
-        res = session.get(download_url, stream=True, timeout=60, verify=False)
-        res.raise_for_status()
-
-        byte_io = io.BytesIO()
-        for chunk in res.iter_content(chunk_size=4096):
-            FeederUtil.cooperate()
-            if chunk:
-                byte_io.write(chunk)
-
-        byte_io.seek(0)
-        return byte_io
+        res = None
+        try:
+            session.headers.update(headers)
+            if proxies:
+                session.proxies.update(proxies)
+            logger.debug('[CrawlUtil] [%s] 첨부파일 스트림 다운로드 시작 · 페이지 연결 컨텍스트 사용', host)
+            res = session.get(download_url, stream=True, timeout=60, verify=False)
+            res.raise_for_status()
+            byte_io = io.BytesIO()
+            for chunk in res.iter_content(chunk_size=4096):
+                FeederUtil.cooperate()
+                if chunk:
+                    byte_io.write(chunk)
+            byte_io.seek(0)
+            return byte_io
+        finally:
+            try:
+                if res is not None:
+                    res.close()
+            finally:
+                session.close()
 
     # --------------------------------------------------------------------------
     # 토렌트 메타데이터 취득 (Torrent Info 플러그인 또는 qBittorrent 연동)

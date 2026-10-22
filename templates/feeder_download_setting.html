@@ -58,7 +58,7 @@
         </div>
       </div>
       <div id="remote_worker_result" class="pl-3" role="status" aria-live="polite"></div>
-      {{ macros.setting_bottom(['저장 전에도 입력한 값으로 테스트할 수 있습니다.', '워커 연결은 위의 일반 설정 저장과 별도로 저장합니다.']) }}
+      {{ macros.setting_bottom(['저장 전에도 입력한 값으로 테스트할 수 있습니다.', '워커 연결은 위의 일반 설정 저장과 별도로 저장합니다.', '워커 0.8.0 이상은 버전이 이전이면 자동 갱신합니다. 기존 전송을 마친 뒤 재로딩하며, 업데이트 실패 시 연결 테스트로 재시도할 수 있습니다.']) }}
       {{ macros.m_hr() }}
       {{ macros.setting_checkbox('download_use_local_staging', '업로드시 로컬 스테이징 사용', value=arg['download_use_local_staging'], desc=['On: 원격 클라우드에서 로컬 디스크로 임시 다운로드 후 목적지로 전송합니다.', 'Off: 로컬 디스크를 거치지 않고 원격 소스에서 목적지로 다이렉트(on-the-fly) 스트리밍 전송합니다.']) }}
       <div id="download_use_local_staging_div" class="collapse">
@@ -68,6 +68,7 @@
 
       <h6 class="text-info font-weight-bold text-center mt-3">Rclone 기본 설정</h6>
       {{ macros.setting_input_text('download_rclone_conf_path', 'Rclone 설정 파일 경로', value=arg['download_rclone_conf_path'], placeholder='예: /root/.config/rclone/rclone.conf') }}
+      {{ macros.setting_input_int('download_rclone_transfers', 'Rclone 파일 동시 전송 수', value=arg['download_rclone_transfers'], min='1', placeholder='2', desc=['업로드·로컬 스테이징에서 Rclone 작업 하나당 동시에 전송할 파일 수 (--transfers, 기본값: 2)', '원격 워커에도 전달됩니다. Google Drive 업로드 동시 전송 수는 동시에 처리할 작업 수이며 이 값과 별개입니다.']) }}
       {{ macros.setting_input_text('download_rclone_chunk_size', 'Rclone 청크 사이즈', value=arg['download_rclone_chunk_size'], placeholder='256M', desc=['구글 드라이브 업로드 청크 크기 (기본값: 256M)']) }}
       {{ macros.setting_input_text('download_rclone_extra_options', 'Rclone 추가 옵션', value=arg['download_rclone_extra_options'], placeholder='--timeout 30m', desc=['Rclone 실행 시 추가로 적용할 확장 옵션 문자열 (공백 구분, 기본값: --timeout 30m)']) }}
       {{ macros.m_hr() }}

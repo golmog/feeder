@@ -9,6 +9,7 @@ from flask import render_template, request, jsonify, abort, send_file
 from sqlalchemy import and_, or_, desc
 import threading
 import time
+import uuid
 from werkzeug.exceptions import HTTPException
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -61,13 +62,8 @@ class ModuleCrawl(PluginModuleBase):
     def plugin_load(self):
         try:
             with F.app.app_context():
-                # Celery 작업은 FF 재시작 후에도 이전 실행 플래그가 남을 수 있으므로
-                # 플러그인 로드 시 런타임 실행 상태를 항상 초기화한다.
+                # 다른 프로세스에서 실행 중인 크롤링의 임대 잠금과 플래그를 보존한다.
                 FeederUtil.init_runtime_locks()
-                FeederUtil.reset_runtime_lock('crawl_pipeline')
-                P.ModelSetting.set(f"{self.name}_is_running", "False")
-                P.ModelSetting.set(f"{self.name}_test_running", "False")
-                P.ModelSetting.set(f"{self.name}_running_start_time", "0")
                 FeederUtil.migrate_db()
             # logger.info(f"[{self.name}] 플러그인 로드: 수집 런타임 락 플래그 초기화 완료")
         except Exception as e:
@@ -130,14 +126,8 @@ class ModuleCrawl(PluginModuleBase):
 
     def process_command(self, command, arg1, arg2, arg3, req):
         if command == 'manual_crawl':
-            is_running = P.ModelSetting.get_bool(f"{self.name}_is_running")
-            if is_running:
-                start_time = P.ModelSetting.get(f"{self.name}_running_start_time")
-                if start_time and str(start_time).isdigit() and (time.time() - int(start_time) > 3600):
-                    logger.warning(f"[{self.name}] 1시간 경과 락 감지 -> 락 강제 해제")
-                    P.ModelSetting.set(f"{self.name}_is_running", "False")
-                else:
-                    return jsonify({'ret': 'running', 'msg': '현재 다른 수집 작업이 이미 실행 중입니다.'})
+            if TaskCrawl.is_running():
+                return jsonify({'ret': 'running', 'msg': '현재 다른 수집 작업이 이미 실행 중입니다.'})
 
             crawler_id = req.form.get('crawler_id')
             target_c_id = int(crawler_id) if crawler_id and str(crawler_id).isdigit() else None
@@ -202,7 +192,7 @@ class ModuleCrawl(PluginModuleBase):
             if not site or not board_input:
                 return jsonify({'ret': 'fail', 'log': '사이트 또는 게시판 ID가 올바르지 않습니다.'})
 
-            if P.ModelSetting.get_bool(f"{self.name}_is_running"):
+            if TaskCrawl.is_running():
                 return jsonify({'ret': 'fail', 'log': '현재 백그라운드 크롤링이 실행 중입니다.'})
 
             board_id, subcat_id, full_board_key = TaskCrawl.parse_board_info(board_input)
@@ -227,13 +217,38 @@ class ModuleCrawl(PluginModuleBase):
                 use_torrent_info=global_torrent_info and site_opts.get('use_torrent_info', False)
             )
 
-            P.ModelSetting.set(f"{self.name}_test_running", "True")
+            if not TaskCrawl._run_mutex.acquire(blocking=False):
+                return jsonify({'ret': 'fail', 'log': '현재 크롤링 또는 테스트가 실행 중입니다.'})
+            owner, acquired = uuid.uuid4().hex, False
             try:
-                test_results = TaskCrawl.execute_board_crawl(site.info, board_id, is_test=True, max_count=test_count, target_cfg=test_target_cfg)
-                if test_results is None:
-                    test_results = []
+                FeederUtil.init_runtime_locks()
+                acquired = FeederUtil.acquire_runtime_lock('crawl_pipeline', owner)
+                if not acquired:
+                    return jsonify({'ret': 'fail', 'log': '다른 프로세스에서 크롤링 또는 테스트가 실행 중입니다.'})
+                P.ModelSetting.set(f"{self.name}_test_running", "True")
+                with CrawlUtil.execution_scope(owner):
+                    try:
+                        test_results = TaskCrawl.execute_board_crawl(site.info, board_id, is_test=True, max_count=test_count, target_cfg=test_target_cfg)
+                        if test_results is None:
+                            return jsonify({'ret': 'fail', 'log': '페이지 수신 또는 브라우저 초기화에 실패했습니다. 플랫폼 로그를 확인하세요.'})
+                        result = getattr(CrawlUtil._fs_scope, 'crawl_result', {})
+                        if result.get('status') == 'partial':
+                            return jsonify({'ret': 'partial', 'list': test_results,
+                                            'log': '일부 페이지 수신에 실패했습니다. 성공한 항목만 표시합니다.', 'diagnostic': result})
+                    except Exception as exc:
+                        logger.warning('[CrawlTest] 수집 테스트 실패: %s', CrawlUtil._safe_network_log(exc))
+                        return jsonify({'ret': 'fail', 'log': '수집 테스트 처리에 실패했습니다. 플랫폼 로그를 확인하세요.'})
+                    finally:
+                        CrawlUtil.finish_execution()
             finally:
-                P.ModelSetting.set(f"{self.name}_test_running", "False")
+                try:
+                    if acquired:
+                        try:
+                            P.ModelSetting.set(f"{self.name}_test_running", "False")
+                        finally:
+                            FeederUtil.release_runtime_lock('crawl_pipeline', owner)
+                finally:
+                    TaskCrawl._run_mutex.release()
 
             return jsonify(test_results)
 
@@ -585,15 +600,9 @@ class ModuleCrawl(PluginModuleBase):
             return jsonify({'ret': 'error', 'log': str(e)}), 500
 
     def scheduler_function(self):
-        is_running = P.ModelSetting.get_bool(f"{self.name}_is_running")
-        if is_running:
-            start_time = P.ModelSetting.get(f"{self.name}_running_start_time")
-            if start_time and str(start_time).isdigit() and (time.time() - int(start_time) > 3600):
-                logger.warning(f"[{self.name}] 1시간 경과 고아 락 감지 -> 락 강제 해제")
-                P.ModelSetting.set(f"{self.name}_is_running", "False")
-            else:
-                logger.info(f"[{self.name}] 이전 수집 작업이 진행 중이므로 스케줄 주기를 건너뜁니다.")
-                return
+        if TaskCrawl.is_running():
+            logger.info(f"[{self.name}] 이전 수집 작업이 진행 중이므로 스케줄 주기를 건너뜁니다.")
+            return
 
         if P.ModelSetting.get_bool(f"{self.name}_db_auto_delete"):
             try:

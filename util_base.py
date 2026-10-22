@@ -348,6 +348,31 @@ class FeederUtil:
             logger.debug(f"[FeederUtil] SQLite WAL 체크포인트 중 예외 (정상 스킵): {e}")
 
     @classmethod
+    def get_rclone_transfers(cls) -> int:
+        """업로드·스테이징 작업 내부의 파일 전송 수를 반환한다."""
+        try:
+            value = int(P.ModelSetting.get('download_rclone_transfers') or 2)
+            return value if 1 <= value <= 2**31 - 1 else 2
+        except (ValueError, TypeError):
+            return 2
+
+    @classmethod
+    def get_rclone_transfer_options(cls) -> list[str]:
+        """추가 옵션의 중복 지정을 제거하고 전용 설정을 마지막에 적용한다."""
+        options = cls.get_rclone_extra_options()
+        result = []
+        index = 0
+        while index < len(options):
+            option = options[index]
+            if option == '--transfers':
+                index += 2
+                continue
+            if not option.startswith('--transfers='):
+                result.append(option)
+            index += 1
+        return result + ['--transfers', str(cls.get_rclone_transfers())]
+
+    @classmethod
     def get_rclone_extra_options(cls) -> list[str]:
         """설정된 Rclone 확장 옵션 문자열을 안전하게 분리하여 리스트로 반환"""
         import shlex
@@ -498,11 +523,22 @@ class FeederUtil:
                     columns = {c['name'] for c in inspector.get_columns(download_table)}
                     with engine.begin() as conn:
                         for name, sql_type in [('upload_state', 'JSON'), ('source_file_name', 'VARCHAR'),
-                                               ('output_folder_name', 'VARCHAR'), ('remote_missing_since', 'DATETIME')]:
+                                               ('output_folder_name', 'VARCHAR'), ('remote_missing_since', 'DATETIME'),
+                                               ('transfer_error_type', 'VARCHAR'), ('source_unavailable_since', 'DATETIME'),
+                                               ('upload_retry_after', 'DATETIME')]:
                             FeederUtil.cooperate()
                             if name not in columns:
                                 conn.execute(db.text(f"ALTER TABLE {download_table} ADD COLUMN {name} {sql_type}"))
                         conn.execute(db.text(f"CREATE INDEX IF NOT EXISTS ix_{download_table}_output_folder_name ON {download_table} (output_folder_name)"))
+
+                stat_table = f'{P.package_name}_download_stat'
+                if stat_table in inspector.get_table_names():
+                    columns = {c['name'] for c in inspector.get_columns(stat_table)}
+                    with engine.begin() as conn:
+                        for name, sql_type in [('download_id', 'INTEGER'), ('attempt_id', 'VARCHAR')]:
+                            if name not in columns:
+                                conn.execute(db.text(f'ALTER TABLE {stat_table} ADD COLUMN {name} {sql_type}'))
+                            conn.execute(db.text(f'CREATE INDEX IF NOT EXISTS ix_{stat_table}_{name} ON {stat_table} ({name})'))
 
                 # feeder_bbs 테이블 infohash 컬럼 확인 및 자동 추가
                 if f'{P.package_name}_bbs' in inspector.get_table_names():
@@ -986,6 +1022,15 @@ class FeederUtil:
 
     @classmethod
     def save_downloader(cls, item: dict) -> str:
+        if item.get('engine_type') == 'alldebrid' and 'webdav_failure_timeout_hours' in item:
+            raw = item['webdav_failure_timeout_hours']
+            try:
+                hours = int(raw)
+                if str(raw).strip() != str(hours) or not 0 <= hours <= 8760:
+                    raise ValueError
+            except (TypeError, ValueError):
+                return 'WebDAV 실패 유예는 0~8760 사이의 정수 시간이어야 합니다.'
+            item = dict(item, webdav_failure_timeout_hours=hours)
         data = cls.load_yaml()
         items = data.get('DOWNLOADERS', [])
         target_name = item.get('name', '').strip()

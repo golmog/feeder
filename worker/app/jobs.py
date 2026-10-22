@@ -6,6 +6,7 @@ import math
 import re
 import json
 from urllib.parse import unquote
+from rclone_logging import classify_error
 
 
 STATUSES = ('queued', 'running', 'completed', 'failed', 'cancelled')
@@ -20,8 +21,8 @@ class ConflictError(ValueError):
 
 
 def validate_payload(payload, settings) -> dict:
-    if not isinstance(payload, dict) or set(payload) - {'job_id', 'source', 'destination', 'config_version', 'exclude_patterns', 'drive_impersonate'}:
-        raise ValueError('job_id, source, destination, config_version, exclude_patterns, drive_impersonate만 지정할 수 있습니다.')
+    if not isinstance(payload, dict) or set(payload) - {'job_id', 'source', 'destination', 'config_version', 'exclude_patterns', 'drive_impersonate', 'rclone_transfers'}:
+        raise ValueError('job_id, source, destination, config_version, exclude_patterns, drive_impersonate, rclone_transfers만 지정할 수 있습니다.')
     job_id = payload.get('job_id')
     if not isinstance(job_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', job_id):
         raise ValueError('job_id는 영문·숫자로 시작하는 1~128자의 영문·숫자·점·밑줄·하이픈이어야 합니다.')
@@ -46,6 +47,11 @@ def validate_payload(payload, settings) -> dict:
     if type(version) is not int or version < 1:
         raise ValueError('config_version은 양의 정수여야 합니다.')
     result = {**{key: payload[key] for key in ('job_id', 'source', 'destination')}, 'config_version': version}
+    if 'rclone_transfers' in payload:
+        transfers = payload['rclone_transfers']
+        if type(transfers) is not int or not 1 <= transfers <= 2**31 - 1:
+            raise ValueError('rclone_transfers에는 1 이상의 정수를 지정해주세요.')
+        result['rclone_transfers'] = transfers
     if 'drive_impersonate' in payload:
         email = payload['drive_impersonate']
         if (not isinstance(email, str) or len(email) > 254 or
@@ -65,6 +71,8 @@ def validate_payload(payload, settings) -> dict:
 
 def as_dict(row) -> dict:
     job = dict(row)
+    if job.get('rclone_transfers') is None:
+        job.pop('rclone_transfers', None)
     job['cancel_requested'] = bool(job['cancel_requested'])
     job['exclude_patterns'] = json.loads(job['exclude_patterns'])
     total = job['total_bytes']
@@ -90,7 +98,8 @@ class JobStore:
         if row is not None:
             job = as_dict(row)
             payload = {key: job[key] for key in ('job_id', 'status', 'progress', 'cancel_requested',
-                'created_at', 'started_at', 'finished_at', 'error_message', 'rclone_exit_code', 'config_version')}
+                'created_at', 'started_at', 'finished_at', 'error_message', 'rclone_exit_code', 'config_version',
+                'chargeable_bytes', 'error_type')}
             self.events.append(connection, event_type, payload)
 
     def worker_status(self, running, failure=False):
@@ -119,6 +128,8 @@ class JobStore:
                         raise ConflictError('동일 job_id의 전송 제외 패턴이 다릅니다.')
                     if row['drive_impersonate'] != data.get('drive_impersonate', ''):
                         raise ConflictError('동일 job_id의 위임 계정이 다릅니다.')
+                    if row['rclone_transfers'] != data.get('rclone_transfers'):
+                        raise ConflictError('동일 job_id의 파일 동시 전송 수가 다릅니다.')
                     return as_dict(row)
                 if connection.execute('SELECT 1 FROM cancelled_job_ids WHERE job_id=?', (data['job_id'],)).fetchone():
                     raise ConflictError('등록 전에 취소된 작업 ID입니다.')
@@ -131,6 +142,8 @@ class JobStore:
                     (json.dumps(data.get('exclude_patterns', [])), data['job_id']))
                 connection.execute('UPDATE jobs SET drive_impersonate=? WHERE job_id=?',
                     (data.get('drive_impersonate', ''), data['job_id']))
+                connection.execute('UPDATE jobs SET rclone_transfers=? WHERE job_id=?',
+                    (data.get('rclone_transfers'), data['job_id']))
                 self.log(connection, data['job_id'], '작업 등록')
                 self.event(connection, data['job_id'], 'job.queued')
                 self.commit(connection)
@@ -162,7 +175,7 @@ class JobStore:
                 self.commit(connection)
                 return None
             if row['status'] == 'queued':
-                connection.execute("UPDATE jobs SET status='cancelled',cancel_requested=1,finished_at=?,speed=0,eta=NULL WHERE job_id=?", (now(), job_id))
+                connection.execute("UPDATE jobs SET status='cancelled',cancel_requested=1,finished_at=?,speed=0,eta=NULL,chargeable_bytes=0 WHERE job_id=?", (now(), job_id))
                 self.log(connection, job_id, '대기 작업 취소')
                 self.event(connection, job_id, 'job.cancelled')
             elif row['status'] == 'running' and not row['cancel_requested']:
@@ -177,7 +190,7 @@ class JobStore:
             connection.execute('BEGIN IMMEDIATE')
             rows = connection.execute("SELECT job_id,cancel_requested FROM jobs WHERE status='running'").fetchall()
             for row in rows:
-                connection.execute('UPDATE jobs SET status=?,finished_at=?,speed=0,eta=NULL,error_message=? WHERE job_id=?',
+                connection.execute("UPDATE jobs SET status=?,finished_at=?,speed=0,eta=NULL,error_message=?,error_type='UNKNOWN_ERROR' WHERE job_id=?",
                     ('cancelled' if row['cancel_requested'] else 'failed', now(), '워커가 재시작되어 이전 전송이 중단됐습니다.', row['job_id']))
                 self.log(connection, row['job_id'], '재시작 중단 복구')
                 self.event(connection, row['job_id'], 'job.cancelled' if row['cancel_requested'] else 'job.failed')
@@ -219,10 +232,16 @@ class JobStore:
                 return
             status = 'cancelled' if row['cancel_requested'] else ('completed' if exit_code == 0 and error is None else 'failed')
             message = None if status in ('completed', 'cancelled') else (error or f'Rclone 종료 코드 {exit_code}')
-            connection.execute('UPDATE jobs SET status=?,finished_at=?,speed=0,eta=NULL,rclone_exit_code=?,error_message=? WHERE job_id=?',
-                               (status, now(), exit_code, message, job_id))
+            connection.execute('UPDATE jobs SET status=?,finished_at=?,speed=0,eta=NULL,rclone_exit_code=?,error_message=?,error_type=? WHERE job_id=?',
+                               (status, now(), exit_code, message, classify_error(message) if message else None, job_id))
             self.log(connection, job_id, f'전송 종료: {status}')
             if message:
                 self.log(connection, job_id, message)
             self.event(connection, job_id, 'job.'+status)
             self.commit(connection)
+
+    def accounting(self, job_id, amount):
+        """전송을 시작한 파일의 전체 크기를 저장하며 불확실하면 예약량을 유지한다."""
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE jobs SET chargeable_bytes=? WHERE job_id=? AND status='running'", (amount, job_id))
+            connection.commit()

@@ -55,6 +55,7 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_rclone_shared_remote_name": "gf",
             f"{self.name}_shared_drive_id": "",
             f"{self.name}_rclone_chunk_size": "256M",
+            f"{self.name}_rclone_transfers": "2",
             f"{self.name}_mydrive_upload_threshold": "14GB",
             f"{self.name}_gdrive_upload_limit": "700GB",
             f"{self.name}_shared_drive_upload_limit": "3TB",
@@ -204,14 +205,16 @@ class ModuleDownload(PluginModuleBase):
                             'download_worker_token_path': '',
                         })
                         return jsonify({'ret': 'success', 'msg': '워커 연결 설정을 저장했습니다.'})
-                    health = client.health()
+                    health = client.ensure_version(force_update=True)
                     configuration = client.configuration()
                     version = tuple(int(part) for part in health.get('version', '').split('.'))
-                    if version < (0, 7, 0):
-                        raise WorkerError('워커 0.7.0 이상으로 업데이트해주세요.')
+                    if version < (0, 7, 3):
+                        raise WorkerError('Rclone 파일 동시 전송 수를 적용하려면 워커 0.7.3 이상으로 업데이트해주세요.')
                     limit = max(1, P.ModelSetting.get_int('download_upload_workers'))
-                    return jsonify({'ret': 'success', 'msg': f"워커 {health['version']} 연결됨 · 실행 {health['active_jobs']} / 대기 {health['queued_jobs']} · Feeder 동시 전송 설정 {limit}개"})
+                    return jsonify({'ret': 'success', 'msg': f"워커 {health['version']} 연결됨 · 실행 {health['active_jobs']} / 대기 {health['queued_jobs']} · Feeder 동시 전송 설정 {limit}개 · 작업당 파일 {FeederUtil.get_rclone_transfers()}개"})
                 except WorkerError as exc:
+                    if exc.status == 202:
+                        return jsonify({'ret': 'success', 'msg': str(exc), 'updating': True})
                     message = '인증에 실패했습니다. 워커 설치 시 안내된 토큰을 확인해주세요.' if exc.status == 401 else str(exc)
                     return jsonify({'ret': 'fail', 'msg': message})
                 except (ValueError, KeyError, TypeError):
@@ -668,6 +671,9 @@ class ModuleDownload(PluginModuleBase):
                         return jsonify({'ret': 'success', 'msg': '복사를 반복하지 않고 최종 이동을 다시 시도합니다.'})
 
                 if action == 'retry':
+                    item.source_unavailable_since = None
+                    item.upload_retry_after = None
+                    item.transfer_error_type = None
                     item.completed_time = None
                     profile_name = req.form.get('profile_name', '').strip()
                     selected_profile = None
@@ -1106,11 +1112,13 @@ class ModuleDownload(PluginModuleBase):
                         cutoff_ts = int(now_ts) - 86400
                         cutoff_dt = datetime.now() - timedelta(hours=24)
 
-                        total_res = db.session.query(func.sum(ModelDownloadStat.stat_value)).filter(
+                        usage_rows = db.session.query(ModelDownloadStat.stat_key, func.sum(ModelDownloadStat.stat_value)).filter(
                             ModelDownloadStat.stat_type == 'gdrive_usage',
                             ModelDownloadStat.timestamp > cutoff_ts
-                        ).scalar()
-                        cached_24h_upload_bytes = int(total_res) if total_res else 0
+                        ).group_by(ModelDownloadStat.stat_key).all()
+                        usage = {key: int(value or 0) for key, value in usage_rows}
+                        # 계정별 사용량과 공유 드라이브 합계는 같은 전송이므로 중복 합산하지 않는다.
+                        cached_24h_upload_bytes = usage.get('SHARED_DRIVE_UPLOAD', sum(usage.values()))
 
                         # CD2/로컬 완료를 포함한 24시간 총 완료 토렌트 용량 계산
                         total_dl_res = db.session.query(func.sum(ModelDownload.file_size)).filter(
@@ -1281,7 +1289,7 @@ class ModuleDownload(PluginModuleBase):
                 func.sum(ModelDownloadStat.stat_value).label('total')
             )
             .filter(
-                ModelDownloadStat.stat_type == 'gdrive_usage',
+                ModelDownloadStat.stat_type.in_(['gdrive_usage', 'gdrive_reservation']),
                 ModelDownloadStat.timestamp > cutoff
             )
             .group_by(ModelDownloadStat.stat_key)
@@ -1289,7 +1297,7 @@ class ModuleDownload(PluginModuleBase):
         )
         usage_map = {r[0]: int(r[1]) for r in usage_rows if r[0]}
         account_total = sum(v for k, v in usage_map.items() if k != 'SHARED_DRIVE_UPLOAD')
-        total_24h = sum(usage_map.values())
+        total_24h = usage_map.get('SHARED_DRIVE_UPLOAD', account_total)
 
         blocked_rows = (
             db.session.query(ModelDownloadStat.stat_key, ModelDownloadStat.stat_value)

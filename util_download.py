@@ -697,14 +697,17 @@ class RcloneSimpleTransporter(BaseTransporter):
         if rclone_conf:
             cmd.extend(["--config", rclone_conf])
 
-        cmd.extend(FeederUtil.get_rclone_extra_options())
+        cmd.extend(FeederUtil.get_rclone_transfer_options())
 
+        item_id = item.id
+        engine_name, engine_task_id = item.current_engine_name, item.engine_task_id
         logger.info(f"[RcloneTransporter] 임시 업로드 시작 ({'원격 다이렉트' if is_remote_source else '로컬'}): {folder_name} -> {temp_full}")
         try:
             from .util_upload import UploadUtil
             from .util_block import DownloadBlock
-            target = db.session.get(ModelDownload, item.id)
-            if not target or DownloadBlock.stopped(item.id):
+            from .model_download import ModelDownload
+            target = db.session.get(ModelDownload, item_id)
+            if not target or DownloadBlock.stopped(item_id):
                 return False, 'blocked', '차단 또는 취소된 작업입니다.'
             target.upload_state = dict(target.upload_state or {}, incoming=temp_full,
                 dest_parent=f'{remote_name}:{complete_path}', folder_name=folder_name,
@@ -712,29 +715,29 @@ class RcloneSimpleTransporter(BaseTransporter):
             db.session.commit()
             db.session.remove()
             success, output = UploadUtil.run_rclone(cmd, f'업로드 {folder_name}',
-                item_id=item.id, execution_timeout=3600)
+                item_id=item_id, execution_timeout=3600)
             if success:
                 move_cmd = ["rclone", "move", temp_full, final_full, "--delete-empty-src-dirs"]
                 if rclone_conf:
                     move_cmd.extend(["--config", rclone_conf])
                 move_cmd.extend(FeederUtil.get_rclone_extra_options())
                 moved, output = UploadUtil.run_rclone(move_cmd, f'최종 이동 {folder_name}',
-                    item_id=item.id, execution_timeout=3600)
+                    item_id=item_id, execution_timeout=3600)
                 if not moved:
                     err = output.strip() or "최종 완료 경로 이동 실패"
                     logger.error(f"[RcloneTransporter] 최종 이동 오류: {err}")
                     return False, "failed", f"Rclone 최종 이동 실패: {err[:120]}"
 
                 logger.info(f"[RcloneTransporter] 최종 이동 완료: {final_full}")
-                if DownloadBlock.stopped(item.id):
+                if DownloadBlock.stopped(item_id):
                     return False, 'blocked', '차단 또는 취소된 작업입니다.'
                 if is_remote_source:
-                    downloader_cfg = FeederUtil.get_downloader_by_name(item.current_engine_name)
-                    if downloader_cfg and item.engine_task_id:
+                    downloader_cfg = FeederUtil.get_downloader_by_name(engine_name)
+                    if downloader_cfg and engine_task_id:
                         try:
                             engine = DownloadUtil.create_engine(downloader_cfg)
                             if engine:
-                                engine.delete_task(item.engine_task_id)
+                                engine.delete_task(engine_task_id)
                         except Exception:
                             pass
                 else:
@@ -933,6 +936,11 @@ class DownloadUtil:
         schemas = []
         for e_id, e_cls in cls._engine_classes.items():
             config_schema = list(getattr(e_cls, 'CONFIG_SCHEMA', []))
+            if e_id == 'alldebrid' and not any(f.get('name') == 'webdav_failure_timeout_hours' for f in config_schema):
+                config_schema.append({
+                    'name': 'webdav_failure_timeout_hours', 'label': 'WebDAV 실패 유예 (시간)',
+                    'type': 'number', 'default': 24, 'min': 0, 'max': 8760, 'step': 1,
+                    'desc': '완료된 소스의 최초 읽기 실패부터 경과한 시간. 이후 소스 실패가 다시 확인되면 다음 엔진으로 전환합니다. 0은 계속 대기합니다.'})
             if not any(field.get('name') == 'missing_timeout_hours' for field in config_schema):
                 config_schema.append({
                     'name': 'missing_timeout_hours', 'label': '원격 목록 누락 유예 (시간)',
