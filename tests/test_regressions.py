@@ -762,15 +762,24 @@ class Regressions(unittest.TestCase):
         self.assertEqual(expected,module.get_upload_queue_counts())
         response=module.process_ajax('pipeline_control_state',NS(form={}))
         self.assertEqual(expected,response['counts'])
-        # SSE must carry the same numbers as the lightweight fallback endpoint.
+        # 제어 프레임은 건너뛰되, v1만으로 시작한 비동기 집계의 실제 숫자를 확인한다.
+        from test_dashboard import Dashboard, metric_cache, wait_metric
         namespace=next(env for env in NAMESPACES if env['__name__']=='feeder_test.mod_download')
-        with patch.object(namespace['logger'],'debug',side_effect=RuntimeError('unexpected SSE error')):
+        with metric_cache(), patch.dict(namespace,Dashboard=Dashboard):
             stream=module.generate_sse_stream()
-            try:message=next(stream)
-            finally:stream.close()
-        payload=json.loads(message.removeprefix('data: ').strip())
+            try:
+                frames=[next(stream),next(stream)]
+                self.assertTrue(frames[0].startswith('retry:'))
+                wait_metric()
+                if not frames[-1].startswith('data: '): frames.append(next(stream))
+                message=next(frame for frame in frames if frame.startswith('data: '))
+                payload=json.loads(message.removeprefix('data: ').strip())
+            finally: stream.close()
         self.assertEqual(50,payload['counts']['upload_current'])
         self.assertEqual(113,payload['counts']['upload_total'])
+        self.assertEqual('ready',payload['upload_counts_state'])
+        response=module.process_ajax('pipeline_control_state',NS(form={'dashboard_version':'2'}))
+        self.assertNotIn('counts',response)
 
     def test_dashboard_upload_count_preserves_actual_overflow_and_deduplicates_buffers(self):
         root=Path(self.tmp.name)/'staging';root.mkdir()

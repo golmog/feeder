@@ -22,6 +22,7 @@ from .util_upload import UploadUtil
 from .util_remote_worker import RemoteWorker
 from .remote_worker_client import WorkerError
 from .util_download_activity import DownloadActivity
+from .util_dashboard import Dashboard
 
 name = 'download'
 
@@ -145,6 +146,25 @@ class ModuleDownload(PluginModuleBase):
         try:
             command = req.form.get('command') or sub
 
+            if command in ('queue_bootstrap', 'queue_page', 'queue_engines', 'queue_progress', 'queue_upload_counts'):
+                try:
+                    if command in ('queue_bootstrap', 'queue_page'):
+                        result = Dashboard.queue(cursor=req.form.get('cursor') if command == 'queue_page' else None,
+                            known=json.loads(req.form.get('known') or '{}'))
+                    elif command == 'queue_engines':
+                        result = Dashboard.engine_view()
+                    elif command == 'queue_progress':
+                        ids = [int(i) for i in json.loads(req.form.get('ids') or '[]') if str(i).isdigit()]
+                        result = Dashboard.progress(ids)
+                    else:
+                        result = Dashboard.upload_counts(self.get_upload_queue_counts)
+                    return jsonify(result)
+                except Exception as exc:
+                    return jsonify({'success': False, 'error': 'snapshot_expired' if str(exc) == 'snapshot_expired'
+                                    else 'dashboard_query_failed', 'observed_at': time.time()})
+                finally:
+                    db.session.remove()
+
             if command in ['pipeline_control_state', 'pause_pipeline', 'resume_pipeline']:
                 if command != 'pipeline_control_state':
                     FeederUtil.set_download_paused(command == 'pause_pipeline')
@@ -159,7 +179,7 @@ class ModuleDownload(PluginModuleBase):
                             name='feeder-download-resume', daemon=True
                         ).start()
                 response = {'ret': 'success', 'control': control}
-                if command == 'pipeline_control_state':
+                if command == 'pipeline_control_state' and req.form.get('dashboard_version') != '2':
                     response['counts'] = self.get_upload_queue_counts()
                 return jsonify(response)
 
@@ -839,7 +859,7 @@ class ModuleDownload(PluginModuleBase):
                 return response
             elif sub == 'sse':
                 response = Response(
-                    stream_with_context(self.generate_sse_stream()),
+                    stream_with_context(self.generate_sse_stream(version=req.args.get('version', '1'))),
                     mimetype='text/event-stream'
                 )
                 response.headers['Cache-Control'] = 'no-cache'
@@ -1095,189 +1115,38 @@ class ModuleDownload(PluginModuleBase):
                 yield 'event: activity_error\ndata: {}\n\n'
             time.sleep(3)
 
-    def generate_sse_stream(self):
-        """실시간 대시보드용 SSE 스트림 (통계 카운트 + 활성 작업 목록 동시 전송)"""
-        sse_cycle = 0
-        engine_tasks_cache = []
-        last_stat_calc_time = 0
-        cached_24h_upload_bytes = 0
-        cached_24h_download_bytes = 0
+    def generate_sse_stream(self, version='1'):
+        """v2는 갱신 신호만 전송한다. 외부 엔진/디스크 조회를 구독자에게 종속시키지 않는다."""
+        yield 'retry: 5000\n\n'
         while True:
-            try:
-                with F.app.app_context():
-                    sse_cycle += 1
-                    now_ts = time.time()
-                    if now_ts - last_stat_calc_time > 30:
-                        last_stat_calc_time = now_ts
-                        cutoff_ts = int(now_ts) - 86400
-                        cutoff_dt = datetime.now() - timedelta(hours=24)
-
-                        usage_rows = db.session.query(ModelDownloadStat.stat_key, func.sum(ModelDownloadStat.stat_value)).filter(
-                            ModelDownloadStat.stat_type == 'gdrive_usage',
-                            ModelDownloadStat.timestamp > cutoff_ts
-                        ).group_by(ModelDownloadStat.stat_key).all()
-                        usage = {key: int(value or 0) for key, value in usage_rows}
-                        # 계정별 사용량과 공유 드라이브 합계는 같은 전송이므로 중복 합산하지 않는다.
-                        cached_24h_upload_bytes = usage.get('SHARED_DRIVE_UPLOAD', sum(usage.values()))
-
-                        # CD2/로컬 완료를 포함한 24시간 총 완료 토렌트 용량 계산
-                        total_dl_res = db.session.query(func.sum(ModelDownload.file_size)).filter(
-                            ModelDownload.success_filter(),
-                            ModelDownload.completed_time >= cutoff_dt
-                        ).scalar()
-                        cached_24h_download_bytes = int(total_dl_res) if total_dl_res else 0
-
-                    counts = {
-                        'pending': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending', 'pending_relay'])).count(),
-                        'downloading': db.session.query(ModelDownload).filter_by(status='downloading').count(),
-                        'staging': db.session.query(ModelDownload).filter(ModelDownload.status.in_(['pending_local_staging', 'local_staging'])).count(),
-                        **self.get_upload_queue_counts(),
-                        'completed': db.session.query(ModelDownload).filter(ModelDownload.success_filter()).count(),
-                        'failed': db.session.query(ModelDownload).filter(ModelDownload.failure_filter()).count(),
-                    }
-
-                    active_statuses = [
-                        'pending', 'downloading', 'pending_local_staging', 'local_staging',
-                        'downloaded', 'waiting_transporter', 'pending_upload', 'uploading', 'pending_relay', 'relay_transferring'
-                    ]
-
-                    # 상태별 우선순위 가중치: 실제 전송/진행 중인 작업을 신규 대기 항목보다 항상 최우선 정렬
-                    status_priority = case(
-                        (ModelDownload.status.in_(['local_staging', 'uploading', 'relay_transferring']), 1),
-                        (ModelDownload.status == 'downloading', 2),
-                        (ModelDownload.status.in_(['pending_local_staging', 'downloaded', 'waiting_transporter', 'pending_upload', 'pending_relay']), 3),
-                        (ModelDownload.status == 'pending', 4),
-                        else_=5
-                    )
-
-                    active_rows = (
-                        db.session.query(ModelDownload)
-                        .filter(ModelDownload.status.in_(active_statuses))
-                        .order_by(status_priority, desc(ModelDownload.id))
-                        .all()
-                    )
-
-                    # Rclone 진행률은 매 주기 갱신하고, 원격 엔진 목록은 2주기(6초)마다 갱신
-                    if sse_cycle == 1 or sse_cycle % 2 == 0:
-                        refreshed_tasks = []
-                        refresh_success = True
-                        for dl in FeederUtil.get_downloaders():
-                            FeederUtil.cooperate()
-                            if dl.get('enabled', True):
-                                engine = DownloadUtil.create_engine(dl)
-                                if engine and hasattr(engine, 'get_status'):
-                                    try:
-                                        s_list, status_error = engine.get_status()
-                                        if status_error:
-                                            refresh_success = False
-                                            logger.debug(f"[{self.name}] SSE 엔진 상태 갱신 오류({dl.get('name')}): {status_error}")
-                                            continue
-                                        if s_list:
-                                            for c_item in s_list:
-                                                FeederUtil.cooperate()
-                                                c_item['engine_name'] = dl.get('name', 'alldebrid')
-                                            refreshed_tasks.extend(s_list)
-                                    except Exception as engine_ex:
-                                        refresh_success = False
-                                        logger.debug(f"[{self.name}] SSE 엔진 상태 갱신 실패({dl.get('name')}): {engine_ex}")
-                        if refresh_success:
-                            engine_tasks_cache = refreshed_tasks
-                    cloud_tasks = engine_tasks_cache
-
-                    engine_live_data = {str(s.get('task_id')): s for s in cloud_tasks if s.get('task_id')}
-                    engine_live_data.update({str(s.get('hash')).lower(): s for s in cloud_tasks if s.get('hash')})
-
-                    # DB의 활성 작업 ID 및 해시 세트
-                    db_tids = {str(it.engine_task_id) for it in active_rows if it.engine_task_id}
-                    db_hashes = {str(it.infohash).lower() for it in active_rows if it.infohash}
-
-                    # 각 아이템 딕셔너리에 실시간 속도, 진행률 병합
-                    active_list = []
-                    for it in active_rows:
-                        FeederUtil.cooperate()
-                        d = it.as_dict()
-
-                        # 엔진 라이브 진행 정보는 DB 상태가 실제 다운로드 중(downloading)일 때만 반영
-                        if it.status == 'downloading':
-                            live_info = engine_live_data.get(str(it.engine_task_id)) or engine_live_data.get(str(it.infohash or '').lower())
-                            if live_info:
-                                dl_bytes = live_info.get('downloaded_bytes', 0)
-                                dl_speed = live_info.get('download_speed', 0)
-                                total_sz = live_info.get('file_size') or it.file_size or 0
-
-                                if 'progress' in live_info:
-                                    prog = float(live_info['progress'])
-                                elif total_sz > 0 and dl_bytes > 0:
-                                    prog = round((dl_bytes / total_sz) * 100, 1)
-                                else:
-                                    prog = 0.0
-
-                                d['downloaded_bytes'] = dl_bytes
-                                d['download_speed'] = dl_speed
-                                d['progress'] = min(prog, 100.0)
-
-                        # 로컬 스테이징 및 Google Drive 업로드 중일 때는 Rclone 실시간 IPC 데이터 병합
-                        elif it.status in ['local_staging', 'uploading']:
-                            rclone_stat = FeederUtil.get_rclone_progress(it.id)
-                            if rclone_stat:
-                                d['progress'] = rclone_stat.get('progress', 0.0)
-                                d['download_speed'] = rclone_stat.get('download_speed', 0)
-                                d['speed_str'] = rclone_stat.get('speed_str', '')
-                                d['downloaded_bytes'] = rclone_stat.get('downloaded_bytes', 0)
-                                d['file_size'] = rclone_stat.get('total_bytes') or d.get('file_size') or 0
-                                d['eta'] = rclone_stat.get('eta', '')
-
-                        # 단계 상태는 항상 DB에 저장된 실제 상태(it.status)를 최우선 유지
-                        d['status'] = it.status
-                        active_list.append(d)
-
-                    # DB에 등록되지 않은 다운로더 엔진(AllDebrid, PikPak 등) 잔여 항목들을 동적 엔진명으로 큐에 노출
-                    for c_task in cloud_tasks:
-                        FeederUtil.cooperate()
-                        tid = str(c_task.get('task_id', ''))
-                        thash = str(c_task.get('hash', '')).lower()
-                        if tid and tid in db_tids:
-                            continue
-                        if thash and thash in db_hashes:
-                            continue
-
-                        eng_name = c_task.get('engine_name') or 'Engine'
-                        raw_id = tid or thash or '0'
-                        display_id = raw_id[:10] if len(raw_id) > 10 else raw_id
-
-                        active_list.append({
-                            'id': display_id,
-                            'task_id': tid,
-                            'hash': thash,
-                            'feed_name': eng_name,
-                            'title': c_task.get('filename') or f"{eng_name} Task {display_id}",
-                            'file_name': c_task.get('filename') or '',
-                            'file_size': c_task.get('file_size', 0),
-                            'status': 'engine_unmanaged',
-                            'current_engine_name': eng_name,
-                            'local_path': c_task.get('source_path', ''),
-                            'raw_status': c_task.get('status', ''),
-                            'created_time': f"{eng_name} 보관중"
-                        })
-
-                    data_str = json.dumps({
-                        'timestamp': int(time.time()),
-                        'control': FeederUtil.get_download_control_state(),
-                        'counts': counts,
-                        'total_upload_24h': cached_24h_upload_bytes,
-                        'total_download_24h': cached_24h_download_bytes,
-                        'active_list': active_list
-                    })
-                    yield f"data: {data_str}\n\n"
-
-            except Exception as e:
-                logger.debug(f"[{self.name}] SSE 스트림 전송 예외: {e}")
-            finally:
+            if version == '2':
+                yield 'data: ' + json.dumps({'version': 2, 'kind': 'refresh', 'observed_at': time.time()}) + '\n\n'
+            else:
+                # 이전 브라우저의 이벤트 형식은 유지하되 DB 전체 스냅샷은 30초 간격으로 제한한다.
                 try:
-                    db.session.remove()
+                    metric = Dashboard.upload_counts(self.get_upload_queue_counts)
+                    if metric['counts'] is None:
+                        # 구형 onmessage가 누락된 숫자를 0으로 덮지 않도록 준비 전에는 상태 이벤트만 보낸다.
+                        yield 'event: upload_counts_state\ndata: ' + json.dumps({
+                            'state': metric['state'], 'observed_at': metric['observed_at']}) + '\n\n'
+                        time.sleep(30)
+                        continue
+                    with F.app.app_context():
+                        try:
+                            rows = db.session.query(ModelDownload).filter(ModelDownload.status.in_(list(Dashboard.ranks))).all()
+                            data = {'timestamp': time.time(), 'counts': Dashboard.counts(),
+                                    'active_list': [Dashboard.serialize(item) for item in rows]}
+                            data['counts'].update(metric['counts'])
+                            data['upload_counts_state'] = metric['state']
+                            data.update(control=FeederUtil.get_download_control_state(),
+                                        total_upload_24h=data['counts']['total_upload_24h'],
+                                        total_download_24h=data['counts']['total_download_24h'])
+                        finally:
+                            db.session.remove()
+                    yield 'data: ' + json.dumps(data) + '\n\n'
                 except Exception:
-                    pass
-            time.sleep(3)
+                    yield 'event: dashboard_error\ndata: {}\n\n'
+            time.sleep(5 if version == '2' else 30)
 
     def get_account_stats_summary(self) -> dict:
         now = int(time.time())

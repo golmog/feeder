@@ -265,3 +265,11 @@
     transform: translateX(100%);
   }
 }
+/* 큐는 원천별로 도착한 데이터를 표시하며 입력을 가리는 로딩 막을 사용하지 않는다. */
+.queue-skeleton-row td { padding: 1rem .5rem; }
+.queue-skeleton { display: block; height: .85rem; margin: .4rem 0; border-radius: .2rem; background: currentColor; opacity: .12; animation: queue-loading 1.5s ease-in-out infinite alternate; }
+.queue-skeleton-short { width: 65%; }
+.queue-source-states { overflow-wrap: anywhere; }
+.queue-source-states [data-state="error"], .queue-source-states [data-state="stale"] { color: #b88920; }
+@keyframes queue-loading { to { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .queue-skeleton { animation: none; } }
