@@ -339,6 +339,252 @@ class CrawlSessionTests(unittest.TestCase):
         scheduler=types.SimpleNamespace(use_proxy=bool(proxies),proxy_url=proxies,use_flaresolverr=True,use_selenium=False)
         return h.CrawlUtil.get_html('https://example.test/page?private=hidden',scheduler_instance=scheduler,max_retries=retries,retry_interval=.5)
 
+    def clearance_post(self, clock, cookies, fail_after=None):
+        real=self.fake.post
+        def post(url,json=None,**kwargs):
+            response=real(url,json=json,**kwargs)
+            if json['cmd']=='request.get':
+                data={'status':'error','message':'API failure'} if fail_after is not None and clock[0]>=fail_after else {
+                    'status':'ok','message':'Challenge not detected!','solution':{
+                        'status':200,'response':'<html>FS</html>','cookies':cookies() if callable(cookies) else cookies,'userAgent':'fs-agent'}}
+                return types.SimpleNamespace(status_code=200,json=lambda:data)
+            return response
+        return post
+
+    def test_clearance_expiry_precedes_http_at_boundary_and_later(self):
+        c=h.CrawlUtil
+        for boundary in [1005,1010]:
+            with self.subTest(boundary=boundary),c.execution_scope(h.uuid.uuid4().hex):
+                clock=[1000];self.fake.calls.clear()
+                direct=Mock(headers={},cookies=[]);direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>HTTP</html>')
+                post=self.clearance_post(clock,[{'name':'cf_clearance','value':'token','expires':1005}])
+                with patch.object(h.time,'time',side_effect=lambda:clock[0]),patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct),requests=types.SimpleNamespace(post=post)):
+                    self.assertEqual('<html>FS</html>',self.crawl(retries=1,proxies=''))
+                    clock[0]=1004;self.assertEqual('<html>HTTP</html>',self.crawl(retries=1,proxies=''))
+                    self.assertEqual(1,sum(x['cmd']=='request.get' for x in self.fake.calls))
+                    clock[0]=boundary;self.assertEqual('<html>FS</html>',self.crawl(retries=1,proxies=''))
+                    self.assertEqual(1,direct.get.call_count)
+                    self.assertEqual(2,sum(x['cmd']=='request.get' for x in self.fake.calls))
+                c.finish_execution()
+
+    def test_expired_clearance_fs_failure_never_tries_http(self):
+        clock=[1000];direct=Mock(headers={},cookies=[])
+        direct.get.return_value=types.SimpleNamespace(status_code=403,text='blocked')
+        post=self.clearance_post(clock,[{'name':'cf_clearance','value':'token','expires':1005}],fail_after=1010)
+        with patch.object(h.time,'time',side_effect=lambda:clock[0]),patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct),requests=types.SimpleNamespace(post=post,Session=lambda:direct)):
+            self.assertEqual('<html>FS</html>',self.crawl(retries=1,proxies=''))
+            clock[0]=1010;self.assertIsNone(self.crawl(retries=1,proxies=''))
+            direct.get.assert_not_called()
+            self.assertFalse(h.CrawlUtil._fs_verified);self.assertFalse(h.CrawlUtil._fs_auth_cookies)
+            self.assertEqual(2,sum(x['cmd']=='request.get' for x in self.fake.calls))
+
+    def test_analytics_expiry_does_not_shorten_cookie_free_fs_success(self):
+        c=h.CrawlUtil
+        for clearance in [False,True]:
+            with self.subTest(clearance=clearance),c.execution_scope(h.uuid.uuid4().hex):
+                clock=[1000];self.fake.calls.clear()
+                cookies=[{'name':'analytics','value':'site','expires':1005}]
+                if clearance:cookies.append({'name':'cf_clearance','value':'auth','expires':1015})
+                direct=Mock(headers={},cookies=[]);direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>HTTP</html>')
+                post=self.clearance_post(clock,cookies)
+                with patch.object(h.time,'time',side_effect=lambda:clock[0]),patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct),requests=types.SimpleNamespace(post=post)):
+                    self.assertEqual('<html>FS</html>',self.crawl(retries=1,proxies=''))
+                    clock[0]=1010;self.assertEqual('<html>HTTP</html>',self.crawl(retries=1,proxies=''))
+                    self.assertNotIn('analytics=',direct.get.call_args.kwargs['headers']['Cookie'])
+                    self.assertEqual(1,sum(x['cmd']=='request.get' for x in self.fake.calls))
+                    if clearance:
+                        clock[0]=1015;self.assertEqual('<html>FS</html>',self.crawl(retries=1,proxies=''))
+                        self.assertEqual(1,direct.get.call_count)
+                c.finish_execution()
+
+    def test_same_clearance_keeps_effective_expiry_but_new_token_can_renew(self):
+        c=h.CrawlUtil;clock=[1000]
+        def cookies():
+            return [{'name':'cf_clearance','value':'new' if clock[0]>=1006 else 'old',
+                     'expires':1020 if clock[0]>=1006 else 1005 if clock[0]==1000 else 2000}]
+        direct=Mock(headers={},cookies=[]);direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>HTTP</html>')
+        post=self.clearance_post(clock,cookies)
+        with patch.object(h.time,'time',side_effect=lambda:clock[0]),patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct),requests=types.SimpleNamespace(post=post)):
+            self.assertTrue(self.crawl(retries=1,proxies=''))
+            clock[0]=1005;self.assertEqual('<html>FS</html>',self.crawl(retries=1,proxies=''))
+            bound=next(iter(c._fs_auth_cookies.values()))
+            self.assertEqual(1005,bound[0]['until']);self.assertEqual(1005,next(iter(c._cookie_records['example.test'].values()))['until'])
+            clock[0]=1006;self.assertEqual('<html>FS</html>',self.crawl(retries=1,proxies=''))
+            self.assertEqual(1020,next(iter(c._fs_auth_cookies.values()))[0]['until'])
+            clock[0]=1007;self.assertEqual('<html>HTTP</html>',self.crawl(retries=1,proxies=''))
+        self.assertEqual(1,direct.get.call_count);self.assertEqual(3,sum(x['cmd']=='request.get' for x in self.fake.calls))
+
+    def test_session_and_already_expired_clearance_keep_distinct_evidence(self):
+        c=h.CrawlUtil
+        for expired in [False,True]:
+            with self.subTest(expired=expired),c.execution_scope(h.uuid.uuid4().hex):
+                clock=[1000];self.fake.calls.clear();cookie={'name':'cf_clearance','value':'auth'}
+                if expired:cookie['expires']=999
+                direct=Mock(headers={},cookies=[]);direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>HTTP</html>')
+                post=self.clearance_post(clock,[cookie])
+                with patch.object(h.time,'time',side_effect=lambda:clock[0]),patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct),requests=types.SimpleNamespace(post=post)):
+                    self.assertEqual('<html>FS</html>',self.crawl(retries=1,proxies=''))
+                    self.assertEqual(999 if expired else 4600,next(iter(c._fs_auth_cookies.values()))[0]['until'])
+                    clock[0]=1001
+                    self.assertEqual('<html>FS</html>' if expired else '<html>HTTP</html>',self.crawl(retries=1,proxies=''))
+                    if expired:direct.get.assert_not_called()
+                    else:
+                        clock[0]=4599;self.assertEqual('<html>HTTP</html>',self.crawl(retries=1,proxies=''))
+                        clock[0]=4600;self.assertEqual('<html>FS</html>',self.crawl(retries=1,proxies=''))
+                        self.assertEqual(2,direct.get.call_count)
+                c.finish_execution()
+
+    def test_clearance_bound_evidence_respects_url_scope_and_other_cookies(self):
+        c=h.CrawlUtil;clock=[1000]
+        scheduler=types.SimpleNamespace(use_proxy=False,use_selenium=False,use_flaresolverr=True)
+        cookies=[{'name':'cf_clearance','value':'valid','domain':'example.test','path':'/private','secure':True,'expires':2000},
+                 {'name':'cf_clearance','value':'short','domain':'example.test','path':'/unrelated','expires':1005}]
+        direct=Mock(headers={},cookies=[]);direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>HTTP</html>')
+        post=self.clearance_post(clock,cookies)
+        with patch.object(h.time,'time',side_effect=lambda:clock[0]),patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct),requests=types.SimpleNamespace(post=post)):
+            self.assertEqual('<html>FS</html>',c.get_html('https://example.test/private/page',scheduler_instance=scheduler,max_retries=1))
+            clock[0]=1010
+            self.assertEqual('<html>HTTP</html>',c.get_html('https://example.test/private/page',scheduler_instance=scheduler,max_retries=1))
+            self.assertEqual(1,sum(x['cmd']=='request.get' for x in self.fake.calls))
+            for url in ['https://example.test/public','http://example.test/private/page','https://other.test/private/page']:
+                self.assertEqual('<html>FS</html>',c.get_html(url,scheduler_instance=scheduler,max_retries=1))
+        self.assertEqual(1,direct.get.call_count);self.assertEqual(4,sum(x['cmd']=='request.get' for x in self.fake.calls))
+
+    def test_missing_clearance_metadata_cannot_become_cookie_free_success(self):
+        c=h.CrawlUtil;clock=[1000]
+        direct=Mock(headers={},cookies=[]);post=self.clearance_post(clock,[{'name':'cf_clearance','value':'auth','expires':1005}])
+        with patch.object(h.time,'time',side_effect=lambda:clock[0]),patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct),requests=types.SimpleNamespace(post=post)):
+            self.assertEqual('<html>FS</html>',self.crawl(retries=1,proxies=''))
+            c._fs_auth_cookies.clear();clock[0]=1010
+            self.assertEqual('<html>FS</html>',self.crawl(retries=1,proxies=''))
+        direct.get.assert_not_called();self.assertEqual(2,sum(x['cmd']=='request.get' for x in self.fake.calls))
+
+    def test_expired_clearance_timeout_rotates_with_owned_id_quarantined(self):
+        c=h.CrawlUtil;clock=[1000];real=self.fake.post
+        def post(url,json=None,**kwargs):
+            response=real(url,json=json,**kwargs)
+            if clock[0]>=1010 and json['cmd']=='sessions.destroy':raise TimeoutError('destroy result unknown')
+            if json['cmd']=='request.get':
+                if clock[0]>=1010 and 'one' in json['proxy']['url']:raise TimeoutError('request timeout')
+                cookie={'name':'cf_clearance','value':'new' if 'two' in json['proxy']['url'] else 'old',
+                        'expires':2000 if 'two' in json['proxy']['url'] else 1005}
+                return types.SimpleNamespace(status_code=200,json=lambda:{'status':'ok','solution':{
+                    'status':200,'response':'<html>FS</html>','cookies':[cookie],'userAgent':'agent'}})
+            return response
+        direct=Mock()
+        with patch.object(h.time,'time',side_effect=lambda:clock[0]),patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct),requests=types.SimpleNamespace(post=post,Session=lambda:direct)):
+            self.assertEqual('<html>FS</html>',self.crawl())
+            old=next(iter(c._fs_sessions.values()))['id']
+            clock[0]=1010;self.assertEqual('<html>FS</html>',self.crawl())
+            calls=[x for x in self.fake.calls if x['cmd']=='request.get']
+            self.assertEqual(3,len(calls));self.assertNotEqual(old,calls[-1]['session'])
+            self.assertEqual('http://two.invalid',calls[-1]['proxy']['url'])
+            self.assertTrue(any(key[2]==old for key in c._fs_retired));self.assertEqual(2,len(c._fs_owned))
+            self.assertEqual(1,len(c._fs_auth_cookies));direct.get.assert_not_called()
+
+    def test_http_only_success_cannot_skip_fs_when_enabled(self):
+        c=h.CrawlUtil
+        scheduler=types.SimpleNamespace(use_proxy=False,use_selenium=False,use_flaresolverr=False)
+        direct=Mock(headers={},cookies=[]);direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>HTTP</html>')
+        with patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct)):
+            self.assertEqual('<html>HTTP</html>',c.get_html('https://example.test/page',scheduler_instance=scheduler,max_retries=1))
+            self.assertEqual(1,direct.get.call_count)
+            self.fake.failures=['API failure'];scheduler.use_flaresolverr=True
+            self.assertIsNone(c.get_html('https://example.test/page',scheduler_instance=scheduler,max_retries=1))
+        self.assertEqual(1,direct.get.call_count,'FS 실패 후 두 번째 HTTP 요청 금지')
+        self.assertEqual(1,sum(x['cmd']=='request.get' for x in self.fake.calls))
+
+    def test_http_only_then_fs_success_keeps_authenticated_fast_path(self):
+        c=h.CrawlUtil; scheduler=types.SimpleNamespace(use_proxy=False,use_selenium=False,use_flaresolverr=False)
+        direct=Mock(headers={},cookies=[]); direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>HTTP</html>')
+        events=[];real=self.fake.post
+        def post(url,json=None,**kwargs):
+            events.append(json['cmd'])
+            return real(url,json=json,**kwargs)
+        direct.get.side_effect=lambda *a,**kw:events.append('http.get') or types.SimpleNamespace(status_code=200,text='<html>HTTP</html>')
+        with patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct),requests=types.SimpleNamespace(post=post)):
+            self.assertEqual('<html>HTTP</html>',c.get_html('https://example.test/page',scheduler_instance=scheduler,max_retries=1))
+            self.assertFalse(c._fs_verified)
+            scheduler.use_flaresolverr=True
+            self.assertEqual('<html>OK</html>',c.get_html('https://example.test/page',scheduler_instance=scheduler,max_retries=1))
+            self.assertEqual(1,direct.get.call_count)
+            self.assertEqual('<html>HTTP</html>',c.get_html('https://example.test/page',scheduler_instance=scheduler,max_retries=1))
+        self.assertEqual(1,events.count('request.get'));self.assertEqual(2,events.count('http.get'))
+        self.assertLess(events.index('http.get'),events.index('request.get'));self.assertLess(events.index('request.get'),len(events)-1)
+        self.assertEqual('test-agent',direct.get.call_args.kwargs['headers']['User-Agent'])
+
+    def test_cookie_free_fs_success_has_its_own_fast_path_evidence(self):
+        c=h.CrawlUtil;direct=Mock(headers={},cookies=[])
+        direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>fast</html>')
+        with patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct)):
+            self.assertEqual('<html>OK</html>',self.crawl(proxies=''))
+            self.assertFalse(c._has_valid_clearance('example.test'));self.assertEqual(1,len(c._fs_verified))
+            direct.get.assert_not_called()
+            self.assertEqual('<html>fast</html>',self.crawl(proxies=''))
+        self.assertEqual(1,direct.get.call_count)
+        self.assertEqual(1,sum(x['cmd']=='request.get' for x in self.fake.calls))
+
+    def test_http_success_never_extends_fs_verification_ttl(self):
+        c=h.CrawlUtil;clock=[0]
+        direct=Mock(headers={},cookies=[]);direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>fast</html>')
+        with patch.object(h.time,'time',side_effect=lambda:clock[0]),patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct)):
+            self.assertEqual('<html>OK</html>',self.crawl(proxies=''))
+            self.assertEqual([0],list(c._fs_verified.values()))
+            for value in [100,3599]:
+                clock[0]=value;self.assertEqual('<html>fast</html>',self.crawl(proxies=''))
+                self.assertEqual([0],list(c._fs_verified.values()))
+            self.assertEqual([3599],list(c._http_ready.values()))
+            clock[0]=3600;self.assertEqual('<html>OK</html>',self.crawl(proxies=''))
+            self.assertEqual([3600],list(c._fs_verified.values()))
+        self.assertEqual(2,direct.get.call_count);self.assertEqual(2,sum(x['cmd']=='request.get' for x in self.fake.calls))
+
+    def test_future_or_missing_fs_evidence_cannot_use_recent_http_history(self):
+        c=h.CrawlUtil;direct=Mock(headers={},cookies=[]);direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>fast</html>')
+        with patch.object(h.time,'time',return_value=1000),patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct)):
+            self.assertTrue(self.crawl(proxies=''))
+            for key in c._fs_verified:c._fs_verified[key]=1001
+            self.assertEqual('<html>OK</html>',self.crawl(proxies=''))
+            c._fs_verified.clear();self.assertTrue(c._http_ready)
+            self.assertEqual('<html>OK</html>',self.crawl(proxies=''))
+        direct.get.assert_not_called();self.assertEqual(3,sum(x['cmd']=='request.get' for x in self.fake.calls))
+
+    def test_fs_evidence_changes_with_site_auth_proxy_and_endpoint(self):
+        c=h.CrawlUtil;direct=Mock(headers={},cookies=[]);direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>fast</html>')
+        scheduler=types.SimpleNamespace(use_proxy=True,proxy_url='http://one.invalid',use_selenium=False,use_flaresolverr=True)
+        site={'NAME':'first'}
+        with patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct)):
+            for field,value in [(None,None),('NAME','second'),('COOKIE','_login=user'),('USER_AGENT','new-agent')]:
+                if field:site[field]=value
+                self.assertEqual('<html>OK</html>',c.get_html('https://example.test/page',site,scheduler,max_retries=1))
+                self.assertEqual(1,len(c._fs_verified));self.assertEqual(1,len(c._fs_auth_cookies))
+            scheduler.proxy_url='http://two.invalid'
+            self.assertEqual('<html>OK</html>',c.get_html('https://example.test/page',site,scheduler,max_retries=1))
+            h.Settings.set('crawl_flaresolverr_url','http://new-fs.invalid')
+            self.assertEqual('<html>OK</html>',c.get_html('https://example.test/page',site,scheduler,max_retries=1))
+        direct.get.assert_not_called();self.assertEqual(6,sum(x['cmd']=='request.get' for x in self.fake.calls))
+
+    def test_fs_evidence_isolated_by_owner_pid_and_cleared_on_finish(self):
+        c=h.CrawlUtil;self.assertTrue(self.crawl(proxies='')); self.assertTrue(c._fs_verified)
+        for other_pid in [False,True]:
+            pid=h.os.getpid()
+            pid_patch=patch.object(h.os,'getpid',return_value=pid+1) if other_pid else contextlib.nullcontext()
+            with pid_patch,c.execution_scope(c._fs_scope.owner if other_pid else 'other-owner'):
+                self.assertFalse(c._fs_verified);self.assertFalse(c._fs_auth_cookies)
+                self.assertTrue(self.crawl(proxies=''));self.assertTrue(c._fs_verified)
+                c.finish_execution();self.assertFalse(c._fs_verified);self.assertFalse(c._fs_auth_cookies)
+            self.assertTrue(c._fs_verified);self.assertTrue(c._fs_auth_cookies)
+        c.finish_execution();self.assertFalse(c._fs_verified);self.assertFalse(c._fs_auth_cookies)
+
+    def test_reinit_and_failed_authenticated_http_clear_fs_evidence(self):
+        c=h.CrawlUtil;self.assertTrue(self.crawl(proxies=''));self.assertTrue(c._fs_verified)
+        with patch.object(c,'init_stealth_selenium',return_value=None),patch.object(c,'get_hook',return_value=None):
+            self.assertIsNone(c.reinit_session({'NAME':'site','TORRENT_SITE_URL':'https://example.test/'}))
+        self.assertFalse(c._fs_verified);self.assertFalse(c._fs_auth_cookies)
+        direct=Mock(headers={},cookies=[]);direct.get.return_value=types.SimpleNamespace(status_code=403,text='blocked')
+        with patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct)):
+            self.assertTrue(self.crawl(proxies=''));self.assertTrue(c._fs_verified)
+            self.assertIsNone(self.crawl(retries=1,proxies=''));self.assertFalse(c._fs_verified);self.assertFalse(c._fs_auth_cookies)
+
     def test_fs_failure_rotates_without_unauthenticated_http(self):
         self.fake.failures=['API unavailable']*2
         direct=Mock(); direct.headers={}; direct.cookies=[]; direct.get.return_value=types.SimpleNamespace(status_code=403,text='blocked')
@@ -365,6 +611,7 @@ class CrawlSessionTests(unittest.TestCase):
         with patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:curl),requests=types.SimpleNamespace(post=Mock(side_effect=AssertionError('FS 호출')),Session=lambda:direct)):
             self.assertEqual('<html>requests</html>',h.CrawlUtil.get_html('https://example.test/page',scheduler_instance=scheduler,max_retries=1))
         self.assertEqual(1,curl.get.call_count); self.assertEqual(1,direct.get.call_count)
+        self.assertFalse(h.CrawlUtil._fs_verified)
 
     def test_authenticated_http_block_rotates_to_fs_before_any_new_http(self):
         curl=Mock(headers={},cookies=[]); curl.get.return_value=types.SimpleNamespace(status_code=403,text='blocked')
@@ -480,6 +727,7 @@ class CrawlSessionTests(unittest.TestCase):
             direct.get.assert_not_called()
             self.assertEqual('<html>fast</html>',self.crawl(proxies=''))
             for key in c._http_ready: c._http_ready[key]=1000-c.CF_COOKIE_EXPIRY-1
+            for key in c._fs_verified: c._fs_verified[key]=1000-c.CF_COOKIE_EXPIRY-1
             self.assertEqual('<html>OK</html>',self.crawl(proxies=''))
         self.assertEqual(1,direct.get.call_count)
 

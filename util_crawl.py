@@ -64,6 +64,8 @@ class CrawlUtil:
     _requests_sessions = {}
     _proxy_index = 0
     _http_ready = {}
+    _fs_verified = {}
+    _fs_auth_cookies = {}
     _fs_locks = {}
     _fs_lock_guard = threading.Lock()
     _fs_sessions = {}
@@ -95,7 +97,7 @@ class CrawlUtil:
                 cls._fs_scope.implicit = implicit
             owner = implicit[1]
         names = ('_cf_cookies', '_cf_user_agents', '_cookie_records', '_configured_cookies', '_requests_sessions',
-                 '_cffi_sessions', '_http_ready', '_network_context', '_fs_sessions', '_fs_owned', '_fs_retired',
+                 '_cffi_sessions', '_http_ready', '_fs_verified', '_fs_auth_cookies', '_network_context', '_fs_sessions', '_fs_owned', '_fs_retired',
                  '_selenium_driver', '_selenium_context')
         # 레거시 훅이 클래스 속성의 드라이버를 읽으므로 바인딩하는 동안 직렬화한다.
         with cls._execution_lock:
@@ -142,6 +144,8 @@ class CrawlUtil:
                 for endpoint, host, session_id in cls._fs_owned)
             logger.warning('[CrawlUtil] 실행 종료: 원격 세션 정리 미확인 %s개 · 다른 실행에서 인수하지 않습니다.', len(cls._fs_owned))
         cls._cleanup_failures[:] = cls._cleanup_failures[-64:]
+        cls._fs_verified.clear()
+        cls._fs_auth_cookies.clear()
         cls._executions.pop(key, None)
 
     @staticmethod
@@ -349,6 +353,8 @@ class CrawlUtil:
         cls._cf_cookies.pop(host, None)
         cls._cf_user_agents.pop(host, None)
         cls._http_ready = {key: stamp for key, stamp in cls._http_ready.items() if key[0] != host}
+        cls._fs_verified = {key: stamp for key, stamp in cls._fs_verified.items() if key[0] != host}
+        cls._fs_auth_cookies = {key: records for key, records in cls._fs_auth_cookies.items() if key[0] != host}
         for sessions in (cls._requests_sessions, cls._cffi_sessions):
             session = sessions.pop(host, None)
             if session is not None:
@@ -476,6 +482,40 @@ class CrawlUtil:
             return any(c['name'] == 'cf_clearance' and c['value'] for c in cls._cached_cookies(host, url))
         return any(record['until'] > time.time() and record['cookie']['name'] == 'cf_clearance'
                    and record['cookie']['value'] for record in cls._cookie_records.get(host, {}).values())
+
+    @classmethod
+    def _mark_fs_success(cls, host, solution, url):
+        key = (host, cls._network_context[host])
+        records = cls._cookie_records.get(host, {})
+        bound = []
+        # 식별 가능한 인가 쿠키만 결부한다. 분석/환경설정 쿠키는 검증 기한을 줄이지 않는다.
+        for cookie in cls.normalize_cookies(solution.get('cookies'), url):
+            if cookie['name'] == 'cf_clearance' and cookie['value']:
+                record = records.get((cookie['name'], cookie['domain'], cookie['path']))
+                if record:
+                    bound.append({'cookie': dict(record['cookie']), 'until': record['until']})
+        cls._fs_verified[key] = time.time()
+        # 빈 목록은 실제 쿠키 없는 성공이다. 기록 부재와 구별하며 만료된 결부도 보존한다.
+        cls._fs_auth_cookies[key] = bound
+
+    @classmethod
+    def _has_fs_success(cls, host, url):
+        key = (host, cls._network_context.get(host))
+        stamp = cls._fs_verified.get(key)
+        now = time.time()
+        if stamp is None or not 0 <= now - stamp < cls.CF_COOKIE_EXPIRY:
+            return False
+        bound = cls._fs_auth_cookies.get(key)
+        if bound is None:
+            return False
+        if not bound:
+            return True
+        # 현재 URL의 도메인/경로/secure/만료를 통과한 실제 쿠키에만 의존한다.
+        valid = cls._cached_cookies(host, url)
+        fields = ('name', 'domain', 'path', 'value')
+        return any(record['until'] > now and any(
+            all(cookie[field] == record['cookie'][field] for field in fields) for cookie in valid)
+            for record in bound)
 
     @staticmethod
     def _is_challenge_html(source: str) -> bool:
@@ -679,9 +719,7 @@ class CrawlUtil:
             proxy_display = '프록시 사용' if proxies else 'Direct'
 
             cls._fs_scope.request.update(blocked=False, inline_recovery=False, reason='FS_CHALLENGE_UNRESOLVED')
-            ready_at = cls._http_ready.get(ready_key)
-            http_ready = ready_at is not None and 0 <= time.time() - ready_at < cls.CF_COOKIE_EXPIRY
-            if use_fs and not cls._has_valid_clearance(host, url) and not http_ready:
+            if use_fs and not cls._has_valid_clearance(host, url) and not cls._has_fs_success(host, url):
                 _, source = cls.get_by_flaresolverr(url, proxies=proxies)
                 if source and not cls._is_challenge_html(source):
                     cls._http_ready[ready_key] = time.time()
@@ -867,6 +905,8 @@ class CrawlUtil:
                 tree = solution if clearance else html.fromstring(html_source)
                 cls._store_solution(host, solution, url)
                 cls._sync_clearance_to_sessions(host)
+                # 실제 FS 성공만 기록하며 후속 HTTP 성공으로 검증 기한을 늘리지 않는다.
+                cls._mark_fs_success(host, solution, url)
                 if 'cookies' in payload:
                     record['seeded'] = True
                 return tree, html_source
@@ -1004,11 +1044,7 @@ class CrawlUtil:
         logger.warning(f"[CrawlUtil] [{host}] 지속적 차단 감지 -> 브라우저/토큰 캐시 파기 후 재초기화")
 
         cls.close_sessions()
-        cls._http_ready = {key: stamp for key, stamp in cls._http_ready.items() if key[0] != host}
-        if host in cls._cf_cookies:
-            cls._cf_cookies.pop(host, None)
-        if host in cls._cf_user_agents:
-            cls._cf_user_agents.pop(host, None)
+        cls._clear_network_state(host)
 
         driver = cls.init_stealth_selenium(site_info or {}, scheduler_instance=scheduler_instance)
 
