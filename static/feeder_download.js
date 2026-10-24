@@ -349,6 +349,22 @@ function queue_progress_percent(value) {
   return Math.round(Math.max(0, Math.min(100, percent)) * 10) / 10;
 }
 
+function queue_eta_text(value) {
+  var text = String(value == null ? '' : value).trim();
+  // 워커/구조화된 Rclone 통계는 초 숫자이고, 일반 Rclone 로그는 시간 단위가 붙어 있다.
+  if (!/^\d+(?:\.\d+)?s?$/.test(text)) return text;
+  var seconds = Math.ceil(Number(text.replace(/s$/, '')));
+  if (!Number.isFinite(seconds)) return '';
+  var hours = Math.floor(seconds / 3600);
+  var minutes = Math.floor(seconds % 3600 / 60);
+  var remaining = seconds % 60;
+  var parts = [];
+  if (hours) parts.push(hours + '시간');
+  if (minutes) parts.push(minutes + '분');
+  if (remaining || !parts.length) parts.push(remaining + '초');
+  return parts.join(' ');
+}
+
 function render_queue_rows(list) {
   var tbody = $('#active_queue_tbody');
   if (!tbody.length) return;
@@ -507,7 +523,8 @@ function render_queue_rows(list) {
       var speedStr = it.speed_str || (it.download_speed ? format_bytes(it.download_speed) + '/s' : '전송 준비중');
       var dlBytesStr = it.downloaded_bytes ? format_bytes(it.downloaded_bytes) : '0 B';
       var totalBytesStr = it.file_size ? format_bytes(it.file_size) : '확인 중';
-      var etaStr = it.eta ? ' (ETA: ' + it.eta + ')' : '';
+      var etaText = queue_eta_text(it.eta);
+      var etaStr = etaText ? ' (ETA: ' + etaText + ')' : '';
 
       detailHtml += '<div class="mt-1 p-1 px-2 rounded" style="background: rgba(23, 162, 184, 0.08); border: 1px solid rgba(23, 162, 184, 0.25);">';
       detailHtml += '  <div class="d-flex justify-content-between align-items-center mb-1 small font-weight-bold">';
@@ -523,7 +540,8 @@ function render_queue_rows(list) {
       var speedStr = it.speed_str || (it.download_speed ? format_bytes(it.download_speed) + '/s' : '전송 준비중');
       var dlBytesStr = it.downloaded_bytes ? format_bytes(it.downloaded_bytes) : '0 B';
       var totalBytesStr = it.file_size ? format_bytes(it.file_size) : '확인 중';
-      var etaStr = it.eta ? ' (ETA: ' + it.eta + ')' : '';
+      var etaText = queue_eta_text(it.eta);
+      var etaStr = etaText ? ' (ETA: ' + etaText + ')' : '';
       var uploadTargetTitle = (it.destination_type === 'rclone_simple') ? 'Rclone 전송' : 'Google Drive 업로드';
 
       detailHtml += '<div class="mt-1 p-1 px-2 rounded" style="background: rgba(40, 167, 69, 0.08); border: 1px solid rgba(40, 167, 69, 0.25);">';
