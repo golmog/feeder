@@ -62,10 +62,13 @@ class ModuleCrawl(PluginModuleBase):
     def plugin_load(self):
         try:
             with F.app.app_context():
-                # 다른 프로세스에서 실행 중인 크롤링의 임대 잠금과 플래그를 보존한다.
+                # 플러그인 로드 시 이전 크롤링 실행 잠금과 상태를 초기화한다.
                 FeederUtil.init_runtime_locks()
+                FeederUtil.reset_runtime_lock('crawl_pipeline')
+                P.ModelSetting.set('crawl_is_running', 'False')
+                P.ModelSetting.set('crawl_test_running', 'False')
+                P.ModelSetting.set('crawl_running_start_time', '0')
                 FeederUtil.migrate_db()
-            # logger.info(f"[{self.name}] 플러그인 로드: 수집 런타임 락 플래그 초기화 완료")
         except Exception as e:
             logger.debug(f"[{self.name}] plugin_load 초기화 예외: {e}")
         try:

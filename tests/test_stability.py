@@ -1217,15 +1217,22 @@ class CrawlLifecycleTests(unittest.TestCase):
         self.assertTrue(h.Settings.get_bool('crawl_is_running'))
         self.assertFalse(h.TaskCrawl._run_mutex.locked())
 
-    def test_plugin_load_preserves_live_lease_and_flags(self):
-        h.FeederUtil.acquire_runtime_lock('crawl_pipeline', 'other-owner')
+    def test_plugin_load_clears_crawl_lease_and_flags_without_touching_other_locks(self):
+        h.FeederUtil.acquire_runtime_lock('crawl_pipeline', 'previous-owner')
+        h.FeederUtil.acquire_runtime_lock('download_pipeline', 'download-owner')
+        h.FeederUtil.set_download_paused(True)
         h.Settings.set('crawl_is_running', 'True')
+        h.Settings.set('crawl_test_running', 'True')
+        h.Settings.set('crawl_running_start_time', '123456')
         module = h.ModuleCrawl.__new__(h.ModuleCrawl); module.name = 'crawl'
-        with patch.object(h.FeederUtil, 'migrate_db'), patch.object(h.FeederUtil, 'reset_runtime_lock') as reset:
+        with patch.object(h.FeederUtil, 'migrate_db'):
             module.plugin_load()
-        reset.assert_not_called()
-        self.assertFalse(h.FeederUtil.acquire_runtime_lock('crawl_pipeline', 'next-owner'))
-        self.assertTrue(h.Settings.get_bool('crawl_is_running'))
+        self.assertTrue(h.FeederUtil.acquire_runtime_lock('crawl_pipeline', 'next-owner'))
+        self.assertFalse(h.Settings.get_bool('crawl_is_running'))
+        self.assertFalse(h.Settings.get_bool('crawl_test_running'))
+        self.assertEqual('0', h.Settings.get('crawl_running_start_time'))
+        self.assertFalse(h.FeederUtil.acquire_runtime_lock('download_pipeline', 'another-owner'))
+        self.assertTrue(h.FeederUtil.is_download_paused())
 
     def test_site_test_uses_same_lease_and_reports_total_failure(self):
         module = h.ModuleCrawl.__new__(h.ModuleCrawl); module.name = 'crawl'
