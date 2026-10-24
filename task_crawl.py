@@ -236,7 +236,7 @@ class TaskCrawl:
                             )
 
                             if crawled is None:
-                                logger.error(f"[TaskCrawl] [{site_name}] 세션 초기화 실패로 수집 작업을 조기 중단합니다.")
+                                logger.error(f"[TaskCrawl] [{site_name}] 게시판 목록을 수신하지 못해 수집 작업을 중단합니다.")
                                 break
 
                             if crawled:

@@ -68,6 +68,8 @@ class CrawlUtil:
     _fs_lock_guard = threading.Lock()
     _fs_sessions = {}
     _fs_owned = set()
+    _fs_retired = {}
+    FS_OWNED_LIMIT = 64
     _network_context = {}
     _fs_scope = threading.local()
     _execution_lock = threading.RLock()
@@ -93,7 +95,7 @@ class CrawlUtil:
                 cls._fs_scope.implicit = implicit
             owner = implicit[1]
         names = ('_cf_cookies', '_cf_user_agents', '_cookie_records', '_configured_cookies', '_requests_sessions',
-                 '_cffi_sessions', '_http_ready', '_network_context', '_fs_sessions', '_fs_owned',
+                 '_cffi_sessions', '_http_ready', '_network_context', '_fs_sessions', '_fs_owned', '_fs_retired',
                  '_selenium_driver', '_selenium_context')
         # 레거시 훅이 클래스 속성의 드라이버를 읽으므로 바인딩하는 동안 직렬화한다.
         with cls._execution_lock:
@@ -136,8 +138,8 @@ class CrawlUtil:
                 'session': getattr(cls._selenium_driver, 'session_id', None)})
         if cls._fs_owned:
             cls._cleanup_failures.extend({'owner': key, 'endpoint': endpoint, 'host': host,
-                'session': cls._fs_sessions.get((endpoint, host), {}).get('id')}
-                for endpoint, host in cls._fs_owned)
+                'session': session_id}
+                for endpoint, host, session_id in cls._fs_owned)
             logger.warning('[CrawlUtil] 실행 종료: 원격 세션 정리 미확인 %s개 · 다른 실행에서 인수하지 않습니다.', len(cls._fs_owned))
         cls._cleanup_failures[:] = cls._cleanup_failures[-64:]
         cls._executions.pop(key, None)
@@ -331,7 +333,11 @@ class CrawlUtil:
 
     @staticmethod
     def _safe_network_log(value):
-        text = re.sub(r'(?i)\b(?:https?|socks[45]h?)://[^\s<>\"\']+', '[URL 숨김]', str(value))
+        text = str(value)
+        markup = re.search(r'(?i)<(?:!doctype\b|/?[a-z][a-z0-9]*\b[^>]*>)', text)
+        if markup:
+            text = text[:markup.start()] + '[HTML 숨김]'
+        text = re.sub(r'(?i)\b(?:https?|socks[45]h?)://[^\s<>\"\']+', '[URL 숨김]', text)
         text = re.sub(r'''(?i)["']?\b(?:set-cookie|cookies?|authorization)["']?\s*[:=]\s*[^\r\n]+''', '[인증 정보 숨김]', text)
         text = re.sub(r'(?i)\b(?:Bearer|Basic)\s+[^\s,;]+', '[인증 정보 숨김]', text)
         return re.sub(r'(?i)\b(password|passwd|token|api[_-]?key|cf_clearance)\s*[:=]\s*[^\s,;]+',
@@ -370,6 +376,8 @@ class CrawlUtil:
             if not isinstance(data, dict):
                 raise ValueError('JSON 객체가 아님')
             message = str(data.get('message') or '')
+            if payload['cmd'] == 'sessions.create' and 'already exists' in message.lower():
+                return data
             absent = 'session' in message.lower() and any(word in message.lower()
                 for word in ('not found', 'does not exist', 'doesn\'t exist', 'not exist', 'already removed'))
             if missing_ok and absent and response.status_code in (200, 400, 404, 500):
@@ -384,36 +392,49 @@ class CrawlUtil:
             return None
 
     @classmethod
-    def _destroy_fs_session(cls, endpoint, host):
-        key = (endpoint, host)
+    def _destroy_fs_session(cls, endpoint, host, session_id=None):
+        current = cls._fs_sessions.get((endpoint, host))
+        name = session_id or (current or {}).get('id')
+        key = (endpoint, host, name)
         if key not in cls._fs_owned:
             return True
-        record = cls._fs_sessions.get(key)
+        record = current if current and current['id'] == name else cls._fs_retired.get(key)
         if not record:
             return False
-        name = record['id']
+        record['state'] = 'unknown'
         if cls._fs_command(endpoint, {'cmd': 'sessions.destroy', 'session': name}, timeout=5, missing_ok=True) is None:
+            logger.warning('[CrawlUtil] [%s] FS_SESSION_UNCERTAIN · 소유 세션 삭제 미확인', host)
             return False
-        cls._fs_sessions.pop(key, None)
+        if current and current['id'] == name:
+            cls._fs_sessions.pop((endpoint, host), None)
+        cls._fs_retired.pop(key, None)
         cls._fs_owned.discard(key)
-        logger.info('[CrawlUtil] [%s] 기존 FlareSolverr 세션 정리', host)
         return True
 
     @classmethod
+    def _retire_fs_session(cls, endpoint, host):
+        record = cls._fs_sessions.pop((endpoint, host), None)
+        if record:
+            record['state'] = 'unknown'
+            cls._fs_retired[(endpoint, host, record['id'])] = record
+
+    @classmethod
     def _create_fs_session(cls, endpoint, host, proxies):
+        if len(cls._fs_owned) >= cls.FS_OWNED_LIMIT:
+            logger.warning('[CrawlUtil] [%s] FS_SESSION_UNCERTAIN · 실행 내 소유 세션 상한 도달', host)
+            return False
         name = 'feeder_' + hashlib.sha256(str(getattr(cls._fs_scope, 'owner', os.getpid())).encode()).hexdigest()[:12] + '_' + uuid.uuid4().hex
         payload = {'cmd': 'sessions.create', 'session': name}
         if (proxies or {}).get('http'):
             payload['proxy'] = {'url': proxies['http']}
-        # 생성 응답이 유실되면 소유 ID만 기록하고 정상 세션으로 사용하지 않는다.
+        key = (endpoint, host, name)
         cls._fs_sessions[(endpoint, host)] = {'id': name, 'proxy': (proxies or {}).get('http', ''), 'state': 'unknown'}
-        cls._fs_owned.add((endpoint, host))
+        cls._fs_owned.add(key)
         data = cls._fs_command(endpoint, payload, timeout=20)
         if data is None:
             return False
         if 'already exists' in str(data.get('message', '')).lower():
-            # 충돌 응답은 소유권의 증거가 아니다. 해당 원격 세션을 정리하지 않는다.
-            cls._fs_owned.discard((endpoint, host))
+            cls._fs_owned.discard(key)
             cls._fs_sessions.pop((endpoint, host), None)
             logger.warning('[CrawlUtil] [%s] 생성 ID 충돌 · 기존 원격 세션을 인수하지 않습니다.', host)
             return False
@@ -427,16 +448,27 @@ class CrawlUtil:
     def _replace_fs_session(cls, endpoint, host, proxies, budget, recovery=True):
         if recovery and budget['recoveries'] >= 1:
             budget['blocked'] = True
-            logger.warning('[CrawlUtil] [%s] FlareSolverr 세션 복구 1회 소진 · 이번 페이지의 추가 복구 중단', host)
             return False
         if recovery:
             budget['recoveries'] += 1
         cls._clear_network_state(host)
-        if not cls._destroy_fs_session(endpoint, host) or not cls._create_fs_session(endpoint, host, proxies):
-            budget['blocked'] = True
+        # 삭제 미확인 ID는 소유 기록을 보존하되 활성 연결에서 격리한다.
+        cls._destroy_fs_session(endpoint, host)
+        cls._retire_fs_session(endpoint, host)
+        if not cls._create_fs_session(endpoint, host, proxies):
+            budget.update(blocked=True, reason='FS_SESSION_UNCERTAIN')
             return False
-        logger.info('[CrawlUtil] [%s] FlareSolverr 세션 재생성 완료', host)
         return True
+
+    @classmethod
+    def _retry_fs_proxy(cls, host, scheduler, attempt, total, reason):
+        if attempt >= total:
+            logger.warning('[CrawlUtil] [%s] FS 재시도 예산 소진 (%s/%s, %s)', host, attempt, total, reason)
+            return
+        cls.rotate_proxy(scheduler_instance=scheduler, reason=reason)
+        count = len(cls._get_proxy_list(scheduler))
+        logger.warning('[CrawlUtil] [%s] FS 재시도 (%s/%s, %s) · 다음 프록시 %s/%s',
+                       host, attempt, total, reason, cls._proxy_index % count + 1 if count else 0, count)
 
     @classmethod
     def _has_valid_clearance(cls, host: str, url=None) -> bool:
@@ -469,7 +501,8 @@ class CrawlUtil:
             return None
         message = cls._safe_network_log(data.get('message') or '')
         if response.status_code != 200 or data.get('status') != 'ok':
-            logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 처리 실패 (API HTTP {response.status_code}, status={data.get("status")}): {message or "원인 메시지 없음"}')
+            api_status = 'error' if data.get('status') == 'error' else 'invalid'
+            logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 처리 실패 (API HTTP {response.status_code}, status={api_status}): {message or "원인 메시지 없음"}')
             return None
         solution = data.get('solution')
         if not isinstance(solution, dict):
@@ -493,7 +526,7 @@ class CrawlUtil:
         except (TypeError, ValueError):
             status = 0
         if status < 200 or status >= 400:
-            logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 대상 페이지 오류 응답 (solution.status={solution.get("status")})')
+            logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 대상 페이지 오류 응답 (solution.status={status})')
             return None
         if not source.strip() and (require_html or not has_clearance):
             logger.warning(f'[CrawlUtil] [{host}] FlareSolverr 정상 페이지 확인 불가: 반환 HTML 없음 (응답 메시지: {message or "없음"})')
@@ -573,8 +606,6 @@ class CrawlUtil:
         cls._fs_scope.user_cookie = (host, cookie or '')
         cls._configured_cookies[host] = cookie or ''
         cls._activate_network_context(host, proxies)
-        ready_key = (host, (proxies or {}).get('http', ''), cookie or '', (site_info or {}).get('USER_AGENT', ''))
-        http_ready = time.time() - cls._http_ready.get(ready_key, 0) < cls.CF_COOKIE_EXPIRY
 
         try:
             if max_retries is None:
@@ -626,33 +657,13 @@ class CrawlUtil:
                     return res_source
 
                 if cls._selenium_driver is None:
-                    logger.warning(f"[CrawlUtil] 브라우저 세션 초기화 실패로 재시도 중단: {url}")
+                    logger.warning(f"[CrawlUtil] [{host}] 브라우저 세션 초기화 실패로 재시도 중단")
                     return None
 
                 if attempt < max_retries:
-                    logger.debug(f"[CrawlUtil] Selenium 재시도 ({attempt}/{max_retries}): {url}")
+                    logger.debug(f"[CrawlUtil] [{host}] Selenium 재시도 ({attempt}/{max_retries})")
                     time.sleep(retry_interval)
             return None
-
-        if use_fs and not cls._has_valid_clearance(host, url) and not http_ready:
-            logger.debug(f"[CrawlUtil] [{host}] 유효한 인가 쿠키 캐시 없음 -> 설정에 따라 FlareSolverr 우선 페이지 요청")
-            fs_attempts = 0
-            for fs_try in range(1, effective_retries + 1):
-                if cls._fs_scope.request['blocked']:
-                    break
-                fs_attempts += 1
-                tree, fs_html = cls.get_by_flaresolverr(url, proxies=proxies)
-                if fs_html and not cls._is_challenge_html(fs_html):
-                    logger.debug(f"[CrawlUtil] [{host}] FlareSolverr 1차 페이지 수신 완료")
-                    cls._http_ready[ready_key] = time.time()
-                    return fs_html
-                if cls._fs_scope.request['blocked']:
-                    break
-                if fs_try < effective_retries:
-                    logger.debug(f"[CrawlUtil] [{host}] FlareSolverr 페이지 요청 재시도 ({fs_try}/{effective_retries})...")
-                    time.sleep(retry_interval)
-
-            logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 페이지 요청 {fs_attempts}회 실패, HTTP 세션으로 폴백 시도")
 
         headers = cls.DEFAULT_HEADERS.copy()
         if referer:
@@ -667,7 +678,25 @@ class CrawlUtil:
             ready_key = (host, (proxies or {}).get('http', ''), cookie or '', (site_info or {}).get('USER_AGENT', ''))
             proxy_display = '프록시 사용' if proxies else 'Direct'
 
+            cls._fs_scope.request.update(blocked=False, inline_recovery=False, reason='FS_CHALLENGE_UNRESOLVED')
+            ready_at = cls._http_ready.get(ready_key)
+            http_ready = ready_at is not None and 0 <= time.time() - ready_at < cls.CF_COOKIE_EXPIRY
+            if use_fs and not cls._has_valid_clearance(host, url) and not http_ready:
+                _, source = cls.get_by_flaresolverr(url, proxies=proxies)
+                if source and not cls._is_challenge_html(source):
+                    cls._http_ready[ready_key] = time.time()
+                    return source
+                cls._clear_network_state(host)
+                cls._retry_fs_proxy(host, scheduler_instance, attempt, effective_retries, cls._fs_scope.request['reason'])
+                if attempt < effective_retries:
+                    time.sleep(retry_interval)
+                continue
+
+            cffi_failed = False
+            http_failure = 'HTTP_CONTEXT_UNAVAILABLE'
+
             if _CURL_CFFI_AVAILABLE:
+                cffi_failed = True
                 try:
                     cffi_session = cls._cffi_sessions.get(host)
                     if not cffi_session:
@@ -685,60 +714,47 @@ class CrawlUtil:
                             cls._http_ready[ready_key] = time.time()
                             return res.text
                         logger.warning(f"[CrawlUtil] [{host}] Cloudflare 챌린지 감지 (HTTP 200 Turnstile) -> 인가 갱신 시도")
+                        http_failure = 'FS_CHALLENGE_UNRESOLVED'
                     else:
-                        logger.debug(f"[CrawlUtil] curl_cffi 응답 코드: {res.status_code} ({url})")
+                        http_failure = 'FS_PROXY_OR_TARGET_ERROR' if res.status_code in (403, 429, 503) else 'HTTP_RESPONSE_UNAVAILABLE'
+                        logger.debug(f"[CrawlUtil] curl_cffi 응답 코드: {res.status_code} ({host})")
 
                 except Exception as e:
                     err_msg = cls._safe_network_log(e)
-                    logger.debug(f"[CrawlUtil] curl_cffi 요청 실패 ({proxy_display} / {url}): {err_msg}")
+                    logger.debug(f"[CrawlUtil] curl_cffi 요청 실패 ({proxy_display} / {host}): {err_msg}")
 
-            try:
-                req_session = cls._requests_sessions.get(host)
-                if req_session is None:
-                    req_session = requests.Session()
-                    cls._requests_sessions[host] = req_session
-                cls._sync_clearance_to_sessions(host)
-                value = cls._http_cookie_header(host, url, cookie, req_session)
-                headers['Cookie'] = value
-                res = req_session.get(url, headers=headers, proxies=proxies, timeout=25)
-                if res.status_code == 200 and not cls._is_challenge_html(res.text):
-                    logger.debug(f'[CrawlUtil] [{host}] 일반 HTTP 페이지 수신 성공 (requests)')
-                    cls._http_ready[ready_key] = time.time()
-                    return res.text
-            except Exception as e:
-                logger.debug(f"[CrawlUtil] requests 폴백 실패 ({proxy_display} / {url}): {cls._safe_network_log(e)}")
-
-            # 차단(403, 429), 서버오류(503), SSL/TLS 연결 단절 감지 시 즉시 세션 파기 및 프록시 로테이션
-            cls._http_ready.pop(ready_key, None)
-            if host in cls._cffi_sessions:
+            if not (use_fs and cffi_failed):
                 try:
-                    cls._cffi_sessions[host].close()
-                except Exception:
-                    pass
-                cls._cffi_sessions.pop(host, None)
-            req_session = cls._requests_sessions.pop(host, None)
-            if req_session is not None:
-                try:
-                    req_session.close()
-                except Exception:
-                    pass
+                    req_session = cls._requests_sessions.get(host)
+                    if req_session is None:
+                        req_session = requests.Session()
+                        cls._requests_sessions[host] = req_session
+                    cls._sync_clearance_to_sessions(host)
+                    value = cls._http_cookie_header(host, url, cookie, req_session)
+                    headers['Cookie'] = value
+                    res = req_session.get(url, headers=headers, proxies=proxies, timeout=25)
+                    if res.status_code == 200 and not cls._is_challenge_html(res.text):
+                        logger.debug(f'[CrawlUtil] [{host}] 일반 HTTP 페이지 수신 성공 (requests)')
+                        cls._http_ready[ready_key] = time.time()
+                        return res.text
+                    http_failure = 'FS_PROXY_OR_TARGET_ERROR' if res.status_code in (403, 429, 503) else 'HTTP_RESPONSE_UNAVAILABLE'
+                except Exception as e:
+                    logger.debug(f"[CrawlUtil] requests 폴백 실패 ({proxy_display} / {host}): {cls._safe_network_log(e)}")
 
-            # 등록된 프록시가 있을 경우 즉시 다음 프록시로 전환하여 차단 우회
-            rotated_proxy = cls.rotate_proxy(scheduler_instance=scheduler_instance, reason=f"차단/응답불가 대응 ({attempt}/{effective_retries})")
-            if rotated_proxy:
-                proxies = cls.get_proxies(scheduler_instance)
-
-            # Cloudflare 사이트의 경우 FlareSolverr 재인가 수행
-            if use_fs and not cls._fs_scope.request['blocked']:
-                cls._cf_cookies.pop(host, None)
-                logger.warning(f"[CrawlUtil] [{host}] Cloudflare 재인가 시도 (프록시 {'사용' if proxies else '미사용'}): {url}")
-                tree, source = cls.get_by_flaresolverr(url, proxies=proxies)
-                if source and not cls._is_challenge_html(source):
-                    logger.info(f"[CrawlUtil] [{host}] 새 프록시로 FlareSolverr 인가 및 페이지 수신 성공")
-                    ready_key = (host, (proxies or {}).get('http', ''), cookie or '', (site_info or {}).get('USER_AGENT', ''))
-                    cls._http_ready[ready_key] = time.time()
-                    return source
-
+            if use_fs:
+                cls._clear_network_state(host)
+                cls._retry_fs_proxy(host, scheduler_instance, attempt, effective_retries, http_failure)
+            else:
+                cls._http_ready.pop(ready_key, None)
+                for sessions in (cls._cffi_sessions, cls._requests_sessions):
+                    session = sessions.pop(host, None)
+                    if session is not None:
+                        try:
+                            session.close()
+                        except Exception:
+                            pass
+                if attempt < effective_retries:
+                    cls.rotate_proxy(scheduler_instance=scheduler_instance, reason='차단/응답불가 대응')
             if attempt < effective_retries:
                 time.sleep(retry_interval)
 
@@ -767,21 +783,21 @@ class CrawlUtil:
         host = urlparse(url).hostname or ''
         proxies = dict(proxies or {})
         budget = cls._fs_scope.request
+        context = (fs_url, host, proxies.get('http', ''), getattr(cls._fs_scope, 'auth', None))
+        if budget.get('context') != context:
+            budget.update(context=context, blocked=False)
         if budget['blocked']:
             return None, None
         cls._activate_network_context(host, proxies)
-        # 서버 주소가 바뀌면 이전 서버에 이 사이트가 만든 세션도 정리한다.
-        if (fs_url, host) not in cls._fs_owned:
-            for endpoint, owned_host in list(cls._fs_owned):
-                if owned_host == host and endpoint != fs_url:
-                    if not cls._destroy_fs_session(endpoint, host):
-                        budget['blocked'] = True
-                        return None, None
+        for endpoint, owned_host in list(cls._fs_sessions):
+            if owned_host == host and endpoint != fs_url:
+                cls._destroy_fs_session(endpoint, host)
+                cls._retire_fs_session(endpoint, host)
         data = cls._fs_command(fs_url, {'cmd': 'sessions.list'})
         if data is None or not isinstance(data.get('sessions'), list):
             if data is not None:
                 logger.warning('[CrawlUtil] [%s] FlareSolverr 세션 목록 응답 형식 오류', host)
-            budget['blocked'] = True
+            budget.update(blocked=True, reason='FS_API_UNAVAILABLE')
             return None, None
         key = (fs_url, host)
         record = cls._fs_sessions.get(key)
@@ -792,11 +808,8 @@ class CrawlUtil:
             if not cls._replace_fs_session(fs_url, host, proxies, budget):
                 return None, None
         elif not record:
-            if record:
-                cls._fs_owned.discard(key)
-                cls._fs_sessions.pop(key, None)
             if not cls._create_fs_session(fs_url, host, proxies):
-                budget['blocked'] = True
+                budget.update(blocked=True, reason='FS_SESSION_UNCERTAIN')
                 return None, None
 
         for attempt in range(2):
@@ -818,6 +831,7 @@ class CrawlUtil:
                 payload['cookies'] = cls.normalize_cookies(seeds, url)
             try:
                 res = requests.post(f'{fs_url}/v1', json=payload, headers={'Content-Type': 'application/json'}, timeout=55 if clearance else 35)
+                result = None
                 try:
                     result = res.json()
                     message = str(result.get('message') or '').lower()
@@ -828,6 +842,10 @@ class CrawlUtil:
                 broken = (api_failed and 'session' in message and any(word in message for word in (
                     'bound to a different proxy', 'stuck', 'invalid', 'not found', 'not exist', 'closed')))
                 if broken:
+                    record['state'] = 'unknown'
+                    if not budget.get('inline_recovery', True):
+                        budget.update(blocked=True, reason='FS_SESSION_UNCERTAIN')
+                        return None, None
                     if attempt == 0:
                         logger.warning('[CrawlUtil] [%s] FlareSolverr 세션 오류 감지: %s', host, cls._safe_network_log(message))
                     if not cls._replace_fs_session(fs_url, host, proxies, budget):
@@ -836,6 +854,10 @@ class CrawlUtil:
                     continue
                 solution = cls._read_flaresolverr_solution(res, host, require_html=not clearance)
                 if solution is None:
+                    budget['reason'] = 'FS_API_UNAVAILABLE' if api_failed else 'FS_CHALLENGE_UNRESOLVED'
+                    target = result.get('solution') if isinstance(result, dict) else None
+                    if not api_failed and isinstance(target, dict) and str(target.get('status')) in ('403', '429', '503'):
+                        budget['reason'] = 'FS_PROXY_OR_TARGET_ERROR'
                     if 'cookies' in payload:
                         # 전송 시도만으로 적용을 확정하지 않고, 같은 세션의 재주입도 막는다.
                         record['state'] = 'unknown'
@@ -850,8 +872,8 @@ class CrawlUtil:
                 return tree, html_source
             except Exception as exc:
                 cls._fs_sessions[key]['state'] = 'unknown'
-                budget['blocked'] = True
-                logger.warning('[CrawlUtil] [%s] FlareSolverr 통신/응답 실패: %s', host, cls._safe_network_log(exc))
+                budget.update(blocked=True, reason='FS_SESSION_UNCERTAIN')
+                logger.warning('[CrawlUtil] [%s] FS_SESSION_UNCERTAIN · FlareSolverr 통신/응답 실패: %s', host, cls._safe_network_log(exc))
                 return None, None
         return None, None
 
@@ -909,8 +931,7 @@ class CrawlUtil:
         total_tries = max(len(p_list), max_retries) if p_list else max_retries
 
         for attempt in range(1, total_tries + 1):
-            if cls._fs_scope.request['blocked']:
-                break
+            cls._fs_scope.request.update(blocked=False, inline_recovery=False, reason='FS_CHALLENGE_UNRESOLVED')
             proxies = dict(cls.get_proxies(scheduler_instance) or {})
             cls._activate_network_context(host, proxies)
             proxy_str = '사용' if proxies else '미사용'
@@ -929,7 +950,7 @@ class CrawlUtil:
                 logger.warning(f"[CrawlUtil] [{host}] FlareSolverr 통신 실패: {cls._safe_network_log(e)}")
 
             if attempt < total_tries:
-                cls.rotate_proxy(scheduler_instance=scheduler_instance, reason="FlareSolverr 인가 실패 대응")
+                cls._retry_fs_proxy(host, scheduler_instance, attempt, total_tries, cls._fs_scope.request['reason'])
                 time.sleep(retry_interval)
 
         return [], "", False
@@ -1309,10 +1330,10 @@ class CrawlUtil:
     @classmethod
     def _close_flaresolverr_current(cls, host=None):
         """전체 수집 종료 때 이 프로세스가 사용한 원격 세션만 정리한다."""
-        for endpoint, owned_host in list(cls._fs_owned):
+        for endpoint, owned_host, session_id in list(cls._fs_owned):
             if host is None or host == owned_host:
                 with cls._site_lock(owned_host):
-                    if cls._destroy_fs_session(endpoint, owned_host):
+                    if cls._destroy_fs_session(endpoint, owned_host, session_id):
                         cls._clear_network_state(owned_host)
 
     @classmethod

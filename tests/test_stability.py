@@ -322,6 +322,7 @@ class CrawlSessionTests(unittest.TestCase):
     def setUp(self):
         self.fixture = h.Regressions(); self.fixture.setUp(); self.addCleanup(self.fixture.doCleanups)
         h.Settings.set('crawl_flaresolverr_url', 'http://fs.invalid')
+        p = patch.object(h.CrawlUtil, '_proxy_index', 0); p.start(); self.addCleanup(p.stop)
         self.fake = FakeFlareSolverr()
         self.env = h.CrawlUtil.get_html.__func__.__globals__
         p = patch.dict(self.env, requests=types.SimpleNamespace(post=self.fake.post, Session=Mock()))
@@ -333,6 +334,166 @@ class CrawlSessionTests(unittest.TestCase):
 
     def request(self, proxies=None):
         return h.CrawlUtil.get_by_flaresolverr('https://example.test/page', proxies=proxies)
+
+    def crawl(self, retries=2, proxies='http://one.invalid,http://two.invalid'):
+        scheduler=types.SimpleNamespace(use_proxy=bool(proxies),proxy_url=proxies,use_flaresolverr=True,use_selenium=False)
+        return h.CrawlUtil.get_html('https://example.test/page?private=hidden',scheduler_instance=scheduler,max_retries=retries,retry_interval=.5)
+
+    def test_fs_failure_rotates_without_unauthenticated_http(self):
+        self.fake.failures=['API unavailable']*2
+        direct=Mock(); direct.headers={}; direct.cookies=[]; direct.get.return_value=types.SimpleNamespace(status_code=403,text='blocked')
+        with patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct),requests=types.SimpleNamespace(post=self.fake.post,Session=lambda:direct)):
+            self.assertIsNone(self.crawl())
+        direct.get.assert_not_called()
+        requests=[x for x in self.fake.calls if x['cmd']=='request.get']
+        self.assertEqual(['http://one.invalid','http://two.invalid'],[x['proxy']['url'] for x in requests])
+
+    def test_fs_second_proxy_success_then_cffi_fast_path(self):
+        self.fake.failures=['API unavailable']
+        direct=Mock(); direct.headers={}; direct.cookies=[]; direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>fast</html>')
+        with patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct)):
+            self.assertEqual('<html>OK</html>',self.crawl())
+            direct.get.assert_not_called()
+            self.assertEqual('<html>fast</html>',self.crawl())
+        self.assertEqual(2,len([x for x in self.fake.calls if x['cmd']=='request.get']))
+        self.assertEqual('test-agent',direct.get.call_args.kwargs['headers']['User-Agent'])
+
+    def test_non_fs_keeps_cffi_then_requests_fallback(self):
+        curl=Mock(headers={},cookies=[]); curl.get.return_value=types.SimpleNamespace(status_code=403,text='blocked')
+        direct=Mock(headers={},cookies=[]); direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>requests</html>')
+        scheduler=types.SimpleNamespace(use_proxy=False,proxy_url='',use_flaresolverr=False,use_selenium=False)
+        with patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:curl),requests=types.SimpleNamespace(post=Mock(side_effect=AssertionError('FS 호출')),Session=lambda:direct)):
+            self.assertEqual('<html>requests</html>',h.CrawlUtil.get_html('https://example.test/page',scheduler_instance=scheduler,max_retries=1))
+        self.assertEqual(1,curl.get.call_count); self.assertEqual(1,direct.get.call_count)
+
+    def test_authenticated_http_block_rotates_to_fs_before_any_new_http(self):
+        curl=Mock(headers={},cookies=[]); curl.get.return_value=types.SimpleNamespace(status_code=403,text='blocked')
+        direct=Mock()
+        with patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:curl),requests=types.SimpleNamespace(post=self.fake.post,Session=lambda:direct)):
+            self.assertTrue(self.crawl()); self.fake.failures=['API unavailable']
+            self.assertIsNone(self.crawl())
+        self.assertEqual(1,curl.get.call_count); direct.get.assert_not_called()
+        calls=[x for x in self.fake.calls if x['cmd']=='request.get']
+        self.assertEqual(['http://one.invalid','http://two.invalid'],[x['proxy']['url'] for x in calls])
+        self.assertFalse(h.CrawlUtil._http_ready)
+
+    def test_destroy_timeout_preserves_old_ownership_and_new_proxy_works(self):
+        c=h.CrawlUtil; self.request({'http':'http://one.invalid'}); old=next(iter(c._fs_sessions.values()))['id']
+        real=self.fake.post
+        def post(url,json=None,**kwargs):
+            if json['cmd']=='sessions.destroy' and json['session']==old: raise TimeoutError('destroy timeout')
+            return real(url,json=json,**kwargs)
+        with patch.dict(self.env,requests=types.SimpleNamespace(post=post)):
+            self.assertTrue(self.request({'http':'http://two.invalid'})[1])
+            new=next(iter(c._fs_sessions.values()))['id']; self.assertNotEqual(old,new)
+            self.assertTrue(any(key[2]==old for key in c._fs_retired)); self.assertEqual(2,len(c._fs_owned))
+            c.close_flaresolverr_sessions()
+            self.assertEqual({old},{key[2] for key in c._fs_owned}); self.assertIn('feeder_example_test',self.fake.sessions)
+        c.close_flaresolverr_sessions(); self.assertFalse(c._fs_owned)
+
+    def test_request_and_create_timeout_allow_next_proxy_without_http(self):
+        c=h.CrawlUtil
+        for command in ['sessions.create','request.get']:
+            with self.subTest(command=command):
+                c.close_flaresolverr_sessions(); self.fake.calls.clear(); c._proxy_index=0
+                real=self.fake.post; failed=[]
+                def post(url,json=None,**kwargs):
+                    if json['cmd']==command and not failed:
+                        failed.append(json['session']); raise TimeoutError('timeout')
+                    return real(url,json=json,**kwargs)
+                direct=Mock()
+                with patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct),requests=types.SimpleNamespace(post=post,Session=lambda:direct)):
+                    self.assertEqual('<html>OK</html>',self.crawl())
+                direct.get.assert_not_called()
+                current=next(iter(c._fs_sessions.values()))['id']; self.assertNotEqual(failed[0],current)
+                self.assertTrue(any(x['cmd']=='request.get' and x['session']==current for x in self.fake.calls))
+
+    def test_fs_down_list_failure_and_single_connection_obey_retry_budget(self):
+        c=h.CrawlUtil
+        for proxies in ['', 'http://one.invalid', 'http://one.invalid,http://two.invalid']:
+            with self.subTest(proxies=bool(proxies)):
+                post=Mock(side_effect=TimeoutError('token=hidden http://secret.invalid/?private=hidden'))
+                direct=Mock()
+                with patch.dict(self.env,requests=types.SimpleNamespace(post=post,Session=lambda:direct)), self.assertLogs('feeder-tests',level='WARNING') as logs:
+                    self.assertIsNone(self.crawl(retries=2,proxies=proxies))
+                self.assertEqual(2,post.call_count); direct.get.assert_not_called()
+                self.assertNotIn('secret.invalid',' '.join(logs.output)); self.assertNotIn('token=hidden',' '.join(logs.output))
+
+    def test_direct_clearance_rotates_after_timeout_and_keeps_return_contract(self):
+        self.fake.failures=[TimeoutError('request timeout')]
+        scheduler=types.SimpleNamespace(use_proxy=True,proxy_url='http://one.invalid,http://two.invalid')
+        cookies,ua,ok=h.CrawlUtil._get_flaresolverr_clearance_result('https://example.test/page',scheduler,max_retries=2)
+        self.assertTrue(ok); self.assertEqual([],cookies); self.assertEqual('test-agent',ua)
+        calls=[x for x in self.fake.calls if x['cmd']=='request.get']
+        self.assertEqual(2,len(calls)); self.assertNotEqual(calls[0]['session'],calls[1]['session'])
+
+    def test_explicit_cookie_does_not_skip_fs_and_overrides_fs_cookie(self):
+        c=h.CrawlUtil; real=self.fake.post
+        def post(url,json=None,**kwargs):
+            if json['cmd']=='request.get':
+                return types.SimpleNamespace(status_code=200,json=lambda:{'status':'ok','solution':{'response':'<html>FS</html>','cookies':[{'name':'_login','value':'auto','path':'/'}],'userAgent':'fs-agent'}})
+            return real(url,json=json,**kwargs)
+        scheduler=types.SimpleNamespace(use_proxy=False,use_selenium=False,use_flaresolverr=True)
+        site={'COOKIE':'_login=user; cf_clearance=manual'}
+        direct=Mock(headers={},cookies=[]);direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>fast</html>')
+        with patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct),requests=types.SimpleNamespace(post=post)):
+            self.assertEqual('<html>FS</html>',c.get_html('https://example.test/page',site_info=site,scheduler_instance=scheduler,max_retries=1))
+            direct.get.assert_not_called()
+            self.assertEqual('<html>fast</html>',c.get_html('https://example.test/page',site_info=site,scheduler_instance=scheduler,max_retries=1))
+        self.assertIn('_login=user',direct.get.call_args.kwargs['headers']['Cookie'])
+        self.assertNotIn('_login=auto',direct.get.call_args.kwargs['headers']['Cookie'])
+
+    def test_proxy_switch_never_seeds_auto_cookies_from_previous_proxy(self):
+        c=h.CrawlUtil; real=self.fake.post; payloads=[]
+        def post(url,json=None,**kwargs):
+            response=real(url,json=json,**kwargs)
+            if json['cmd']=='request.get':
+                payloads.append(json.copy()); value='one' if 'one' in json['proxy']['url'] else 'two'
+                return types.SimpleNamespace(status_code=200,json=lambda:{'status':'ok','solution':{'response':'<html>'+value+'</html>','cookies':[{'name':'cf_clearance','value':value,'path':'/'}],'userAgent':value+'-agent'}})
+            return response
+        direct=Mock(headers={},cookies=[]);direct.get.side_effect=[types.SimpleNamespace(status_code=403,text='blocked'),types.SimpleNamespace(status_code=200,text='<html>fast</html>')]
+        with patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct),requests=types.SimpleNamespace(post=post)):
+            self.assertEqual('<html>one</html>',self.crawl())
+            self.assertEqual('<html>two</html>',self.crawl())
+            self.assertEqual('<html>fast</html>',self.crawl())
+        self.assertTrue(all('cookies' not in payload for payload in payloads))
+        self.assertEqual('cf_clearance=two',direct.get.call_args.kwargs['headers']['Cookie'])
+        self.assertEqual('two-agent',direct.get.call_args.kwargs['headers']['User-Agent'])
+
+    def test_ownership_cap_and_sensitive_log_redaction(self):
+        c=h.CrawlUtil
+        with patch.object(c,'FS_OWNED_LIMIT',2), patch.object(c,'_destroy_fs_session',return_value=False):
+            self.assertTrue(self.request({'http':'http://one.invalid'})[1])
+            self.assertTrue(self.request({'http':'http://two.invalid'})[1])
+            self.assertEqual((None,None),self.request({'http':'http://three.invalid'}))
+            self.assertEqual(2,len(c._fs_owned));self.assertEqual(2,len(c._fs_retired))
+            self.assertEqual(2,sum(x['cmd']=='sessions.create' for x in self.fake.calls))
+        value=c._safe_network_log('token=secret http://user:pass@proxy.invalid/?q=secret <html>private-body</html>')
+        for secret in ['secret','user:pass','proxy.invalid','private-body','<html>']:
+            self.assertNotIn(secret,value)
+
+    def test_expired_or_missing_success_history_starts_fs_even_at_early_clock(self):
+        c=h.CrawlUtil
+        direct=Mock(headers={},cookies=[]); direct.get.return_value=types.SimpleNamespace(status_code=200,text='<html>fast</html>')
+        with patch.object(h.time,'time',return_value=1000), patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct)):
+            self.assertEqual('<html>OK</html>',self.crawl(proxies=''))
+            direct.get.assert_not_called()
+            self.assertEqual('<html>fast</html>',self.crawl(proxies=''))
+            for key in c._http_ready: c._http_ready[key]=1000-c.CF_COOKIE_EXPIRY-1
+            self.assertEqual('<html>OK</html>',self.crawl(proxies=''))
+        self.assertEqual(1,direct.get.call_count)
+
+    def test_unsolved_challenge_empty_html_and_target_error_never_use_http(self):
+        c=h.CrawlUtil
+        for source,status in [('<title>Just a moment...</title>',200),('',200),('<html>Error</html>',403)]:
+            with self.subTest(status=status,empty=not source):
+                c._clear_network_state('example.test')
+                self.fake.calls.clear(); self.fake.failures=[{'status':'ok','solution':{'response':source,'status':status,'cookies':[]}}]*2
+                direct=Mock()
+                with patch.dict(self.env,_CURL_CFFI_AVAILABLE=True,cffi_requests=types.SimpleNamespace(Session=lambda:direct),requests=types.SimpleNamespace(post=self.fake.post,Session=lambda:direct)):
+                    self.assertIsNone(self.crawl())
+                self.assertEqual(2,len([x for x in self.fake.calls if x['cmd']=='request.get']))
+                direct.get.assert_not_called()
 
     def test_unknown_fixed_session_is_never_adopted_or_destroyed(self):
         self.assertTrue(self.request()[1])
@@ -376,6 +537,10 @@ class CrawlSessionTests(unittest.TestCase):
         self.assertEqual((None, None), self.request())
         self.assertEqual('unknown', next(iter(c._fs_sessions.values()))['state'])
         self.assertEqual(1, len([x for x in self.fake.calls if x['cmd'] == 'request.get']))
+        old=next(iter(c._fs_sessions.values()))['id']
+        self.assertTrue(self.request({'http':'http://other.invalid'})[1])
+        calls=[x for x in self.fake.calls if x['cmd']=='request.get']
+        self.assertEqual(2,len(calls));self.assertNotEqual(old,calls[-1]['session'])
 
     def test_different_owner_creates_and_cleans_only_its_session(self):
         self.request()
@@ -432,14 +597,17 @@ class CrawlSessionTests(unittest.TestCase):
                 c.close_flaresolverr_sessions()
 
     def test_failed_cookie_seed_cannot_replace_without_confirmed_destroy(self):
-        c = h.CrawlUtil
-        c._fs_scope.user_cookie = ('example.test', '_login=user')
-        self.fake.failures = ['API failure']
-        self.assertEqual((None, None), self.request())
-        before = len([call for call in self.fake.calls if call['cmd'] == 'sessions.create'])
-        with patch.object(c, '_destroy_fs_session', return_value=False):
-            self.assertEqual((None, None), self.request())
-        self.assertEqual(before, len([call for call in self.fake.calls if call['cmd'] == 'sessions.create']))
+        c=h.CrawlUtil; c._fs_scope.user_cookie=('example.test','_login=user')
+        self.fake.failures=['API failure']
+        self.assertEqual((None,None),self.request({'http':'http://one.invalid'}))
+        old=next(iter(c._fs_sessions.values()))['id']
+        with patch.object(c,'_destroy_fs_session',return_value=False):
+            self.assertTrue(self.request({'http':'http://two.invalid'})[1])
+        calls=[x for x in self.fake.calls if x['cmd']=='request.get']
+        self.assertNotEqual(old,calls[-1]['session']); self.assertTrue(calls[-1].get('cookies'))
+        self.assertEqual(1,sum(x['session']==old for x in calls))
+        self.assertTrue(any(key[2]==old for key in c._fs_retired))
+        self.assertTrue(next(iter(c._fs_sessions.values()))['seeded'])
 
     def test_attachment_closes_response_and_session_after_stream_error(self):
         response = Mock(); response.iter_content.side_effect = IOError('stream failed')
@@ -478,12 +646,16 @@ class CrawlSessionTests(unittest.TestCase):
         self.assertEqual(2, len(self.fake.sessions))
 
     def test_unconfirmed_destroy_prevents_new_generation(self):
-        self.request()
-        old_id = next(iter(h.CrawlUtil._fs_sessions.values()))['id']
-        with patch.object(h.CrawlUtil, '_destroy_fs_session', return_value=False):
-            self.assertEqual((None, None), self.request({'http': 'http://proxy.invalid:8000'}))
-        self.assertEqual(old_id, next(iter(h.CrawlUtil._fs_sessions.values()))['id'])
-        self.assertEqual(1, sum(call['cmd'] == 'sessions.create' for call in self.fake.calls))
+        c=h.CrawlUtil; self.request({'http':'http://one.invalid'})
+        old=next(iter(c._fs_sessions.values()))['id']
+        with patch.object(c,'_destroy_fs_session',return_value=False):
+            self.assertTrue(self.request({'http':'http://two.invalid'})[1])
+        current=next(iter(c._fs_sessions.values()))['id']
+        self.assertNotEqual(old,current)
+        self.assertTrue(any(key[2]==old for key in c._fs_owned))
+        self.assertEqual('unknown',next(iter(c._fs_retired.values()))['state'])
+        calls=[x for x in self.fake.calls if x['cmd']=='request.get']
+        self.assertEqual([old,current],[x['session'] for x in calls])
 
     def test_attachment_keeps_preceding_page_proxy_and_closes_after_http_error(self):
         c = h.CrawlUtil
