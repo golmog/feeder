@@ -1,27 +1,50 @@
 // 데이터 원천별 상태를 보존한다. 부분 응답은 전체 큐를 대체하지 않는다.
+function queue_sort_progress(value) {
+  if ((typeof value !== 'number' && typeof value !== 'string') || String(value).trim() === '') return null;
+  var progress = Number(value);
+  return Number.isFinite(progress) && progress >= 0 && progress <= 100 ? progress : null;
+}
+
 function FeederQueueState() {
   this.dbItemsById = new Map();
   this.loadedPages = [];
   this.engineSnapshots = new Map();
   this.progress = new Map();
+  this.lastProgress = new Map();
   this.counts = {};
   this.requestGeneration = 0;
   this.dbReady = false;
   this.total = 0;
   this.nextCursor = null;
   this.dbAt = 0;
+  this.activeStage = undefined;
+  this.stageAt = 0;
+  this.queueTime = null;
+  this.queueTimeAt = 0;
   this.orphanLimit = 40;
 }
 FeederQueueState.prototype.mergeDB = function (data, generation, page) {
   if (generation !== this.requestGeneration || !data || data.success !== true || !Array.isArray(data.items)) return false;
   if (!page && data.observed_at < this.dbAt) return false;
   if (!page) this.dbAt = data.observed_at;
+  if (data.observed_at >= this.queueTimeAt && typeof data.queue_time === 'string') {
+    this.queueTime = data.queue_time;
+    this.queueTimeAt = data.observed_at;
+  }
+  // 늦게 도착한 페이지가 최신 전역 단계 컨텍스트를 되돌리지 않게 한다.
+  if (data.observed_at >= this.stageAt &&
+      [null, 'uploading', 'local_staging', 'relay_transferring'].indexOf(data.active_stage) >= 0) {
+    this.activeStage = data.active_stage;
+    this.stageAt = data.observed_at;
+  }
   var self = this;
   data.items.forEach(function (item) {
     var old = self.dbItemsById.get(String(item.id));
     if (!old || (item.row_version || '') >= (old.row_version || '')) self.dbItemsById.set(String(item.id), item);
   });
-  (data.removed_ids || []).forEach(function (id) { self.dbItemsById.delete(String(id)); self.progress.delete(String(id)); });
+  (data.removed_ids || []).forEach(function (id) {
+    self.dbItemsById.delete(String(id)); self.progress.delete(String(id)); self.lastProgress.delete(String(id));
+  });
   this.loadedPages.push(data.items.map(function (item) { return item.id; }));
   if (this.loadedPages.length > 100) this.loadedPages.shift();
   if (data.counts) this.counts = data.counts;
@@ -67,24 +90,32 @@ FeederQueueState.prototype.mergeProgress = function (data, generation) {
   return true;
 };
 FeederQueueState.prototype.view = function (now) {
-  var self = this, rows = new Map(), orphans = [], orphanTotal = 0, unverifiedTotal = 0,
+  var self = this, rows = new Map(), orphans = [], orphanTotal = 0, unverifiedTotal = 0, downloadSpeeds = [],
     registeredTasks = new Set(), registeredHashes = new Map();
   this.dbItemsById.forEach(function (item, id) {
     var row = Object.assign({}, item), live = self.progress.get(id);
     if (row.status === 'downloading') row.engine_stale = true;
     if (live && live.status === row.status && live.row_version === row.row_version) {
       Object.assign(row, live);
-      if (now - live.observed_at > 15) { row.download_speed = 0; row.speed_str = '갱신 지연'; }
+      if (now - live.observed_at > 15) { row.download_speed = 0; row.speed_str = '갱신 지연'; row.progress_stale = true; }
     }
+    row.sort_progress = queue_sort_progress(row.progress);
     rows.set(id, row);
     var prefix = row.current_engine_name + '\u0000';
     if (row.engine_task_id) registeredTasks.add(prefix + row.engine_task_id);
     if (row.infohash) registeredHashes.set(prefix + String(row.infohash).toLowerCase(), row.engine_task_id || '');
   });
   this.engineSnapshots.forEach(function (snapshot) {
+    var speed = 0, speedKnown = false;
     snapshot.items.forEach(function (item, identity) {
       if (now - item.last_seen_at > 300) return;
       var stale = item.stale || snapshot.state === 'error' || snapshot.error_type || now - item.last_seen_at > 60;
+      // DB 행의 로딩·매칭 여부와 관계없이 수신한 엔진 작업에서 속도를 합산한다.
+      if (!stale && item.status === 'downloading' && typeof item.download_speed === 'number' &&
+          Number.isFinite(item.download_speed) && item.download_speed >= 0) {
+        speed += item.download_speed;
+        speedKnown = true;
+      }
       if (item.db_id) {
         var row = rows.get(String(item.db_id));
         var matches = row && row.current_engine_name === snapshot.engine_name &&
@@ -96,6 +127,10 @@ FeederQueueState.prototype.view = function (now) {
           row.downloaded_bytes = item.downloaded_bytes;
           row.download_speed = stale ? 0 : item.download_speed;
           row.engine_stale = !!stale;
+          var confirmed = queue_sort_progress(item.sort_progress === undefined ? item.progress : item.sort_progress);
+          if (item.sort_progress === undefined && confirmed === null && item.file_size > 0 && typeof item.downloaded_bytes === 'number')
+            confirmed = queue_sort_progress(item.downloaded_bytes / item.file_size * 100);
+          if (confirmed !== null) row.sort_progress = confirmed;
         }
       } else {
         var prefix = snapshot.engine_name + '\u0000';
@@ -112,9 +147,18 @@ FeederQueueState.prototype.view = function (now) {
           raw_status: item.status, engine_stale: !!stale, created_time: '원격 보관', last_seen_at: item.last_seen_at});
       }
     });
+    if (speedKnown) downloadSpeeds.push({engine_name:snapshot.engine_name, speed:speed});
+  });
+  rows.forEach(function (row, id) {
+    // 같은 작업·상태·행 버전에서만 마지막 유효 값을 보존한다. 속도/ETA는 보존하지 않는다.
+    var context = JSON.stringify([row.status, row.row_version, row.current_engine_name, row.engine_task_id, row.infohash]);
+    var previous = self.lastProgress.get(id);
+    if (previous && previous.context !== context) { self.lastProgress.delete(id); previous = null; }
+    if (row.sort_progress !== null) self.lastProgress.set(id, {context:context, value:row.sort_progress});
+    else if (previous) row.sort_progress = previous.value;
   });
   return {rows: Array.from(rows.values()).concat(orphans.slice(0, this.orphanLimit)),
-    orphanTotal: orphanTotal, unverifiedTotal: unverifiedTotal};
+    orphanTotal: orphanTotal, unverifiedTotal: unverifiedTotal, downloadSpeeds:downloadSpeeds};
 };
 
 function FeederDashboard() {
@@ -124,6 +168,7 @@ function FeederDashboard() {
   this.busy = {};
   this.last = {};
   this.lastRender = '';
+  this.engineStatusSignature = null;
   this.dbError = false;
   this.uploadHasCounts = false;
   this.uploadPendingSince = null;
@@ -299,11 +344,47 @@ FeederDashboard.prototype.uploadResult = function (data) {
   $('#queue_upload_state').text(warming ? '업로드 큐 집계 중' : '업로드 큐 갱신 지연 · ' +
     (this.uploadHasCounts ? '이전 값 유지' : '재확인 대기')).attr('data-state', warming ? 'loading' : 'stale');
 };
+// 엔진별 상태를 독립 텍스트 요소로 표시한다. 전체 요청 실패는 별도 안내로만 구분한다.
+FeederDashboard.prototype.renderEngineStatus = function (requestFailed) {
+  var host = document.getElementById && document.getElementById('queue_engine_state');
+  if (!host) return;
+  var entries = [];
+  this.state.engineSnapshots.forEach(function (snapshot) {
+    var at = snapshot.last_success_at ? new Date(snapshot.last_success_at * 1000).toLocaleTimeString('ko-KR', {hour12:false}) : '정상 수신 대기';
+    var status = snapshot.state === 'ready' ? 'ready' : snapshot.state === 'loading' ? 'loading' :
+      snapshot.state === 'error' ? 'error' : 'stale';
+    var label = snapshot.engine_name + ': ' +
+      (status === 'ready' ? '정상' : status === 'loading' ? '확인 중' : '갱신 지연') +
+      (snapshot.match_verified === true ? '' : ' · DB 연결 확인 중 · 원격 항목 읽기 전용') +
+      (snapshot.complete ? '' : ' · 부분/미확인 목록') + ' · 마지막 정상 ' + at;
+    entries.push({text:label, status:status});
+  });
+  if (requestFailed) entries.push({text:'엔진 정보 갱신 지연 · 이전 수신 정보 유지', status:'stale'});
+  if (!entries.length) entries.push({text:'활성 엔진 없음', status:null});
+  var signature = JSON.stringify(entries);
+  if (signature === this.engineStatusSignature) return;
+  var fragment = document.createDocumentFragment();
+  entries.forEach(function (entry, index) {
+    if (index) fragment.appendChild(document.createTextNode(' / '));
+    if (!entry.status) {
+      fragment.appendChild(document.createTextNode(entry.text));
+      return;
+    }
+    var span = document.createElement('span');
+    span.className = 'queue-engine-state-item';
+    span.setAttribute('data-state', entry.status);
+    span.textContent = entry.text; // 엔진명과 원격 상태 문자열을 HTML로 해석하지 않는다.
+    fragment.appendChild(span);
+  });
+  host.replaceChildren(fragment);
+  this.engineStatusSignature = signature;
+};
 FeederDashboard.prototype.render = function () {
-  var view = this.state.view(Date.now() / 1000), signature = String(this.state.dbReady) + JSON.stringify(view.rows);
+  var view = this.state.view(Date.now() / 1000), signature = String(this.state.dbReady) + JSON.stringify([this.state.activeStage, this.state.queueTime, view.rows]);
+  render_queue_speed_badge(view.downloadSpeeds);
   if ((this.state.dbReady || view.rows.length) && signature !== this.lastRender) {
     this.lastRender = signature;
-    render_queue_rows(view.rows);
+    render_queue_rows(view.rows, this.state.activeStage, this.state.queueTime);
     if (!this.state.dbReady) $('#active_queue_tbody').append('<tr id="queue_db_wait_row"><td colspan="3" class="py-3 text-muted">' +
       (this.dbError ? 'DB 불러오기 실패 · 수동 새로고침으로 재시도' : 'DB 큐 불러오는 중…') + '</td></tr>');
   }
@@ -317,17 +398,9 @@ FeederDashboard.prototype.poll = function () {
   if (!this.last.queue_bootstrap || now - this.last.queue_bootstrap >= 10000) this.bootstrap();
   if (!this.last.queue_engines || now - this.last.queue_engines >= 5000) this.request('queue_engines', {}, function (data, gen) {
     if (!self.state.mergeEngines(data, gen)) return;
-    var labels = [];
-    self.state.engineSnapshots.forEach(function (snapshot) {
-      var at = snapshot.last_success_at ? new Date(snapshot.last_success_at * 1000).toLocaleTimeString('ko-KR', {hour12:false}) : '정상 수신 대기';
-      labels.push(snapshot.engine_name + ': ' + (snapshot.state === 'ready' ? '정상' : '갱신 지연') +
-        (snapshot.match_verified === true ? '' : ' · DB 연결 확인 중 · 원격 항목 읽기 전용') +
-        (snapshot.complete ? '' : ' · 부분/미확인 목록') + ' · 마지막 정상 ' + at);
-    });
-    $('#queue_engine_state').text(labels.join(' / ') || '활성 엔진 없음').attr('data-state',
-      Array.from(self.state.engineSnapshots.values()).some(function (s) { return s.state !== 'ready'; }) ? 'stale' : 'ready');
+    self.renderEngineStatus(false);
     self.render();
-  }, function () { $('#queue_engine_state').text('엔진 정보 갱신 지연 · 이전 수신 정보 유지').attr('data-state', 'stale'); });
+  }, function () { self.renderEngineStatus(true); });
   if (!this.last.queue_progress || now - this.last.queue_progress >= 5000) {
     var ids = [];
     this.state.dbItemsById.forEach(function (item) { if (['uploading','local_staging','relay_transferring'].indexOf(item.status) >= 0) ids.push(item.id); });

@@ -10,7 +10,7 @@ import uuid
 import zlib
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, case, func, or_
+from sqlalchemy import and_, func, or_
 from .setup import F, P, db
 from .model_download import ModelDownload, ModelDownloadStat
 from .util_base import FeederUtil
@@ -18,9 +18,11 @@ from .util_download import DownloadUtil
 from .worker.rclone_logging import redact_log
 
 
-RANKS = {'uploading': 0, 'local_staging': 1, 'relay_transferring': 2, 'downloading': 3,
-         'pending_upload': 4, 'pending_local_staging': 5, 'pending_relay': 6,
-         'downloaded': 7, 'waiting_transporter': 8, 'pending': 9}
+TRANSFER_STAGES = {'uploading': 'pending_upload', 'local_staging': 'pending_local_staging',
+                   'relay_transferring': 'pending_relay'}
+RANKS = {'uploading': 0, 'local_staging': 1, 'relay_transferring': 2,
+         'pending_upload': 3, 'pending_local_staging': 4, 'pending_relay': 5,
+         'downloaded': 6, 'waiting_transporter': 7, 'downloading': 8, 'pending': 9}
 
 
 class EngineBusy(Exception):
@@ -103,6 +105,13 @@ class EngineStatusCache:
                     if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                         value = 0
                     item[field] = value
+                # 표시용 0 보정과 실제 확인된 0%를 정렬에서 구별한다.
+                progress = row.get('progress')
+                if type(progress) not in (int, float) or not math.isfinite(progress) or not 0 <= progress <= 100:
+                    size, done = row.get('file_size'), row.get('downloaded_bytes')
+                    progress = (done / size * 100 if type(size) in (int, float) and math.isfinite(size) and size > 0
+                                and type(done) in (int, float) and math.isfinite(done) and 0 <= done <= size else None)
+                item['sort_progress'] = progress
                 for field in ('task_id', 'hash', 'filename', 'source_path', 'status'):
                     item[field] = redact_log(item[field] or '', limit=2000)
                 item['last_seen_at'] = now
@@ -204,14 +213,15 @@ class Dashboard:
                 cls._metric_after = time.time() + 15
     fields = ('id', 'created_time', 'updated_time', 'feed_name', 'title', 'file_name', 'file_size',
               'status', 'current_engine_name', 'engine_task_id', 'infohash', 'local_path', 'destination_type',
-              'error_message', 'upload_retry_after', 'source_unavailable_since')
+              'error_message', 'upload_retry_after', 'source_unavailable_since', 'last_status_time')
 
     @classmethod
     def serialize(cls, item):
         result = {field: getattr(item, field) for field in cls.fields}
         for key, value in result.items():
             if isinstance(value, datetime):
-                result[key] = value.strftime('%Y-%m-%d %H:%M:%S')
+                result[key] = (value.isoformat(timespec='microseconds') if key in ('last_status_time', 'upload_retry_after')
+                               else value.strftime('%Y-%m-%d %H:%M:%S'))
         result['error_message'] = redact_log(result['error_message'] or '', limit=3500)
         result['local_path'] = redact_log(result['local_path'] or '', limit=2000)
         result['row_key'] = 'db:' + str(item.id)
@@ -271,12 +281,37 @@ class Dashboard:
                 'total_upload_24h': usage.get('SHARED_DRIVE_UPLOAD', sum(usage.values()))}
 
     @classmethod
+    def stage_ranks(cls, active_stage):
+        """실제 전송을 모두 앞세우고 각 그룹 안에서 현재 전송 단계를 우선한다."""
+        stages = list(TRANSFER_STAGES)
+        if active_stage in stages:
+            stages.remove(active_stage)
+            stages.insert(0, active_stage)
+        order = stages + [TRANSFER_STAGES[stage] for stage in stages]
+        order += ['downloaded', 'waiting_transporter', 'downloading', 'pending']
+        return {status: rank for rank, status in enumerate(order)}
+
+    @classmethod
     def queue(cls, cursor=None, known=None):
         """서명된 잔여 ID 스냅샷. OFFSET이나 외부 엔진/스테이징 디스크에 의존하지 않는다."""
         observed = time.time()
+        sort_time = datetime.fromtimestamp(observed)
         active = ModelDownload.status.in_(list(RANKS))
-        rank = case(*[(ModelDownload.status == status, value) for status, value in RANKS.items()], else_=99)
-        ids = [i for (i,) in db.session.query(ModelDownload.id).filter(active).order_by(rank, ModelDownload.id).all()]
+        # 첫 페이지나 외부 진행률이 아닌 전체 활성 DB 상태로 현재 단계를 결정한다.
+        active_rows = db.session.query(ModelDownload.id, ModelDownload.status,
+                                       ModelDownload.last_status_time, ModelDownload.upload_retry_after).filter(active).all()
+        states = {row.status for row in active_rows}
+        active_stage = next((stage for stage in TRANSFER_STAGES if stage in states), None)
+        ranks = cls.stage_ranks(active_stage)
+
+        def sort_key(row):
+            # 기존 실행기의 후보 우선순위를 표시 순서에 반영한다.
+            deferred = row.status in ('pending_upload', 'pending_local_staging') and bool(
+                row.upload_retry_after and row.upload_retry_after > sort_time)
+            status_time = row.last_status_time if row.status == 'pending_upload' else None
+            return ranks.get(row.status, 99), deferred, status_time is not None, status_time or datetime.min, row.id
+
+        ids = [row.id for row in sorted(active_rows, key=sort_key)]
         removed = []
         counts = None
         counts_error = False
@@ -300,10 +335,11 @@ class Dashboard:
                 db.session.rollback()
                 counts_error = True
         rows = db.session.query(ModelDownload).filter(ModelDownload.id.in_(chosen)).all() if chosen else []
-        items = sorted((cls.serialize(row) for row in rows), key=lambda item: (RANKS[item['status']], item['id']))
+        items = [cls.serialize(row) for row in sorted(rows, key=sort_key)]
         return {'success': True, 'version': 2, 'items': items, 'removed_ids': removed, 'counts': counts, 'counts_error': counts_error,
                 'total': len(ids), 'has_more': bool(remaining), 'next_cursor': cls.cursor(remaining),
-                'observed_at': observed}
+                'observed_at': observed, 'active_stage': active_stage,
+                'queue_time': sort_time.isoformat(timespec='microseconds')}
 
     @staticmethod
     def fetch_engine(config):

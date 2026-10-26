@@ -365,7 +365,20 @@ function queue_eta_text(value) {
   return parts.join(' ');
 }
 
-function render_queue_rows(list) {
+function render_queue_speed_badge(speeds) {
+  var labels = (speeds || []).map(function (item) {
+    var name = item.engine_name || '엔진';
+    return {name:queue_escape_html(name.length <= 4 ? name.toUpperCase() : name), speed:format_bytes(item.speed) + '/s'};
+  });
+  var text = '다운로드: — (속도 정보 없음)';
+  if (labels.length === 1) text = labels[0].name + ' 다운로드: ' + labels[0].speed;
+  else if (labels.length > 1) text = '다운로드: ' + labels.map(function (item) {
+    return item.name + ': ' + item.speed;
+  }).join(' | ');
+  $('#queue_engine_speed_badge').html('<i class="fa fa-arrow-circle-o-down mr-1"></i>' + text);
+}
+
+function render_queue_rows(list, activeStage, queueTime) {
   var tbody = $('#active_queue_tbody');
   if (!tbody.length) return;
   if (!list || list.length === 0) {
@@ -376,49 +389,52 @@ function render_queue_rows(list) {
   }
 
   cached_download_list = list.slice();
-  // DB와 같은 단계 우선순위. 실시간 진행률은 같은 단계의 표시 순서만 보강한다.
-  var ranks = {uploading:0, local_staging:1, relay_transferring:2, downloading:3, pending_upload:4,
-    pending_local_staging:5, pending_relay:6, downloaded:7, waiting_transporter:8, pending:9};
-  list = list.slice().sort(function (a, b) {
-    var rankA = ranks[a.status] === undefined ? 99 : ranks[a.status];
-    var rankB = ranks[b.status] === undefined ? 99 : ranks[b.status];
-    if (rankA !== rankB) return rankA - rankB;
-    if (rankA < 4 && Number(a.progress || 0) !== Number(b.progress || 0)) return Number(b.progress || 0) - Number(a.progress || 0);
-    if (rankA < 99) return Number(a.id) - Number(b.id);
-    return String(a.row_key).localeCompare(String(b.row_key));
+  // 전역 DB 단계가 우선이다. 컨텍스트 없는 이전 호출에만 로딩된 행을 사용한다.
+  var stages = ['uploading', 'local_staging', 'relay_transferring'];
+  var waiting = {uploading:'pending_upload', local_staging:'pending_local_staging', relay_transferring:'pending_relay'};
+  if (activeStage === undefined) activeStage = stages.find(function (stage) {
+    return list.some(function (item) { return item.status === stage; });
   });
-
-  // 엔진별 실시간 다운로드 속도 합산 집계
-  var engineSpeeds = {};
-  for (var k = 0; k < list.length; k++) {
-    var rowItem = list[k];
-    if (rowItem.status === 'downloading') {
-      var spd = parseFloat(rowItem.download_speed) || 0;
-      if (spd > 0) {
-        var rawEng = rowItem.current_engine_name || rowItem.engine_name || '';
-        var engKey = rawEng ? (rawEng.length <= 4 ? rawEng.toUpperCase() : rawEng) : '엔진';
-        engineSpeeds[engKey] = (engineSpeeds[engKey] || 0) + spd;
+  if (stages.indexOf(activeStage) >= 0) {
+    stages.splice(stages.indexOf(activeStage), 1);
+    stages.unshift(activeStage);
+  }
+  var order = stages.concat(stages.map(function (stage) { return waiting[stage]; }),
+    ['downloaded', 'waiting_transporter', 'downloading', 'pending']);
+  var ranks = {};
+  order.forEach(function (status, rank) { ranks[status] = rank; });
+  function rank(item) {
+    if (String(item.row_key || '').startsWith('engine:')) return 99;
+    return ranks[item.status] === undefined ? 99 : ranks[item.status];
+  }
+  function progress(item) {
+    return queue_sort_progress(item.sort_progress === undefined ? item.progress : item.sort_progress);
+  }
+  function deferred(item) {
+    // 브라우저 시계 대신 DB 응답의 공통 관측 시각을 사용한다.
+    return !!(queueTime && item.upload_retry_after && item.upload_retry_after.replace(' ', 'T') > queueTime);
+  }
+  list = list.slice().sort(function (a, b) {
+    var rankA = rank(a), rankB = rank(b);
+    if (rankA !== rankB) return rankA - rankB;
+    if (rankA < 99 && ['uploading', 'local_staging', 'downloading'].indexOf(a.status) >= 0) {
+      var progressA = progress(a), progressB = progress(b);
+      if (progressA !== null && progressB === null) return -1;
+      if (progressA === null && progressB !== null) return 1;
+      if (progressA !== null && progressA !== progressB) return progressB - progressA;
+    }
+    if (rankA < 99 && ['pending_upload', 'pending_local_staging'].indexOf(a.status) >= 0) {
+      var deferredA = deferred(a), deferredB = deferred(b);
+      if (deferredA !== deferredB) return deferredA ? 1 : -1;
+      if (a.status === 'pending_upload') {
+        var timeA = (a.last_status_time || '').replace(' ', 'T'), timeB = (b.last_status_time || '').replace(' ', 'T');
+        if (timeA !== timeB) return timeA < timeB ? -1 : 1;
       }
     }
-  }
-
-  var speedDisplay = '';
-  var engKeys = Object.keys(engineSpeeds);
-  if (engKeys.length === 1) {
-    var singleKey = engKeys[0];
-    speedDisplay = '<i class="fa fa-arrow-circle-o-down mr-1"></i>표시 중 ' + queue_escape_html(singleKey) + ' 다운로드: ' + format_bytes(engineSpeeds[singleKey]) + '/s';
-  } else if (engKeys.length > 1) {
-    var parts = [];
-    for (var eIdx = 0; eIdx < engKeys.length; eIdx++) {
-      var eKey = engKeys[eIdx];
-      parts.push(queue_escape_html(eKey) + ': ' + format_bytes(engineSpeeds[eKey]) + '/s');
-    }
-    speedDisplay = '<i class="fa fa-arrow-circle-o-down mr-1"></i>표시 중 다운로드: ' + parts.join(' | ');
-  } else {
-    speedDisplay = '<i class="fa fa-arrow-circle-o-down mr-1"></i>다운로드: — (수신한 작업 기준)';
-  }
-
-  $('#queue_engine_speed_badge').html(speedDisplay);
+    var idA = Number(a.id), idB = Number(b.id);
+    if (rankA < 99 && Number.isInteger(idA) && Number.isInteger(idB) && idA !== idB) return idA - idB;
+    return String(a.row_key || ('db:' + a.id)).localeCompare(String(b.row_key || ('db:' + b.id)));
+  });
 
   var currentRows = {}, signatures = {}, renderedIds = {}, ordered = [];
   var oldOrder = [];
@@ -627,9 +643,12 @@ function render_queue_rows(list) {
   Object.keys(currentRows).forEach(function (key) { if (!renderedIds[key]) currentRows[key].remove(); });
   var newOrder = list.map(function (item) { return item.row_key || ('db:' + item.id); });
   if (JSON.stringify(oldOrder) !== JSON.stringify(newOrder)) {
-    var fragment = document.createDocumentFragment();
-    ordered.forEach(function (row) { fragment.appendChild(row); });
-    tbody[0].appendChild(fragment);
+    // 제자리에 있는 행은 그대로 두고 새 행이나 순서가 바뀐 행만 이동한다.
+    var anchor = tbody[0].firstElementChild;
+    ordered.forEach(function (row) {
+      if (row === anchor) anchor = anchor.nextElementSibling;
+      else tbody[0].insertBefore(row, anchor);
+    });
   }
   render_queue_rows.signatures = signatures;
   if (focusedKey && focusedAction && document.activeElement !== focus) {
