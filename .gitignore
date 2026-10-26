@@ -7,11 +7,7 @@ tmp/
 .idea/
 
 # Agent-generated local tests, reports and temporary artifacts (not for distribution)
-/tests/*
-!/tests/test_regressions.py
-!/tests/test_stability.py
-!/tests/test_dashboard.py
-!/tests/dashboard_state_test.js
+/tests/
 /test-results/
 /playwright-report/
 /agent_tmp/
