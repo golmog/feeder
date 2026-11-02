@@ -373,12 +373,30 @@ class FeederUtil:
         return result + ['--transfers', str(cls.get_rclone_transfers())]
 
     @classmethod
+    def migrate_rclone_options(cls):
+        """구형 청크 설정을 한 번만 합치고 이후 사용자 편집은 그대로 둔다."""
+        import shlex
+        if P.ModelSetting.get_bool('download_rclone_options_migrated'):
+            return
+        raw = P.ModelSetting.get('download_rclone_extra_options') or ''
+        try:
+            arguments = shlex.split(raw)
+        except ValueError:
+            logger.warning('[FeederUtil] Rclone 추가 옵션의 따옴표를 확인해주세요. 청크 설정 통합을 보류합니다.')
+            return
+        if not any(value == '--drive-chunk-size' or value.startswith('--drive-chunk-size=') for value in arguments):
+            chunk = P.ModelSetting.get('download_rclone_chunk_size') or '256M'
+            extra = '--timeout 60m' if not raw.strip() or raw == '--timeout 30m' else raw
+            P.ModelSetting.set('download_rclone_extra_options', '--drive-chunk-size ' + shlex.quote(chunk) + ' ' + extra)
+        P.ModelSetting.set('download_rclone_options_migrated', 'True')
+
+    @classmethod
     def get_rclone_extra_options(cls) -> list[str]:
         """설정된 Rclone 확장 옵션 문자열을 안전하게 분리하여 리스트로 반환"""
         import shlex
         raw_opt = P.ModelSetting.get('download_rclone_extra_options') if P.ModelSetting else ''
-        if not raw_opt:
-            raw_opt = '--timeout 30m'
+        if not raw_opt or not raw_opt.strip():
+            raw_opt = '--drive-chunk-size 256M --timeout 60m'
         try:
             return shlex.split(raw_opt.strip())
         except Exception as ex:
@@ -623,41 +641,41 @@ class FeederUtil:
             """))
 
     @classmethod
-    def acquire_runtime_lock(cls, lock_name: str, owner: str, stale_after: int = 86400) -> bool:
-        """만료된 실행권만 교체할 수 있는 원자적 DB 락을 획득한다."""
+    def acquire_runtime_lock(cls, lock_name: str, owner: str, stale_after: int | None = 86400) -> bool:
+        """None이면 자동 만료 없이, 그 외에는 만료된 실행권만 교체한다."""
         try:
             engine = db.get_engine(bind=P.package_name)
         except Exception:
             engine = db.engine
         now = time.time()
+        conflict = 'DO NOTHING' if stale_after is None else f"""DO UPDATE SET
+            owner = excluded.owner,
+            acquired_at = excluded.acquired_at
+            WHERE {P.package_name}_runtime_lock.acquired_at < :expired_at"""
+        values = {'lock_name': lock_name, 'owner': owner, 'acquired_at': now}
+        if stale_after is not None:
+            values['expired_at'] = now - stale_after
         with engine.begin() as conn:
             result = conn.execute(db.text(f"""
                 INSERT INTO {P.package_name}_runtime_lock (lock_name, owner, acquired_at)
                 VALUES (:lock_name, :owner, :acquired_at)
-                ON CONFLICT(lock_name) DO UPDATE SET
-                    owner = excluded.owner,
-                    acquired_at = excluded.acquired_at
-                WHERE {P.package_name}_runtime_lock.acquired_at < :expired_at
-            """), {
-                'lock_name': lock_name,
-                'owner': owner,
-                'acquired_at': now,
-                'expired_at': now - stale_after,
-            })
+                ON CONFLICT(lock_name) {conflict}
+            """), values)
             return result.rowcount == 1
 
     @classmethod
-    def release_runtime_lock(cls, lock_name: str, owner: str) -> None:
+    def release_runtime_lock(cls, lock_name: str, owner: str) -> bool:
         """소유자가 바뀐 경우에는 새 소유자의 락을 건드리지 않는다."""
         try:
             engine = db.get_engine(bind=P.package_name)
         except Exception:
             engine = db.engine
         with engine.begin() as conn:
-            conn.execute(db.text(f"""
+            result = conn.execute(db.text(f"""
                 DELETE FROM {P.package_name}_runtime_lock
                 WHERE lock_name = :lock_name AND owner = :owner
             """), {'lock_name': lock_name, 'owner': owner})
+            return result.rowcount == 1
 
     @classmethod
     def reset_runtime_lock(cls, lock_name: str) -> None:
@@ -730,6 +748,8 @@ class FeederUtil:
             'running': running,
             'state': ('stopping' if running else 'paused') if paused else ('running' if running else 'idle'),
             'active_transfers': active_transfers,
+            'pipeline_locked': 'download_pipeline' in locks,
+            'pipeline_owner': pipeline_owner,
             'single_item_id': int(single_match[1]) if single_match else None,
             'observed_at': time.time(),
         }
@@ -873,6 +893,16 @@ class FeederUtil:
 
     @classmethod
     def save_crawler(cls, item: dict) -> str:
+        item = dict(item)
+        if not str(item.get('site') or '').strip() or not isinstance(item.get('boards'), list):
+            return 'invalid_crawler'
+        if any(not isinstance(b, dict) or not str(b.get('board') if b.get('board') is not None else '').strip() for b in item['boards']):
+            return 'invalid_boards'
+        try:
+            target_id = int(item.get('id') or 0)
+        except (TypeError, ValueError):
+            return 'invalid_id'
+        item['id'] = target_id
         data = cls.load_yaml()
         crawlers = data.get('CRAWLERS', [])
         target_id = item.get('id')
@@ -893,9 +923,10 @@ class FeederUtil:
         if target_id is not None and int(target_id) > 0:
             for idx, c in enumerate(crawlers):
                 if str(c.get('id')) == str(target_id):
-                    crawlers[idx].update(item)
+                    crawlers[idx] = item
                     data['CRAWLERS'] = crawlers
-                    cls.save_yaml(data)
+                    if not cls.save_yaml(data):
+                        return 'save_failed'
                     logger.info(f"[FeederUtil] 수집기 설정 수정 완료: ID={target_id}, Site={item.get('site')}")
                     return 'success_update'
             return 'not_found'
@@ -909,7 +940,8 @@ class FeederUtil:
         item['id'] = max_id + 1
         crawlers.append(item)
         data['CRAWLERS'] = crawlers
-        cls.save_yaml(data)
+        if not cls.save_yaml(data):
+            return 'save_failed'
         logger.info(f"[FeederUtil] 신규 수집기 추가 완료: ID={item['id']}, Site={item.get('site')}")
         return 'success'
 
@@ -945,6 +977,16 @@ class FeederUtil:
 
     @classmethod
     def save_feed(cls, item: dict) -> str:
+        item = dict(item)
+        if not str(item.get('name') or '').strip() or not isinstance(item.get('sources'), list):
+            return 'invalid_feed'
+        if any(not isinstance(src, dict) or not (src.get('board') or src.get('url')) for src in item['sources']):
+            return 'invalid_sources'
+        try:
+            target_id = int(item.get('id') or 0)
+        except (TypeError, ValueError):
+            return 'invalid_id'
+        item['id'] = target_id
         data = cls.load_yaml()
         feeds = data.get('FEEDS', [])
         target_id = item.get('id')
@@ -972,9 +1014,10 @@ class FeederUtil:
         if target_id is not None and int(target_id) > 0:
             for idx, f in enumerate(feeds):
                 if str(f.get('id')) == str(target_id):
-                    feeds[idx].update(item)
+                    feeds[idx] = item
                     data['FEEDS'] = feeds
-                    cls.save_yaml(data)
+                    if not cls.save_yaml(data):
+                        return 'save_failed'
                     logger.info(f"[FeederUtil] 피드 설정 수정 완료: ID={target_id}, Name={item.get('name')}")
                     return 'success_update'
             return 'not_found'
@@ -989,7 +1032,8 @@ class FeederUtil:
         item['id'] = max_id + 1
         feeds.append(item)
         data['FEEDS'] = feeds
-        cls.save_yaml(data)
+        if not cls.save_yaml(data):
+            return 'save_failed'
         logger.info(f"[FeederUtil] 신규 피드 추가 완료: ID={item['id']}, Name={item.get('name')}")
         return 'success'
 
@@ -1022,6 +1066,26 @@ class FeederUtil:
 
     @classmethod
     def save_downloader(cls, item: dict) -> str:
+        item = dict(item)
+        if not str(item.get('name') or '').strip():
+            return 'empty_name'
+        if not item.get('engine_type'):
+            return 'empty_engine_type'
+        for key in ('upload_root', 'complete_root'):
+            if key in item and cls.relative_path_error(item[key]):
+                return cls.relative_path_error(item[key])
+        if 'default_destination' in item:
+            item['default_destination'] = cls.destination_settings(item['default_destination'])
+            effective = cls.resolve_destination_paths(item['default_destination'], item, {})
+            error = cls.validate_destination(effective)
+            if error:
+                return error
+        for profile in cls.get_download_profiles():
+            if str(item['name']).strip().lower() not in [str(name).strip().lower() for name in profile.get('priority_chain') or []]:
+                continue
+            error = cls.get_engine_destination(item, profile).get('_path_error', '')
+            if error:
+                return error
         if item.get('engine_type') == 'alldebrid' and 'webdav_failure_timeout_hours' in item:
             raw = item['webdav_failure_timeout_hours']
             try:
@@ -1039,15 +1103,17 @@ class FeederUtil:
 
         for idx, d in enumerate(items):
             if str(d.get('name', '')).strip().lower() == target_name.lower():
-                items[idx].update(item)
+                items[idx] = item
                 data['DOWNLOADERS'] = items
-                cls.save_yaml(data)
+                if not cls.save_yaml(data):
+                    return 'save_failed'
                 logger.info(f"[FeederUtil] 다운로더 설정 갱신: {target_name}")
                 return 'success_update'
 
         items.append(item)
         data['DOWNLOADERS'] = items
-        cls.save_yaml(data)
+        if not cls.save_yaml(data):
+            return 'save_failed'
         logger.info(f"[FeederUtil] 신규 다운로더 추가: {target_name}")
         return 'success'
 
@@ -1076,33 +1142,191 @@ class FeederUtil:
         return None
 
     @classmethod
-    def get_profile_destination(cls, profile: dict | None, engine_name: str = '') -> dict:
-        """프로필 기본 목적지에 현재 엔진별 override를 적용"""
-        if not profile:
-            return {}
-        destination = dict(profile.get('destination') or {})
-        overrides = profile.get('destination_by_engine') or {}
-        target = str(engine_name or '').strip().lower()
-        for name, override in overrides.items():
-            if str(name).strip().lower() == target and isinstance(override, dict):
-                destination.update(override)
-                break
-        return destination
+    def get_upload_roots(cls):
+        roots = {}
+        for key, default in (('upload_root', 'incoming'), ('complete_root', 'uploads')):
+            value = P.ModelSetting.get('download_' + key)
+            roots[key] = default if value is None else value
+        return roots
+
+    @staticmethod
+    def relative_path_error(value, single=False):
+        message = '다운로드 상위 폴더는 유효한 한 개의 폴더명으로 지정해주세요.' if single else '업로드 루트는 유효한 비어있지 않은 상대 경로로 지정해주세요.'
+        if (not isinstance(value, str) or not value.strip() or ':' in value or '\\' in value or
+                any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value)):
+            return message
+        parts = value.split('/')
+        if (single and len(parts) != 1) or any(not p.strip() or p.strip() in ('.', '..') for p in parts):
+            return message
+        return ''
+
+    @staticmethod
+    def destination_settings(destination):
+        """내장 원격 목적지의 계산 경로는 YAML에 복제하지 않는다."""
+        if not isinstance(destination, dict):
+            return destination
+        result = dict(destination)
+        if result.get('type') in ('rclone_simple', 'gdrive_rotation', 'remote_worker'):
+            result.pop('upload_path', None)
+            result.pop('complete_path', None)
+            result.pop('staging_path', None)
+        return result
+
+    @staticmethod
+    def get_profile_folder(profile):
+        folder = profile.get('destination_subfolder')
+        return profile.get('name', 'direct') if folder is None or (isinstance(folder, str) and not folder.strip()) else folder
 
     @classmethod
-    def get_upload_options(cls, profile: dict | None, engine_name: str = '') -> dict:
-        """목적지 > 프로필 > 엔진 > 전역 순서로 전송 스위치를 해석한다."""
+    def resolve_download_subpath(cls, engine, profile):
+        """다운로드 원본과 원격 임시 경로가 공유하는 상대 계층을 계산한다."""
+        upload = engine.get('upload_root', cls.get_upload_roots()['upload_root'])
+        folder = cls.get_profile_folder(profile)
+        error = cls.relative_path_error(upload) or cls.relative_path_error(folder, single=True)
+        if error:
+            raise ValueError(error)
+        return upload + '/' + folder
+
+    @classmethod
+    def get_download_subpath(cls, profile=None, engine_name='', item=None):
         profile = profile or {}
+        chain = (item.priority_chain if item is not None else None) or profile.get('priority_chain') or []
+        index = (item.current_engine_index or 0) if item is not None else 0
+        engine_name = engine_name or (item.current_engine_name if item is not None else '') or (chain[index] if 0 <= index < len(chain) else '')
+        engine = cls.get_downloader_by_name(engine_name) or {}
+        destination = cls.get_profile_destination(profile, engine_name, item)
+        state = (item.upload_state or {}) if item is not None else {}
+        explicit = state.get('destination_snapshot') or (state.get('routing') or {}).get('destination')
+        custom = destination.get('type') not in ('local', 'rclone_simple', 'gdrive_rotation', 'remote_worker', '')
+        if (explicit or custom) and 'upload_path' in destination:
+            path = destination['upload_path']
+            error = cls.relative_path_error(path)
+            if error:
+                raise ValueError(error)
+            return path
+        return cls.resolve_download_subpath(engine, profile)
+
+    @classmethod
+    def get_local_staging_root(cls):
+        return os.path.abspath(P.ModelSetting.get('download_local_staging_path') or
+            cls.get_global().get('local_staging_path') or os.path.join(cls.get_tmp_dir(), 'staging'))
+
+    @classmethod
+    def get_local_staging_path(cls, item, profile=None, root=None):
+        """등록한 원본 계층을 사용하고 디스크 루트 밖이나 심볼릭 링크에는 쓰지 않는다."""
+        root = os.path.abspath(root or cls.get_local_staging_root())
+        saved = (item.upload_state or {}).get('staging_local_path')
+        if saved:
+            path = saved
+        else:
+            profile = cls.get_item_profile(item) if profile is None else profile
+            sub = cls.get_download_source_subpath(item, None)
+            if sub is None:
+                sub = cls.get_download_subpath(profile, item=item)
+            folder = item.output_folder_name or item.file_name
+            error = cls.relative_path_error(sub) or cls.relative_path_error(folder, single=True)
+            if error:
+                raise ValueError(error)
+            path = os.path.join(root, sub, folder)
+        absolute = os.path.abspath(path)
+        actual = os.path.realpath(path)
+        real_root = os.path.realpath(root)
+        if (absolute == root or os.path.commonpath([root, absolute]) != root or
+                actual == real_root or os.path.commonpath([real_root, actual]) != real_root):
+            raise ValueError('로컬 스테이징 경로가 저장 루트 밖에 있습니다.')
+        if item.local_path and os.path.exists(item.local_path) and os.path.commonpath([actual, os.path.realpath(item.local_path)]) == actual:
+            raise ValueError('로컬 스테이징 경로가 다운로드 원본을 포함합니다.')
+        cursor = absolute
+        while cursor != root:
+            if os.path.islink(cursor):
+                raise ValueError('로컬 스테이징 경로에 심볼릭 링크를 사용할 수 없습니다.')
+            cursor = os.path.dirname(cursor)
+        return path
+
+    @classmethod
+    def resolve_destination_paths(cls, destination, engine, profile):
+        if not isinstance(destination, dict):
+            return destination
+        result = dict(destination)
+        if result.get('type') not in ('rclone_simple', 'gdrive_rotation', 'remote_worker'):
+            return result
+        defaults = cls.get_upload_roots()
+        complete = engine['complete_root'] if 'complete_root' in engine else defaults['complete_root']
+        try:
+            upload = cls.resolve_download_subpath(engine, profile)
+            error = cls.relative_path_error(complete)
+        except ValueError as exc:
+            error = str(exc)
+        if error:
+            result.update(upload_path='', complete_path='', _path_error=error)
+        else:
+            result.update(upload_path=upload, complete_path=complete + '/' + cls.get_profile_folder(profile))
+            up, final = result['upload_path'], result['complete_path']
+            if up == final or up.startswith(final + '/') or final.startswith(up + '/'):
+                result['_path_error'] = '임시 업로드 경로와 최종 이동 경로가 같거나 서로 포함되지 않도록 설정해주세요.'
+        return result
+
+    @staticmethod
+    def get_download_source_subpath(item, fallback=''):
+        source = (item.upload_state or {}).get('download_source') or {}
+        if (source and source.get('engine_name') == item.current_engine_name and
+                str(source.get('task_id')) == str(item.engine_task_id)):
+            return source.get('upload_path', '')
+        return item.gdrive_upload_path if item.gdrive_upload_path is not None else fallback
+
+    @classmethod
+    def get_profile_destination(cls, profile: dict | None, engine_name: str = '', item=None) -> dict:
+        """전송 스냅샷·단건 지정 목적지 또는 현재 엔진 기본값과 오버라이드를 해석한다."""
+        if item is not None:
+            saved = (item.upload_state or {}).get('destination_snapshot')
+            if isinstance(saved, dict):
+                return dict(saved)
+            routing = (item.upload_state or {}).get('routing') or {}
+            if isinstance(routing.get('destination'), dict):
+                destination = dict(routing['destination'])
+                destination.setdefault('type', '')
+                return destination
+        profile = profile or {}
+        chain = (item.priority_chain if item is not None else None) or profile.get('priority_chain') or []
+        index = (item.current_engine_index or 0) if item is not None else 0
+        engine_name = engine_name or (item.current_engine_name if item is not None else '') or (chain[index] if 0 <= index < len(chain) else '')
+        engine = cls.get_downloader_by_name(engine_name) or {}
+        return cls.get_engine_destination(engine, profile, engine_name)
+
+    @classmethod
+    def get_engine_destination(cls, engine, profile, engine_name=''):
+        """저장 전 후보 엔진도 런타임과 같은 규칙으로 해석한다."""
+        destination = dict(engine.get('default_destination') or {})
+        overrides = profile.get('destination_by_engine') or {}
+        target = str(engine_name or engine.get('name') or '').strip().lower()
+        for name, override in overrides.items():
+            if isinstance(override, str):
+                override = {'type': override}
+            if str(name).strip().lower() == target and isinstance(override, dict):
+                if override.get('type', destination.get('type')) != destination.get('type'):
+                    destination = {}
+                destination.update(override)
+                break
+        destination.setdefault('type', '')
+        return cls.resolve_destination_paths(destination, engine, profile)
+
+    @classmethod
+    def get_upload_options(cls, profile: dict | None, engine_name: str = '', item=None) -> dict:
+        """중앙 목적지 해석 결과를 사용해 전송 스위치의 상속을 적용한다."""
+        if item is not None and (item.upload_state or {}).get('upload_options_snapshot'):
+            return dict(item.upload_state['upload_options_snapshot'])
+        profile = profile or {}
+        chain = (item.priority_chain if item is not None else None) or profile.get('priority_chain') or []
+        index = (item.current_engine_index or 0) if item is not None else 0
+        engine_name = engine_name or (item.current_engine_name if item is not None else '') or (chain[index] if 0 <= index < len(chain) else '')
         engine = cls.get_downloader_by_name(engine_name) or {}
         keys = {'use_gdrive_pool': 'download_use_gdrive_pool',
                 'use_impersonate': 'download_gdrive_use_impersonate',
                 'use_local_staging': 'download_use_local_staging'}
         options = {key: P.ModelSetting.get_bool(global_key) for key, global_key in keys.items()}
-        override = next((value for name, value in (profile.get('destination_by_engine') or {}).items()
-                         if str(name).strip().lower() == str(engine_name or '').strip().lower()
-                         and isinstance(value, dict)), {})
         modes = {'direct': (False, False), 'rotation': (True, False), 'impersonate': (True, True)}
-        for layer in (engine, profile, profile.get('destination') or {}, override):
+        destination = cls.get_profile_destination(profile, engine_name, item)
+        for layer in (engine, destination):
             if layer.get('gdrive_mode') in modes:
                 options['use_gdrive_pool'], options['use_impersonate'] = modes[layer['gdrive_mode']]
             for key in keys:
@@ -1110,12 +1334,94 @@ class FeederUtil:
                     options[key] = str(layer[key]).lower() in ('true', 'on', '1')
             if layer.get('type') == 'gdrive_rotation':
                 options['use_gdrive_pool'] = True
-        if cls.get_profile_destination(profile, engine_name).get('type') == 'gdrive_rotation':
+        if destination.get('type') == 'gdrive_rotation':
             options['use_gdrive_pool'] = True
+        if destination.get('type') == 'remote_worker':
+            options['use_local_staging'] = False
         return options
 
     @classmethod
+    def validate_destination(cls, destination):
+        from .util_download import DownloadUtil
+        if isinstance(destination, dict) and destination.get('_path_error'):
+            return destination['_path_error']
+        if not isinstance(destination, dict) or not destination.get('type'):
+            return '목적지 유형이 미설정입니다. 엔진의 기본 목적지 또는 엔진별 오버라이드를 설정해주세요.'
+        schema = next((s for s in DownloadUtil.get_transporter_schemas()
+                       if s['transporter_id'] == destination['type']), None)
+        if schema is None:
+            return '등록되지 않은 이송 핸들러입니다. 스크립트와 목적지 설정을 확인해주세요.'
+        required = ['upload_path', 'complete_path'] if destination['type'] in ('rclone_simple', 'gdrive_rotation', 'remote_worker') else []
+        if any(not isinstance(destination.get(key), str) for key in required):
+            return '목적지 필수 경로 또는 필수 설정이 누락되었습니다.'
+        if required:
+            error = cls.relative_path_error(destination['upload_path']) or cls.relative_path_error(destination['complete_path'])
+            if error:
+                return error
+            upload, complete = destination['upload_path'], destination['complete_path']
+            if upload == complete or upload.startswith(complete + '/') or complete.startswith(upload + '/'):
+                return '임시 업로드 경로와 최종 이동 경로가 같거나 서로 포함되지 않도록 설정해주세요.'
+        if destination['type'] == 'local' and destination.get('complete_path') is not None and not isinstance(destination['complete_path'], str):
+            return '목적지 필수 경로 또는 필수 설정이 누락되었습니다.'
+        required += [f['name'] for f in schema.get('config_schema', []) if f.get('required')]
+        if any(destination.get(key) is None or (isinstance(destination.get(key), str) and not destination[key].strip()) for key in required):
+            return '목적지 필수 경로 또는 필수 설정이 누락되었습니다.'
+        return ''
+
+    @classmethod
+    def get_item_profile(cls, item):
+        routing = (item.upload_state or {}).get('routing') or {}
+        if 'profile_name' in routing:
+            if not routing['profile_name']:
+                return {'priority_chain': item.priority_chain or []}
+            return next((p for p in cls.get_download_profiles() if p.get('name') == routing['profile_name']), {})
+        return cls.get_download_profile_by_feed(item.feed_name) or {}
+
+    @classmethod
+    def pin_transfer_destination(cls, item, profile=None, destination=None, options=None):
+        """전송 시작 전 경로와 스위치를 체크포인트에 고정한다."""
+        if (item.upload_state or {}).get('destination_snapshot'):
+            return
+        profile = cls.get_item_profile(item) if profile is None else profile
+        if destination is None:
+            destination = cls.get_profile_destination(profile, item.current_engine_name, item)
+        if options is None:
+            options = cls.get_upload_options(profile, item.current_engine_name, item)
+        item.upload_state = dict(item.upload_state or {}, destination_snapshot=destination, upload_options_snapshot=options)
+
+    @staticmethod
+    def clear_transfer_state(item):
+        routing = (item.upload_state or {}).get('routing')
+        item.upload_state = {'routing': routing} if routing else None
+
+    @classmethod
     def save_download_profile(cls, item: dict) -> str:
+        item = dict(item)
+        item.pop('destination', None)
+        item.pop('destination_mode', None)
+        folder = item.get('destination_subfolder')
+        if folder is None or (isinstance(folder, str) and not folder.strip()):
+            item.pop('destination_subfolder', None)
+        error = cls.relative_path_error(cls.get_profile_folder(item), single=True)
+        if error:
+            return error
+        overrides = {}
+        for engine_name, value in (item.get('destination_by_engine') or {}).items():
+            if isinstance(value, dict):
+                value = dict(value)
+                effective_type = value.get('type', ((cls.get_downloader_by_name(engine_name) or {}).get('default_destination') or {}).get('type'))
+                if effective_type in ('rclone_simple', 'gdrive_rotation', 'remote_worker'):
+                    value.pop('upload_path', None)
+                    value.pop('complete_path', None)
+                    value.pop('staging_path', None)
+            overrides[engine_name] = value
+        item['destination_by_engine'] = overrides
+        if not item.get('priority_chain'):
+            return '우선순위 엔진을 설정해주세요.'
+        for engine_name in item.get('priority_chain') or []:
+            error = cls.validate_destination(cls.get_profile_destination(item, engine_name))
+            if error:
+                return error
         data = cls.load_yaml()
         profiles = data.get('DOWNLOAD_PROFILES', [])
         name = item.get('name', '').strip()
@@ -1124,15 +1430,17 @@ class FeederUtil:
 
         for idx, p in enumerate(profiles):
             if str(p.get('name', '')).strip().lower() == name.lower():
-                profiles[idx].update(item)
+                profiles[idx] = item
                 data['DOWNLOAD_PROFILES'] = profiles
-                cls.save_yaml(data)
+                if not cls.save_yaml(data):
+                    return 'save_failed'
                 logger.info(f"[FeederUtil] 다운로드 프로필 갱신: {name}")
                 return 'success_update'
 
         profiles.append(item)
         data['DOWNLOAD_PROFILES'] = profiles
-        cls.save_yaml(data)
+        if not cls.save_yaml(data):
+            return 'save_failed'
         logger.info(f"[FeederUtil] 신규 다운로드 프로필 추가: {name}")
         return 'success'
 
@@ -1168,38 +1476,25 @@ class FeederUtil:
             infohash=infohash
         )
 
-        # 사용자가 폼에서 직접 수정한 커스텀 옵션이 존재하는 경우 최우선 적용
-        if custom_chain is not None or custom_dest_type:
-            dl_item.priority_chain = list(custom_chain) if custom_chain else [d['name'] for d in cls.get_downloaders() if d.get('enabled', True)]
-            dl_item.destination_type = custom_dest_type or 'local'
-            cfg = custom_dest_config or {}
-            dl_item.gdrive_upload_path = cfg.get('upload_path', '')
-            dl_item.gdrive_complete_path = cfg.get('complete_path', '')
-            dl_item.gdrive_remote_id = cfg.get('shared_drive_id', '')
-
-        # 커스텀 옵션 없이 특정 프로필 프리셋만 선택된 경우 프로필 설정 적용
-        elif profile_name:
-            selected_profile = None
-            for p in cls.get_download_profiles():
-                if p.get('name') == profile_name:
-                    selected_profile = p
-                    break
-
-            if selected_profile:
-                dl_item.priority_chain = list(selected_profile.get('priority_chain', []))
-                dest = selected_profile.get('destination', {})
-                dl_item.destination_type = dest.get('type', 'local')
-                dl_item.gdrive_upload_path = dest.get('upload_path', '')
-                dl_item.gdrive_complete_path = dest.get('complete_path', '')
-                dl_item.gdrive_remote_id = dest.get('shared_drive_id', '')
-            else:
-                dl_item.priority_chain = [d['name'] for d in cls.get_downloaders() if d.get('enabled', True)]
-                dl_item.destination_type = 'local'
-
-        # 기본 설정 fallback
-        else:
-            dl_item.priority_chain = [d['name'] for d in cls.get_downloaders() if d.get('enabled', True)]
-            dl_item.destination_type = 'local'
+        selected_profile = next((p for p in cls.get_download_profiles() if p.get('name') == profile_name), None) if profile_name else {}
+        if profile_name and selected_profile is None:
+            return {'ret': 'fail', 'msg': '선택한 다운로드 프로필을 찾을 수 없습니다.'}
+        selected_profile = selected_profile or {}
+        dl_item.priority_chain = list(custom_chain if custom_chain is not None else selected_profile.get('priority_chain') or
+                                      [d['name'] for d in cls.get_downloaders() if d.get('enabled', True)])
+        routing = {'profile_name': profile_name}
+        if custom_dest_type:
+            routing['destination'] = dict(custom_dest_config or {}, type=custom_dest_type)
+        if routing:
+            dl_item.upload_state = {'routing': routing}
+        dest = cls.get_profile_destination(selected_profile, item=dl_item)
+        error = cls.validate_destination(dest)
+        if error:
+            return {'ret': 'fail', 'msg': error}
+        dl_item.destination_type = dest['type']
+        dl_item.gdrive_upload_path = dest.get('upload_path', '')
+        dl_item.gdrive_complete_path = dest.get('complete_path', '')
+        dl_item.gdrive_remote_id = dest.get('shared_drive_id', '')
 
         dl_item.status = 'pending'
         db.session.add(dl_item)

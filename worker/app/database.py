@@ -7,7 +7,7 @@ import sqlite3
 import uuid
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 12
 
 
 class Database:
@@ -67,6 +67,10 @@ class Database:
                     connection.execute("ALTER TABLE jobs ADD COLUMN drive_impersonate TEXT NOT NULL DEFAULT ''")
                 if 'rclone_transfers' not in columns:
                     connection.execute('ALTER TABLE jobs ADD COLUMN rclone_transfers INTEGER')
+                if 'rclone_extra_args' not in columns:
+                    connection.execute('ALTER TABLE jobs ADD COLUMN rclone_extra_args TEXT')
+                if 'session_id' not in columns:
+                    connection.execute('ALTER TABLE jobs ADD COLUMN session_id TEXT')
                 if 'chargeable_bytes' not in columns:
                     connection.execute('ALTER TABLE jobs ADD COLUMN chargeable_bytes INTEGER')
                 if 'error_type' not in columns:

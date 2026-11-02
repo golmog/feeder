@@ -9,6 +9,34 @@ import time
 from html.parser import HTMLParser
 
 
+def validate_extra_args(arguments):
+    """성능 플래그 허용 목록 없이 argv 구조와 Feeder 소유 설정만 보호한다."""
+    if type(arguments) is not list or len(arguments) > 128:
+        raise ValueError('Rclone 추가 옵션은 최대 128개 인자의 문자열 목록이어야 합니다.')
+    result, may_have_value, total = [], False, 0
+    owned = {'--config', '--drive-impersonate', '--transfers',
+             '--rc', '--rc-addr', '--rc-user', '--rc-pass', '--rc-htpasswd'}
+    for token in arguments:
+        if (type(token) is not str or not token or len(token) > 4096 or
+                any(ord(char) < 32 or ord(char) == 127 or 0xD800 <= ord(char) <= 0xDFFF
+                    for char in token)):
+            raise ValueError('Rclone 추가 옵션에 유효하지 않은 문자열이 있습니다.')
+        total += len(token)
+        if total > 16384 or token == '--':
+            raise ValueError('Rclone 추가 옵션의 길이 또는 경계가 유효하지 않습니다.')
+        flag = re.fullmatch(r'-{1,2}[A-Za-z][A-Za-z0-9_-]*(?:=.*)?', token)
+        if flag:
+            if token.split('=', 1)[0].lower() in owned:
+                raise ValueError('Rclone 실행 경로·인증·전용 전송 수·관리 서버 옵션은 Feeder 설정에서 지정합니다.')
+            may_have_value = '=' not in token
+        elif not may_have_value:
+            raise ValueError('Rclone 추가 옵션에는 플래그와 해당 값만 지정할 수 있습니다.')
+        else:
+            may_have_value = False
+        result.append(token)
+    return result
+
+
 class _ErrorPageText(HTMLParser):
     """HTML 머리말과 실행 코드를 제외하고 화면의 오류 문구만 모은다."""
 

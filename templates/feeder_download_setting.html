@@ -35,6 +35,8 @@
       {{ macros.setting_input_int('download_feed_sync_hours', '다운로드 대상 피드 기간 (시간)', value=arg['download_feed_sync_hours'], min='1', placeholder='72', desc=['최근 N시간 이내에 수집된 피드 게시물만 다운로드 대상으로 큐에 추가합니다 (기본값: 72시간)']) }}
       {{ macros.setting_input_int('download_max_staging_items', 'Google Drive 업로드 최대 큐', value=arg['download_max_staging_items'], min='0', placeholder='10', desc=['스테이징 중·업로드 대기·업로드 진행 작업을 합산한 최대 큐 (기본값: 10, 0은 무제한)', '직접 업로드도 포함하며, 실패 후 로컬 버퍼에 남은 작업도 슬롯을 차지합니다.']) }}
       {{ macros.setting_input_int('download_upload_workers', 'Google Drive 업로드 동시 전송 수', value=arg['download_upload_workers'], min='1', max='10', placeholder='2', desc=['Google Drive 업로드와 로컬 스테이징에 공통으로 적용할 동시 전송 수 (기본값: 2)']) }}
+      {{ macros.setting_input_text('download_upload_root', '임시 업로드 루트', value=arg['download_upload_root'], placeholder='incoming', desc=['목적지 Rclone 리모트 내부의 상대 경로입니다. 엔진별 루트와 프로필 폴더로 실제 경로를 구성합니다. 로컬 스테이징 경로와 별개입니다.']) }}
+      {{ macros.setting_input_text('download_complete_root', '최종 이동 루트', value=arg['download_complete_root'], placeholder='uploads', desc=['목적지 Rclone 리모트 내부의 상대 경로입니다. 예: uploads/프로필명/작업폴더']) }}
       {{ macros.setting_input_textarea('download_exclude_pattern', '전송 제외/삭제 파일 패턴', value=arg['download_exclude_pattern'], row='3', desc=['전송하지 않고 삭제하거나 제외할 파일/폴더 패턴 (줄바꿈으로 구분, Rclone --exclude 규격 지원)', '예시: *.nfo, *.txt, *.exe, Sample, *.sample.mkv']) }}
       {{ macros.setting_checkbox('download_enable_sse', '실시간 SSE 브로드캐스트', value=arg['download_enable_sse'], desc=['On: 큐 대시보드 화면에서 실시간 진행 현황을 자동 수신합니다.']) }}
       {{ macros.m_hr() }}
@@ -62,15 +64,14 @@
       {{ macros.m_hr() }}
       {{ macros.setting_checkbox('download_use_local_staging', '업로드시 로컬 스테이징 사용', value=arg['download_use_local_staging'], desc=['On: 원격 클라우드에서 로컬 디스크로 임시 다운로드 후 목적지로 전송합니다.', 'Off: 로컬 디스크를 거치지 않고 원격 소스에서 목적지로 다이렉트(on-the-fly) 스트리밍 전송합니다.']) }}
       <div id="download_use_local_staging_div" class="collapse">
-        {{ macros.setting_input_text('download_local_staging_path', '로컬 스테이징 임시 경로 루트', value=arg['download_local_staging_path'], placeholder='예: /data/tmp/staging', desc=['원격 클라우드 다운로드 후 로컬 버퍼로 수신할 기본 루트 디렉터리 (프로필의 임시 수신 경로와 조합되어 사용됩니다)']) }}
+        {{ macros.setting_input_text('download_local_staging_path', '로컬 스테이징 임시 경로 루트', value=arg['download_local_staging_path'], placeholder='예: /data/tmp/staging', desc=['로컬 저장 장치의 절대 루트입니다. 그 아래에 원격 임시 업로드 상대 경로 전체와 작업 폴더가 붙습니다. 예: /data/tmp/staging/incoming/films/작업폴더']) }}
       </div>
       {{ macros.m_hr() }}
 
       <h6 class="text-info font-weight-bold text-center mt-3">Rclone 기본 설정</h6>
       {{ macros.setting_input_text('download_rclone_conf_path', 'Rclone 설정 파일 경로', value=arg['download_rclone_conf_path'], placeholder='예: /root/.config/rclone/rclone.conf') }}
-      {{ macros.setting_input_int('download_rclone_transfers', 'Rclone 파일 동시 전송 수', value=arg['download_rclone_transfers'], min='1', placeholder='2', desc=['업로드·로컬 스테이징에서 Rclone 작업 하나당 동시에 전송할 파일 수 (--transfers, 기본값: 2)', '원격 워커에도 전달됩니다. Google Drive 업로드 동시 전송 수는 동시에 처리할 작업 수이며 이 값과 별개입니다.']) }}
-      {{ macros.setting_input_text('download_rclone_chunk_size', 'Rclone 청크 사이즈', value=arg['download_rclone_chunk_size'], placeholder='256M', desc=['구글 드라이브 업로드 청크 크기 (기본값: 256M)']) }}
-      {{ macros.setting_input_text('download_rclone_extra_options', 'Rclone 추가 옵션', value=arg['download_rclone_extra_options'], placeholder='--timeout 30m', desc=['Rclone 실행 시 추가로 적용할 확장 옵션 문자열 (공백 구분, 기본값: --timeout 30m)']) }}
+      {{ macros.setting_input_int('download_rclone_transfers', 'Rclone 파일 동시 전송 수', value=arg['download_rclone_transfers'], min='1', placeholder='2', desc=['로컬 스테이징·호스트 다이렉트·원격 워커의 Rclone 작업당 파일 동시 전송 수입니다 (--transfers, 기본값: 2). 추가 옵션에서 중복 지정하지 마세요.', 'Google Drive 업로드 동시 전송 수는 동시에 실행하는 작업 수로, 이 값과 별개입니다.']) }}
+      {{ macros.setting_input_text('download_rclone_extra_options', 'Rclone 추가 옵션', value=arg['download_rclone_extra_options'], placeholder='--drive-chunk-size 256M --timeout 60m', desc=['공란일 때만 --drive-chunk-size 256M --timeout 60m을 적용합니다. 값을 입력하면 이 두 옵션은 자동으로 합쳐지지 않습니다.', 'Feeder가 --config, --stats, --log-level, 경로별 --stats-one-line/--use-json-log와 제외 패턴·위임 계정을 내부 지정하므로 중복 입력하지 마세요.', '기타 Rclone 추가 옵션은 로컬 스테이징·호스트 다이렉트·원격 워커의 새 작업에 그대로 적용됩니다. 예: --multi-thread-streams 0 --checkers 16 --low-level-retries 2', '--transfers는 위 전용 설정을 우선합니다. 미지정 옵션은 실행 서버의 Rclone 기본값을 따르며 버전에 따라 지원 여부가 다를 수 있습니다.']) }}
       {{ macros.m_hr() }}
 
       <h6 class="text-info font-weight-bold text-center mt-2">Google Drive 기본 설정</h6>
@@ -235,6 +236,22 @@
 
           <!-- 스크립트의 CONFIG_SCHEMA에 따라 자동 생성되는 동적 입력 필드 컨테이너 -->
           <div id="dl_dynamic_engine_fields" class="mt-3"></div>
+          {% for key, label in [('upload_root', '임시 업로드 루트'), ('complete_root', '최종 이동 루트')] %}
+          <div class="form-group row mb-2">
+            <label for="engine_{{ key }}" class="col-sm-3 col-form-label text-right font-weight-bold">{{ label }}</label>
+            <div class="col-sm-9">
+              <input id="engine_{{ key }}" class="form-control form-control-sm" aria-label="{{ label }}" type="text">
+              <small class="form-text text-muted">비워두면 DOWNLOAD 기본 설정 상속, 입력하면 해당 엔진에서 재설정. 프로필 폴더 자동 추가</small>
+            </div>
+          </div>
+          {% endfor %}
+          <hr>
+          <div class="form-group row mb-2">
+            <label class="col-sm-3 col-form-label text-right font-weight-bold">기본 목적지 유형</label>
+            <div class="col-sm-9"><select id="engine_dest_type" class="form-control form-control-sm"></select>
+              <small class="form-text text-muted">프로필에서 별도로 지정하지 않으면 이 목적지를 사용합니다. 연결 테스트는 다운로드 엔진 접속만 확인합니다.</small></div>
+          </div>
+          <div id="engine_dynamic_dest_fields" class="mt-2"></div>
         </form>
       </div>
       <div class="modal-footer">
@@ -303,6 +320,13 @@
         <form id="profile_form">
           <input type="hidden" id="profile_mode" value="add">
           {{ macros.setting_input_text('profile_name', '프로필명', col='9', placeholder='예: default_profile, media_direct') }}
+          <div class="form-group row mb-2">
+            <label for="profile_subfolder" class="col-sm-3 col-form-label text-right font-weight-bold">다운로드 상위 폴더</label>
+            <div class="col-sm-9">
+              <input id="profile_subfolder" class="form-control form-control-sm" aria-label="다운로드 상위 폴더" placeholder="비워두면 프로필명 사용 (예: movies)" type="text">
+              <small class="form-text text-muted">다운로드 파일을 저장할 프로필별 상위 폴더입니다. 비워두면 프로필명이 사용되며, 다운로드 엔진 저장 경로·로컬 스테이징·원격 임시 업로드·최종 이동에 동일하게 적용됩니다.</small>
+            </div>
+          </div>
           {{ macros.setting_input_int('profile_sync_hours', '개별 피드 탐색 기간 (시간)', min='1', placeholder='미입력 시 기본 설정값 사용', desc=['해당 프로필이 적용된 피드에서 최근 N시간 이내 수집된 게시물만 다운로드 대상으로 큐에 추가합니다.']) }}
           <!-- 적용 피드 선택 영역 -->
           <div class="form-group row mb-2">
@@ -351,29 +375,12 @@
           </div>
           {{ macros.setting_checkbox('profile_append_hash_on_conflict', '중복 시 폴더명 해시 추가', value='On', desc=['On: DB에 동일한 폴더명이 이미 존재할 때만 해시(_[hash])를 붙여 분리합니다. Off: 원본 폴더명을 항상 그대로 유지합니다.']) }}
           {{ macros.m_hr() }}
-          <div class="form-group row mb-2">
-            <label class="col-sm-3 col-form-label text-right font-weight-bold">목적지 유형</label>
-            <div class="col-sm-9">
-              <select id="profile_dest_type" class="form-control form-control-sm"></select>
-            </div>
-          </div>
-
-          <!-- 트랜스포터 스크립트의 CONFIG_SCHEMA에 따라 자동 생성되는 동적 목적지 폼 컨테이너 -->
-          <div id="profile_dynamic_dest_fields" class="mt-2"></div>
-          <div class="form-group row mb-2">
-            <div class="col-sm-3"></div>
-            <div class="col-sm-9">
-              <div class="alert alert-info small py-2 mb-0">
-                <i class="fa fa-info-circle mr-1"></i>
-                <strong>단순 경로 이동(local)</strong>: <code class="text-white">/</code>로 시작하면 시스템 절대경로(예: mergerfs 결합 경로 등)로 직접 이동하고, 상대경로로 입력하면 엔진 설정 루트 하위 경로로 자동 결합됩니다.
-              </div>
-            </div>
-          </div>
+          <div id="profile_destination_notice" class="alert alert-info small py-2"></div>
           <div class="form-group row mb-2 mt-3">
             <label class="col-sm-3 col-form-label text-right font-weight-bold">엔진별 목적지</label>
             <div class="col-sm-9">
               <div id="profile_engine_destinations"></div>
-              <small class="form-text text-muted">지정하지 않은 엔진은 위 기본 목적지를 사용합니다. 엔진별로 목적지 유형과 세부 설정을 다르게 지정할 수 있습니다.</small>
+              <small class="form-text text-muted">지정하지 않은 엔진은 해당 다운로더 엔진의 기본 목적지를 자동 상속합니다. 엔진별로 목적지 유형과 세부 설정을 다르게 지정할 수 있습니다.</small>
             </div>
           </div>
         </form>

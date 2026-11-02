@@ -234,7 +234,7 @@ window.globalRequestSearch = function (page, preserveScroll) {
   } else if ($('#download_list_tbody').length > 0) {
     var tblSkeleton = '';
     for (var tk = 0; tk < skeletonCount; tk++) {
-      tblSkeleton += '<tr><td colspan="6" class="py-3"><div class="skeleton-box" style="height: 24px; width: 100%;"></div></td></tr>';
+      tblSkeleton += '<tr><td colspan="3" class="py-3"><div class="skeleton-box" style="height: 24px; width: 100%;"></div></td></tr>';
     }
     $('#download_list_tbody').html(tblSkeleton);
   }
@@ -273,7 +273,7 @@ window.globalRequestSearch = function (page, preserveScroll) {
         if ($('#list_div').length > 0) {
           $('#list_div').html('<div class="alert alert-danger m-3">렌더링 오류: ' + renderErr.message + '</div>');
         } else if ($('#download_list_tbody').length > 0) {
-          $('#download_list_tbody').html('<tr><td colspan="4" class="text-center p-4 text-danger font-weight-bold">목록 렌더링 오류: ' + renderErr.message + '</td></tr>');
+          $('#download_list_tbody').html('<tr><td colspan="3" class="text-center p-4 text-danger font-weight-bold">목록 렌더링 오류: ' + renderErr.message + '</td></tr>');
         }
         return;
       }
@@ -294,7 +294,7 @@ window.globalRequestSearch = function (page, preserveScroll) {
       if ($('#list_div').length > 0) {
         $('#list_div').html('<div class="col-12 text-center p-4 text-danger">목록 요청 실패: ' + (error || status || '서버 응답 없음') + '</div>');
       } else if ($('#download_list_tbody').length > 0) {
-        $('#download_list_tbody').html('<tr><td colspan="6" class="text-center p-4 text-danger">목록 요청 실패: ' + (error || status) + '</td></tr>');
+        $('#download_list_tbody').html('<tr><td colspan="3" class="text-center p-4 text-danger">목록 요청 실패: ' + (error || status) + '</td></tr>');
       }
     }
   });
@@ -415,6 +415,7 @@ $(document).on('click', '.direct_download_btn', function (e) {
 
   var destSelect = $('#modal_direct_dest_type');
   destSelect.empty();
+  destSelect.append('<option value="">프로필/현재 엔진 목적지 자동 상속</option>');
   if (cached_transporter_schemas && cached_transporter_schemas.length > 0) {
     for (var k = 0; k < cached_transporter_schemas.length; k++) {
       var s = cached_transporter_schemas[k];
@@ -456,10 +457,8 @@ function apply_direct_preset(presetName) {
   modal_direct_chain = (prof.priority_chain && prof.priority_chain.length > 0) ? JSON.parse(JSON.stringify(prof.priority_chain)) : [];
   render_direct_chain_table();
 
-  var dest = prof.destination || {};
-  var destType = dest.type || 'local';
-  $('#modal_direct_dest_type').val(destType);
-  render_direct_dynamic_dest_fields(destType, dest);
+  $('#modal_direct_dest_type').val('');
+  render_direct_dynamic_dest_fields('', {});
 }
 
 $(document).on('change', '#modal_direct_preset_select', function () {
@@ -531,6 +530,7 @@ $(document).on('click', '.direct-chain-remove-btn', function (e) {
 function render_direct_dynamic_dest_fields(transporter_id, current_values) {
   var container = $('#modal_direct_dynamic_dest_fields');
   container.empty();
+  if (!transporter_id) { container.text('실제로 선택된 엔진의 기본 목적지와 프로필의 엔진별 설정을 사용합니다.'); return; }
 
   var schemaObj = cached_transporter_schemas.find(function (s) { return s.transporter_id === transporter_id; });
   if (!schemaObj || !schemaObj.config_schema || schemaObj.config_schema.length === 0) {
@@ -551,7 +551,14 @@ function render_direct_dynamic_dest_fields(transporter_id, current_values) {
     html += '  <label class="col-sm-3 col-form-label text-right font-weight-bold">' + f.label + '</label>';
     html += '  <div class="col-sm-9">';
 
-    if (f.type === 'checkbox') {
+    if (f.type === 'radio') {
+      html += '<div id="direct_dest_field_' + f.name + '" class="d-flex flex-wrap">';
+      (f.options || []).forEach(function (option) {
+        html += '<label class="form-check form-check-inline"><input class="form-check-input" type="radio" name="direct_dest_' + f.name + '" value="' + option.value + '"' +
+          (String(val) === option.value ? ' checked' : '') + '><span class="form-check-label">' + option.label + '</span></label>';
+      });
+      html += '</div>';
+    } else if (f.type === 'checkbox') {
       var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
       html += '    <input type="checkbox" id="direct_dest_field_' + f.name + '" class="mt-2" ' + isChk + '>';
     } else if (f.type === 'number') {
@@ -593,7 +600,10 @@ $(document).on('click', '#btn_confirm_direct_download', function (e) {
     for (var i = 0; i < schemaObj.config_schema.length; i++) {
       var f = schemaObj.config_schema[i];
       var el = $('#direct_dest_field_' + f.name);
-      if (f.type === 'checkbox') {
+      if (f.type === 'radio') {
+        var selected = el.find('input:checked').val();
+        if (selected !== '' && selected != null) destObj[f.name] = f.allow_inherit ? selected === 'true' : selected;
+      } else if (f.type === 'checkbox') {
         destObj[f.name] = el.is(':checked');
       } else if (f.type === 'number') {
         destObj[f.name] = parseInt(el.val()) || 0;
@@ -614,7 +624,7 @@ $(document).on('click', '#btn_confirm_direct_download', function (e) {
       feed_name: feed,
       priority_chain: JSON.stringify(modal_direct_chain),
       destination_type: destType,
-      destination_config: JSON.stringify(destObj)
+      destination_config: destType ? JSON.stringify(destObj) : ''
     },
     dataType: 'json',
     success: function (data) {

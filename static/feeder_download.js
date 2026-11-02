@@ -303,17 +303,51 @@ function pipeline_control_unavailable() {
 $('#pipeline_pause_btn, #pipeline_resume_btn').click(function () {
   if (pipeline_control_changing) return;
   var command = this.id === 'pipeline_pause_btn' ? 'pause_pipeline' : 'resume_pipeline';
+  if (command === 'resume_pipeline' && last_pipeline_control && last_pipeline_control.pipeline_locked) {
+    $('#pipeline_resume_owner').val(last_pipeline_control.pipeline_owner);
+    $('#pipeline_finished_confirm').prop('checked', false);
+    $('#pipeline_recover_resume_btn').prop('disabled', true);
+    $('#pipeline_resume_modal').modal('show');
+    return;
+  }
+  change_pipeline_control(command);
+});
+
+$('#pipeline_finished_confirm').change(function () {
+  $('#pipeline_recover_resume_btn').prop('disabled', !$(this).is(':checked'));
+});
+
+$('#pipeline_continue_btn').click(function () {
+  if (pipeline_control_changing) return;
+  $('#pipeline_resume_modal').modal('hide');
+  change_pipeline_control('resume_pipeline');
+});
+
+$('#pipeline_recover_resume_btn').click(function () {
+  if (pipeline_control_changing) return;
+  if (!$('#pipeline_finished_confirm').is(':checked')) {
+    notify('이전 Celery 작업과 실제 전송이 종료됐는지 먼저 확인해주세요.', 'warning');
+    return;
+  }
+  var owner = $('#pipeline_resume_owner').val();
+  $('#pipeline_resume_modal').modal('hide');
+  change_pipeline_control('resume_pipeline', {recover_lock: 'true', confirm_finished: 'true', expected_owner: owner});
+});
+
+function change_pipeline_control(command, data) {
+  if (pipeline_control_changing) return;
   pipeline_control_changing = true;
   pipeline_control_version += 1;
   $('#pipeline_pause_btn, #pipeline_resume_btn').prop('disabled', true);
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/' + command,
-    type: 'POST', dataType: 'json', timeout: 10000
+    type: 'POST', data: data || {}, dataType: 'json', timeout: 10000
   }).done(function (data) {
     if (queue_page_closed) return;
-    if (data.ret === 'success' && data.control) {
+    if (data.control) {
       render_pipeline_control(data.control);
-      notify(command === 'pause_pipeline' ? '진행 중인 작업이 끝나면 중단합니다.' : '작업 중단 상태를 해제했습니다.', 'info');
+      notify(data.msg || (data.ret === 'success' ? '작업 상태를 변경했습니다.' : '현재 상태를 다시 확인해주세요.'),
+        data.ret === 'success' ? 'info' : 'warning');
     } else {
       last_pipeline_control = null;
       pipeline_control_unavailable();
@@ -331,7 +365,7 @@ $('#pipeline_pause_btn, #pipeline_resume_btn').click(function () {
       if (last_pipeline_control) render_pipeline_control(last_pipeline_control);
       refresh_pipeline_control();
     });
-});
+}
 
 function request_active_queue() {
   if (!queue_page_closed && feeder_dashboard) feeder_dashboard.refresh();
@@ -623,7 +657,8 @@ function render_queue_rows(list, activeStage, queueTime) {
         var singleDisabled = !last_pipeline_control || last_pipeline_control.state !== 'paused';
         str += '      <button type="button" class="btn btn-sm btn-outline-primary queue_action_btn" data-action="execute_single" data-id="' + it.id + '"' + (singleDisabled ? ' disabled' : '') + ' title="전체 작업이 완전히 중단된 상태에서 이 항목만 실행합니다.">개별 실행</button>';
       }
-      str += '      <button type="button" class="btn btn-sm btn-warning text-dark font-weight-bold queue_action_btn" data-action="retry" data-id="' + it.id + '">재시도</button>';
+      str += '      <button type="button" class="btn btn-sm btn-warning text-dark font-weight-bold queue_action_btn" data-action="retry" data-id="' + it.id + '" title="현재 전송 단계 또는 보존된 로컬 파일부터 재개합니다.">재시도</button>';
+      str += redownload_button(it, 'queue_action_btn');
       str += '      <button type="button" class="btn btn-sm btn-success text-white queue_action_btn" data-action="force_complete" data-id="' + it.id + '">완료</button>';
       str += '      <button type="button" class="btn btn-sm btn-secondary text-white queue_action_btn" data-action="force_fail" data-id="' + it.id + '">실패</button>';
       str += '      <button type="button" class="btn btn-sm btn-danger text-white queue_action_btn" data-action="delete" data-id="' + it.id + '">삭제</button>';
@@ -665,11 +700,23 @@ $('#queue_refresh_btn').click(function (e) {
   request_active_queue();
 });
 
+function redownload_button(item, actionClass) {
+  if (['pending', 'pending_local_staging', 'downloaded', 'waiting_transporter', 'pending_upload', 'move_failed', 'failed', 'completed', 'cancelled'].indexOf(item.status) === -1) return '';
+  var size = ['queue_action_btn', 'btn_list_action'].indexOf(actionClass) !== -1 ? 'btn-sm ' : '';
+  return '<button type="button" class="btn ' + size + 'btn-outline-warning ' + actionClass + '" data-action="redownload" data-id="' + queue_escape_html(item.id) + '" title="임시 파일과 이전 전송 상태를 정리하고 1순위 엔진부터 다시 등록합니다.">처음부터 다시 받기</button>';
+}
+function confirm_redownload() {
+  return confirm('기존 엔진 작업과 임시 업로드·로컬 스테이징 파일을 정리하고 1순위 엔진부터 다시 등록하시겠습니까?\n기존 최종 보관 파일은 삭제하지 않습니다. 작업 중단 상태는 유지됩니다.');
+}
+
 $(document).on('click', '.queue_action_btn', function (e) {
   e.preventDefault();
   var act = $(this).data('action');
   var id = $(this).data('id');
   var targetRow = $(this).closest('tr');
+  var actionButton = $(this);
+  if (act === 'redownload' && (actionButton.prop('disabled') || !confirm_redownload())) return;
+  if (act === 'redownload') actionButton.prop('disabled', true);
 
   if (act === 'block' && !confirm('전송을 즉시 중단하고 이 콘텐츠를 차단하시겠습니까?\n로컬 스테이징과 원격 임시 업로드 파일도 삭제합니다.')) return;
   if (act === 'execute_single') $('.queue_action_btn[data-action="execute_single"]').prop('disabled', true);
@@ -679,6 +726,7 @@ $(document).on('click', '.queue_action_btn', function (e) {
     type: 'POST',
     data: { action: act, id: id },
     dataType: 'json',
+    complete: function () { if (act === 'redownload') actionButton.prop('disabled', false); },
     success: function (data) {
       if (queue_page_closed) return;
       if (data.ret === 'success') {
@@ -726,7 +774,7 @@ $(document).on('click', '.adopt_orphan_btn', function (e) {
       var p = cached_download_profiles[i];
       // 1순위 엔진이 대상 엔진과 일치하는 프로필만 선택지로 추가
       if (p.priority_chain && p.priority_chain.length > 0 && p.priority_chain[0].toLowerCase() === targetEngine.toLowerCase()) {
-        pSelect.append('<option value="' + p.name + '">' + p.name + ' (목적지: ' + (p.destination ? p.destination.type : 'local') + ')</option>');
+        pSelect.append('<option value="' + p.name + '">' + p.name + ' (목적지: ' + '엔진별 설정' + ')</option>');
         matchingCount++;
       }
     }
@@ -789,6 +837,7 @@ function load_retry_profiles() {
     dataType: 'json',
     success: function (data) {
       cached_download_profiles = data.profiles || [];
+      current_downloaders = data.downloaders || current_downloaders;
     }
   });
 }
@@ -798,7 +847,7 @@ function make_list(list) {
   var tbody = $('#download_list_tbody');
   if (!tbody.length) return;
   if (!list || list.length === 0) {
-    tbody.html('<tr><td colspan="4" class="py-4 text-muted">검색 조건에 일치하는 다운로드 이력이 없습니다.</td></tr>');
+    tbody.html('<tr><td colspan="3" class="py-4 text-muted">검색 조건에 일치하는 다운로드 이력이 없습니다.</td></tr>');
     return;
   }
 
@@ -834,18 +883,17 @@ function make_list(list) {
     detailHtml += '  <strong style="font-size: 0.95rem;">' + it.title + '</strong>';
     detailHtml += '</div>';
 
-    // 2행: 파일명 (용량) + 저장 경로 + [우측: 완료시각] (한 줄 통합 배치)
+    // 2행: 파일명 (용량) + 저장 경로
     var fsizeText = it.file_size ? ' (' + format_bytes(it.file_size) + ')' : '';
     var nameAndSize = it.file_name
       ? '<span class="font-weight-bold text-info mr-2"><i class="fa fa-folder-open-o mr-1"></i>' + it.file_name + fsizeText + '</span>'
       : (fsizeText ? '<span class="badge badge-secondary mr-2"><i class="fa fa-database mr-1"></i>' + format_bytes(it.file_size) + '</span>' : '');
 
-    detailHtml += '<div class="small text-muted d-flex justify-content-between align-items-center flex-wrap" style="line-height: 1.5;">';
+    detailHtml += '<div class="queue-file-location small text-muted d-flex align-items-center flex-wrap" style="line-height: 1.5;">';
     detailHtml += '  <div class="d-inline-flex align-items-center flex-wrap mr-2">';
     detailHtml +=      nameAndSize;
     detailHtml += '    <span class="mr-2"><i class="fa fa-hdd-o mr-1"></i>' + pathDisplay + '</span>';
     detailHtml += '  </div>';
-    detailHtml += '  <span class="text-muted ml-auto"><i class="fa fa-clock-o mr-1"></i>' + timeStr + '</span>';
     detailHtml += '</div>';
 
     detailHtml += errorMsg;
@@ -853,17 +901,20 @@ function make_list(list) {
     str += '<tr>';
     str += '  <td class="font-weight-bold">' + it.id + '</td>';
     str += '  <td>' + statusBadge + engineInfo + '</td>';
-    str += '  <td class="text-left">' + detailHtml + '</td>';
-    str += '  <td>';
-    str += '    <div class="btn-group btn-group-sm">';
+    str += '  <td class="text-left">' + detailHtml;
+    str += '    <div class="queue-item-actions d-flex flex-wrap align-items-center mt-2 pt-1">';
+    str += '      <span class="small text-muted text-nowrap mr-2"><i class="fa fa-clock-o mr-1"></i>' + timeStr + '</span>';
+    str += '      <div class="queue-item-buttons d-flex flex-wrap justify-content-end ml-auto">';
     if (it.status !== 'blocked') {
-    str += '      <button type="button" class="btn btn-warning text-dark font-weight-bold btn_list_action" data-action="retry" data-id="' + it.id + '">재시도</button>';
-    str += '      <button type="button" class="btn btn-success text-white btn_list_action" data-action="force_complete" data-id="' + it.id + '">완료</button>';
-    str += '      <button type="button" class="btn btn-secondary text-white btn_list_action" data-action="force_fail" data-id="' + it.id + '">실패</button>';
+    str += '      <button type="button" class="btn btn-sm btn-warning text-dark font-weight-bold btn_list_action" data-action="retry" data-id="' + it.id + '" title="현재 전송 단계 또는 보존된 로컬 파일부터 재개합니다.">재시도</button>';
+    str += '      <button type="button" class="btn btn-sm btn-success text-white btn_list_action" data-action="force_complete" data-id="' + it.id + '">완료</button>';
+    str += '      <button type="button" class="btn btn-sm btn-secondary text-white btn_list_action" data-action="force_fail" data-id="' + it.id + '">실패</button>';
     }
-    str += '      <button type="button" class="btn btn-danger text-white btn_list_action" data-action="delete" data-id="' + it.id + '">삭제</button>';
-    if (it.status !== 'blocked') str += '      <button type="button" class="btn btn-outline-danger btn_list_action" data-action="block" data-id="' + it.id + '">중단·차단</button>';
-    else str += '      <button type="button" class="btn btn-outline-danger blacklist_open_btn">차단 관리</button>';
+    str += redownload_button(it, 'btn_list_action');
+    str += '      <button type="button" class="btn btn-sm btn-danger text-white btn_list_action" data-action="delete" data-id="' + it.id + '">삭제</button>';
+    if (it.status !== 'blocked') str += '      <button type="button" class="btn btn-sm btn-outline-danger btn_list_action" data-action="block" data-id="' + it.id + '">중단·차단</button>';
+    else str += '      <button type="button" class="btn btn-sm btn-outline-danger blacklist_open_btn">차단 관리</button>';
+    str += '      </div>';
     str += '    </div>';
     str += '  </td>';
     str += '</tr>';
@@ -926,10 +977,7 @@ $('#modal_retry_profile_select').change(function () {
   var pObj = cached_download_profiles.find(function (p) { return p.name === pName; });
   if (pObj) {
     var chainStr = (pObj.priority_chain || []).join(' -> ') || '(비어있음)';
-    var dest = pObj.destination || {};
-    var destStr = dest.type || 'local';
-    if (dest.type === 'colab_gdrive') destStr += ' (Colab 무트래픽)';
-    else if (dest.type === 'gdrive_rotation') destStr += ' (SA 15GB 우회)';
+    var destStr = (pObj.priority_chain || []).map(function (engine) { return engine + ': ' + (ui_profile_destination(pObj, engine).type || '미설정'); }).join(' / ');
 
     $('#modal_retry_chain_preview').text(chainStr);
     $('#modal_retry_dest_preview').text(destStr);
@@ -946,6 +994,9 @@ $(document).on('click', '.btn_list_action', function (e) {
   var item = cached_download_list.find(function (x) { return String(x.id) === String(id); });
   var titleText = item ? item.title : ('ID: ' + id);
   var targetRow = $(this).closest('tr');
+  var actionButton = $(this);
+  if (act === 'redownload' && (actionButton.prop('disabled') || !confirm_redownload())) return;
+  if (act === 'redownload') actionButton.prop('disabled', true);
 
   if (act === 'retry') {
     $('#modal_retry_item_id').val(id);
@@ -985,6 +1036,7 @@ $(document).on('click', '.btn_list_action', function (e) {
     type: 'POST',
     data: { action: act, id: id },
     dataType: 'json',
+    complete: function () { if (act === 'redownload') actionButton.prop('disabled', false); },
     success: function (data) {
       if (data.ret === 'success') {
         notify(data.msg || '작업이 처리되었습니다.', 'success');
@@ -1087,9 +1139,13 @@ function load_all_download_config() {
     type: 'POST',
     dataType: 'json',
     success: function (data) {
+      if (data.upload_roots) configured_upload_roots = data.upload_roots;
+      if (data.local_staging_root) configured_local_staging_root = data.local_staging_root;
       current_downloaders = data.downloaders || [];
       available_engine_schemas = data.schemas || [];
+      available_transporter_schemas = data.transporter_schemas || available_transporter_schemas;
       render_downloaders(current_downloaders);
+      render_profiles(current_profiles);
       update_engine_type_dropdown();
     }
   });
@@ -1099,11 +1155,14 @@ function load_all_download_config() {
     type: 'POST',
     dataType: 'json',
     success: function (data) {
+      if (data.upload_roots) configured_upload_roots = data.upload_roots;
+      if (data.local_staging_root) configured_local_staging_root = data.local_staging_root;
       current_profiles = data.profiles || [];
       available_feeds = data.feeds || [];
       available_transporter_schemas = data.transporter_schemas || [];
+      current_downloaders = data.downloaders || current_downloaders;
       render_profiles(current_profiles);
-      update_profile_dest_type_dropdown();
+      render_downloaders(current_downloaders);
     }
   });
 
@@ -1145,7 +1204,7 @@ function render_downloaders(data) {
     } else {
       // 커스텀 엔진(AllDebrid, PikPak 등): 식별용 주요 설정값 동적 표시
       var keys = Object.keys(item).filter(function (k) {
-        return ['name', 'engine_type', 'enabled', 'stalled_timeout_hours', 'missing_timeout_hours', 'webdav_failure_timeout_hours'].indexOf(k) === -1 && !/key|token|secret|password|credential/i.test(k);
+        return ['name', 'engine_type', 'enabled', 'stalled_timeout_hours', 'missing_timeout_hours', 'webdav_failure_timeout_hours', 'default_destination'].indexOf(k) === -1 && !/key|token|secret|password|credential/i.test(k);
       });
       connDetail = keys.slice(0, 3).map(function (k) {
         var val = item[k];
@@ -1156,7 +1215,7 @@ function render_downloaders(data) {
 
     str += '<tr>';
     str += '  <td class="font-weight-bold">' + item.name + '</td>';
-    str += '  <td><span class="badge badge-info">' + item.engine_type + '</span></td>';
+    str += '  <td><span class="badge badge-info">' + item.engine_type + '</span><br><small>기본 목적지: ' + queue_escape_html((item.default_destination || {}).type || '미설정') + '</small></td>';
     str += '  <td>' + statusBadge + '<br><small class="text-muted">' + timeoutStr + '</small></td>';
     str += '  <td class="text-left small">' + connDetail + '</td>';
     str += '  <td>';
@@ -1173,6 +1232,9 @@ function render_downloaders(data) {
 function update_engine_type_dropdown(selected_type) {
   var select = $('#dl_engine_type');
   select.empty();
+  if (selected_type && !available_engine_schemas.some(function (schema) { return schema.engine_id === selected_type; })) {
+    select.append('<option selected value="' + queue_escape_html(selected_type) + '">사용 불가: ' + queue_escape_html(selected_type) + '</option>');
+  }
   if (!available_engine_schemas || available_engine_schemas.length === 0) {
     select.append('<option value="">-- 등록된 엔진 없음 --</option>');
     return;
@@ -1214,11 +1276,11 @@ function render_dynamic_engine_fields(engine_id, current_values) {
       var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
       html += '    <input type="checkbox" id="dl_field_' + f.name + '" class="mt-2" ' + isChk + '>';
     } else if (f.type === 'number') {
-      html += '    <input type="number" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '"' + (f.min !== undefined ? ' min="' + f.min + '"' : '') + (f.max !== undefined ? ' max="' + f.max + '"' : '') + (f.step !== undefined ? ' step="' + f.step + '"' : '') + '>';
+      html += '    <input type="number" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + queue_escape_html(val) + '" placeholder="' + ph + '"' + (f.min !== undefined ? ' min="' + f.min + '"' : '') + (f.max !== undefined ? ' max="' + f.max + '"' : '') + (f.step !== undefined ? ' step="' + f.step + '"' : '') + '>';
     } else if (f.type === 'password') {
-      html += '    <input type="password" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+      html += '    <input type="password" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + queue_escape_html(val) + '" placeholder="' + ph + '">';
     } else {
-      html += '    <input type="text" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+      html += '    <input type="text" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + queue_escape_html(val) + '" placeholder="' + ph + '">';
     }
 
     html += descHtml;
@@ -1246,6 +1308,9 @@ $(document).on('click', '#downloader_add_btn', function (e) {
   var default_engine = available_engine_schemas.length > 0 ? available_engine_schemas[0].engine_id : '';
   update_engine_type_dropdown(default_engine);
   render_dynamic_engine_fields(default_engine, null);
+  update_engine_dest_type_dropdown('local');
+  render_dynamic_dest_fields('local', {});
+  set_engine_roots({});
 
   $('#downloader_modal').modal('show');
 });
@@ -1262,6 +1327,9 @@ $(document).on('click', '.edit_dl_btn', function (e) {
 
   update_engine_type_dropdown(item.engine_type);
   render_dynamic_engine_fields(item.engine_type, item);
+  update_engine_dest_type_dropdown((item.default_destination || {}).type || '');
+  render_dynamic_dest_fields((item.default_destination || {}).type || '', item.default_destination || {});
+  set_engine_roots(item);
 
   $('#downloader_modal').modal('show');
 });
@@ -1274,12 +1342,14 @@ $(document).on('click', '#downloader_test_btn', function (e) {
 
   var cfg = { name: name, engine_type: e_type };
   var schemaObj = available_engine_schemas.find(function (s) { return s.engine_id === e_type; });
+  if (!schemaObj) { notify('엔진 설정 스키마를 확인할 수 없습니다. 엔진을 복구하거나 다시 선택해주세요.', 'warning'); return; }
   if (schemaObj && schemaObj.config_schema) {
     for (var i = 0; i < schemaObj.config_schema.length; i++) {
       var f = schemaObj.config_schema[i];
       var el = $('#dl_field_' + f.name);
       if (f.type === 'checkbox') cfg[f.name] = el.is(':checked');
       else if (f.type === 'number') cfg[f.name] = f.name === 'webdav_failure_timeout_hours' ? el.val() : (parseInt(el.val()) || 0);
+      else if (f.type === 'password') cfg[f.name] = el.val();
       else cfg[f.name] = el.val().trim();
     }
   }
@@ -1319,16 +1389,26 @@ $(document).on('click', '#downloader_save_btn', function (e) {
   };
 
   var schemaObj = available_engine_schemas.find(function (s) { return s.engine_id === e_type; });
+  if (!schemaObj) { notify('엔진 설정 스키마를 확인할 수 없습니다. 엔진을 복구하거나 다시 선택해주세요.', 'warning'); return; }
   if (schemaObj && schemaObj.config_schema) {
     for (var i = 0; i < schemaObj.config_schema.length; i++) {
       var f = schemaObj.config_schema[i];
       var el = $('#dl_field_' + f.name);
       if (f.type === 'checkbox') cfg[f.name] = el.is(':checked');
       else if (f.type === 'number') cfg[f.name] = f.name === 'webdav_failure_timeout_hours' ? el.val() : (parseInt(el.val()) || 0);
-      else cfg[f.name] = el.val().trim();
+      else cfg[f.name] = f.type === 'password' ? el.val() : el.val().trim();
     }
   }
 
+  Object.assign(cfg, read_engine_roots());
+  for (var rootKey of Object.keys(read_engine_roots())) {
+    var rootError = ui_relative_path_error(cfg[rootKey]);
+    if (rootError) { notify(rootError, 'warning'); return; }
+  }
+  cfg.default_destination = read_engine_default_destination();
+  var effective = ui_resolve_destination_paths(cfg.default_destination, cfg, {});
+  if (effective._path_error) { notify(effective._path_error, 'warning'); return; }
+  if (!cfg.default_destination.type) { notify('기본 목적지를 설정해주세요.', 'warning'); return; }
   button.prop('disabled', true);
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/save_downloader',
@@ -1341,6 +1421,9 @@ $(document).on('click', '#downloader_save_btn', function (e) {
         // 검증된 고정 문구만 표시하여 서버 응답에 섞인 인증 값의 노출을 막는다.
         var errors = {
           empty_name: '식별명을 입력하세요.',
+          '업로드 루트는 유효한 비어있지 않은 상대 경로로 지정해주세요.': '업로드 루트는 유효한 비어있지 않은 상대 경로로 지정해주세요.',
+          '다운로드 상위 폴더는 유효한 한 개의 폴더명으로 지정해주세요.': '다운로드 상위 폴더는 유효한 한 개의 폴더명으로 지정해주세요.',
+          '임시 업로드 경로와 최종 이동 경로가 같거나 서로 포함되지 않도록 설정해주세요.': '임시 업로드 경로와 최종 이동 경로가 같거나 서로 포함되지 않도록 설정해주세요.',
           'WebDAV 실패 유예는 0~8760 사이의 정수 시간이어야 합니다.': 'WebDAV 실패 유예는 0~8760 사이의 정수 시간이어야 합니다.'
         };
         var message = Object.prototype.hasOwnProperty.call(errors, result) ? errors[result] : '다운로더 설정을 저장하지 못했습니다. 입력값을 확인하고 다시 시도하세요.';
@@ -1349,8 +1432,11 @@ $(document).on('click', '#downloader_save_btn', function (e) {
       }
       notify('다운로더 설정이 저장되었습니다.', 'success');
       $('#downloader_modal').modal('hide');
+      if (data.upload_roots) configured_upload_roots = data.upload_roots;
+      if (data.local_staging_root) configured_local_staging_root = data.local_staging_root;
       current_downloaders = data.downloaders || [];
       render_downloaders(current_downloaders);
+      render_profiles(current_profiles);
     },
     error: function () {
       notify('다운로더 설정 저장 중 통신 오류가 발생했습니다. 입력값은 유지됩니다.', 'danger');
@@ -1372,6 +1458,8 @@ $(document).on('click', '.delete_dl_btn', function (e) {
     dataType: 'json',
     success: function (data) {
       notify('삭제되었습니다.', 'success');
+      if (data.upload_roots) configured_upload_roots = data.upload_roots;
+      if (data.local_staging_root) configured_local_staging_root = data.local_staging_root;
       current_downloaders = data.downloaders || [];
       render_downloaders(current_downloaders);
     }
@@ -1485,9 +1573,149 @@ $(document).on('click', '#download_script_delete_btn', function (e) {
   });
 });
 
-function update_profile_dest_type_dropdown(selected_type) {
-  var select = $('#profile_dest_type');
+var configured_upload_roots = {upload_root: 'incoming', complete_root: 'uploads'};
+var configured_local_staging_root = '';
+$(document).on('ajaxSuccess', function (event, xhr, settings, data) {
+  if (settings && settings.url && settings.url.split('?')[0].endsWith('/' + package_name + '/ajax/' + sub + '/setting_save') && data && data.ret === 'success') {
+    load_all_download_config();
+  }
+});
+function remote_destination_type(type) {
+  return ['rclone_simple', 'gdrive_rotation', 'remote_worker'].indexOf(type) !== -1;
+}
+function destination_form_fields(schema) {
+  return ((schema || {}).config_schema || []).filter(function (field) {
+    return !remote_destination_type((schema || {}).transporter_id) || ['upload_path', 'complete_path', 'staging_path'].indexOf(field.name) === -1;
+  });
+}
+function ui_relative_path_error(value, single) {
+  if (typeof value !== 'string' || !value.trim() || /[:\\\x00-\x1f\x7f-\x9f]/.test(value)) return '비어있지 않은 상대 경로를 지정해주세요.';
+  var parts = value.split('/');
+  if ((single && parts.length !== 1) || parts.some(function (part) { return !part.trim() || part.trim() === '.' || part.trim() === '..'; })) return single ? '슬래시 없는 폴더명 하나를 지정해주세요.' : '유효한 상대 경로를 지정해주세요.';
+  return '';
+}
+function ui_profile_folder(profile) {
+  var folder = profile.destination_subfolder;
+  return folder == null || (typeof folder === 'string' && !folder.trim()) ? (Object.prototype.hasOwnProperty.call(profile, 'name') ? profile.name : 'direct') : folder;
+}
+function ui_download_subpath(engine, profile) {
+  var up = Object.prototype.hasOwnProperty.call(engine, 'upload_root') ? engine.upload_root : configured_upload_roots.upload_root;
+  var folder = ui_profile_folder(profile);
+  var error = ui_relative_path_error(up) || ui_relative_path_error(folder, true);
+  if (error) throw new Error(error);
+  return up + '/' + folder;
+}
+function ui_resolve_destination_paths(destination, engine, profile) {
+  var result = Object.assign({}, destination);
+  if (!remote_destination_type(result.type)) return result;
+  var end = Object.prototype.hasOwnProperty.call(engine, 'complete_root') ? engine.complete_root : configured_upload_roots.complete_root;
+  var error = ui_relative_path_error(end);
+  try { result.upload_path = ui_download_subpath(engine, profile); }
+  catch (exc) { error = exc.message; }
+  result.complete_path = error ? '' : end + '/' + ui_profile_folder(profile);
+  if (!error && (result.upload_path === result.complete_path || result.upload_path.indexOf(result.complete_path + '/') === 0 || result.complete_path.indexOf(result.upload_path + '/') === 0)) error = '임시·최종 경로가 같거나 서로 포함되지 않도록 설정해주세요.';
+  if (error) { result._path_error = error; result.upload_path = ''; }
+  return result;
+}
+function set_engine_roots(engine) {
+  ['upload_root', 'complete_root'].forEach(function (key) {
+    var custom = Object.prototype.hasOwnProperty.call(engine, key);
+    $('#engine_' + key).val(custom ? engine[key] : '').prop('readonly', false)
+      .attr('placeholder', '비워두면 DOWNLOAD 기본 설정 상속 (' + configured_upload_roots[key] + ')');
+  });
+}
+function read_engine_roots() {
+  var result = {};
+  ['upload_root', 'complete_root'].forEach(function (key) {
+    var value = $('#engine_' + key).val();
+    if (value && value.trim()) result[key] = value;
+  });
+  return result;
+}
+function set_profile_subfolder(profile) {
+  var folder = profile.destination_subfolder;
+  $('#profile_subfolder').val(typeof folder === 'string' && folder.trim() ? folder : '').prop('readonly', false)
+    .attr('placeholder', '비워두면 프로필명 사용 (예: ' + (profile.name || 'movies') + ')');
+}
+function profile_path_draft() {
+  var draft = {name: $('#profile_name').val().trim(), destination_by_engine: modal_engine_destinations};
+  var folder = $('#profile_subfolder').val();
+  if (folder && folder.trim()) draft.destination_subfolder = folder;
+  return draft;
+}
+function profile_path_preview(engineName) {
+  var profile = profile_path_draft(), dest = ui_profile_destination(profile, engineName);
+  var engine = current_downloaders.find(function (item) { return String(item.name).trim().toLowerCase() === String(engineName).trim().toLowerCase(); }) || {};
+  var source, error = dest._path_error;
+  try {
+    source = !remote_destination_type(dest.type) && dest.type !== 'local' && dest.upload_path !== undefined ? dest.upload_path : ui_download_subpath(engine, profile);
+    error = error || ui_relative_path_error(source);
+  } catch (exc) { error = exc.message; }
+  if (error) return '<div class="text-warning small mt-2">' + queue_escape_html(error) + '</div>';
+  var sourceRoot = engine.save_path || (engine.cd2_virtual_path ? '/' + engine.cd2_virtual_path.replace(/^\/+|\/+$/g, '') : '[엔진 저장 루트]');
+  var diskRoot = $('#download_local_staging_path').length ? $('#download_local_staging_path').val() : '';
+  diskRoot = diskRoot || configured_local_staging_root || '[로컬 스테이징 루트]';
+  var rows = [
+    ['다운로드 원본', sourceRoot.replace(/\/+$/, '') + '/' + source],
+    ['로컬 스테이징', dest.type === 'remote_worker' ? '미사용 · 원격 워커' : diskRoot.replace(/\/+$/, '') + '/' + source + ' (사용 시)']
+  ];
+  if (remote_destination_type(dest.type)) {
+    rows.push(['임시 업로드', dest.upload_path], ['최종 이동', dest.complete_path]);
+  } else if (dest.type === 'local') {
+    rows.push(['최종 이동', '로컬 파일 이동' + (dest.complete_path ? ': ' + dest.complete_path : '')]);
+  } else {
+    rows.push(['이송 경로', '커스텀 핸들러의 경로 설정을 사용합니다.']);
+  }
+  return '<div class="small mt-2 text-break">' + rows.map(function (row) { return queue_escape_html(row[0]) + ': ' + queue_escape_html(row[1]); }).join('<br>') + '</div>';
+}
+$(document).on('change input', '#profile_subfolder, #profile_name, #download_local_staging_path', function () {
+  $('#profile_subfolder').attr('placeholder', '비워두면 프로필명 사용 (예: ' + ($('#profile_name').val().trim() || 'movies') + ')');
+  render_engine_destinations();
+});
+
+function ui_engine_destination(engineName) {
+  var engine = current_downloaders.find(function (d) { return String(d.name).trim().toLowerCase() === String(engineName).trim().toLowerCase(); });
+  return Object.assign({}, engine && engine.default_destination || {});
+}
+function ui_profile_destination(profile, engineName) {
+  var base = ui_engine_destination(engineName);
+  var key = Object.keys(profile.destination_by_engine || {}).find(function (key) { return key.trim().toLowerCase() === String(engineName).trim().toLowerCase(); });
+  var override = (profile.destination_by_engine || {})[key] || {};
+  if (typeof override === 'string') override = {type:override};
+  if (Object.prototype.hasOwnProperty.call(override, 'type') && override.type !== base.type) base = {};
+  var engine = current_downloaders.find(function (d) { return String(d.name).trim().toLowerCase() === String(engineName).trim().toLowerCase(); }) || {};
+  return ui_resolve_destination_paths(Object.assign(base, override), engine, profile);
+}
+function profile_destination_draft(profile) {
+  var result = {};
+  (profile.priority_chain || []).forEach(function (engineName) {
+    var key = Object.keys(profile.destination_by_engine || {}).find(function (key) { return key.trim().toLowerCase() === engineName.trim().toLowerCase(); });
+    if (key) result[engineName] = typeof profile.destination_by_engine[key] === 'string'
+      ? {type:profile.destination_by_engine[key]} : Object.assign({}, profile.destination_by_engine[key]);
+  });
+  return result;
+}
+function read_engine_default_destination() {
+  var type = $('#engine_dest_type').val();
+  var result = {type:type};
+  var schema = available_transporter_schemas.find(function (s) { return s.transporter_id === type; });
+  destination_form_fields(schema).forEach(function (field) {
+    var el = $('#dest_field_' + field.name), value;
+    if (field.type === 'radio') value = el.find('input:checked').val();
+    else if (field.type === 'checkbox' && !field.allow_inherit) value = el.is(':checked');
+    else value = el.val();
+    if (field.allow_inherit) { if (value === '' || value == null) return; value = value === true || value === 'true'; }
+    else if (field.type === 'number') value = Number(value);
+    result[field.name] = value;
+  });
+  return result;
+}
+
+function update_engine_dest_type_dropdown(selected_type) {
+  var select = $('#engine_dest_type');
   select.empty();
+  select.append('<option value="">-- 기본 목적지 설정 필요 --</option>');
+  if (selected_type && !available_transporter_schemas.some(function (s) { return s.transporter_id === selected_type; })) select.append('<option selected value="' + queue_escape_html(selected_type) + '">사용 불가: ' + queue_escape_html(selected_type) + '</option>');
   if (!available_transporter_schemas || available_transporter_schemas.length === 0) {
     select.append('<option value="">-- 등록된 이송 핸들러 없음 --</option>');
     return;
@@ -1554,35 +1782,31 @@ function profile_inherited_pool(engineName) {
 }
 
 function profile_destination_pool(engineName) {
-  if ($('#profile_dest_type').val() === 'gdrive_rotation') return true;
-  var value = $('#dest_field_use_gdrive_pool input:checked').val();
-  return value === 'true' || (value !== 'false' && profile_inherited_pool(engineName));
+  var dest = ui_profile_destination({priority_chain:modal_profile_chain, destination_by_engine:modal_engine_destinations}, engineName);
+  return profile_pool_enabled(dest, profile_inherited_pool(engineName));
 }
 
 function toggle_profile_impersonation() {
-  var engines = modal_profile_chain.length ? modal_profile_chain : [''];
-  var enabled = engines.some(function (engineName) { return profile_destination_pool(engineName); });
-  $('#profile_dynamic_dest_fields .dest-field-row-use_impersonate').toggle(
-    $('#profile_dest_type').val() === 'gdrive_rotation' || enabled);
+  var engine = current_downloaders.find(function (d) { return d.name === $('#dl_name').val(); }) || {};
+  var values = read_engine_default_destination();
+  $('#engine_dynamic_dest_fields .dest-field-row-use_impersonate').toggle(profile_pool_enabled(values,
+    profile_pool_enabled(engine, $('#download_use_gdrive_pool').is(':checked'))));
 }
 
-$(document).on('change', '#dest_field_use_gdrive_pool input', function () {
-  toggle_profile_impersonation();
-  render_engine_destinations();
-});
+$(document).on('change', '#dest_field_use_gdrive_pool input', toggle_profile_impersonation);
 
 function render_dynamic_dest_fields(transporter_id, current_values) {
-  var container = $('#profile_dynamic_dest_fields');
+  var container = $('#engine_dynamic_dest_fields');
   container.empty();
 
   var schemaObj = available_transporter_schemas.find(function (s) { return s.transporter_id === transporter_id; });
   if (!schemaObj || !schemaObj.config_schema || schemaObj.config_schema.length === 0) {
-    container.html('<div class="text-muted small p-2 text-center">해당 목적지에 별도 세부 설정 항목이 없습니다.</div>');
+    container.html('<div class="text-warning small p-2 text-center">' + (!schemaObj ? '목적지 미설정 또는 이송 핸들러를 찾을 수 없습니다.' : '별도 세부 설정 항목이 없습니다.') + '</div>');
     return;
   }
 
   var html = '<hr><h6 class="text-info text-center font-weight-bold mb-3"><i class="fa fa-folder-open mr-1"></i>' + schemaObj.transporter_name + ' 세부 설정</h6>';
-  var fields = schemaObj.config_schema;
+  var fields = destination_form_fields(schemaObj);
 
   for (var i = 0; i < fields.length; i++) {
     var f = fields[i];
@@ -1602,11 +1826,11 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
       var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
       html += '    <div><input type="checkbox" id="dest_field_' + f.name + '" data-toggle="toggle" data-on="On" data-off="Off" data-size="small" ' + isChk + '></div>';
     } else if (f.type === 'number') {
-      html += '    <input type="number" id="dest_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+      html += '    <input type="number" id="dest_field_' + f.name + '" class="form-control form-control-sm" value="' + queue_escape_html(val) + '" placeholder="' + ph + '">';
     } else if (f.type === 'password') {
-      html += '    <input type="password" id="dest_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+      html += '    <input type="password" id="dest_field_' + f.name + '" class="form-control form-control-sm" value="' + queue_escape_html(val) + '" placeholder="' + ph + '">';
     } else {
-      html += '    <input type="text" id="dest_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+      html += '    <input type="text" id="dest_field_' + f.name + '" class="form-control form-control-sm" value="' + queue_escape_html(val) + '" placeholder="' + ph + '">';
     }
 
     html += descHtml;
@@ -1620,57 +1844,10 @@ function render_dynamic_dest_fields(transporter_id, current_values) {
     container.find('input[data-toggle="toggle"]').bootstrapToggle();
   } catch (err) {}
 
-  function toggleStagingPathField() {
-    var stagingChk = $('#dest_field_use_local_staging');
-    if (stagingChk.length > 0) {
-      var stagingValue = stagingChk.is('select') ? stagingChk.val() : stagingChk.find('input:checked').val();
-      if (stagingChk.is(':checkbox') ? stagingChk.is(':checked') : stagingValue !== 'false') {
-        $('.dest-field-row-staging_path').show();
-      } else {
-        $('.dest-field-row-staging_path').hide();
-      }
-    }
-  }
 
-  toggleStagingPathField();
-  $('#dest_field_use_local_staging').on('change', function () {
-    toggleStagingPathField();
-  });
 }
 
-$('#profile_dest_type').change(function () {
-  render_dynamic_dest_fields($(this).val(), null);
-  var pName = $('#profile_name').val().trim() || 'default';
-  var upField = $('#dest_field_upload_path');
-  var stagingField = $('#dest_field_staging_path');
-  var compField = $('#dest_field_complete_path');
-  if (stagingField.length && (!stagingField.val() || stagingField.val() === 'default')) {
-    stagingField.val(pName);
-  }
-  if (upField.length && (!upField.val() || upField.val() === 'default' || upField.val().startsWith('incoming/'))) {
-    upField.val('incoming/' + pName);
-  }
-  if (compField.length && (!compField.val() || compField.val() === 'default' || compField.val().startsWith('uploads/'))) {
-    compField.val('uploads/' + pName);
-  }
-});
-
-$(document).on('input change', '#profile_name', function () {
-  if ($('#profile_mode').val() !== 'add') return;
-  var pName = $(this).val().trim() || 'default';
-  var upField = $('#dest_field_upload_path');
-  var stagingField = $('#dest_field_staging_path');
-  var compField = $('#dest_field_complete_path');
-  if (stagingField.length && (!stagingField.val() || stagingField.val() === 'default')) {
-    stagingField.val(pName);
-  }
-  if (upField.length && (!upField.val() || upField.val() === 'default' || upField.val().startsWith('incoming/'))) {
-    upField.val('incoming/' + pName);
-  }
-  if (compField.length && (!compField.val() || compField.val() === 'default' || compField.val().startsWith('uploads/'))) {
-    compField.val('uploads/' + pName);
-  }
-});
+$('#engine_dest_type').change(function () { render_dynamic_dest_fields($(this).val(), {}); });
 
 function render_profiles(data) {
   var tbody = $('#profile_list_tbody');
@@ -1687,19 +1864,12 @@ function render_profiles(data) {
       return '<span class="badge badge-secondary mr-1">' + (idx + 1) + '. ' + c + '</span>';
     }).join(' <i class="fa fa-arrow-right text-muted small mr-1"></i> ');
 
-    var dest = p.destination || {};
-    var destInfo = '<span class="badge badge-dark">' + (dest.type || 'local') + '</span>';
-    if (dest.type === 'rclone_simple' || dest.type === 'remote_worker') {
-      if (dest.type === 'remote_worker') destInfo = '<span class="badge badge-primary">원격 워커</span>';
-    } else if (dest.type === 'gdrive_rotation') {
-      destInfo = '<span class="badge badge-success">GDrive 계정 풀</span>';
-    } else if (dest.type && dest.type.indexOf('relay') !== -1) {
-      destInfo = '<span class="badge badge-primary">원격 릴레이</span>';
-    } else {
-      // 커스텀 트랜스포터 기본 표기
-      if (dest.type) destInfo = '<span class="badge badge-info">' + dest.type + '</span>';
-    }
-    if (dest.complete_path) destInfo += '<br><small class="text-muted">' + dest.complete_path + '</small>';
+    var destInfo = '<small>' + '엔진 기본값 상속' + '</small>';
+    (p.priority_chain || []).forEach(function (engineName) {
+      var dest = ui_profile_destination(p, engineName);
+      destInfo += '<br><span class="badge badge-dark">' + queue_escape_html(engineName) + ' → ' + queue_escape_html(dest.type || '미설정') + '</span>';
+      if (dest.complete_path) destInfo += '<br><small class="text-muted">' + queue_escape_html(dest.complete_path) + '</small>';
+    });
 
     str += '<tr>';
     str += '  <td class="font-weight-bold">' + p.name + '</td>';
@@ -1802,26 +1972,29 @@ function render_engine_destinations() {
     if (typeof selectedConfig === 'string') selectedConfig = { type: selectedConfig };
     selectedConfig = normalize_profile_transfer_config(selectedConfig);
     if (modal_engine_destinations[engineName]) modal_engine_destinations[engineName] = selectedConfig;
-    var selected = selectedConfig.type || '';
-    var fieldPrefix = 'dest_override_' + String(engineName).replace(/[^a-zA-Z0-9_-]/g, '_');
+    var base = ui_engine_destination(engineName);
+    var selected = selectedConfig.type || (modal_engine_destinations[engineName] ? base.type : '') || '';
+    var fieldPrefix = 'dest_override_' + i + '_' + String(engineName).replace(/[^a-zA-Z0-9_-]/g, '_');
     html += '<tr><td class="font-weight-bold" style="min-width: 80px; white-space: nowrap;">' + engineName + '</td><td>' +
       '<select class="form-control form-control-sm profile-engine-dest-select" data-engine="' + engineName + '">';
-    html += '<option value="">기본 목적지 사용</option>';
+    html += '<option value="">엔진 기본 목적지 사용(자동 상속)</option>';
+    if (selected && !available_transporter_schemas.some(function (s) { return s.transporter_id === selected; })) html += '<option selected value="' + queue_escape_html(selected) + '">사용 불가: ' + queue_escape_html(selected) + '</option>';
     for (var j = 0; j < available_transporter_schemas.length; j++) {
       var schema = available_transporter_schemas[j];
       html += '<option value="' + schema.transporter_id + '"' +
         (schema.transporter_id === selected ? ' selected' : '') + '>' +
         schema.transporter_name + ' (' + schema.transporter_id + ')</option>';
     }
-    html += '</select>';
+    html += '</select><small class="form-text text-muted">엔진 기본값: ' + queue_escape_html(base.type || '미설정 · 엔진에서 먼저 설정해주세요') + '</small>';
     if (selected) {
         var selectedSchema = available_transporter_schemas.find(function (schema) {
           return schema.transporter_id === selected;
         });
         if (selectedSchema && selectedSchema.config_schema) {
           html += '<div class="mt-2 pl-2 border-left">';
-          for (var k = 0; k < selectedSchema.config_schema.length; k++) {
-            var f = selectedSchema.config_schema[k];
+          var fields = destination_form_fields(selectedSchema);
+          for (var k = 0; k < fields.length; k++) {
+            var f = fields[k];
             var value = profile_field_value(f, selectedConfig);
             var inputId = fieldPrefix + '_' + f.name;
             var hidden = f.depends_on === 'use_gdrive_pool' && !profile_pool_enabled(selectedConfig, profile_destination_pool(engineName));
@@ -1835,7 +2008,7 @@ function render_engine_destinations() {
               var checked = (value === true || value === 'true' || value === 'On' || value === 'on') ? ' checked' : '';
               html += '<div><input type="checkbox" class="profile-engine-dest-field" id="' + inputId + '" data-engine="' + engineName + '" data-field="' + f.name + '"' + checked + '></div>';
             } else {
-              html += '<input type="' + (f.type === 'number' ? 'number' : 'text') + '" class="form-control form-control-sm profile-engine-dest-field" id="' + inputId + '" data-engine="' + engineName + '" data-field="' + f.name + '" value="' + value + '" placeholder="' + (f.placeholder || '') + '">';
+              html += '<input type="' + (f.type === 'number' ? 'number' : f.type === 'password' ? 'password' : 'text') + '" class="form-control form-control-sm profile-engine-dest-field" id="' + inputId + '" data-engine="' + engineName + '" data-field="' + f.name + '" value="' + queue_escape_html(value) + '" placeholder="' + (f.placeholder || '') + '">';
             }
             if (f.desc) html += '<small class="form-text text-muted">' + f.desc + '</small>';
             html += '</div>';
@@ -1843,7 +2016,7 @@ function render_engine_destinations() {
           html += '</div>';
         }
     }
-    html += '</td></tr>';
+    html += profile_path_preview(engineName) + '</td></tr>';
   }
   html += '</tbody></table></div>';
   container.html(html);
@@ -1862,6 +2035,7 @@ $(document).on('change input', '.profile-engine-dest-field', function () {
   var fieldName = $(this).data('field');
   if (!modal_engine_destinations[engineName]) return;
   var value = $(this).is(':checkbox') ? $(this).is(':checked') : $(this).val();
+  if ($(this).attr('type') === 'number' && value !== '') value = Number(value);
   if ($(this).is('[data-inherit-boolean]')) value = value === '' ? undefined : value === 'true';
   if ($(this).is(':radio') && value === '') value = undefined;
   if (value === undefined) {
@@ -1941,18 +2115,9 @@ $(document).on('click', '#profile_add_btn', function (e) {
   $('#profile_sync_hours').val('');
   $('#profile_append_hash_on_conflict').prop('checked', true);
   modal_profile_settings = {};
+  set_profile_subfolder({});
 
-  var default_trans = available_transporter_schemas.length > 0 ? available_transporter_schemas[0].transporter_id : '';
-  update_profile_dest_type_dropdown(default_trans);
-  render_dynamic_dest_fields(default_trans, null);
-
-  var upField = $('#dest_field_upload_path');
-  var stagingField = $('#dest_field_staging_path');
-  var compField = $('#dest_field_complete_path');
-  if (stagingField.length) stagingField.val('default');
-  if (upField.length) upField.val('incoming/default');
-  if (compField.length) compField.val('uploads/default');
-
+  $('#profile_destination_notice').text('엔진 기본 목적지를 자동 상속합니다. 필요한 엔진에만 오버라이드를 지정하세요.');
   modal_profile_feeds = ['*'];
   modal_profile_chain = [];
   modal_engine_destinations = {};
@@ -1972,25 +2137,15 @@ $(document).on('click', '.edit_profile_btn', function (e) {
   $('#profile_modal_title').text('다운로드 프로필 수정: ' + p.name);
   $('#profile_mode').val('edit');
   $('#profile_name').val(p.name).prop('readonly', true);
+  set_profile_subfolder(p);
   var rawHours = (p.sync_hours !== undefined && p.sync_hours !== null) ? p.sync_hours : (p.sync_days ? p.sync_days * 24 : '');
   $('#profile_sync_hours').val(rawHours);
   $('#profile_append_hash_on_conflict').prop('checked', p.append_hash_on_conflict !== false);
 
-  var dest = p.destination || {};
-  update_profile_dest_type_dropdown(dest.type || '');
-  render_dynamic_dest_fields(dest.type || '', dest);
-
   modal_profile_feeds = (p.feeds && p.feeds.length > 0) ? JSON.parse(JSON.stringify(p.feeds)) : ['*'];
-  modal_profile_chain = (p.priority_chain && p.priority_chain.length > 0) ? JSON.parse(JSON.stringify(p.priority_chain)) : [];
-  modal_engine_destinations = {};
-  var savedDestinations = p.destination_by_engine || {};
-  Object.keys(savedDestinations).forEach(function (engineName) {
-    if (savedDestinations[engineName]) {
-      modal_engine_destinations[engineName] = typeof savedDestinations[engineName] === 'string'
-        ? { type: savedDestinations[engineName] }
-        : JSON.parse(JSON.stringify(savedDestinations[engineName]));
-    }
-  });
+  modal_profile_chain = (p.priority_chain || []).slice();
+  modal_engine_destinations = profile_destination_draft(p);
+  $('#profile_destination_notice').text('엔진 기본 목적지와 엔진별 오버라이드만 적용합니다. 기본값이 미설정이면 다운로더 엔진에서 먼저 설정해주세요.');
 
   update_profile_modal_dropdowns();
   render_selected_feeds();
@@ -2012,46 +2167,39 @@ $(document).on('click', '#profile_save_btn', function (e) {
     return;
   }
 
-  var destType = $('#profile_dest_type').val();
-  var destObj = { type: destType };
-
-  var schemaObj = available_transporter_schemas.find(function (s) { return s.transporter_id === destType; });
-  if (schemaObj && schemaObj.config_schema) {
-    for (var i = 0; i < schemaObj.config_schema.length; i++) {
-      var f = schemaObj.config_schema[i];
-      var el = $('#dest_field_' + f.name);
-      if (f.type === 'radio') {
-        var selected = el.find('input:checked').val();
-        if (selected) destObj[f.name] = f.allow_inherit ? selected === 'true' : selected;
-      } else if (f.allow_inherit && f.type === 'checkbox') {
-        if (el.val() !== '') destObj[f.name] = el.val() === 'true';
-      } else if (f.type === 'checkbox') destObj[f.name] = el.is(':checked');
-      else if (f.type === 'number') destObj[f.name] = parseInt(el.val()) || 0;
-      else destObj[f.name] = el.val().trim();
-    }
-  }
-
   var profile_obj = {
     name: name,
     sync_hours: $('#profile_sync_hours').val().trim() !== '' ? parseInt($('#profile_sync_hours').val().trim(), 10) : '',
     feeds: modal_profile_feeds,
     priority_chain: modal_profile_chain,
     append_hash_on_conflict: $('#profile_append_hash_on_conflict').is(':checked'),
-    destination: destObj,
-    destination_by_engine: Object.keys(modal_engine_destinations).reduce(function (result, engineName) {
-      result[engineName] = modal_engine_destinations[engineName];
+    destination_by_engine: modal_profile_chain.filter(function (engineName) { return !!modal_engine_destinations[engineName]; }).reduce(function (result, engineName) {
+      var values = Object.assign({}, modal_engine_destinations[engineName]);
+      if (remote_destination_type(values.type || ui_engine_destination(engineName).type)) { delete values.upload_path; delete values.complete_path; delete values.staging_path; }
+      result[engineName] = values;
       return result;
     }, {})
   };
 
+  var folder = $('#profile_subfolder').val();
+  if (folder && folder.trim()) profile_obj.destination_subfolder = folder;
+  var folderError = ui_relative_path_error(Object.prototype.hasOwnProperty.call(profile_obj, 'destination_subfolder') ? profile_obj.destination_subfolder : name, true);
+  if (folderError) { notify(folderError, 'warning'); return; }
+  for (var engineName of modal_profile_chain) {
+    var destination = ui_profile_destination(profile_obj, engineName);
+    if (destination._path_error) { notify(destination._path_error, 'warning'); return; }
+  }
   $.ajax({
     url: '/' + package_name + '/ajax/' + sub + '/save_profile',
     type: 'POST',
     data: { profile_json: JSON.stringify(profile_obj) },
     dataType: 'json',
     success: function (data) {
+      if (data.ret !== 'success' && data.ret !== 'success_update') { notify(data.ret || '목적지 설정을 확인해주세요.', 'warning'); return; }
       notify('프로필이 저장되었습니다.', 'success');
       $('#profile_modal').modal('hide');
+      if (data.upload_roots) configured_upload_roots = data.upload_roots;
+      if (data.local_staging_root) configured_local_staging_root = data.local_staging_root;
       current_profiles = data.profiles || [];
       render_profiles(current_profiles);
     }
@@ -2069,6 +2217,8 @@ $(document).on('click', '.delete_profile_btn', function (e) {
     dataType: 'json',
     success: function (data) {
       notify('삭제되었습니다.', 'success');
+      if (data.upload_roots) configured_upload_roots = data.upload_roots;
+      if (data.local_staging_root) configured_local_staging_root = data.local_staging_root;
       current_profiles = data.profiles || [];
       render_profiles(current_profiles);
     }
@@ -2392,7 +2542,7 @@ $(document).on('click', '#transporter_script_save_btn', function (e) {
         $('#transporter_script_status').text('저장 완료 (' + filename + ')');
         load_transporter_script_list(data.filename);
         available_transporter_schemas = data.transporter_schemas || [];
-        update_profile_dest_type_dropdown();
+        update_engine_dest_type_dropdown();
       } else {
         notify('저장 실패: ' + (data.log || data.ret), 'danger');
       }

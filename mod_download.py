@@ -45,6 +45,8 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_local_staging_path": "",
             f"{self.name}_max_staging_items": "10",
             f"{self.name}_upload_workers": "2",
+            f"{self.name}_upload_root": "incoming",
+            f"{self.name}_complete_root": "uploads",
             f"{self.name}_exclude_pattern": "",
             f"{self.name}_enable_sse": "True",
             f"{self.name}_rclone_conf_path": "",
@@ -55,22 +57,26 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_gdrive_mydrive_remote_name": "gdrive_sa",
             f"{self.name}_rclone_shared_remote_name": "gf",
             f"{self.name}_shared_drive_id": "",
-            f"{self.name}_rclone_chunk_size": "256M",
+            f"{self.name}_rclone_options_migrated": "False",
             f"{self.name}_rclone_transfers": "2",
             f"{self.name}_mydrive_upload_threshold": "14GB",
             f"{self.name}_gdrive_upload_limit": "700GB",
             f"{self.name}_shared_drive_upload_limit": "3TB",
             f"{self.name}_shared_drive_quota_reset_time": "16:00",
-            f"{self.name}_rclone_extra_options": "--timeout 30m",
+            f"{self.name}_rclone_extra_options": "--drive-chunk-size 256M --timeout 60m",
             f"{self.name}_worker_url": "",
             f"{self.name}_worker_token": "",
             f"{self.name}_worker_token_path": "",
+            f"{self.name}_worker_session_id": "",
         }
 
     def plugin_load(self):
         """플러그인 로드 시 이전 비정상 종료된 전송 중 작업을 직전 대기 상태로 일괄 초기화"""
         try:
             with F.app.app_context():
+                if not RemoteWorker.begin_session():
+                    return
+                FeederUtil.migrate_rclone_options()
                 RemoteWorker.migrate_token()
                 # FF 재시작 후 남아 있을 수 있는 다운로드 파이프라인 런타임 락 초기화
                 FeederUtil.init_runtime_locks()
@@ -85,7 +91,27 @@ class ModuleDownload(PluginModuleBase):
                         DownloadBlock.start_cleanup(block.content_key)
 
                 stg_cnt = db.session.query(ModelDownload).filter_by(status='local_staging').update({'status': 'pending_local_staging'})
-                up_cnt = db.session.query(ModelDownload).filter_by(status='uploading').update({'status': 'pending_upload'})
+                # 이전 세션에 접수된 원격 작업도 새 설정으로 재등록한다.
+                # 이미 복사를 마친 단계는 건드리지 않고 최종 이동 체크포인트를 보존한다.
+                for item in db.session.query(ModelDownload).filter_by(status='pending_upload').all():
+                    state = dict(item.upload_state or {})
+                    if state.get('phase') == 'copying' and state.get('worker'):
+                        state['restart_recopy'] = True
+                        item.upload_state = state
+
+                # 미완료 복사만 새 전송 대상으로 복원한다. 복사 완료 체크포인트는 최종 이동을 재개한다.
+                active_uploads = db.session.query(ModelDownload).filter_by(status='uploading').all()
+                up_cnt = len(active_uploads)
+                for item in active_uploads:
+                    state = dict(item.upload_state or {})
+                    if state.get('phase') == 'copying' and state.get('incoming'):
+                        if state.get('worker'):
+                            # 원격 실행 종료 확인 전에는 새 job/정리 명령을 제출하지 않는다.
+                            state['restart_recopy'] = True
+                        else:
+                            state['cleanup_pending'] = True
+                        item.upload_state = state
+                    item.status = 'pending_upload'
                 rel_cnt = db.session.query(ModelDownload).filter_by(status='relay_transferring').update({'status': 'pending_relay'})
                 db.session.commit()
 
@@ -146,6 +172,30 @@ class ModuleDownload(PluginModuleBase):
         try:
             command = req.form.get('command') or sub
 
+            if command == 'setting_save':
+                roots = FeederUtil.get_upload_roots()
+                for key in roots:
+                    roots[key] = req.form.get('download_' + key, roots[key])
+                error = (FeederUtil.relative_path_error(roots['upload_root']) or
+                         FeederUtil.relative_path_error(roots['complete_root']))
+                if not error:
+                    destination = FeederUtil.resolve_destination_paths({'type': 'remote_worker'}, roots, {})
+                    error = destination.get('_path_error', '')
+                if not error:
+                    for engine in FeederUtil.get_downloaders():
+                        candidate = dict(roots, **engine)
+                        for profile in FeederUtil.get_download_profiles() + [{}]:
+                            if profile and str(engine['name']).strip().lower() not in [str(name).strip().lower() for name in profile.get('priority_chain') or []]:
+                                continue
+                            error = FeederUtil.get_engine_destination(candidate, profile).get('_path_error', '')
+                            if error:
+                                break
+                        if error:
+                            break
+                if error:
+                    return jsonify({'ret': 'warning', 'msg': error})
+                return super(ModuleDownload, self).process_ajax(sub, req)
+
             if command in ('queue_bootstrap', 'queue_page', 'queue_engines', 'queue_progress', 'queue_upload_counts'):
                 try:
                     if command in ('queue_bootstrap', 'queue_page'):
@@ -166,10 +216,43 @@ class ModuleDownload(PluginModuleBase):
                     db.session.remove()
 
             if command in ['pipeline_control_state', 'pause_pipeline', 'resume_pipeline']:
-                if command != 'pipeline_control_state':
-                    FeederUtil.set_download_paused(command == 'pause_pipeline')
+                if command == 'pause_pipeline':
+                    FeederUtil.set_download_paused(True)
                 control = FeederUtil.get_download_control_state()
-                if command == 'resume_pipeline' and not control['running']:
+                action = 'paused' if command == 'pause_pipeline' else 'state'
+                submitted = False
+                message = '진행 중인 작업의 최종 이동·정리를 마친 뒤 중단합니다.' if command == 'pause_pipeline' else ''
+                start_requested = False
+                if command == 'resume_pipeline':
+                    recovery = any(key in req.form for key in ('recover_lock', 'confirm_finished', 'expected_owner'))
+                    if recovery:
+                        expected_owner = req.form.get('expected_owner')
+                        if (req.form.get('recover_lock') != 'true' or req.form.get('confirm_finished') != 'true'
+                                or not expected_owner or not control['pause_requested']):
+                            return jsonify({'ret': 'warning', 'action': 'conflict', 'task_submitted': False,
+                                'msg': '중단 예약 상태에서 이전 Celery 작업과 실제 전송의 종료를 확인한 경우에만 복구할 수 있습니다.',
+                                'control': control})
+                        if (not control['pipeline_locked'] or control['pipeline_owner'] != expected_owner or
+                                not FeederUtil.release_runtime_lock('download_pipeline', expected_owner)):
+                            return jsonify({'ret': 'warning', 'action': 'conflict', 'task_submitted': False,
+                                'msg': '잠금 소유자가 바뀌었거나 이미 해제되어 복구를 보류합니다. 현재 상태를 다시 확인해주세요.',
+                                'control': FeederUtil.get_download_control_state()})
+                        P.ModelSetting.set('download_is_running', 'False')
+                        P.ModelSetting.set('download_running_start_time', '0')
+                        with FeederUtil._rclone_stats_lock:
+                            FeederUtil._rclone_live_stats.clear()
+                        action, start_requested = 'recovered', True
+                        message = '잔여 잠금을 복구하고 새 실행을 요청했습니다. 실제 실행 상태는 화면에서 확인해주세요.'
+                    elif control['pipeline_locked']:
+                        action = 'continued' if control['pause_requested'] else 'already_running'
+                        message = ('중단 예약을 취소하고 기존 작업을 계속합니다. 새 작업은 등록하지 않습니다.'
+                                   if control['pause_requested'] else '이미 실행 잠금이 있어 새 작업을 등록하지 않습니다.')
+                    else:
+                        action, start_requested = 'started', True
+                        message = '작업 재개를 요청했습니다. 실제 실행 상태는 화면에서 확인해주세요.'
+                    FeederUtil.set_download_paused(False)
+                    control = FeederUtil.get_download_control_state()
+                if start_requested:
                     # start_celery는 작업 완료까지 기다리므로 HTTP 요청에서 호출하지 않는다.
                     if F.config.get('use_celery', False):
                         TaskDownloadBase.start.apply_async(args=('default',))
@@ -178,7 +261,9 @@ class ModuleDownload(PluginModuleBase):
                             target=TaskDownload.run_pipeline,
                             name='feeder-download-resume', daemon=True
                         ).start()
-                response = {'ret': 'success', 'control': control}
+                    submitted = True
+                response = {'ret': 'success', 'control': control, 'action': action,
+                            'task_submitted': submitted, 'msg': message}
                 if command == 'pipeline_control_state' and req.form.get('dashboard_version') != '2':
                     response['counts'] = self.get_upload_queue_counts()
                 return jsonify(response)
@@ -195,7 +280,9 @@ class ModuleDownload(PluginModuleBase):
                 DownloadUtil.load_engines()
                 return jsonify({
                     'downloaders': FeederUtil.get_downloaders(),
-                    'schemas': DownloadUtil.get_engine_schemas()
+                    'schemas': DownloadUtil.get_engine_schemas(),
+                    'upload_roots': FeederUtil.get_upload_roots(),
+                    'transporter_schemas': DownloadUtil.get_transporter_schemas()
                 })
 
             elif command == 'save_downloader':
@@ -285,8 +372,10 @@ class ModuleDownload(PluginModuleBase):
                 DownloadUtil.load_transporters()
                 return jsonify({
                     'profiles': FeederUtil.get_download_profiles(),
+                    'local_staging_root': FeederUtil.get_local_staging_root(),
                     'downloaders': FeederUtil.get_downloaders(),
                     'feeds': FeederUtil.get_feeds(),
+                    'upload_roots': FeederUtil.get_upload_roots(),
                     'transporter_schemas': DownloadUtil.get_transporter_schemas()
                 })
 
@@ -415,8 +504,11 @@ class ModuleDownload(PluginModuleBase):
                     return jsonify({'ret': 'fail', 'msg': f'선택한 프로필의 1순위 엔진({first_engine})이 대상 엔진({engine_name})과 일치하지 않습니다.'})
 
                 dest_cfg = FeederUtil.get_profile_destination(selected_profile, engine_name)
-                dest_type = dest_cfg.get('type', 'local')
-                use_local_staging = str(dest_cfg.get('use_local_staging', True)).lower() in ['true', 'on', '1']
+                dest_type = dest_cfg.get('type') or ''
+                error = FeederUtil.validate_destination(dest_cfg)
+                if error:
+                    return jsonify({'ret': 'fail', 'msg': error})
+                use_local_staging = FeederUtil.get_upload_options(selected_profile, engine_name)['use_local_staging']
 
                 # 등록 일시를 현재 시각으로 초기화하여 타임아웃 조기 종료 방지
                 now = datetime.now()
@@ -433,6 +525,7 @@ class ModuleDownload(PluginModuleBase):
                 item.file_name = file_name or title
                 item.file_size = fsize
                 item.priority_chain = chain
+                item.upload_state = {'routing': {'profile_name': profile_name}}
                 item.current_engine_index = 0
                 item.current_engine_name = engine_name
                 item.engine_task_id = str(task_id)
@@ -449,6 +542,8 @@ class ModuleDownload(PluginModuleBase):
                 # 엔진 상태 및 프로필 스테이징 설정에 따라 알맞은 파이프라인 단계로 진입
                 transporter = DownloadUtil.get_transporter(dest_type)
                 is_relay = bool(transporter and getattr(transporter, 'IS_RELAY_HANDLER', False))
+                if transporter and getattr(transporter, 'FORCE_REMOTE_SOURCE', False):
+                    use_local_staging = False
 
                 if raw_status == 'completed':
                     if is_relay:
@@ -682,6 +777,9 @@ class ModuleDownload(PluginModuleBase):
                             return jsonify({'ret': 'success', 'msg': '항목을 삭제했습니다. 콘텐츠 차단은 유지됩니다.'})
                     return jsonify({'ret': 'fail', 'msg': '차단된 콘텐츠입니다. 차단 목록에서 해제하거나 정리 상태를 확인해주세요.'})
 
+                if action == 'redownload':
+                    return jsonify(TaskDownload.redownload(item_id))
+
                 if action in ('retry', 'delete', 'force_fail', 'force_complete') and (item.upload_state or {}).get('worker'):
                     try:
                         resumed = RemoteWorker.prepare_action(item, action)
@@ -691,6 +789,7 @@ class ModuleDownload(PluginModuleBase):
                         return jsonify({'ret': 'success', 'msg': '복사를 반복하지 않고 최종 이동을 다시 시도합니다.'})
 
                 if action == 'retry':
+                    source_subpath = FeederUtil.get_download_source_subpath(item)
                     item.source_unavailable_since = None
                     item.upload_retry_after = None
                     item.transfer_error_type = None
@@ -705,12 +804,15 @@ class ModuleDownload(PluginModuleBase):
                                 selected_profile = p
                                 break
                     if not selected_profile:
-                        selected_profile = FeederUtil.get_download_profile_by_feed(item.feed_name)
+                        selected_profile = FeederUtil.get_item_profile(item)
+                    elif profile_name:
+                        routing = dict((item.upload_state or {}).get('routing') or {}, profile_name=profile_name)
+                        item.upload_state = dict(item.upload_state or {}, routing=routing)
 
                     if selected_profile:
                         item.priority_chain = list(selected_profile.get('priority_chain', []))
-                        dest = FeederUtil.get_profile_destination(selected_profile, item.current_engine_name)
-                        item.destination_type = dest.get('type', 'local')
+                        dest = FeederUtil.get_profile_destination(selected_profile, item.current_engine_name, item)
+                        item.destination_type = dest.get('type') or ''
                         item.gdrive_upload_path = dest.get('upload_path', '')
                         item.gdrive_complete_path = dest.get('complete_path', '')
                         item.gdrive_remote_id = dest.get('shared_drive_id', '')
@@ -718,7 +820,7 @@ class ModuleDownload(PluginModuleBase):
                         enabled_downloaders = [d['name'] for d in FeederUtil.get_downloaders() if d.get('enabled', True)]
                         if enabled_downloaders:
                             item.priority_chain = enabled_downloaders
-                        item.destination_type = item.destination_type or 'local'
+                        item.destination_type = FeederUtil.get_profile_destination(None, item=item).get('type') or ''
 
                     err_msg = str(item.error_message or '')
                     clean_title = item.title[:25]
@@ -742,7 +844,7 @@ class ModuleDownload(PluginModuleBase):
                                             break
 
                                 if found_path:
-                                    upload_sub = (item.gdrive_upload_path or (selected_profile.get('destination', {}).get('upload_path') if selected_profile else '') or '').strip('/')
+                                    upload_sub = source_subpath.strip('/')
                                     target_dir = os.path.join(mount_root, upload_sub) if upload_sub else mount_root
                                     os.makedirs(target_dir, exist_ok=True)
                                     final_dest_path = os.path.join(target_dir, target_fname)
@@ -923,6 +1025,11 @@ class ModuleDownload(PluginModuleBase):
         if not item:
             return jsonify({'ret': 'success', 'has_task': False, 'msg': '대기 중인 원격 릴레이 전송 작업이 없습니다.'})
 
+        destination = FeederUtil.get_profile_destination(FeederUtil.get_item_profile(item), item.current_engine_name, item)
+        error = FeederUtil.validate_destination(destination)
+        if error:
+            return jsonify({'ret': 'fail', 'msg': error}), 400
+        FeederUtil.pin_transfer_destination(item, destination=destination)
         item.status = 'relay_transferring'
         db.session.commit()
 
@@ -989,8 +1096,8 @@ class ModuleDownload(PluginModuleBase):
                 rclone_conf_text += ad_section
                 logger.info(f"[{self.name}] [Relay API] AllDebrid WebDAV Rclone 설정([{engine_remote}]) 동적 주입 완료")
 
-        profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
-        dest_cfg = FeederUtil.get_profile_destination(profile, item.current_engine_name)
+        profile = FeederUtil.get_item_profile(item) or {}
+        dest_cfg = FeederUtil.get_profile_destination(profile, item.current_engine_name, item)
         remote_name = (
             dest_cfg.get('shared_remote_name')
             or dest_cfg.get('remote_name')
@@ -998,7 +1105,7 @@ class ModuleDownload(PluginModuleBase):
             or 'gdrive_shared'
         )
         shared_drive_id = item.gdrive_remote_id or dest_cfg.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
-        complete_path = (item.gdrive_complete_path or dest_cfg.get('complete_path') or 'uploads/default').strip('/')
+        complete_path = (dest_cfg.get('complete_path') or item.gdrive_complete_path or '').strip('/')
         source_name = item.source_file_name or item.file_name or f"item_{item.id}"
         folder_name = DownloadUtil.reserve_output_folder(item, source_name)
         is_single_file = DownloadUtil.is_single_file(source_name, item.local_path or '')
@@ -1011,10 +1118,10 @@ class ModuleDownload(PluginModuleBase):
         dest_dir_path = f"{dest_base_path}/{folder_name}"
         dest_full_path = f"{dest_dir_path}/{source_name}" if is_single_file else dest_dir_path
 
-        if engine_remote and engine_base:
-            src_full_path = item.local_path or f"{engine_remote}:{engine_base}/{source_name}"
-        elif engine_remote:
-            src_full_path = item.local_path or f"{engine_remote}:{source_name}"
+        if engine_remote:
+            source_sub = FeederUtil.get_download_source_subpath(item).strip('/')
+            source_parts = '/'.join(part for part in (engine_base, source_sub, source_name) if part)
+            src_full_path = item.local_path or f"{engine_remote}:{source_parts}"
         else:
             src_full_path = item.local_path or source_name
 

@@ -106,7 +106,7 @@ class Worker:
         except Exception as exc:
             self.failure = True
             self._stop.set()
-            logger.error('작업 워커 중단: %s', type(exc).__name__)
+            logger.exception('작업 워커 중단')
             try:
                 self.store.worker_status(False, True)
             except Exception:
@@ -119,7 +119,7 @@ class Worker:
             self.failure = True
             self._stop.set()
             self.notify()
-            logger.error('작업 실행 중단: %s', type(exc).__name__)
+            logger.exception('작업 실행 중단')
             try:
                 self.store.worker_status(False, True)
             except Exception:
@@ -137,11 +137,11 @@ class Worker:
 
     def command(self, job):
         options = Configurations(self.store.database, self.store.events).get(job['config_version'])['rclone']
-        # 옵션은 고정하고 원본과 목적지는 -- 뒤에 넣어 옵션 해석을 차단한다.
+        # 검증해 저장한 작업별 값만 적용하고 경로는 -- 뒤에 둔다.
         return [str(self.settings.rclone_binary), '--config', str(self.settings.rclone_config),
-            'copy', '--transfers', str(job.get('rclone_transfers', options['transfers'])), '--checkers', str(options['checkers']), '--buffer-size', f"{options['buffer_size_mib']}Mi",
-            '--multi-thread-streams', '0', '--retries', '1', '--low-level-retries', '1',
-            '--contimeout', '10s', '--timeout', '2m', '--stats', f"{options['stats_interval_seconds']}s", '--stats-log-level', 'INFO',
+            'copy', '--transfers', str(job.get('rclone_transfers', options['transfers'])),
+            *job['rclone_extra_args'],
+            '--stats', f"{options['stats_interval_seconds']}s", '--stats-log-level', 'INFO',
             '--use-json-log', '--log-level', 'INFO',
             *[value for pattern in job.get('exclude_patterns', []) for value in ('--exclude', pattern)],
             *(['--drive-impersonate', job['drive_impersonate']] if job.get('drive_impersonate') else []),
@@ -185,7 +185,7 @@ class Worker:
                 pass
 
         try:
-            validate_payload({k: job[k] for k in ('job_id', 'source', 'destination', 'config_version', 'exclude_patterns', 'drive_impersonate', 'rclone_transfers') if k in job}, self.settings)
+            validate_payload({k: job[k] for k in ('job_id', 'source', 'destination', 'config_version', 'exclude_patterns', 'drive_impersonate', 'rclone_transfers', 'rclone_extra_args', 'session_id') if k in job}, self.settings)
             current = self.store.get(job['job_id'])
             if self._stop.is_set() or current['cancel_requested']:
                 self.store.finish(job['job_id'], None, '서비스 종료로 전송 시작이 중단됐습니다.')

@@ -209,7 +209,7 @@ class Updates:
             with self.lock:
                 self.phase, self.busy, self.ready = 'failed', False, False
                 self.error = '업데이트 준비에 실패했습니다. 기존 워커와 작업은 유지됩니다.'
-            logger.error('워커 업데이트 준비 실패: %s', type(exc).__name__)
+            logger.exception('워커 업데이트 준비 실패')
 
     def activate(self):
         """모든 전송·API 종료 후 복구용 DB와 새 릴리스 포인터를 저장한다."""

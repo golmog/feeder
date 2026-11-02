@@ -163,7 +163,7 @@ class QBittorrentEngine(BaseDownloadEngine):
         # 기본 저장 경로와 프로필 지정 하위 수신/완료 경로 결합
         effective_save_path = self.save_path
         if upload_path and str(upload_path).strip():
-            clean_sub = str(upload_path).strip().strip('/\\')
+            clean_sub = str(upload_path).strip('/\\')
             if effective_save_path:
                 effective_save_path = os.path.join(effective_save_path, clean_sub)
             else:
@@ -362,7 +362,7 @@ class CloudDrive2Engine(BaseDownloadEngine):
         try:
             target_vpath = self.vpath
             if upload_path and str(upload_path).strip():
-                clean_sub = str(upload_path).strip().strip('/')
+                clean_sub = str(upload_path).strip('/')
                 target_vpath = f"{self.vpath}/{clean_sub}"
 
             try:
@@ -654,17 +654,19 @@ class RcloneSimpleTransporter(BaseTransporter):
         {"name": "use_local_staging", "label": "로컬 스테이징 사용", "type": "radio", "allow_inherit": True,
          "options": [{"value": "", "label": "상위 설정 사용"}, {"value": "true", "label": "사용"}, {"value": "false", "label": "사용 안 함"}],
          "desc": "사용: 원격 소스를 로컬 임시 경로에 먼저 수신합니다. 사용 안 함: 로컬 디스크를 거치지 않고 직접 전송합니다."},
-        {"name": "staging_path", "label": "임시 수신 경로", "type": "text", "placeholder": "예: profile-name", "desc": "전역 로컬 스테이징 루트 아래에 생성할 작업별 임시 수신 경로입니다."},
         {"name": "upload_path", "label": "임시 업로드 경로", "type": "text", "placeholder": "예: incoming/프로필명", "desc": "Rclone 리모트 안에서 업로드가 먼저 완료되는 임시 경로입니다."},
         {"name": "complete_path", "label": "최종 완료 이동 경로", "type": "text", "placeholder": "예: uploads/프로필명", "desc": "임시 업로드가 성공한 뒤 최종적으로 이동할 Rclone 리모트 경로입니다."},
         {"name": "remote_name", "label": "일반 업로드 리모트명", "type": "text", "placeholder": "미입력 시 기본 설정값 사용", "desc": "비워두면 기본 설정의 일반 업로드 리모트를 사용합니다."}
     ]
 
     def transport(self, item, source_path: str, dest_config: dict) -> tuple[bool, str, str]:
-        upload_path = (dest_config.get('upload_path') or '').strip().strip('/')
-        complete_path = (dest_config.get('complete_path') or '').strip().strip('/')
-        if not upload_path or not complete_path:
-            return False, "failed", "Rclone 임시 업로드 경로(upload_path)와 최종 완료 이동 경로(complete_path)가 모두 필요합니다."
+        upload_path = dest_config.get('upload_path')
+        complete_path = dest_config.get('complete_path')
+        error = FeederUtil.relative_path_error(upload_path) or FeederUtil.relative_path_error(complete_path)
+        if error:
+            return False, 'failed', error
+        if upload_path == complete_path or upload_path.startswith(complete_path + '/') or complete_path.startswith(upload_path + '/'):
+            return False, 'failed', '임시 업로드 경로와 최종 이동 경로가 겹치지 않도록 설정해주세요.'
 
         is_remote_source = bool(source_path and not os.path.exists(source_path) and (':' in source_path or source_path.startswith(('http://', 'https://'))))
         if not source_path or (not is_remote_source and not os.path.exists(source_path)):
@@ -687,12 +689,9 @@ class RcloneSimpleTransporter(BaseTransporter):
         folder_name = getattr(item, 'output_folder_name', None) or (base_name if DownloadUtil.is_single_file(raw_name, source_path) else raw_name)
         temp_full = f"{remote_name}:{upload_path}/{folder_name}"
         final_full = f"{remote_name}:{complete_path}/{folder_name}"
-        chunk_size = P.ModelSetting.get('download_rclone_chunk_size') or '256M'
-
         cmd = [
             "rclone", "copy", source_path, temp_full,
-            "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE",
-            "--drive-chunk-size", chunk_size
+            "--stats", "10s", "--stats-one-line", "--log-level", "NOTICE"
         ]
         if rclone_conf:
             cmd.extend(["--config", rclone_conf])
@@ -766,7 +765,6 @@ class GDrivePoolTransporter(BaseTransporter):
         {"name": "use_local_staging", "label": "로컬 스테이징 사용", "type": "radio", "allow_inherit": True,
          "options": [{"value": "", "label": "상위 설정 사용"}, {"value": "true", "label": "사용"}, {"value": "false", "label": "사용 안 함"}],
          "desc": "사용: 원격 소스를 로컬 임시 경로에 먼저 수신합니다. 사용 안 함: 로컬 디스크를 거치지 않고 직접 전송합니다."},
-        {"name": "staging_path", "label": "임시 수신 경로", "type": "text", "placeholder": "예: profile-name", "desc": "전역 로컬 스테이징 루트 아래에 생성할 작업별 임시 수신 경로입니다."},
         {"name": "upload_path", "label": "임시 업로드 경로", "type": "text", "placeholder": "예: incoming/프로필명", "desc": "Google Drive에서 업로드가 먼저 완료되는 임시 경로입니다."},
         {"name": "mydrive_remote_name", "label": "내 드라이브 SA 리모트명", "type": "text", "placeholder": "미입력 시 기본 설정값 사용"},
         {"name": "shared_remote_name", "label": "목적지 공유 드라이브 리모트명", "type": "text", "placeholder": "미입력 시 기본 설정값 사용"},
@@ -776,8 +774,11 @@ class GDrivePoolTransporter(BaseTransporter):
 
     def transport(self, item, source_path: str, dest_config: dict) -> tuple[bool, str, str]:
         item.destination_type = "gdrive_rotation"
-        item.gdrive_upload_path = dest_config.get('upload_path', 'incoming/default')
-        item.gdrive_complete_path = dest_config.get('complete_path', 'uploads/default')
+        error = FeederUtil.validate_destination(dest_config)
+        if error:
+            return False, 'failed', error
+        item.gdrive_upload_path = dest_config['upload_path']
+        item.gdrive_complete_path = dest_config['complete_path']
         item.gdrive_remote_id = dest_config.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
         item.local_path = source_path
         item.status = "pending_upload"
@@ -1036,59 +1037,151 @@ class DownloadUtil:
             logger.error(f"[DownloadUtil] 이송 핸들러 생성 오류 ({transporter_id}): {e}")
             return None
 
+    @staticmethod
+    def _queue_hash(value, expected=''):
+        raw = str(value or '').strip().lower()
+        result = FeederUtil.extract_info_hash(raw) or raw.removeprefix('urn:btih:')
+        if len(expected) == 40 and len(result) == 32 and not re.fullmatch(r'[a-f0-9]{32}', result):
+            result = FeederUtil.extract_info_hash('magnet:?xt=urn:btih:' + result) or result
+        return result
+
     @classmethod
-    def delete_remote_tasks(cls, item, strict=False) -> None:
-        """작업 취소/삭제 시 연동된 모든 다운로더 엔진에서 해당 원격 작업을 확실히 선제 삭제"""
-        target_hash = (item.infohash or FeederUtil.extract_info_hash(item.magnet) or '').lower()
+    def _queue_match(cls, row, target_hash, target_tid, same_engine):
+        """해시의 명시적 불일치는 ID보다 우선하며 식별 불가는 None으로 남긴다."""
+        raw_hash = next((row.get(key) for key in ('hash', 'infohash', 'info_hash', 'infoHash') if row.get(key)), '')
+        if not raw_hash:
+            raw_hash = FeederUtil.extract_info_hash(row.get('magnet') or row.get('url') or row.get('link') or '') or ''
+        row_hash = cls._queue_hash(raw_hash, target_hash)
+        row_tid = str(row.get('task_id') or row.get('id') or '')
+        if row_hash and target_hash:
+            if not re.fullmatch(r'(?:[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64})', row_hash):
+                return None
+            if len(row_hash) == 32 and len(target_hash) == 40 and FeederUtil.extract_info_hash('magnet:?xt=urn:btih:' + row_hash) == target_hash:
+                # 32자리 16진수와 Base32가 겹치면 서로 다른 콘텐츠를 삭제하지 않는다.
+                return None
+            return row_hash == target_hash
+        if same_engine and target_tid and row_tid == target_tid:
+            return True
+        return None
+
+    @classmethod
+    def _delete_remote_tasks_verified(cls, item):
+        """프로필 큐의 완전한 조회와 삭제 후 부재 확인을 재다운로드에만 적용한다."""
+        target_hash = cls._queue_hash(FeederUtil.extract_info_hash(item.magnet) or item.infohash)
         target_tid = str(item.engine_task_id or '')
+        names = list(item.priority_chain or [])
+        if not names:
+            raise RuntimeError('다운로드 프로필의 엔진 체인이 비어 있습니다.')
+        if item.current_engine_name and target_tid:
+            names.append(item.current_engine_name)
+        seen = set()
+        for engine_name in names:
+            FeederUtil.cooperate()
+            key = str(engine_name).strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            cfg = FeederUtil.get_downloader_by_name(engine_name)
+            if not cfg:
+                raise RuntimeError(f'{engine_name}: 다운로더 설정을 찾을 수 없습니다.')
+            try:
+                engine = cls.create_engine(cfg)
+            except Exception as exc:
+                raise RuntimeError(f'{engine_name}: 엔진 연결 실패 ({type(exc).__name__})') from None
+            if not engine:
+                raise RuntimeError(f'{engine_name}: 다운로더를 로드하지 못했습니다.')
+            same_engine = key == str(item.current_engine_name or '').strip().lower()
 
-        engines_to_check = set()
-        if item.current_engine_name:
-            engines_to_check.add(item.current_engine_name)
-        if item.priority_chain:
-            for eng in item.priority_chain:
-                engines_to_check.add(eng)
-        if not engines_to_check:
-            for d in FeederUtil.get_downloaders():
-                if d.get('enabled', True):
-                    engines_to_check.add(d.get('name'))
+            def read_queue():
+                try:
+                    rows, error = engine.get_status()
+                except Exception as exc:
+                    raise RuntimeError(f'{engine_name}: 큐 조회 실패 ({type(exc).__name__})') from None
+                if error:
+                    raise RuntimeError(f'{engine_name}: 큐 조회 실패: {error}')
+                if getattr(engine, 'status_list_complete', True) is False:
+                    raise RuntimeError(f'{engine_name}: 큐 목록이 불완전하여 삭제를 확인할 수 없습니다. 목록 조회 페이지 한도 등 엔진 설정을 확인해주세요.')
+                if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                    raise RuntimeError(f'{engine_name}: 큐 응답 형식을 확인하지 못했습니다.')
+                return rows
 
-        for engine_name in engines_to_check:
-            downloader_cfg = FeederUtil.get_downloader_by_name(engine_name)
-            if not downloader_cfg:
-                if strict and engine_name == item.current_engine_name and target_tid:
+            def targets(rows):
+                ids = []
+                for row in rows:
+                    match = cls._queue_match(row, target_hash, target_tid, same_engine)
+                    if match is None:
+                        raise RuntimeError(f'{engine_name}: 콘텐츠 해시 등 식별 정보가 없어 큐 대상 부재를 확인할 수 없습니다.')
+                    if match:
+                        tid = str(row.get('task_id') or row.get('id') or '')
+                        if not tid:
+                            raise RuntimeError(f'{engine_name}: 동일 콘텐츠의 작업 ID가 없어 삭제할 수 없습니다.')
+                        ids.append(tid)
+                return list(dict.fromkeys(ids))
+
+            ids = targets(read_queue())
+            if ids:
+                failed = False
+                for tid in ids:
+                    try:
+                        failed = not engine.delete_task(tid) or failed
+                    except Exception as exc:
+                        raise RuntimeError(f'{engine_name}: 큐 작업 삭제 실패 ({type(exc).__name__})') from None
+                remaining = targets(read_queue())
+                if failed:
+                    raise RuntimeError(f'{engine_name}: 큐 작업 삭제 요청이 실패했습니다.')
+                if remaining:
+                    raise RuntimeError(f'{engine_name}: 삭제 후에도 동일 콘텐츠 작업 {len(remaining)}건이 큐에 남아 있습니다. 잠시 후 다시 요청해주세요.')
+            logger.info('[DownloadUtil] [%s] 재다운로드 큐 정리 확인 (%s건 삭제)', engine_name, len(ids))
+
+    @classmethod
+    def delete_remote_tasks(cls, item, strict=False, verify_absent=False) -> None:
+        """일반 정리의 정책은 유지하고 큐 부재 확인은 명시적 요청에만 수행한다."""
+        if verify_absent:
+            return cls._delete_remote_tasks_verified(item)
+        target_hash = cls._queue_hash(FeederUtil.extract_info_hash(item.magnet) or item.infohash)
+        target_tid = str(item.engine_task_id or '')
+        names = ([item.current_engine_name] if item.current_engine_name else []) + list(item.priority_chain or [])
+        if not names:
+            names = [cfg.get('name') for cfg in FeederUtil.get_downloaders() if cfg.get('enabled', True)]
+        seen = set()
+        for engine_name in names:
+            key = str(engine_name).strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            same_engine = key == str(item.current_engine_name or '').strip().lower()
+            cfg = FeederUtil.get_downloader_by_name(engine_name)
+            if not cfg:
+                if strict and same_engine and target_tid:
                     raise RuntimeError(f'{engine_name}: 다운로더 설정이 없어 원격 작업을 중단하지 못했습니다.')
                 continue
-            engine = cls.create_engine(downloader_cfg)
+            engine = cls.create_engine(cfg)
             if not engine:
-                if strict and engine_name == item.current_engine_name and target_tid:
+                if strict and same_engine and target_tid:
                     raise RuntimeError(f'{engine_name}: 다운로더를 로드하지 못했습니다.')
                 continue
-
             try:
-                # 작업 ID로 직접 삭제 시도
-                if target_tid and str(item.current_engine_name) == str(engine_name):
-                    deleted = engine.delete_task(target_tid)
+                rows, error = [], ''
+                if target_hash or (same_engine and target_tid):
+                    try:
+                        rows, error = engine.get_status()
+                    except Exception as exc:
+                        error = str(exc)
+                ids = [str(row.get('task_id') or row.get('id') or '') for row in rows
+                       if cls._queue_match(row, target_hash, target_tid, same_engine) is True]
+                # 직접 저장한 ID도 같은 엔진에서 해시 불일치가 보이면 삭제하지 않는다.
+                if same_engine and target_tid and not any(str(row.get('task_id') or row.get('id') or '') == target_tid for row in rows):
+                    ids.insert(0, target_tid)
+                for tid in dict.fromkeys(tid for tid in ids if tid):
+                    deleted = engine.delete_task(tid)
                     if strict and not deleted:
-                        statuses, error = engine.get_status()
-                        if error or any(str(s.get('task_id') or s.get('id')) == target_tid for s in statuses):
-                            raise RuntimeError(f'{engine_name}: 원격 작업 중단 실패')
-
-                # 원격 엔진 목록을 조회하여 동일 해시를 가진 잔여 작업 모두 삭제
-                if target_hash and hasattr(engine, 'get_status'):
-                    status_list, err = engine.get_status()
-                    if strict and err:
-                        raise RuntimeError(f'{engine_name}: 원격 작업 목록 조회 실패: {err}')
-                    if not err and status_list:
-                        for s in status_list:
-                            s_hash = (s.get('hash') or '').lower()
-                            s_tid = str(s.get('task_id') or s.get('id') or '')
-                            if (s_hash and s_hash == target_hash) or (s_tid and s_tid == target_tid):
-                                deleted = engine.delete_task(s_tid)
-                                if strict and not deleted:
-                                    raise RuntimeError(f'{engine_name}: 원격 작업 삭제 실패 ({s_tid})')
-                                logger.info(f"[DownloadUtil] [{engine_name}] 원격 소스 작업 삭제 완료: ID={s_tid}, Title={item.title[:25]}")
-            except Exception as ex:
+                        statuses, failure = engine.get_status()
+                        if failure or any(str(row.get('task_id') or row.get('id') or '') == tid for row in statuses):
+                            raise RuntimeError(f'{engine_name}: 원격 작업 삭제 실패 ({tid})')
+                    logger.info('[DownloadUtil] [%s] 원격 소스 작업 정리: ID=%s', engine_name, tid)
+                if strict and error:
+                    raise RuntimeError(f'{engine_name}: 원격 작업 목록 조회 실패: {error}')
+            except Exception as exc:
                 if strict:
                     raise
-                logger.debug(f"[DownloadUtil] [{engine_name}] 원격 소스 삭제 중 예외: {ex}")
+                logger.debug('[DownloadUtil] [%s] 원격 소스 삭제 중 예외: %s', engine_name, exc)

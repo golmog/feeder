@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import re
 import shutil
 import threading
 from sqlalchemy import event, select, or_, func
@@ -7,6 +8,7 @@ from sqlalchemy import event, select, or_, func
 from .setup import *
 from .model_download import ModelDownload, ModelDownloadBlock
 from .util_base import FeederUtil
+from .worker.rclone_logging import redact_log
 
 
 class DownloadBlock:
@@ -17,29 +19,31 @@ class DownloadBlock:
     @staticmethod
     def snapshot(item):
         state = dict(item.upload_state or {})
-        profile = FeederUtil.get_download_profile_by_feed(item.feed_name) or {}
-        dest = FeederUtil.get_profile_destination(profile, item.current_engine_name)
+        profile = FeederUtil.get_item_profile(item) or {}
+        dest = FeederUtil.get_profile_destination(profile, item.current_engine_name, item)
         folder = item.output_folder_name or item.file_name
         if item.status == 'local_staging' and not state.get('staging_local_path') and folder:
-            root = P.ModelSetting.get('download_local_staging_path') or FeederUtil.get_global().get('local_staging_path') or os.path.join(FeederUtil.get_tmp_dir(), 'staging')
-            sub = (dest.get('staging_path') or profile.get('name') or 'default').strip('/\\')
-            state['staging_local_path'] = os.path.join(root, sub, folder)
+            try:
+                state['staging_local_path'] = FeederUtil.get_local_staging_path(item, profile)
+            except ValueError as exc:
+                state['cleanup_error'] = str(exc)
         # 기존 버전이 전송 시작 전에 저장하지 않았던 임시 경로도 계정 설정으로 복원한다.
         if item.gdrive_account and not state.get('incoming') and item.destination_type == 'gdrive_rotation':
             rclone = FeederUtil.load_yaml().get('rclone', {})
-            pooled = P.ModelSetting.get_bool('download_use_gdrive_pool')
-            impersonate = pooled and P.ModelSetting.get_bool('download_gdrive_use_impersonate')
+            options = FeederUtil.get_upload_options(profile, item.current_engine_name, item)
+            pooled = options['use_gdrive_pool']
+            impersonate = pooled and options['use_impersonate']
             account = next((a for a in FeederUtil.get_gdrive_accounts()
                             if a.get('username') == item.gdrive_account), {}) if pooled else {}
             remote = dest.get('mydrive_remote_name') or P.ModelSetting.get('download_gdrive_mydrive_remote_name') or rclone.get('mydrive_remote_name') or 'gdrive_sa'
             if not pooled:
-                remote = P.ModelSetting.get('download_rclone_upload_remote_name') or remote
+                remote = dest.get('remote_name') or P.ModelSetting.get('download_rclone_upload_remote_name') or remote
             elif not impersonate:
                 remote = account.get('remote_name') or remote
             drive = dest.get('shared_drive_id') or item.gdrive_remote_id or P.ModelSetting.get('download_shared_drive_id') or rclone.get('shared_drive_id')
-            upload = (dest.get('upload_path') or item.gdrive_upload_path or 'incoming/default').strip('/')
-            final = (dest.get('complete_path') or item.gdrive_complete_path or 'uploads/default').strip('/')
-            if not folder or not drive or (pooled and not account.get('mydrive_rclone_id')):
+            upload = (item.gdrive_upload_path or dest.get('upload_path') or '').strip('/')
+            final = (item.gdrive_complete_path or dest.get('complete_path') or '').strip('/')
+            if not upload or not final or not folder or not drive or (pooled and not account.get('mydrive_rclone_id')):
                 state['cleanup_error'] = '기존 업로드의 계정/임시 경로를 복원하지 못했습니다. 설정을 확인해주세요.'
             else:
                 shared = f'{remote}:{{{drive}}}/{upload}/{folder}'
@@ -149,6 +153,45 @@ class DownloadBlock:
             os.remove(actual)
 
     @classmethod
+    def cleanup_temporary(cls, snapshot):
+        """항목 전용 임시 파일만 정리하고 최종 보관 경로와 원본은 보존한다."""
+        from .util_upload import UploadUtil
+        state = snapshot.get('state') or {}
+        if state.get('cleanup_error'):
+            raise ValueError(state['cleanup_error'])
+        paths = set(filter(None, (state.get('incoming'), state.get('shared_incoming'))))
+        parent = str(state.get('dest_parent') or '').rstrip('/')
+        folder = state.get('folder_name')
+
+        def scope(path):
+            remote = re.fullmatch(r'([A-Za-z0-9_-]+):(.+)', path)
+            if not remote or FeederUtil.relative_path_error(remote.group(2)):
+                raise ValueError('안전한 업로드 임시 경로를 확인하지 못했습니다.')
+            head, separator, tail = remote.group(2).partition('/')
+            # 같은 드라이브 ID는 인증 리모트 이름이 달라도 최종 경로를 보호한다.
+            return (head, tail) if head.startswith('{') and head.endswith('}') else (remote.group(1), remote.group(2))
+
+        for path in paths:
+            remote = re.fullmatch(r'[A-Za-z0-9_-]+:(.+)', path)
+            source_scope, source_path = scope(path)
+            final_scope, final_path = scope(parent)
+            if (not folder or folder in ('.', '..') or any(char in folder for char in '/\\') or
+                    not parent or not remote or FeederUtil.relative_path_error(remote.group(1)) or
+                    '/' not in remote.group(1) or not path.endswith('/' + folder) or
+                    (source_scope == final_scope and (not source_path or not final_path or source_path == final_path or
+                        source_path.startswith(final_path + '/') or final_path.startswith(source_path + '/')))):
+                raise ValueError('안전한 업로드 임시 경로를 확인하지 못했습니다.')
+        cls.remove_staging(state.get('staging_local_path'))
+        cls.remove_staging(snapshot.get('local_path'))
+        for path in paths:
+            cmd = ['rclone', 'purge', path, '--config', state['rclone_conf'],
+                   '--drive-use-trash=false'] + state.get('impersonate_arg', [])
+            success, output = UploadUtil.run_rclone(cmd, '항목 임시 파일 정리', execution_timeout=60)
+            if not success and not any(text in output.lower() for text in
+                    ('directory not found', 'object not found', "doesn't exist")):
+                raise RuntimeError('원격 임시 파일 정리 실패: ' + (redact_log(output)[:200] or '응답을 확인하지 못했습니다.'))
+
+    @classmethod
     def cleanup(cls, key):
         from .util_upload import UploadUtil
         from .util_download import DownloadUtil
@@ -170,7 +213,14 @@ class DownloadBlock:
                     RemoteWorker.cancel_snapshot(state)
                     job = RemoteWorker.client(state['worker']['endpoint']).job(state['worker']['job_id'])
                     if item := db.session.get(ModelDownload, item_id):
+                        settled = RemoteWorker.settled_worker(state['worker'], job) if job else dict(state['worker'], settled=True)
+                        item.upload_state = dict(item.upload_state or {}, worker=settled)
                         UploadUtil.settle_usage(item, None, job.get('chargeable_bytes') if job else None)
+                        db.session.commit()
+                        state['worker'] = settled
+                        if (item.upload_state or {}).get('usage'):
+                            state['usage'] = item.upload_state['usage']
+                        snapshot['state'] = state
                 failures = []
                 item = db.session.get(ModelDownload, item_id)
                 if item:
@@ -186,21 +236,7 @@ class DownloadBlock:
                         snapshot['state'] = state
                     if state.get('cleanup_error'):
                         raise ValueError(state['cleanup_error'])
-                cls.remove_staging(state.get('staging_local_path'))
-                cls.remove_staging(snapshot.get('local_path'))
-                # 항목 전용 incoming 경로만 삭제한다. 최종 보관 경로는 절대 삭제하지 않는다.
-                for path in set(filter(None, (state.get('incoming'), state.get('shared_incoming')))):
-                    parent = str(state.get('dest_parent') or '').rstrip('/')
-                    folder = state.get('folder_name')
-                    if (not folder or not parent or not path.endswith('/' + folder)
-                            or path == parent or path.startswith(parent + '/')):
-                        raise ValueError('안전한 업로드 임시 경로를 확인하지 못했습니다.')
-                    cmd = ['rclone', 'purge', path, '--config', state['rclone_conf'],
-                           '--drive-use-trash=false'] + state.get('impersonate_arg', [])
-                    success, output = UploadUtil.run_rclone(cmd, '차단 항목 임시 파일 정리', execution_timeout=60)
-                    if not success and not any(text in output.lower() for text in
-                            ('directory not found', 'object not found', "doesn't exist")):
-                        failures.append(output.strip()[:200] or '원격 임시 파일 정리 실패')
+                cls.cleanup_temporary(dict(snapshot, state=state))
                 if failures:
                     raise RuntimeError('; '.join(failures))
                 snapshot['pending'] = False
@@ -214,11 +250,13 @@ class DownloadBlock:
                                       if snapshot.get('pending') else '차단됨: 임시 파일 정리 완료')
                 if not snapshot.get('pending'):
                     item.local_path = None
-                    item.upload_state = None
+                    FeederUtil.clear_transfer_state(item)
                     item.gdrive_account = None
             record.cleanup = [dict(s) for s in snapshots]
             record.error_message = '\n'.join(errors) or None
             db.session.commit()
+            if not snapshot.get('pending') and state.get('worker'):
+                RemoteWorker.acknowledge(dict(state, cleanup_pending=False))
         db.session.remove()
 
     @staticmethod

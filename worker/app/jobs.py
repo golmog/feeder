@@ -6,7 +6,7 @@ import math
 import re
 import json
 from urllib.parse import unquote
-from rclone_logging import classify_error
+from rclone_logging import classify_error, validate_extra_args
 
 
 STATUSES = ('queued', 'running', 'completed', 'failed', 'cancelled')
@@ -21,9 +21,12 @@ class ConflictError(ValueError):
 
 
 def validate_payload(payload, settings) -> dict:
-    if not isinstance(payload, dict) or set(payload) - {'job_id', 'source', 'destination', 'config_version', 'exclude_patterns', 'drive_impersonate', 'rclone_transfers'}:
-        raise ValueError('job_id, source, destination, config_version, exclude_patterns, drive_impersonate, rclone_transfers만 지정할 수 있습니다.')
+    if not isinstance(payload, dict) or set(payload) - {'job_id', 'source', 'destination', 'config_version', 'exclude_patterns', 'drive_impersonate', 'rclone_transfers', 'rclone_extra_args', 'session_id'}:
+        raise ValueError('작업 경로·설정 버전·필터·위임·전송 수·추가 옵션의 지원 필드만 지정할 수 있습니다.')
     job_id = payload.get('job_id')
+    session_id = payload.get('session_id')
+    if not isinstance(session_id, str) or not re.fullmatch(r'[a-f0-9]{32}', session_id):
+        raise ValueError('현재 Feeder 실행의 session_id가 필요합니다.')
     if not isinstance(job_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', job_id):
         raise ValueError('job_id는 영문·숫자로 시작하는 1~128자의 영문·숫자·점·밑줄·하이픈이어야 합니다.')
     remotes = settings.validate_remotes()
@@ -47,6 +50,10 @@ def validate_payload(payload, settings) -> dict:
     if type(version) is not int or version < 1:
         raise ValueError('config_version은 양의 정수여야 합니다.')
     result = {**{key: payload[key] for key in ('job_id', 'source', 'destination')}, 'config_version': version}
+    result['session_id'] = session_id
+    if 'rclone_extra_args' not in payload:
+        raise ValueError('rclone_extra_args 배열이 필요합니다. 추가 옵션이 없으면 빈 배열을 지정해주세요.')
+    result['rclone_extra_args'] = validate_extra_args(payload['rclone_extra_args'])
     if 'rclone_transfers' in payload:
         transfers = payload['rclone_transfers']
         if type(transfers) is not int or not 1 <= transfers <= 2**31 - 1:
@@ -70,7 +77,14 @@ def validate_payload(payload, settings) -> dict:
 
 
 def as_dict(row) -> dict:
-    job = dict(row)
+    job = {field: row[field] for field in ('job_id', 'status', 'source', 'destination', 'created_at',
+        'started_at', 'finished_at', 'bytes_transferred', 'total_bytes', 'speed', 'eta', 'error_message',
+        'rclone_exit_code', 'config_version', 'cancel_requested', 'exclude_patterns', 'drive_impersonate',
+        'rclone_transfers', 'rclone_extra_args', 'chargeable_bytes', 'error_type', 'session_id')}
+    if job.get('rclone_extra_args') is None:
+        job.pop('rclone_extra_args', None)
+    else:
+        job['rclone_extra_args'] = json.loads(job['rclone_extra_args'])
     if job.get('rclone_transfers') is None:
         job.pop('rclone_transfers', None)
     job['cancel_requested'] = bool(job['cancel_requested'])
@@ -120,6 +134,11 @@ class JobStore:
         with closing(self.database.connect()) as connection:
             connection.execute('BEGIN IMMEDIATE')
             try:
+                session = connection.execute("SELECT value FROM schema_meta WHERE key='feeder_session_id'").fetchone()
+                if not session or not data.get('session_id') or data['session_id'] != session['value']:
+                    raise ConflictError('Feeder 세션 초기화 확인 후 현재 세션으로 등록해주세요.')
+                if not data['job_id'].startswith(data['session_id'] + '-'):
+                    raise ConflictError('새 작업 ID는 현재 Feeder 세션 ID와 하이픈으로 시작해야 합니다.')
                 row = connection.execute('SELECT * FROM jobs WHERE job_id=?', (data['job_id'],)).fetchone()
                 if row:
                     if any(row[key] != data[key] for key in ('source', 'destination', 'config_version')):
@@ -130,6 +149,9 @@ class JobStore:
                         raise ConflictError('동일 job_id의 위임 계정이 다릅니다.')
                     if row['rclone_transfers'] != data.get('rclone_transfers'):
                         raise ConflictError('동일 job_id의 파일 동시 전송 수가 다릅니다.')
+                    stored_args = json.loads(row['rclone_extra_args']) if row['rclone_extra_args'] is not None else None
+                    if stored_args != data.get('rclone_extra_args'):
+                        raise ConflictError('동일 job_id의 Rclone 추가 옵션이 다릅니다.')
                     return as_dict(row)
                 if connection.execute('SELECT 1 FROM cancelled_job_ids WHERE job_id=?', (data['job_id'],)).fetchone():
                     raise ConflictError('등록 전에 취소된 작업 ID입니다.')
@@ -144,6 +166,9 @@ class JobStore:
                     (data.get('drive_impersonate', ''), data['job_id']))
                 connection.execute('UPDATE jobs SET rclone_transfers=? WHERE job_id=?',
                     (data.get('rclone_transfers'), data['job_id']))
+                connection.execute('UPDATE jobs SET rclone_extra_args=? WHERE job_id=?',
+                    (json.dumps(data['rclone_extra_args'], ensure_ascii=False), data['job_id']))
+                connection.execute('UPDATE jobs SET session_id=? WHERE job_id=?', (data['session_id'], data['job_id']))
                 self.log(connection, data['job_id'], '작업 등록')
                 self.event(connection, data['job_id'], 'job.queued')
                 self.commit(connection)
@@ -151,6 +176,56 @@ class JobStore:
                 connection.rollback()
                 raise
         return self.get(data['job_id'])
+
+    def reset_session(self, session_id):
+        """이전 실행이 모두 종료된 경우에만 작업 기록을 원자적으로 초기화한다."""
+        if not isinstance(session_id, str) or not re.fullmatch(r'[a-f0-9]{32}', session_id):
+            raise ValueError('Feeder 세션 ID가 유효하지 않습니다.')
+        with closing(self.database.connect()) as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                current = connection.execute("SELECT value FROM schema_meta WHERE key='feeder_session_id'").fetchone()
+                if current and current['value'] == session_id:
+                    return {'session_id': session_id, 'reset': False}
+                if connection.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1").fetchone():
+                    raise ConflictError('이전 워커 작업의 종료 확인을 기다립니다.')
+                connection.execute('DELETE FROM job_logs')
+                connection.execute('DELETE FROM jobs')
+                connection.execute('DELETE FROM cancelled_job_ids')
+                connection.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES ('feeder_session_id',?)", (session_id,))
+                self.commit(connection)
+            except Exception:
+                connection.rollback()
+                raise
+        return {'session_id': session_id, 'reset': True}
+
+    def acknowledge(self, job_id, session_id):
+        """Feeder가 영속 확정한 종료 작업만 지우고 같은 ID의 재접수를 막는다."""
+        if (not isinstance(session_id, str) or not re.fullmatch(r'[a-f0-9]{32}', session_id) or
+                not isinstance(job_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', job_id)):
+            raise ValueError('작업 ID와 세션 ID가 유효하지 않습니다.')
+        if not job_id.startswith(session_id + '-'):
+            raise ConflictError('작업 ID의 소유 세션이 일치하지 않습니다.')
+        with closing(self.database.connect()) as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            try:
+                row = connection.execute('SELECT status,session_id FROM jobs WHERE job_id=?', (job_id,)).fetchone()
+                if row is None:
+                    if connection.execute('SELECT 1 FROM cancelled_job_ids WHERE job_id=?', (job_id,)).fetchone():
+                        return {'job_id': job_id, 'removed': False, 'already_absent': True}
+                    return None
+                if row['session_id'] != session_id:
+                    raise ConflictError('작업의 소유 세션이 일치하지 않습니다.')
+                if row['status'] not in ('completed', 'failed', 'cancelled'):
+                    raise ConflictError('실행·대기 작업의 결과는 승인할 수 없습니다.')
+                connection.execute('INSERT OR IGNORE INTO cancelled_job_ids(job_id,created_at) VALUES (?,?)', (job_id, now()))
+                connection.execute('DELETE FROM job_logs WHERE job_id=?', (job_id,))
+                connection.execute('DELETE FROM jobs WHERE job_id=?', (job_id,))
+                self.commit(connection)
+            except Exception:
+                connection.rollback()
+                raise
+        return {'job_id': job_id, 'removed': True, 'already_absent': False}
 
     def get(self, job_id):
         with closing(self.database.connect()) as connection:

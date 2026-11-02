@@ -83,12 +83,47 @@ def create_job():
     return jsonify(job), 202
 
 
+@api.post('/session/reset')
+def reset_session():
+    try:
+        updates = current_app.extensions['worker_updates']
+        with updates.lock:
+            if updates.busy:
+                return jsonify(error={'code': 'updating', 'message': '워커 업데이트 완료 후 세션을 확인해주세요.'}), 503
+            payload = request.get_json(silent=True)
+            if not isinstance(payload, dict) or set(payload) != {'session_id'}:
+                raise ValueError('session_id 하나만 지정해주세요.')
+            result = current_app.extensions['worker_jobs'].reset_session(payload['session_id'])
+    except ConflictError as exc:
+        return jsonify(error={'code': 'session_busy', 'message': str(exc)}), 409
+    except ValueError as exc:
+        return jsonify(error={'code': 'invalid_request', 'message': str(exc)}), 400
+    return jsonify(result)
+
+
 @api.get('/jobs/<job_id>')
 def get_job(job_id):
     job = current_app.extensions['worker_jobs'].get(job_id)
     if job is None:
         abort(404)
     return jsonify(job)
+
+
+@api.post('/jobs/<job_id>/ack')
+def acknowledge_job(job_id):
+    try:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or set(payload) != {'session_id'}:
+            raise ValueError('결과를 확정한 작업의 session_id를 지정해주세요.')
+        result = current_app.extensions['worker_jobs'].acknowledge(job_id, payload['session_id'])
+    except ConflictError as exc:
+        return jsonify(error={'code': 'conflict', 'message': str(exc)}), 409
+    except ValueError as exc:
+        return jsonify(error={'code': 'invalid_request', 'message': str(exc)}), 400
+    if result is None:
+        return jsonify(error={'code': 'not_found', 'message': '확인된 작업 또는 차단 ID가 없습니다.'}), 404
+    # 업데이트 draining 중에도 이미 종료된 작업의 승인·조회는 계속 허용한다.
+    return jsonify(result)
 
 
 @api.get('/jobs')

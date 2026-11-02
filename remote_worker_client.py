@@ -71,9 +71,7 @@ class WorkerClient:
                 timeout=(3, 20 if stream else 10), stream=True, allow_redirects=False)
             if stream and response.status_code == 200:
                 return session, response
-            body = response.raw.read(65537, decode_content=True)
-            if len(body) > 65536:
-                raise WorkerError('워커 응답이 허용 크기를 초과했습니다.')
+            body = response.raw.read(decode_content=True)
             status = response.status_code
             if status == 404 and method == 'GET' and path.startswith('/jobs/'):
                 return None
@@ -87,7 +85,8 @@ class WorkerClient:
                     raw_code = error.get('code')
                 except (ValueError, TypeError, AttributeError):
                     raw_code = None
-                code = ('auth' if status in (401, 403) else 'configuration' if status in (400, 409)
+                code = ('checking' if status == 409 and raw_code == 'session_busy' else
+                        'auth' if status in (401, 403) else 'configuration' if status in (400, 409)
                         else 'updating' if status == 503 and raw_code == 'updating' else 'unavailable')
                 message = {'updating': '워커 업데이트 중입니다. 기존 작업 ID를 유지하고 재확인합니다.',
                            'auth': '워커 인증이 거부됐습니다. 연결 설정을 확인해주세요.',
@@ -98,7 +97,7 @@ class WorkerClient:
                 result = json.loads(body)
                 if not isinstance(result, dict): raise ValueError
             except (ValueError, UnicodeError):
-                raise WorkerError('워커 응답 형식을 확인하지 못했습니다.') from None
+                raise WorkerError('워커 응답 형식을 확인하지 못했습니다.', code='invalid_response') from None
             if status == 202 and (result.get('status') == 'updating' or
                     isinstance(result.get('error'), dict) and result['error'].get('code') == 'updating'):
                 raise WorkerError('워커 업데이트 중입니다. 기존 작업 ID를 유지하고 재확인합니다.', 202, 'updating')
@@ -132,11 +131,11 @@ class WorkerClient:
             return health
         try:
             if tuple(map(int, health['version'].split('.'))) > tuple(map(int, expected.split('.'))):
-                raise WorkerError('워커가 Feeder보다 최신 버전입니다. Feeder를 업데이트해주세요.')
+                raise WorkerError('워커가 Feeder보다 최신 버전입니다. Feeder를 업데이트해주세요.', code='configuration')
         except (ValueError, KeyError, AttributeError):
-            raise WorkerError('워커 버전을 확인하지 못했습니다.') from None
+            raise WorkerError('워커 버전을 확인하지 못했습니다.', code='configuration') from None
         if not health.get('self_update'):
-            raise WorkerError('이 워커는 자동 업데이트를 지원하지 않습니다. 설치 스크립트로 한 번 업데이트하면 이후부터 자동 갱신됩니다.')
+            raise WorkerError('이 워커는 자동 업데이트를 지원하지 않습니다. 설치 스크립트로 한 번 업데이트하면 이후부터 자동 갱신됩니다.', code='configuration')
         update = health.get('update') or {}
         if update.get('status') in ('validating', 'draining', 'restarting') and update.get('target_version') == expected:
             raise WorkerError(f'워커 {expected} 업데이트 진행 중입니다. 기존 전송 종료와 재로딩을 기다립니다.', 202)
@@ -158,6 +157,13 @@ class WorkerClient:
 
     def job(self, job_id): return self._request('GET', '/jobs/' + self._job_id(job_id))
     def submit(self, payload): return self._request('POST', '/jobs', payload)
+    def jobs(self, limit=100, offset=0, status=None):
+        params = {'limit': limit, 'offset': offset}
+        if status is not None: params['status'] = status
+        return self._request('GET', '/jobs', params=params)
+    def acknowledge(self, job_id, session_id):
+        return self._request('POST', '/jobs/' + self._job_id(job_id) + '/ack', {'session_id': session_id})
+    def reset_session(self, session_id): return self._request('POST', '/session/reset', {'session_id': session_id})
     def cancel(self, job_id): return self._request('POST', '/jobs/' + self._job_id(job_id) + '/cancel')
 
     def events(self, cursor=None, stream_id=None, stop=None):

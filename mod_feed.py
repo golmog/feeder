@@ -184,7 +184,7 @@ class ModuleFeed(PluginModuleBase):
 
             item_data = {
                 'id': int(feed_id) if (feed_id and feed_id != '-1') else -1,
-                'name': name_val or f"feed_{feed_id}",
+                'name': name_val,
                 'sources': sources,
                 'quality': quality,
                 'feed_count': feed_count,

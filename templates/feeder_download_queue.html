@@ -129,6 +129,35 @@
 </div>
 
 <!-- 모달: 다운로드 재시도 설정 모달 -->
+<div class="modal fade" id="pipeline_resume_modal" tabindex="-1" role="dialog" aria-hidden="true">
+  <div class="modal-dialog modal-md">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">작업 재개 방법 선택</h5>
+        <button type="button" class="close" data-dismiss="modal" aria-label="닫기"><span aria-hidden="true">&times;</span></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="pipeline_resume_owner" value="">
+        <p>진행 중인 작업이 있다면 <strong>중단 예약 취소</strong>를 선택하세요. 현재 잠금을 유지하고 기존 작업을 계속합니다.</p>
+        <div class="alert alert-warning small">
+          잠금이나 업로드 표시만으로 작업 종료를 판단할 수 없습니다.
+          이전 Celery 작업과 실제 업로드·스테이징·최종 이동이 모두 종료됐는데 잠금만 남은 경우에만 복구하세요.
+          실행 중에 잠금을 복구하면 중복 전송이 발생할 수 있습니다.
+        </div>
+        <div class="form-check">
+          <input class="form-check-input" type="checkbox" id="pipeline_finished_confirm">
+          <label class="form-check-label" for="pipeline_finished_confirm">이전 Celery 작업과 실제 전송이 종료된 것을 확인했습니다.</label>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-sm btn-secondary" data-dismiss="modal">닫기</button>
+        <button id="pipeline_continue_btn" type="button" class="btn btn-sm btn-success">중단 예약 취소</button>
+        <button id="pipeline_recover_resume_btn" type="button" class="btn btn-sm btn-danger" disabled>잠금 복구 후 재개</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="modal fade" id="download_retry_modal" tabindex="-1" role="dialog" aria-hidden="true">
   <div class="modal-dialog modal-md">
     <div class="modal-content">
