@@ -386,6 +386,11 @@ class TaskDownload:
                 DownloadActivity.record('완료', '다운로드 작업 주기 완료 · 다음 실행을 기다립니다.')
 
             except Exception as e:
+                if isinstance(e, WorkerError) and e.code == 'wait_timeout':
+                    message = '원격 워커 연결 대기 120초 초과 · 현재 실행 종료, 다음 스케줄러 주기 재시도'
+                    DownloadActivity.record('원격 워커 대기', message, 'warning')
+                    logger.warning('[DownloadPipeline] %s', message)
+                    return
                 DownloadActivity.record('오류', '다운로드 작업 중 오류가 발생했습니다. 상세 원인은 플랫폼 로그를 확인하세요.', 'error')
                 logger.error(f"[DownloadPipeline] 파이프라인 처리 중 오류: {e}")
                 logger.error(traceback.format_exc())
@@ -1803,14 +1808,26 @@ class TaskDownload:
 
         def can_assign(item_id):
             # 실행 슬롯·DB 세션·제출 잠금 밖에서 같은 첫 미접수 항목을 기다린다.
+            deadline = None
             while not FeederUtil.is_download_paused():
                 result = check_assignment(item_id)
                 if isinstance(result, bool):
                     return result
-                while time.monotonic() < result['after']:
+                if result['code'] == 'full':
+                    deadline = None
+                elif deadline is None:
+                    # 이전 실행의 readiness.since와 무관한 현재 항목의 연결 대기 한도다.
+                    deadline = time.monotonic() + 120
+                while True:
                     if FeederUtil.is_download_paused():
                         return False
-                    time.sleep(min(1.0, max(0.0, result['after'] - time.monotonic())))
+                    now = time.monotonic()
+                    if deadline is not None and now >= deadline:
+                        raise WorkerError('원격 워커 연결 대기 시간 초과', code='wait_timeout')
+                    if now >= result['after']:
+                        break
+                    delay = min(1.0, result['after'] - now)
+                    time.sleep(min(delay, deadline - now) if deadline is not None else delay)
             return False
 
         def _upload_worker(item_id):
