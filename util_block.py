@@ -35,7 +35,7 @@ class DownloadBlock:
             impersonate = pooled and options['use_impersonate']
             account = next((a for a in FeederUtil.get_gdrive_accounts()
                             if a.get('username') == item.gdrive_account), {}) if pooled else {}
-            remote = dest.get('mydrive_remote_name') or P.ModelSetting.get('download_gdrive_mydrive_remote_name') or rclone.get('mydrive_remote_name') or 'gdrive_sa'
+            remote = dest.get('mydrive_remote_name') or P.ModelSetting.get('download_gdrive_mydrive_remote_name') or rclone.get('mydrive_remote_name') or ''
             if not pooled:
                 remote = dest.get('remote_name') or P.ModelSetting.get('download_rclone_upload_remote_name') or remote
             elif not impersonate:

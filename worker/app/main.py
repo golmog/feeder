@@ -20,6 +20,7 @@ def main() -> None:
     logging.getLogger(__name__).info('Feeder Remote Worker %s 시작 (%s:%s)', VERSION, settings.bind, settings.port)
     worker = app.extensions['worker_runner']
     updates = app.extensions['worker_updates']
+    worker.failure_callback = lambda: os.kill(os.getpid(), signal.SIGTERM)
     updates.callback = lambda: os.kill(os.getpid(), signal.SIGTERM)
     previous = {kind: signal.getsignal(kind) for kind in (signal.SIGTERM, signal.SIGINT)}
     def terminate(signum, frame):
@@ -42,20 +43,25 @@ def main() -> None:
         updates.confirm_started()
         server.run()
     except KeyboardInterrupt:
-        if not updates.ready:
-            raise
+        pass
     finally:
         try:
-            app.extensions['worker_events'].close()
-            worker.stop()
+            try:
+                app.extensions['worker_events'].close()
+            finally:
+                worker.stop()
         finally:
             try:
                 if server is not None:
-                    server.task_dispatcher.shutdown()
-                    server.close()
+                    try:
+                        server.task_dispatcher.shutdown()
+                    finally:
+                        server.close()
             finally:
                 for kind, handler in previous.items():
                     signal.signal(kind, handler)
+    if worker.failure:
+        raise SystemExit(1)
     if updates.ready:
         updates.activate()
 

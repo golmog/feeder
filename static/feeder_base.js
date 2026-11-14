@@ -214,6 +214,12 @@ window.globalRequestSearch = function (page, preserveScroll) {
     var feed_select = ($('#feed_select').length > 0) ? ($('#feed_select').val() || 'all') : (localStorage.getItem(storage_pfx + 'feed_select') || 'all');
     localStorage.setItem(storage_pfx + 'feed_select', feed_select);
     postData.feed_select = feed_select;
+  } else if (sub === 'download') {
+    ['feed_select', 'engine_select'].forEach(function (name) {
+      var value = $('#' + name).length ? ($('#' + name).val() || 'all') : (localStorage.getItem(storage_pfx + name) || 'all');
+      localStorage.setItem(storage_pfx + name, value);
+      postData[name] = value;
+    });
   }
 
   var savedScrollTop = (preserveScroll === true) ? window.scrollY : 0;
@@ -527,12 +533,15 @@ $(document).on('click', '.direct-chain-remove-btn', function (e) {
   render_direct_chain_table();
 });
 
-function render_direct_dynamic_dest_fields(transporter_id, current_values) {
-  var container = $('#modal_direct_dynamic_dest_fields');
+function render_direct_dynamic_dest_fields(transporter_id, current_values, options) {
+  options = options || {};
+  var container = $(options.container || '#modal_direct_dynamic_dest_fields');
+  var fieldPrefix = options.fieldPrefix || 'direct_dest_field_';
+  var radioPrefix = options.radioPrefix || 'direct_dest_';
   container.empty();
   if (!transporter_id) { container.text('실제로 선택된 엔진의 기본 목적지와 프로필의 엔진별 설정을 사용합니다.'); return; }
 
-  var schemaObj = cached_transporter_schemas.find(function (s) { return s.transporter_id === transporter_id; });
+  var schemaObj = (options.schemas || cached_transporter_schemas).find(function (s) { return s.transporter_id === transporter_id; });
   if (!schemaObj || !schemaObj.config_schema || schemaObj.config_schema.length === 0) {
     container.html('<div class="text-muted small p-2 text-center">해당 목적지에 별도 세부 설정 항목이 없습니다.</div>');
     return;
@@ -552,21 +561,21 @@ function render_direct_dynamic_dest_fields(transporter_id, current_values) {
     html += '  <div class="col-sm-9">';
 
     if (f.type === 'radio') {
-      html += '<div id="direct_dest_field_' + f.name + '" class="d-flex flex-wrap">';
+      html += '<div id="' + fieldPrefix + f.name + '" class="d-flex flex-wrap">';
       (f.options || []).forEach(function (option) {
-        html += '<label class="form-check form-check-inline"><input class="form-check-input" type="radio" name="direct_dest_' + f.name + '" value="' + option.value + '"' +
+        html += '<label class="form-check form-check-inline"><input class="form-check-input" type="radio" name="' + radioPrefix + f.name + '" value="' + option.value + '"' +
           (String(val) === option.value ? ' checked' : '') + '><span class="form-check-label">' + option.label + '</span></label>';
       });
       html += '</div>';
     } else if (f.type === 'checkbox') {
       var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
-      html += '    <input type="checkbox" id="direct_dest_field_' + f.name + '" class="mt-2" ' + isChk + '>';
+      html += '    <input type="checkbox" id="' + fieldPrefix + f.name + '" class="mt-2" ' + isChk + '>';
     } else if (f.type === 'number') {
-      html += '    <input type="number" id="direct_dest_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+      html += '    <input type="number" id="' + fieldPrefix + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
     } else if (f.type === 'password') {
-      html += '    <input type="password" id="direct_dest_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+      html += '    <input type="password" id="' + fieldPrefix + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
     } else {
-      html += '    <input type="text" id="direct_dest_field_' + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
+      html += '    <input type="text" id="' + fieldPrefix + f.name + '" class="form-control form-control-sm" value="' + val + '" placeholder="' + ph + '">';
     }
 
     html += descHtml;
@@ -580,26 +589,14 @@ $(document).on('change', '#modal_direct_dest_type', function () {
   render_direct_dynamic_dest_fields($(this).val(), null);
 });
 
-$(document).on('click', '#btn_confirm_direct_download', function (e) {
-  e.preventDefault();
-  var mag = $('#modal_direct_magnet').val();
-  var title = $('#modal_direct_title').text();
-  var pName = $('#modal_direct_preset_select').val();
-  var feed = $('#modal_direct_feed_name').val() || 'DIRECT';
-
-  if (!modal_direct_chain || modal_direct_chain.length === 0) {
-    notify('우선순위 체인에 다운로더 엔진을 1개 이상 추가하세요.', 'warning');
-    return;
-  }
-
-  var destType = $('#modal_direct_dest_type').val();
+function collect_direct_destination_fields(destType, options) {
+  options = options || {};
   var destObj = { type: destType };
-
-  var schemaObj = cached_transporter_schemas.find(function (s) { return s.transporter_id === destType; });
+  var schemaObj = (options.schemas || cached_transporter_schemas).find(function (s) { return s.transporter_id === destType; });
   if (schemaObj && schemaObj.config_schema) {
     for (var i = 0; i < schemaObj.config_schema.length; i++) {
       var f = schemaObj.config_schema[i];
-      var el = $('#direct_dest_field_' + f.name);
+      var el = $('#' + (options.fieldPrefix || 'direct_dest_field_') + f.name);
       if (f.type === 'radio') {
         var selected = el.find('input:checked').val();
         if (selected !== '' && selected != null) destObj[f.name] = f.allow_inherit ? selected === 'true' : selected;
@@ -612,6 +609,22 @@ $(document).on('click', '#btn_confirm_direct_download', function (e) {
       }
     }
   }
+  return destObj;
+}
+
+$(document).on('click', '#btn_confirm_direct_download', function (e) {
+  e.preventDefault();
+  var mag = $('#modal_direct_magnet').val();
+  var title = $('#modal_direct_title').text();
+  var pName = $('#modal_direct_preset_select').val();
+  var feed = $('#modal_direct_feed_name').val() || 'DIRECT';
+
+  if (!modal_direct_chain || modal_direct_chain.length === 0) {
+    notify('우선순위 체인에 다운로더 엔진을 1개 이상 추가하세요.', 'warning');
+    return;
+  }
+  var destType = $('#modal_direct_dest_type').val();
+  var destObj = collect_direct_destination_fields(destType);
 
   notify('다운로드 큐 등록 요청 중...', 'info');
   $.ajax({

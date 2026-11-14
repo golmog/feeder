@@ -33,6 +33,7 @@
     <!-- 탭 1: 기본 설정 -->
     {{ macros.m_tab_content_start('basic', true) }}
       {{ macros.setting_input_int('download_feed_sync_hours', '다운로드 대상 피드 기간 (시간)', value=arg['download_feed_sync_hours'], min='1', placeholder='72', desc=['최근 N시간 이내에 수집된 피드 게시물만 다운로드 대상으로 큐에 추가합니다 (기본값: 72시간)']) }}
+      {{ macros.setting_input_int('download_duplicate_min_video_size_mb', '중복 비교 최소 영상 크기 (MiB)', value=arg['download_duplicate_min_video_size_mb'], min='0', placeholder='100', desc=['AllDebrid Ready 이후 원래 폴더명(대소문자 무시)과 이 크기 이상인 영상들의 개수·바이트 크기 목록이 완료 이력과 같으면 전송을 생략합니다. 1MiB=1,048,576바이트, 기본 100MiB, 0은 양수 크기의 모든 영상입니다.', '파일 해시 검증이 없는 휴리스틱입니다. 내부 영상 이름과 작은 영상·부속파일은 비교하지 않으며 새 목적지에 두 번째 파일이 생성되지 않을 수 있습니다. 기존 파일·마그넷은 자동 삭제하지 않습니다.']) }}
       {{ macros.setting_input_int('download_max_staging_items', 'Google Drive 업로드 최대 큐', value=arg['download_max_staging_items'], min='0', placeholder='10', desc=['스테이징 중·업로드 대기·업로드 진행 작업을 합산한 최대 큐 (기본값: 10, 0은 무제한)', '직접 업로드도 포함하며, 실패 후 로컬 버퍼에 남은 작업도 슬롯을 차지합니다.']) }}
       {{ macros.setting_input_int('download_upload_workers', 'Google Drive 업로드 동시 전송 수', value=arg['download_upload_workers'], min='1', max='10', placeholder='2', desc=['Google Drive 업로드와 로컬 스테이징에 공통으로 적용할 동시 전송 수 (기본값: 2)']) }}
       {{ macros.setting_input_text('download_upload_root', '임시 업로드 루트', value=arg['download_upload_root'], placeholder='incoming', desc=['목적지 Rclone 리모트 내부의 상대 경로입니다. 엔진별 루트와 프로필 폴더로 실제 경로를 구성합니다. 로컬 스테이징 경로와 별개입니다.']) }}
@@ -80,7 +81,7 @@
       <div id="download_use_gdrive_pool_div" class="collapse">
         {{ macros.setting_checkbox('download_gdrive_use_impersonate', 'Google Workspace Impersonate', value=arg['download_gdrive_use_impersonate'], desc=['On: 단일 SA 위임 리모트에서 --drive-impersonate로 각 계정에 동적 접근합니다.', 'Off: 계정 풀에 등록된 개별 Rclone 리모트를 직접 사용합니다.']) }}
         <div id="download_gdrive_use_impersonate_div" class="collapse">
-          {{ macros.setting_input_text('download_gdrive_mydrive_remote_name', '위임용 리모트', value=arg['download_gdrive_mydrive_remote_name'], placeholder='예: gdrive_sa', desc=['Impersonate 위임 사용 시 기준이 되는 서비스 계정(SA) Rclone 리모트 이름']) }}
+          {{ macros.setting_input_text('download_gdrive_mydrive_remote_name', '위임용 리모트', value=arg['download_gdrive_mydrive_remote_name'], placeholder='예: workspace_drive', desc=['Impersonate 위임 사용 시 기준이 되는 서비스 계정(SA) Rclone 리모트 이름']) }}
         </div>
         {{ macros.setting_input_text('download_shared_drive_id', '기본 목적지 공유 드라이브 ID', value=arg['download_shared_drive_id'], placeholder='예: 0ABCDE12345678') }}
         {{ macros.setting_input_text('download_mydrive_upload_threshold', '내 드라이브 바이패스 임계 용량', value=arg['download_mydrive_upload_threshold'], placeholder='14GB', desc=['이 용량 이하의 파일만 15GB MyDrive로 1차 업로드 후 공유 드라이브로 서버사이드 이동합니다. (기본값: 14GB)']) }}

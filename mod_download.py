@@ -45,17 +45,18 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_local_staging_path": "",
             f"{self.name}_max_staging_items": "10",
             f"{self.name}_upload_workers": "2",
+            f"{self.name}_duplicate_min_video_size_mb": "100",
             f"{self.name}_upload_root": "incoming",
             f"{self.name}_complete_root": "uploads",
             f"{self.name}_exclude_pattern": "",
             f"{self.name}_enable_sse": "True",
             f"{self.name}_rclone_conf_path": "",
-            f"{self.name}_rclone_remote_name": "net",
+            f"{self.name}_rclone_remote_name": "",
             f"{self.name}_rclone_upload_remote_name": "",
             f"{self.name}_use_gdrive_pool": "False",
             f"{self.name}_gdrive_use_impersonate": "False",
-            f"{self.name}_gdrive_mydrive_remote_name": "gdrive_sa",
-            f"{self.name}_rclone_shared_remote_name": "gf",
+            f"{self.name}_gdrive_mydrive_remote_name": "",
+            f"{self.name}_rclone_shared_remote_name": "",
             f"{self.name}_shared_drive_id": "",
             f"{self.name}_rclone_options_migrated": "False",
             f"{self.name}_rclone_transfers": "2",
@@ -272,6 +273,9 @@ class ModuleDownload(PluginModuleBase):
                 if FeederUtil.is_download_paused():
                     return jsonify({'ret': 'warning', 'msg': '중단 상태입니다. 다운로드 큐에서 작업을 재개하세요.'})
                 return self.one_execute()
+
+            if command == 'list_filter_options':
+                return jsonify(self.web_list_model.list_filter_options())
 
             if sub == 'web_list' or command == 'web_list':
                 return jsonify(self.web_list_model.web_list(req))
@@ -672,6 +676,9 @@ class ModuleDownload(PluginModuleBase):
                     db.session.rollback()
                     return jsonify({'ret': 'fail', 'msg': str(ex)})
 
+            elif command == 'direct_add_batch':
+                return jsonify(self._direct_add_batch(req))
+
             elif command in ['direct_add', 'direct_download']:
                 title = req.form.get('title', '').strip()
                 magnet = req.form.get('magnet', '').strip()
@@ -786,9 +793,17 @@ class ModuleDownload(PluginModuleBase):
                     except WorkerError as exc:
                         return jsonify({'ret': 'fail', 'msg': str(exc)})
                     if resumed:
+                        if action == 'retry':
+                            state = dict(item.upload_state or {})
+                            state.pop('engine_retry', None)
+                            item.upload_state = state
+                            db.session.commit()
                         return jsonify({'ret': 'success', 'msg': '복사를 반복하지 않고 최종 이동을 다시 시도합니다.'})
 
                 if action == 'retry':
+                    state = dict(item.upload_state or {})
+                    state.pop('engine_retry', None)
+                    item.upload_state = state
                     source_subpath = FeederUtil.get_download_source_subpath(item)
                     item.source_unavailable_since = None
                     item.upload_retry_after = None
@@ -946,6 +961,87 @@ class ModuleDownload(PluginModuleBase):
             logger.error(traceback.format_exc())
             return jsonify({'ret': 'error', 'msg': str(e)})
 
+    def _direct_add_batch(self, req):
+        """편집 후 체인·목적지를 검증하고 모든 링크에 같은 등록 설정을 전달한다."""
+        text = req.form.get('links_text', '')
+        if len(text.encode('utf-8')) > 1024 * 1024:
+            return {'ret': 'fail', 'msg': '전체 입력은 1MiB 이하로 나누어 등록해주세요.'}
+        lines = [(number, line.strip()) for number, line in enumerate(text.splitlines(), 1) if line.strip()]
+        if not lines or len(lines) > 200:
+            return {'ret': 'fail', 'msg': '빈 줄을 제외하고 1~200개의 링크를 입력해주세요.'}
+        profile_name = req.form.get('profile_name', '').strip()
+        try:
+            profile = next((p for p in FeederUtil.get_download_profiles() if p.get('name') == profile_name), None) if profile_name else {}
+            if profile is None:
+                return {'ret': 'fail', 'msg': '선택한 설정 프리셋을 찾을 수 없습니다. 목록을 다시 불러와주세요.'}
+            raw_chain = req.form.get('priority_chain')
+            custom_chain = json.loads(raw_chain) if raw_chain else None
+            chain = custom_chain if custom_chain is not None else profile.get('priority_chain')
+            destination_type = req.form.get('destination_type', '').strip()
+            raw_destination = req.form.get('destination_config')
+            destination_config = json.loads(raw_destination) if raw_destination else {}
+            if not isinstance(destination_config, dict):
+                return {'ret': 'fail', 'msg': '목적지 세부 설정 형식을 확인해주세요.'}
+            if not isinstance(chain, list) or not chain or any(not isinstance(name, str) or not name.strip() for name in chain):
+                return {'ret': 'fail', 'msg': '우선순위 체인에 다운로더 엔진을 1개 이상 추가해주세요.'}
+            configs = [FeederUtil.get_downloader_by_name(name) for name in chain]
+            if any(not config or FeederUtil.validate_destination(dict(destination_config, type=destination_type) if destination_type
+                   else FeederUtil.get_profile_destination(profile, name))
+                   for name, config in zip(chain, configs)):
+                return {'ret': 'fail', 'msg': '선택한 프로필의 엔진과 목적지 설정을 확인해주세요.'}
+            if not DownloadUtil._engine_classes:
+                DownloadUtil.load_engines()
+            supported = set()
+            for config in configs:
+                engine = DownloadUtil._engine_classes.get(config.get('engine_type', '').lower())
+                supported.update(getattr(engine, 'SUPPORTED_PROTOCOLS', []))
+        except Exception:
+            db.session.rollback()
+            return {'ret': 'fail', 'msg': '프로필과 엔진 설정을 확인하지 못했습니다. 설정을 확인한 뒤 다시 시도해주세요.'}
+
+        counts = dict.fromkeys(('added', 'duplicate', 'blocked', 'invalid', 'unsupported', 'failed'), 0)
+        results, seen = [], set()
+        messages = {'added': '다운로드 대기열에 추가했습니다.', 'duplicate': '이미 등록됐거나 입력에서 중복된 링크입니다.',
+                    'blocked': '차단된 콘텐츠입니다.', 'invalid': '유효한 Magnet 또는 ED2K 파일 링크를 입력해주세요.',
+                    'unsupported': '선택한 엔진 체인에 이 링크를 지원하는 엔진이 없습니다.', 'failed': '등록하지 못했습니다. 설정을 확인한 뒤 다시 시도해주세요.'}
+        for number, link in lines:
+            try:
+                FeederUtil.cooperate()
+                protocol = 'magnet' if link.startswith('magnet:?') else 'ed2k' if link.startswith('ed2k://|file|') else ''
+                valid = (protocol == 'magnet' and re.fullmatch(r'magnet:\?[^\s\x00-\x1f\x7f]+', link) and
+                         re.search(r'(?:[?&])xt=urn:btih:(?:[a-f0-9]{40}|[a-z2-7]{32})(?=&|$)', link, re.IGNORECASE)) or (
+                         protocol == 'ed2k' and re.fullmatch(r'ed2k://\|file\|[^|\x00-\x1f\x7f]+\|[0-9]+\|[a-f0-9]{32}\|(?:[^|\x00-\x1f\x7f]*\|)*/', link, re.IGNORECASE))
+                infohash = FeederUtil.extract_info_hash(link) if valid else None
+                if (len(link.encode('utf-8')) > 16384 or
+                        not re.fullmatch(r'[a-f0-9]{40}' if protocol == 'magnet' else r'[a-f0-9]{32}', infohash or '')):
+                    status = 'invalid'
+                elif infohash in seen:
+                    status = 'duplicate'
+                else:
+                    seen.add(infohash)
+                    if ModelDownload.is_blocked(infohash, link):
+                        status = 'blocked'
+                    elif ModelDownload.get_by_infohash(infohash) or ModelDownload.get_by_magnet(link):
+                        status = 'duplicate'
+                    elif protocol not in supported:
+                        status = 'unsupported'
+                    else:
+                        result = FeederUtil.add_direct_download(title='', magnet=link, profile_name=profile_name,
+                                                               feed_name='DIRECT', caller_name=self.name, custom_chain=custom_chain,
+                                                               custom_dest_type=destination_type, custom_dest_config=destination_config)
+                        status = {'success': 'added', 'exist': 'duplicate'}.get(result.get('ret'), 'failed')
+                        if status == 'failed' and ModelDownload.is_blocked(infohash, link):
+                            status = 'blocked'
+                        if status == 'failed':
+                            db.session.rollback()
+            except Exception as exc:
+                db.session.rollback()
+                logger.warning('[DownloadBatch] %s번째 줄 등록 실패 (%s)', number, type(exc).__name__)
+                status = 'failed'
+            counts[status] += 1
+            results.append({'line': number, 'status': status, 'message': messages[status]})
+        return {'ret': 'success', 'total': len(lines), 'counts': counts, 'results': results}
+
     def process_api(self, sub, req):
         try:
             if sub == 'activity':
@@ -1088,7 +1184,7 @@ class ModuleDownload(PluginModuleBase):
                 ad_section = (
                     f"\n[{engine_remote}]\n"
                     f"type = webdav\n"
-                    f"url = https://webdav.alldebrid.com\n"
+                    f"url = https://webdav.debrid.it/\n"
                     f"vendor = other\n"
                     f"user = {apikey}\n"
                     f"pass = {obscured_pass}\n"
@@ -1102,7 +1198,7 @@ class ModuleDownload(PluginModuleBase):
             dest_cfg.get('shared_remote_name')
             or dest_cfg.get('remote_name')
             or P.ModelSetting.get('download_rclone_shared_remote_name')
-            or 'gdrive_shared'
+            or ''
         )
         shared_drive_id = item.gdrive_remote_id or dest_cfg.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
         complete_path = (dest_cfg.get('complete_path') or item.gdrive_complete_path or '').strip('/')
@@ -1174,6 +1270,7 @@ class ModuleDownload(PluginModuleBase):
 
         if is_success:
             item.status = 'completed'
+            item.mark_video_stored()
             item.completed_time = datetime.now()
             item.error_message = None
             if bytes_transferred > 0:

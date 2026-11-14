@@ -103,9 +103,13 @@ def reset_session():
 
 @api.get('/jobs/<job_id>')
 def get_job(job_id):
-    job = current_app.extensions['worker_jobs'].get(job_id)
+    store = current_app.extensions['worker_jobs']
+    job = store.get(job_id)
     if job is None:
-        abort(404)
+        reason = 'tombstoned' if store.is_tombstoned(job_id) else 'unknown'
+        message = ('작업 기록은 없으며 재접수 방지 ID가 있습니다. 완료 또는 ACK 여부를 뜻하지 않습니다.'
+                   if reason == 'tombstoned' else '해당 작업 기록을 찾을 수 없습니다.')
+        return jsonify(error={'code': 'job_not_found', 'reason': reason, 'message': message}), 404
     return jsonify(job)
 
 

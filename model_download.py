@@ -2,7 +2,7 @@
 from datetime import datetime
 import hashlib
 import base64
-from sqlalchemy import desc, or_, and_, case
+from sqlalchemy import desc, or_, and_, case, func
 
 from .setup import *
 from .util_base import FeederUtil
@@ -27,6 +27,7 @@ class ModelDownload(ModelBase):
     infohash = db.Column(db.String, index=True, nullable=True)
     file_name = db.Column(db.String, nullable=True, index=True)
     source_file_name = db.Column(db.String, nullable=True)
+    video_manifest = db.Column(db.JSON, nullable=True)
     output_folder_name = db.Column(db.String, nullable=True, index=True)
     file_size = db.Column(db.BigInteger, default=0)
 
@@ -74,6 +75,8 @@ class ModelDownload(ModelBase):
 
     def as_dict(self):
         ret = {x.name: getattr(self, x.name) for x in self.__table__.columns}
+        ret['remote_submission'] = self.remote_submission()
+        ret['duplicate_of'] = (self.video_manifest or {}).get('duplicate_of')
         ret['created_time'] = self.created_time.strftime('%Y-%m-%d %H:%M:%S') if self.created_time else ''
         ret['updated_time'] = self.updated_time.strftime('%Y-%m-%d %H:%M:%S') if self.updated_time else ''
         ret['completed_time'] = self.completed_time.strftime('%Y-%m-%d %H:%M:%S') if self.completed_time else ''
@@ -94,6 +97,17 @@ class ModelDownload(ModelBase):
     @classmethod
     def failure_filter(cls):
         return or_(cls.status == 'failed', and_(cls.status == 'move_failed', cls.completed_time.is_(None)))
+
+    def remote_submission(self):
+        """원격 접수와 FF의 모니터링 상태를 구분할 공개 정보만 반환한다."""
+        remote = (self.upload_state or {}).get('worker') or {}
+        submission = remote.get('submission')
+        return submission if remote.get('job_id') and not remote.get('settled') and submission in ('accepted', 'uncertain') else None
+
+    def mark_video_stored(self):
+        """실제 보관 완료 경로에서만 다음 작업의 중복 비교 근거로 확정한다."""
+        if self.video_manifest and not self.video_manifest.get('duplicate_of'):
+            self.video_manifest = dict(self.video_manifest, stored=True)
 
     @classmethod
     def get_by_magnet(cls, magnet: str):
@@ -125,6 +139,21 @@ class ModelDownload(ModelBase):
             return []
 
     @classmethod
+    def list_filter_options(cls):
+        """설정에서 사라진 이름도 포함해 전체 이력의 필터 값을 조회한다."""
+        try:
+            result = {'success': True}
+            for name, column in (('feed_select', cls.feed_name), ('engine_select', cls.current_engine_name)):
+                result[name] = [row[0] for row in db.session.query(column).filter(
+                    column.isnot(None), func.trim(column) != '').distinct().order_by(column.asc()).all()]
+            return result
+        except Exception:
+            logger.error('[ModelDownload] 다운로드 필터 옵션 조회 실패')
+            return {'success': False}
+        finally:
+            db.session.remove()
+
+    @classmethod
     def web_list(cls, req):
         try:
             try:
@@ -143,10 +172,17 @@ class ModelDownload(ModelBase):
             search_word = req.form.get('search_word', '').strip()
 
             query = db.session.query(cls)
+            for name, column in (('feed_select', cls.feed_name), ('engine_select', cls.current_engine_name)):
+                value = req.form.get(name, 'all')
+                if value and value != 'all':
+                    query = query.filter(column == value)
 
             if status_filter != 'all':
                 if status_filter == 'completed':
-                    query = query.filter(cls.success_filter())
+                    # 정상 완료와 중복 생략은 동일한 completed 중 duplicate_of로 구분한다.
+                    query = query.filter(cls.status == 'completed', cls.video_manifest['duplicate_of'].as_integer().is_(None))
+                elif status_filter == 'duplicate':
+                    query = query.filter(cls.status == 'completed', cls.video_manifest['duplicate_of'].as_integer().isnot(None))
                 elif status_filter == 'failed':
                     query = query.filter(cls.failure_filter())
                 elif status_filter == 'active':
@@ -161,7 +197,8 @@ class ModelDownload(ModelBase):
             if search_word:
                 query = query.filter(or_(
                     cls.title.like(f"%{search_word}%"),
-                    cls.file_name.like(f"%{search_word}%")
+                    cls.file_name.like(f"%{search_word}%"),
+                    cls.magnet.like(f"%{search_word}%")
                 ))
 
             total_count = query.count()

@@ -540,7 +540,7 @@ class FeederUtil:
                 if download_table in inspector.get_table_names():
                     columns = {c['name'] for c in inspector.get_columns(download_table)}
                     with engine.begin() as conn:
-                        for name, sql_type in [('upload_state', 'JSON'), ('source_file_name', 'VARCHAR'),
+                        for name, sql_type in [('upload_state', 'JSON'), ('video_manifest', 'JSON'), ('source_file_name', 'VARCHAR'),
                                                ('output_folder_name', 'VARCHAR'), ('remote_missing_since', 'DATETIME'),
                                                ('transfer_error_type', 'VARCHAR'), ('source_unavailable_since', 'DATETIME'),
                                                ('upload_retry_after', 'DATETIME')]:
@@ -1275,7 +1275,7 @@ class FeederUtil:
         return item.gdrive_upload_path if item.gdrive_upload_path is not None else fallback
 
     @classmethod
-    def get_profile_destination(cls, profile: dict | None, engine_name: str = '', item=None) -> dict:
+    def get_profile_destination(cls, profile: dict | None, engine_name: str = '', item=None, engine_config: dict | None = None) -> dict:
         """전송 스냅샷·단건 지정 목적지 또는 현재 엔진 기본값과 오버라이드를 해석한다."""
         if item is not None:
             saved = (item.upload_state or {}).get('destination_snapshot')
@@ -1290,7 +1290,7 @@ class FeederUtil:
         chain = (item.priority_chain if item is not None else None) or profile.get('priority_chain') or []
         index = (item.current_engine_index or 0) if item is not None else 0
         engine_name = engine_name or (item.current_engine_name if item is not None else '') or (chain[index] if 0 <= index < len(chain) else '')
-        engine = cls.get_downloader_by_name(engine_name) or {}
+        engine = (cls.get_downloader_by_name(engine_name) or {}) if engine_config is None else engine_config
         return cls.get_engine_destination(engine, profile, engine_name)
 
     @classmethod
@@ -1483,6 +1483,8 @@ class FeederUtil:
         dl_item.priority_chain = list(custom_chain if custom_chain is not None else selected_profile.get('priority_chain') or
                                       [d['name'] for d in cls.get_downloaders() if d.get('enabled', True)])
         routing = {'profile_name': profile_name}
+        if custom_chain is not None:
+            routing['priority_chain'] = list(dl_item.priority_chain)
         if custom_dest_type:
             routing['destination'] = dict(custom_dest_config or {}, type=custom_dest_type)
         if routing:

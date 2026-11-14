@@ -855,7 +855,7 @@ class UploadUtil:
                 drive_id = item.gdrive_remote_id or default_drive
                 protected_shared_paths.add(f":{{{drive_id}}}/{item.gdrive_upload_path.strip('/')}")
         db.session.remove()
-        base_remote = P.ModelSetting.get('download_gdrive_mydrive_remote_name') or rclone.get('mydrive_remote_name') or 'gdrive_sa'
+        base_remote = P.ModelSetting.get('download_gdrive_mydrive_remote_name') or rclone.get('mydrive_remote_name') or ''
         default_remote = P.ModelSetting.get('download_rclone_upload_remote_name') or base_remote
         routes = []
         profiles = list(FeederUtil.get_download_profiles())
@@ -1104,7 +1104,7 @@ class UploadUtil:
         options = FeederUtil.get_upload_options(profile, item.current_engine_name, item)
         cfg = FeederUtil.load_yaml().get('rclone', {})
         account = next((a for a in FeederUtil.get_gdrive_accounts() if a.get('username') == item.gdrive_account), {})
-        base_remote = dest.get('mydrive_remote_name') or P.ModelSetting.get('download_gdrive_mydrive_remote_name') or cfg.get('mydrive_remote_name') or 'gdrive_sa'
+        base_remote = dest.get('mydrive_remote_name') or P.ModelSetting.get('download_gdrive_mydrive_remote_name') or cfg.get('mydrive_remote_name') or ''
         if item.gdrive_account == 'Default_Account' or not state.get('uses_pool', options['use_gdrive_pool']):
             selected_remote = P.ModelSetting.get('download_rclone_upload_remote_name') or base_remote
         elif options['use_impersonate']:
@@ -1248,7 +1248,7 @@ class UploadUtil:
             return False
         options = FeederUtil.get_upload_options(profile, item.current_engine_name, item)
         use_pool = options['use_gdrive_pool']
-        remote_sa = dest_cfg.get('mydrive_remote_name') or P.ModelSetting.get('download_gdrive_mydrive_remote_name') or rclone_cfg.get('mydrive_remote_name') or 'gdrive_sa'
+        remote_sa = dest_cfg.get('mydrive_remote_name') or P.ModelSetting.get('download_gdrive_mydrive_remote_name') or rclone_cfg.get('mydrive_remote_name') or ''
         target_drive_id = dest_cfg.get('shared_drive_id') or item.gdrive_remote_id or P.ModelSetting.get('download_shared_drive_id') or rclone_cfg.get('shared_drive_id', '')
         if not target_drive_id:
             item.status = 'failed'
@@ -1448,6 +1448,7 @@ class UploadUtil:
             if not item or item.status in ['cancelled', 'failed', 'completed', 'blocked']:
                 return bool(item and item.status == 'completed')
             item.status = 'completed'
+            item.mark_video_stored()
             item.completed_time = datetime.now()
             item.error_message = None
             item.transfer_error_type = None

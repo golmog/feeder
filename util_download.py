@@ -217,6 +217,7 @@ class QBittorrentEngine(BaseDownloadEngine):
                 progress_val = round(float(t.get('progress', 0.0)) * 100, 1)
                 ret.append({
                     'task_id': t_hash,
+                    'statusCode': state,
                     'hash': t_hash,
                     'status': std_status,
                     'filename': fname,
@@ -267,9 +268,10 @@ class CloudDrive2Engine(BaseDownloadEngine):
         {"name": "cd2_port", "label": "CD2 포트 (gRPC)", "type": "number", "default": 19798},
         {"name": "cd2_token", "label": "CD2 인증 토큰", "type": "password", "placeholder": "CloudDrive2 JWT 토큰"},
         {"name": "cd2_mount_path", "label": "CD2 로컬 마운트 경로", "type": "text", "placeholder": "예: /mnt/cd2", "desc": "로컬 시스템에 CD2가 마운트된 FUSE 루트 디렉터리 (예: /mnt/cd2)"},
-        {"name": "cd2_virtual_path", "label": "마그넷 저장 가상 경로", "type": "text", "default": "115open/云下载", "placeholder": "예: 115open/云下载", "desc": "CD2 내부에서 오프라인 다운로드가 저장될 클라우드 상대 경로. 로컬 실물 탐색 시 [마운트 경로] + [가상 경로]가 자동 결합됩니다."},
+        {"name": "cd2_virtual_path", "label": "마그넷 저장 가상 경로", "type": "text", "default": "", "placeholder": "예: cloud/offline-downloads", "desc": "CD2 내부에서 오프라인 다운로드가 저장될 클라우드 상대 경로. 로컬 실물 탐색 시 [마운트 경로] + [가상 경로]가 자동 결합됩니다."},
         {"name": "use_local_staging", "label": "로컬 스테이징 기본 사용", "type": "checkbox", "default": False, "desc": "CD2 마운트는 기본적으로 직접 전송합니다. 다운로드 프로필에서 명시하면 프로필 설정이 우선합니다."},
         {"name": "cd2_max_pages", "label": "작업 목록 최대 탐색 페이지 수", "type": "number", "default": 1, "desc": "오프라인 작업 목록 조회 시 최대 탐색할 페이지 수 (기본값: 1페이지)"},
+        {"name": "cd2_cleanup_manual_completed", "label": "수동 등록 완료 히스토리 자동 정리", "type": "checkbox", "default": False, "desc": "CD2에서 직접 추가한 작업 중 다운로드가 완료된 기록을 Feeder의 정기 상태 확인 시 정리합니다. 진행 중·실패 작업과 실제 115 파일은 삭제하지 않습니다. CD2 작업 목록 조회 페이지 설정 범위에서만 적용됩니다."},
         {"name": "cd2_timeout", "label": "gRPC 타임아웃 (초)", "type": "number", "default": 30, "desc": "gRPC 요청 제한 시간(초) (기본값: 30초)"},
         {"name": "stalled_timeout_hours", "label": "지연 타임아웃 (시간)", "type": "number", "default": 24, "desc": "해당 시간 동안 미완료 시 다음 엔진으로 자동 폴백 (0 입력 시 무제한 대기)"}
     ]
@@ -429,6 +431,8 @@ class CloudDrive2Engine(BaseDownloadEngine):
                         FeederUtil.cooperate()
                         infohash = _get_pb_attr(t, 'infoHash', 'info_hash', 'infohash', 'hash', default='')
                         infohash = str(infohash).strip().lower()
+                        # 외부 이력 정리는 URL에서 추출한 값과 원본 infoHash를 구분한다.
+                        cd2_infohash = infohash
                         original_url = getattr(t, 'url', '')
                         if not infohash and original_url:
                             infohash = (FeederUtil.extract_info_hash(original_url) or '').lower()
@@ -471,6 +475,7 @@ class CloudDrive2Engine(BaseDownloadEngine):
                             'hash': infohash,
                             'status': std_status,
                             'statusCode': status_code,
+                            'cd2_infohash': cd2_infohash,
                             'filename': fname,
                             'file_size': fsize,
                             'downloaded_bytes': dl_bytes,
@@ -537,9 +542,12 @@ class CloudDrive2Engine(BaseDownloadEngine):
             kwargs['deleteFiles'] = False
         elif 'delete_files' in field_names:
             kwargs['delete_files'] = False
+        else:
+            logger.warning('[CloudDrive2Engine] 원본 파일 보존 옵션 미확인 · 히스토리 삭제 보류')
+            return False
 
-        # 40자리 infoHash 및 식별자 추출
-        hashes = [tid.lower() for tid in task_ids if len(tid) == 40]
+        # 32자리와 40자리 infoHash가 섞여도 어느 쪽도 누락하지 않는다.
+        hashes = [tid.lower() for tid in task_ids if len(tid) in (32, 40)]
         if not hashes:
             hashes = task_ids
 
@@ -553,6 +561,9 @@ class CloudDrive2Engine(BaseDownloadEngine):
             kwargs['taskIds'] = task_ids
         elif 'urls' in field_names:
             kwargs['urls'] = task_ids
+        else:
+            logger.warning('[CloudDrive2Engine] 개별 작업 식별 필드 미확인 · 히스토리 삭제 보류')
+            return False
 
         try:
             req = req_cls(**kwargs)

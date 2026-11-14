@@ -8,6 +8,7 @@ import time
 import uuid
 import hashlib
 from datetime import datetime, timedelta
+from contextlib import nullcontext
 
 from .setup import *
 from .util_base import FeederUtil
@@ -69,7 +70,7 @@ class RemoteWorker:
             return True
 
     @classmethod
-    def wait_for_worker(cls, client, exc):
+    def wait_for_worker(cls, client, exc, item_id=None):
         """워커 단위 대기를 기록하며 미접수 항목의 오류·재시도 기록은 바꾸지 않는다."""
         key, now = client.endpoint, time.monotonic()
         cached = cls._readiness.get(key)
@@ -82,12 +83,14 @@ class RemoteWorker:
             'updating': ('info', '업데이트 후 재연결 대기' if reconnecting or (cached or {}).get('reconnecting') else '워커 업데이트 대기'),
             'checking': ('info', '워커 준비 확인 대기'),
             'full': ('info', '워커 전송 슬롯 대기'),
+            'missing_job': ('warning', '원격 접수 작업' + (f' #{item_id}' if type(item_id) is int else '') +
+                            ' 기록 없음(HTTP 404) · FF 미정산 상태 확인 중 · 연결 장애 아님'),
             'auth': ('error', '워커 인증 오류 · 연결 설정을 확인해주세요.'),
             'configuration': ('error', '워커 설정·버전 확인이 필요합니다.'),
             'update_failed': ('error', '워커 업데이트 실패 · 서비스 로그를 확인해주세요.'),
         }.get(code, ('warning', '워커 연결·서비스 장애 대기'))
         unchanged = cached and cached['code'] == code
-        state = {'after': now + 10, 'message': message, 'status': exc.status, 'code': code,
+        state = {'after': now + 10, 'message': message, 'status': exc.status, 'code': code, 'item_id': item_id,
                  'since': cached['since'] if unchanged else now,
                  'reported': cached['reported'] if unchanged else now,
                  'update_confirmed': code == 'updating' or bool(code == 'checking' and cached and cached.get('update_confirmed')),
@@ -552,14 +555,50 @@ class RemoteWorker:
             db.session.commit()
             DownloadActivity.record('업로드 재전송', f'작업 #{item_id} · 중단된 원격 복사 정리 완료, 새 전송 대기')
 
+    @staticmethod
+    def same_job(current, expected):
+        """상태 스냅샷 대신 작업 ID·엔드포인트·소유 세션을 비교한다."""
+        return (current.get('job_id') == expected.get('job_id') and
+                current.get('endpoint') == expected.get('endpoint') and
+                (current.get('payload') or {}).get('session_id') == (expected.get('payload') or {}).get('session_id'))
+
     @classmethod
-    def execute(cls, item, manager):
+    def pending_job(cls, item_id, expected):
+        """이전 읽기 세션을 버리고 아직 같은 원격 작업을 소유하는 최신 커밋만 읽는다."""
+        db.session.remove()
+        current = db.session.get(ModelDownload, item_id)
+        remote = ((current.upload_state or {}).get('worker') or {}) if current else {}
+        if (current and current.status in ('pending_upload', 'uploading') and current.remote_submission() and
+                cls.same_job(remote, expected)):
+            return current
+        return None
+
+    @staticmethod
+    def _validate_job(remote, job):
+        """원격 응답의 소유권과 전송 옵션을 확인한 뒤에만 접수·정산 상태를 바꾼다."""
+        if job.get('job_id') != remote['job_id']:
+            raise WorkerError('원격 작업 ID가 저장된 요청과 일치하지 않습니다.', code='configuration')
+        payload = remote['payload']
+        if job.get('source') != payload['source'] or job.get('destination') != payload['destination']:
+            raise WorkerError('원격 작업의 소스/목적지가 저장된 요청과 일치하지 않습니다.', code='configuration')
+        if job.get('drive_impersonate', '') != payload.get('drive_impersonate', ''):
+            raise WorkerError('원격 작업의 위임 계정이 저장된 요청과 일치하지 않습니다.', code='configuration')
+        if job.get('rclone_transfers') != payload.get('rclone_transfers'):
+            raise WorkerError('원격 작업의 파일 동시 전송 수가 저장된 요청과 일치하지 않습니다.', code='configuration')
+        if job.get('rclone_extra_args') != payload.get('rclone_extra_args'):
+            raise WorkerError('원격 작업의 Rclone 추가 옵션이 저장된 요청과 일치하지 않습니다.', code='configuration')
+
+    @classmethod
+    def execute(cls, item, manager, reconcile=False):
         from .util_upload import UploadUtil
         from .util_block import DownloadBlock
         item_id, hub, held_account = item.id, None, None
-        initial_status = item.status
+        keep_progress = False
         try:
             state = dict(item.upload_state or {})
+            if reconcile and (not item.remote_submission() or state.get('restart_recopy') or
+                              state.get('cleanup_pending') or (state.get('worker') or {}).get('recovery_required')):
+                return None
             if (state.get('restart_recopy') or (state.get('worker') or {}).get('recovery_required')) and state.get('worker') and state.get('phase') == 'copying':
                 # FF 재시작 이전 작업을 계속 전송하지 않는다. 원격 종료 확인 뒤 새 설정으로 재접수한다.
                 remote = state['worker']
@@ -591,7 +630,7 @@ class RemoteWorker:
             if state.get('worker') and state.get('phase') in ('uploaded', 'shared_incoming', 'moved'):
                 cls.acknowledge(state)
                 return UploadUtil.resume_upload(item_id, manager)
-            with cls._submit_lock:
+            with (nullcontext() if reconcile else cls._submit_lock):
                 client = cls.client((state.get('worker') or {}).get('endpoint'))
                 if not state.get('worker'):
                     if FeederUtil.is_download_paused() or DownloadBlock.stopped(item_id): return False
@@ -610,7 +649,7 @@ class RemoteWorker:
                         return cls.defer(item_id, '업로드 계정·한도 대기: ' + reason)
                     held_account = account.get('username') if account else None
                     state = cls.prepare(target, client, configuration, (mode, account))
-                elif state.get('uses_pool'):
+                elif state.get('uses_pool') and not reconcile:
                     if not manager.reserve_existing_account(state['account']):
                         return cls.defer(item_id, '이전 원격 작업의 계정 사용권을 기다립니다.')
                     held_account = state['account']
@@ -624,7 +663,10 @@ class RemoteWorker:
                     if remote.get('settled'):
                         raise WorkerError('종료된 원격 작업의 결과를 찾지 못했습니다. 항목의 재시도를 실행해주세요.', code='job')
                     if remote.get('submission') not in ('new', 'rejected'):
-                        raise cls.wait_for_worker(client, WorkerError('기존 원격 작업의 접수 여부 확인 대기', code='unavailable'))
+                        if cls.pending_job(item_id, remote) is None:
+                            current = db.session.get(ModelDownload, item_id)
+                            return bool(current and current.status == 'completed')
+                        raise cls.wait_for_worker(client, WorkerError('기존 원격 작업의 접수 여부 확인 대기', 404, 'missing_job'), item_id)
                     if FeederUtil.is_download_paused():
                         return cls.defer(item_id, '중단 예약으로 원격 작업의 신규 등록을 보류합니다.')
                     if DownloadBlock.stopped(item_id):
@@ -646,34 +688,36 @@ class RemoteWorker:
                             db.session.commit()
                         cls.wait_for_worker(client, exc)
                         raise
+                cls._validate_job(remote, job)
                 remote = dict(remote, submission='accepted')
                 state['worker'] = remote
                 target = db.session.get(ModelDownload, item_id)
-                if (not target or DownloadBlock.stopped(item_id) or
-                        (target.upload_state or {}).get('worker', {}).get('settled')):
-                    cls.cancel_snapshot(state)
+                if (not target or target.status not in ('pending_upload', 'uploading') or DownloadBlock.stopped(item_id) or
+                        (target.upload_state or {}).get('worker', {}).get('settled') or
+                        (target.upload_state or {}).get('worker', {}).get('job_id') != remote['job_id']):
+                    if not reconcile:
+                        cls.cancel_snapshot(state)
                     return False
                 target.status = 'uploading'
                 target.upload_state = dict(state)
                 target.error_message = None
                 db.session.commit(); db.session.remove()
-            hub = WorkerEvents.acquire(client)
-            generation = hub.generation
+            if not reconcile:
+                hub = WorkerEvents.acquire(client)
+                generation = hub.generation
             while True:
                 if DownloadBlock.stopped(item_id):
-                    cls.cancel_snapshot(state)
+                    if not reconcile:
+                        cls.cancel_snapshot(state)
                     return False
-                job = client.job(remote['job_id'])
+                if not reconcile:
+                    job = client.job(remote['job_id'])
                 if job is None:
-                    raise WorkerError('등록했던 원격 작업이 없습니다. 같은 작업 ID를 유지하고 복구를 기다립니다.')
-                if job.get('source') != remote['payload']['source'] or job.get('destination') != remote['payload']['destination']:
-                    raise WorkerError('원격 작업의 소스/목적지가 저장된 요청과 일치하지 않습니다.', code='configuration')
-                if job.get('drive_impersonate', '') != remote['payload'].get('drive_impersonate', ''):
-                    raise WorkerError('원격 작업의 위임 계정이 저장된 요청과 일치하지 않습니다.', code='configuration')
-                if job.get('rclone_transfers') != remote['payload'].get('rclone_transfers'):
-                    raise WorkerError('원격 작업의 파일 동시 전송 수가 저장된 요청과 일치하지 않습니다.', code='configuration')
-                if job.get('rclone_extra_args') != remote['payload'].get('rclone_extra_args'):
-                    raise WorkerError('원격 작업의 Rclone 추가 옵션이 저장된 요청과 일치하지 않습니다.', code='configuration')
+                    if cls.pending_job(item_id, remote) is None:
+                        current = db.session.get(ModelDownload, item_id)
+                        return bool(current and current.status == 'completed')
+                    raise cls.wait_for_worker(client, WorkerError('기존 원격 작업의 접수 여부 확인 대기', 404, 'missing_job'), item_id)
+                cls._validate_job(remote, job)
                 cls._progress(item_id, job)
                 status = job.get('status')
                 if status in ('completed', 'failed', 'cancelled'):
@@ -723,18 +767,40 @@ class RemoteWorker:
                     return False
                 if status not in ('queued', 'running'):
                     raise WorkerError('원격 작업 상태를 확인하지 못했습니다.')
+                if reconcile:
+                    keep_progress = True
+                    return None
                 db.session.remove()
                 generation = hub.wait(generation)
         except Exception as exc:
             db.session.rollback()
             if isinstance(exc, WorkerError) and exc.code in ('updating', 'checking', 'full', 'unavailable',
-                    'invalid_response', 'auth', 'configuration', 'update_failed') and 'client' in locals():
+                    'invalid_response', 'auth', 'configuration', 'update_failed', 'missing_job') and 'client' in locals():
                 cached = cls._readiness.get(client.endpoint)
                 if not cached or time.monotonic() >= cached['after']:
                     cls.wait_for_worker(client, exc)
                 current = db.session.get(ModelDownload, item_id)
-                if current and initial_status == 'pending_upload' and current.status == 'uploading':
+                expected = state.get('worker') or {}
+                current_remote = ((current.upload_state or {}).get('worker') or {}) if current else {}
+                if (current and current.status in ('pending_upload', 'uploading') and
+                        not current_remote.get('settled') and cls.same_job(current_remote, expected)):
                     current.status = 'pending_upload'
+                    reason = {
+                        'updating': '원격 워커 업데이트 대기',
+                        'checking': '원격 워커 준비 확인 대기',
+                        'full': '원격 워커 전송 슬롯 대기',
+                        'invalid_response': '원격 워커 응답 확인 불가',
+                        'auth': '원격 워커 인증 확인 필요',
+                        'configuration': '원격 워커 설정 확인 필요',
+                        'update_failed': '원격 워커 업데이트 실패',
+                        'missing_job': '기존 원격 작업 미확인(404) · 재등록 없이 확인 대기',
+                    }.get(exc.code, '원격 워커 연결 확인 불가')
+                    receipt = current.remote_submission()
+                    if receipt:
+                        prefix = '원격 접수됨' if receipt == 'accepted' else '원격 접수 확인 필요'
+                        current.error_message = prefix + ' · ' + reason + ' · 상태 확인 대기'
+                    else:
+                        current.error_message = reason + ' · 다음 실행에서 재확인'
                     db.session.commit()
                 return None
             message = str(exc) if isinstance(exc, WorkerError) else '원격 작업 처리 오류: 기존 작업 ID를 보존하고 재확인합니다.'
@@ -746,7 +812,8 @@ class RemoteWorker:
         finally:
             if hub: hub.release()
             if held_account: manager.release_account(held_account)
-            FeederUtil.report_rclone_progress(item_id, {}, action='clear')
+            if not keep_progress:
+                FeederUtil.report_rclone_progress(item_id, {}, action='clear')
             db.session.remove()
 
     @staticmethod

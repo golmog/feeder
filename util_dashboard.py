@@ -224,7 +224,11 @@ class Dashboard:
                                else value.strftime('%Y-%m-%d %H:%M:%S'))
         result['error_message'] = redact_log(result['error_message'] or '', limit=3500)
         result['local_path'] = redact_log(result['local_path'] or '', limit=2000)
+        # 경로 자체를 노출하지 않고 로컬 스테이징 결과 여부만 UI에 전달한다.
+        staging_path = (item.upload_state or {}).get('staging_local_path')
+        result['staging_completed'] = bool(item.status == 'downloaded' and staging_path and staging_path == item.local_path)
         result['row_key'] = 'db:' + str(item.id)
+        result['remote_submission'] = item.remote_submission()
         result['row_version'] = item.updated_time.isoformat(timespec='microseconds') if item.updated_time else ''
         return result
 

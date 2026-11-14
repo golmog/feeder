@@ -232,6 +232,11 @@ class JobStore:
             row = connection.execute('SELECT * FROM jobs WHERE job_id=?', (job_id,)).fetchone()
         return as_dict(row) if row else None
 
+    def is_tombstoned(self, job_id):
+        """재접수 방지 기록의 존재만 확인하며 완료나 ACK 여부를 추론하지 않는다."""
+        with closing(self.database.connect()) as connection:
+            return connection.execute('SELECT 1 FROM cancelled_job_ids WHERE job_id=?', (job_id,)).fetchone() is not None
+
     def list(self, status, limit, offset):
         with closing(self.database.connect()) as connection:
             where = ' WHERE status=?' if status else ''

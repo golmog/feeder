@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import selectors
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -33,6 +34,7 @@ class Worker:
         self._lock = None
         self.started = False
         self.failure = False
+        self.failure_callback = None
 
     def start(self):
         if self.started:
@@ -88,7 +90,13 @@ class Worker:
     def _loop(self):
         try:
             while not self._stop.is_set():
-                job = self.store.claim()
+                try:
+                    job = self.store.claim()
+                except sqlite3.Error:
+                    logger.warning('작업 저장소 조회 지연 · 다음 순회에서 재확인합니다.')
+                    self._wake.wait(.5)
+                    self._wake.clear()
+                    continue
                 if job is None:
                     self._wake.wait(.5)
                     self._wake.clear()
@@ -103,27 +111,31 @@ class Worker:
                         self._threads.discard(thread)
                     self.store.finish(job['job_id'], None, '작업 실행 스레드를 시작하지 못했습니다.')
                     raise
-        except Exception as exc:
+        except Exception:
+            self._fail('작업 워커 중단')
+
+    def _fail(self, message):
+        """치명적인 실행기 오류만 기존 메인 종료 경로에 한 번 알린다."""
+        with self._threads_lock:
+            first_failure = not self.failure
             self.failure = True
-            self._stop.set()
-            logger.exception('작업 워커 중단')
-            try:
-                self.store.worker_status(False, True)
-            except Exception:
-                logger.error('워커 중단 상태 이벤트를 기록하지 못했습니다.')
+        self._stop.set()
+        self.notify()
+        logger.exception(message)
+        if first_failure and self.failure_callback is not None:
+            self.failure_callback()
+        try:
+            self.store.worker_status(False, True)
+        except Exception:
+            logger.error('워커 중단 상태 이벤트를 기록하지 못했습니다.')
 
     def _run_job(self, job):
         try:
             self._execute(job)
-        except Exception as exc:
-            self.failure = True
-            self._stop.set()
-            self.notify()
-            logger.exception('작업 실행 중단')
-            try:
-                self.store.worker_status(False, True)
-            except Exception:
-                logger.error('워커 중단 상태 이벤트를 기록하지 못했습니다.')
+        except sqlite3.Error:
+            logger.warning('작업 %s 저장소 처리 지연 · 전송 상태 재확인이 필요합니다.', job['job_id'])
+        except Exception:
+            self._fail('작업 실행 중단')
         finally:
             with self._threads_lock:
                 self._threads.discard(threading.current_thread())
@@ -257,5 +269,8 @@ class Worker:
             selector.close()
         if error:
             logger.error('작업 %s: %s', job['job_id'], error)
-        self.store.accounting(job['job_id'], quota.charged_bytes() if process is not None else 0)
-        self.store.finish(job['job_id'], process.returncode if process is not None else None, error)
+        try:
+            self.store.accounting(job['job_id'], quota.charged_bytes() if process is not None else 0)
+            self.store.finish(job['job_id'], process.returncode if process is not None else None, error)
+        except Exception as exc:
+            logger.error('작업 %s 결과 저장 미확인 (%s) · 기존 작업 ID를 유지합니다.', job['job_id'], type(exc).__name__)

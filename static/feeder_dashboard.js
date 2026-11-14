@@ -228,7 +228,7 @@ FeederDashboard.prototype.bootstrap = function () {
   });
 };
 FeederDashboard.prototype.renderCounts = function (counts) {
-  ['pending', 'downloading', 'staging', 'completed', 'failed'].forEach(function (key) {
+  ['pending', 'downloading', 'completed', 'failed'].forEach(function (key) {
     if (counts[key] !== undefined) $('#stat_' + key).text(counts[key]);
   });
   $('#queue_counts_state').text('DB 통계 최신 확인').attr('data-state', 'ready');
@@ -382,11 +382,26 @@ FeederDashboard.prototype.renderEngineStatus = function (requestFailed) {
 FeederDashboard.prototype.render = function () {
   var view = this.state.view(Date.now() / 1000), signature = String(this.state.dbReady) + JSON.stringify([this.state.activeStage, this.state.queueTime, view.rows]);
   render_queue_speed_badge(view.downloadSpeeds);
+  var uploadSpeed = 0, stagingSpeed = 0, hasUploading = false, hasStaging = false;
+  view.rows.forEach(function (item) {
+    if (item.status === 'uploading') hasUploading = true;
+    else if (item.status === 'local_staging') hasStaging = true;
+    else return;
+    if (item.progress_stale || typeof item.download_speed !== 'number' ||
+        !Number.isFinite(item.download_speed) || item.download_speed <= 0) return;
+    if (item.status === 'uploading') uploadSpeed += item.download_speed;
+    else stagingSpeed += item.download_speed;
+  });
+  var showStaging = !hasUploading && hasStaging;
+  $('#stat_transfer_speed_label').text(showStaging ? '스테이징 속도' : '업로드 속도');
+  var parts = format_bytes(showStaging ? stagingSpeed : uploadSpeed).split(' ');
+  $('#stat_upload_speed_value').text(parts[0]);
+  $('#stat_upload_speed_unit').text((parts[1] || 'B') + '/s');
   if ((this.state.dbReady || view.rows.length) && signature !== this.lastRender) {
     this.lastRender = signature;
     render_queue_rows(view.rows, this.state.activeStage, this.state.queueTime);
     if (!this.state.dbReady) $('#active_queue_tbody').append('<tr id="queue_db_wait_row"><td colspan="3" class="py-3 text-muted">' +
-      (this.dbError ? 'DB 불러오기 실패 · 수동 새로고침으로 재시도' : 'DB 큐 불러오는 중…') + '</td></tr>');
+      (this.dbError ? 'DB 불러오기 실패 · 자동 재시도 중' : 'DB 큐 불러오는 중…') + '</td></tr>');
   }
   $('#queue_page_summary').text((this.state.dbReady ? this.state.dbItemsById.size + ' / 전체 ' + this.state.total + '건' : 'DB 큐 확인 중') +
     ' · 미등록 ' + view.orphanTotal + '건' + (view.unverifiedTotal ? ' · DB 연결 확인 대기 ' + view.unverifiedTotal + '건' : ''));
