@@ -11,7 +11,7 @@ while (($#)); do
         --bind|--port|--rclone-config|--rclone-binary)
             [[ $# -ge 2 ]] || exit 2; WORKER_OPTIONS+=("$1" "$2"); shift 2 ;;
         --help)
-            echo '사용법: bash install.sh [--install-dir 경로] [--bind Tailscale_IP] [--port 8000]'
+            echo '사용법: bash install.sh [--install-dir 경로] [--bind IP] [--port 8000]'
             echo '  [--rclone-config 절대경로] [--rclone-binary 절대경로]'
             echo '소스·목적지 리모트는 Feeder가 작업별로 지정합니다.'
             echo 'Debian/Ubuntu에서는 누락된 Python·venv·curl·인증서 패키지를 apt로 준비합니다(sudo 권한 필요).'

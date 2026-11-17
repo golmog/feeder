@@ -21,8 +21,8 @@ from .worker.rclone_logging import redact_log
 TRANSFER_STAGES = {'uploading': 'pending_upload', 'local_staging': 'pending_local_staging',
                    'relay_transferring': 'pending_relay'}
 RANKS = {'uploading': 0, 'local_staging': 1, 'relay_transferring': 2,
-         'pending_upload': 3, 'pending_local_staging': 4, 'pending_relay': 5,
-         'downloaded': 6, 'waiting_transporter': 7, 'downloading': 8, 'pending': 9}
+         'pending_upload': 3, 'upload_held': 4, 'pending_local_staging': 5, 'pending_relay': 6,
+         'downloaded': 7, 'waiting_transporter': 8, 'downloading': 9, 'pending': 10}
 
 
 class EngineBusy(Exception):
@@ -226,6 +226,7 @@ class Dashboard:
         result['local_path'] = redact_log(result['local_path'] or '', limit=2000)
         # 경로 자체를 노출하지 않고 로컬 스테이징 결과 여부만 UI에 전달한다.
         staging_path = (item.upload_state or {}).get('staging_local_path')
+        result['hold_reason'] = ((item.upload_state or {}).get('hold') or {}).get('reason')
         result['staging_completed'] = bool(item.status == 'downloaded' and staging_path and staging_path == item.local_path)
         result['row_key'] = 'db:' + str(item.id)
         result['remote_submission'] = item.remote_submission()
@@ -240,15 +241,18 @@ class Dashboard:
         return secret if isinstance(secret, bytes) else str(secret).encode()
 
     @staticmethod
-    def cursor(ids):
+    def cursor(ids, seen=None):
         if not ids:
             return None
-        raw = zlib.compress(json.dumps({'ids': ids, 'at': time.time()}).encode())
+        data = {'ids': ids, 'at': time.time()}
+        if seen is not None:
+            data['seen'] = seen
+        raw = zlib.compress(json.dumps(data).encode())
         key = Dashboard.cursor_key()
         return base64.urlsafe_b64encode(hmac.digest(key, raw, 'sha256') + raw).decode()
 
     @staticmethod
-    def read_cursor(value):
+    def read_cursor(value, with_seen=False):
         if not isinstance(value, str) or len(value) > 500000:
             raise ValueError('invalid_cursor')
         raw = base64.b64decode(value.encode(), altchars=b'-_', validate=True)
@@ -263,9 +267,13 @@ class Dashboard:
         if not 0 <= time.time() - data['at'] <= 600:
             raise ValueError('snapshot_expired')
         ids = data['ids']
-        if not isinstance(ids, list) or any(type(i) is not int or i <= 0 for i in ids):
+        def valid(key):
+            return ((type(key) is int and key > 0) or (isinstance(key, str) and len(key) <= 4096 and
+                    ((key.startswith('db:') and key[3:].isdigit() and int(key[3:]) > 0) or key.startswith('engine:'))))
+        if (not isinstance(ids, list) or not all(valid(i) for i in ids) or
+                not isinstance(data.get('seen', []), list) or not all(valid(i) for i in data.get('seen', []))):
             raise ValueError('invalid_cursor')
-        return ids
+        return data if with_seen else ids
 
     @staticmethod
     def counts():
@@ -292,12 +300,13 @@ class Dashboard:
             stages.remove(active_stage)
             stages.insert(0, active_stage)
         order = stages + [TRANSFER_STAGES[stage] for stage in stages]
+        order.insert(order.index('pending_upload') + 1, 'upload_held')
         order += ['downloaded', 'waiting_transporter', 'downloading', 'pending']
         return {status: rank for rank, status in enumerate(order)}
 
     @classmethod
     def queue(cls, cursor=None, known=None):
-        """서명된 잔여 ID 스냅샷. OFFSET이나 외부 엔진/스테이징 디스크에 의존하지 않는다."""
+        """DB 정렬 인덱스와 기존 엔진 캐시를 합쳐 하나의 서명 커서로 40건씩 선택한다."""
         observed = time.time()
         sort_time = datetime.fromtimestamp(observed)
         active = ModelDownload.status.in_(list(RANKS))
@@ -316,32 +325,65 @@ class Dashboard:
             return ranks.get(row.status, 99), deferred, status_time is not None, status_time or datetime.min, row.id
 
         ids = [row.id for row in sorted(active_rows, key=sort_key)]
-        removed = []
+        cached = cls.engine_view(refresh=False)
+        remote = {}
+        for snapshot in cached['engines']:
+            for item in snapshot['items']:
+                if not item.get('registered'):
+                    remote[item['row_key']] = (snapshot, item)
+        keys = ['db:' + str(i) for i in ids] + sorted(remote)
+        present = set(keys)
+        known = known if isinstance(known, dict) else {}
+        known = {('db:' + str(k) if str(k).isdigit() else str(k)): v for k, v in known.items()}
         counts = None
         counts_error = False
         if cursor:
-            snapshot = cls.read_cursor(cursor)
-            batch, remaining = snapshot[:40], snapshot[40:]
-            chosen = set(batch).intersection(ids)
+            snapshot = cls.read_cursor(cursor, with_seen=True)
+            seen = set(snapshot.get('seen', []))
+            if 'seen' not in snapshot:
+                seen = set('db:' + str(i) for i in ids).difference('db:' + str(i) for i in snapshot['ids'])
+            removed = seen.difference(present)
+            batch = [key for key in keys if key not in seen][:40]
+            chosen = set(batch)
+            seen.update(batch)
         else:
-            known = known if isinstance(known, dict) else {}
-            known = {int(key): value for key, value in known.items() if str(key).isdigit()}
-            chosen = set(ids[:40])
-            for row in db.session.query(ModelDownload.id, ModelDownload.updated_time).filter(active, ModelDownload.id.in_(list(known))).all():
+            seen = set(known).intersection(present)
+            # 화면 내 갱신은 펼친 깊이를 유지하고 완료/소멸로 빈 자리만 보충한다.
+            added = [key for key in keys if key not in seen][:max(0, max(40, len(known)) - len(seen))]
+            seen.update(added)
+            chosen = set(added)
+            known_ids = [int(key[3:]) for key in seen if key.startswith('db:')]
+            for row in db.session.query(ModelDownload.id, ModelDownload.updated_time).filter(active, ModelDownload.id.in_(known_ids)).all():
                 version = row.updated_time.isoformat(timespec='microseconds') if row.updated_time else ''
-                if known.get(row.id) != version:
-                    chosen.add(row.id)
-            removed = list(set(known).difference(ids))
-            remaining = [i for i in ids if i not in chosen and i not in known]
+                if known.get('db:' + str(row.id)) != version:
+                    chosen.add('db:' + str(row.id))
+            chosen.update(key for key in seen if key.startswith('engine:'))
+            removed = set(known).difference(present)
             try:
                 counts = cls.counts()
             except Exception:
                 db.session.rollback()
                 counts_error = True
-        rows = db.session.query(ModelDownload).filter(ModelDownload.id.in_(chosen)).all() if chosen else []
-        items = [cls.serialize(row) for row in sorted(rows, key=sort_key)]
-        return {'success': True, 'version': 2, 'items': items, 'removed_ids': removed, 'counts': counts, 'counts_error': counts_error,
-                'total': len(ids), 'has_more': bool(remaining), 'next_cursor': cls.cursor(remaining),
+        chosen_ids = [int(key[3:]) for key in chosen if key.startswith('db:')]
+        rows = db.session.query(ModelDownload).filter(ModelDownload.id.in_(chosen_ids)).all() if chosen_ids else []
+        details = {'db:' + str(row.id): cls.serialize(row) for row in rows}
+        for key in chosen.intersection(remote):
+            snapshot, item = remote[key]
+            verified = item['match_verified']
+            details[key] = dict(id=str(item.get('task_id') or item.get('hash'))[:10], row_key=key,
+                task_id=item.get('task_id'), hash=item.get('hash'), title=item.get('filename'), file_name=item.get('filename'),
+                file_size=item.get('file_size'), local_path=item.get('source_path'), feed_name=snapshot['engine_name'],
+                current_engine_name=snapshot['engine_name'], status='engine_unmanaged' if verified else 'engine_unverified',
+                raw_status=item.get('status'), engine_stale=bool(item.get('stale')), created_time='원격 보관',
+                last_seen_at=item.get('last_seen_at'), row_version=str(item.get('last_seen_at')))
+        remaining = [key for key in keys if key not in seen]
+        unverified = sum(not item['match_verified'] for _, item in remote.values())
+        return {'success': True, 'version': 3, 'auto_disabled_engines': FeederUtil.auto_disabled_engines(),
+                'items': [details[key] for key in keys if key in details],
+                'removed_ids': [int(key[3:]) for key in removed if key.startswith('db:')],
+                'removed_keys': [key for key in removed if key.startswith('engine:')], 'counts': counts, 'counts_error': counts_error,
+                'total': len(keys), 'db_total': len(ids), 'orphan_total': len(remote) - unverified, 'unverified_total': unverified,
+                'has_more': bool(remaining), 'next_cursor': cls.cursor(remaining, sorted(seen)),
                 'observed_at': observed, 'active_stage': active_stage,
                 'queue_time': sort_time.isoformat(timespec='microseconds')}
 
@@ -353,6 +395,15 @@ class Dashboard:
             running = 'dashboard_running:' + fingerprint
             cooldown = 'dashboard_poll:' + fingerprint
             try:
+                # A submitted refresh may outlive the enabled configuration it captured.
+                current = FeederUtil.get_downloader_by_name(config.get('name', ''))
+                if config.get('engine_type') == 'pikpak' and (current is None or
+                        DownloadUtil.pikpak_config_revision(current) != DownloadUtil.pikpak_config_revision(config)):
+                    return [], True
+                if ((current is not None and current.get('enabled', True) in (False, 'False', 'false', 0)) or
+                        not DownloadUtil.pikpak_dashboard_allowed(current or config) or
+                        not DownloadUtil.pikpak_dashboard_allowed(config)):
+                    return [], True
                 if not FeederUtil.acquire_runtime_lock(cooldown, owner, stale_after=30):
                     raise EngineBusy
                 if not FeederUtil.acquire_runtime_lock(running, owner, stale_after=120):
@@ -361,8 +412,9 @@ class Dashboard:
                     engine = DownloadUtil.create_engine(config)
                     if not engine:
                         raise ValueError('engine_unavailable')
-                    rows, error = engine.get_status()
+                    rows, error = engine.get_status(resolve_paths=False) if config.get('engine_type') == 'pikpak' else engine.get_status()
                     if error:
+                        FeederUtil.engine_auth_error(engine, error, 'get_status')
                         raise RuntimeError('engine_status_error')
                     return rows, getattr(engine, 'status_list_complete', True)
                 finally:
@@ -371,22 +423,27 @@ class Dashboard:
                 db.session.remove()
 
     @classmethod
-    def engine_view(cls):
+    def engine_view(cls, refresh=True, visible=None):
         observed = time.time()
-        cls.engines.request(FeederUtil.get_downloaders(), cls.fetch_engine)
-        snapshots = cls.engines.view()
-        # 상태 변경/삭제 뒤에도 엔진 ID/hash만으로 다른 엔진의 행을 인수하지 않는다.
-        matches = []
+        configs = [c for c in FeederUtil.get_downloaders() if c.get('enabled', True) not in (False, 'False', 'false', 0)
+                   and DownloadUtil.pikpak_dashboard_allowed(c)]
+        if refresh:
+            cls.engines.request(configs, cls.fetch_engine)
+        allowed = {c['name'] for c in configs}
+        snapshots = [s for s in cls.engines.view() if s['engine_name'] in allowed]
+        # 콘텐츠 귀속은 유효한 infohash로만 판정하며 ID는 동일 해시 안의 동률만 해소한다.
+        hashes = set()
         for snapshot in snapshots:
-            tids = [str(item['task_id']) for item in snapshot['items'] if item['task_id']]
-            hashes = [str(item['hash']).lower() for item in snapshot['items'] if item['hash']]
-            if tids or hashes:
-                matches.append(and_(ModelDownload.current_engine_name == snapshot['engine_name'],
-                    or_(ModelDownload.engine_task_id.in_(tids), func.lower(ModelDownload.infohash).in_(hashes))))
+            for item in snapshot['items']:
+                value = (FeederUtil.extract_info_hash('magnet:?xt=urn:btih:' + str(item.get('hash') or '')) or '').lower()
+                item['hash'] = value if len(value) == 40 and all(c in '0123456789abcdef' for c in value) else ''
+                if item['hash']:
+                    hashes.add(item['hash'])
         match_verified = True
         try:
             rows = db.session.query(ModelDownload.id, ModelDownload.current_engine_name,
-                                    ModelDownload.engine_task_id, ModelDownload.infohash).filter(or_(*matches)).all() if matches else []
+                                    ModelDownload.engine_task_id, ModelDownload.infohash).filter(
+                                        func.lower(ModelDownload.infohash).in_(hashes)).all() if hashes else []
         except Exception:
             # DB 보강 실패를 정상 원격 캐시의 조회 실패로 확대하지 않는다.
             match_verified = False
@@ -398,29 +455,67 @@ class Dashboard:
                     db.session.remove()
                 except Exception:
                     pass
-        tids = {(name, str(tid)): i for i, name, tid, hash_value in rows if name and tid}
-        hashes = {(name, str(hash_value).lower()): (i, tid) for i, name, tid, hash_value in rows if name and hash_value}
+        by_hash = {}
+        by_id = {row.id: row for row in rows}
+        for row in rows:
+            by_hash.setdefault(str(row.infohash).lower(), []).append(row)
+        visible = set(visible) if visible is not None else None
+        orphan_total = unverified_total = 0
         for snapshot in snapshots:
             snapshot['match_verified'] = match_verified
             name = snapshot['engine_name']
+            speed, speed_known = 0, False
             for item in snapshot['items']:
-                matched = tids.get((name, str(item['task_id'])))
-                fallback = hashes.get((name, str(item['hash']).lower()))
-                if not matched and fallback and (not fallback[1] or not item['task_id']):
-                    matched = fallback[0]
-                item['db_id'] = matched
-        return {'success': True, 'version': 2, 'engines': snapshots,
+                candidates = by_hash.get(item['hash'], [])
+                pool = [r for r in candidates if r.current_engine_name == name] or candidates
+                exact = [r for r in pool if item.get('task_id') and str(r.engine_task_id) == str(item['task_id'])]
+                matched = pool[0] if len(pool) == 1 else exact[0] if len(exact) == 1 else None
+                item['db_id'] = matched.id if matched else None
+                item['registered'] = bool(candidates)
+                item['match_verified'] = match_verified and bool(item['hash'])
+                identity = str(item.get('task_id') or item['hash'])
+                item['row_key'] = 'engine:' + str(snapshot.get('engine_key') or EngineStatusCache.key({'name': name})) + ':' + identity
+                if not candidates:
+                    if item['match_verified']:
+                        orphan_total += 1
+                    else:
+                        unverified_total += 1
+                stale = item.get('stale') or snapshot.get('state') == 'error' or snapshot.get('error_type') or observed - item.get('last_seen_at', 0) > 60
+                value = item.get('download_speed')
+                if not stale and item.get('status') == 'downloading' and type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                    speed += value
+                    speed_known = True
+            snapshot['download_speed_total'] = speed if speed_known else None
+            if visible is not None:
+                selected = {}
+                for item in snapshot['items']:
+                    row = by_id.get(item['db_id'])
+                    key = item['row_key'] if item['row_key'] in visible else 'db:' + str(item['db_id'])
+                    if key not in visible or (key.startswith('db:') and (not row or row.current_engine_name != name)):
+                        continue
+                    old = selected.get(key)
+                    if old is None or (row and str(row.engine_task_id) == str(item.get('task_id'))):
+                        selected[key] = item
+                snapshot['items'] = list(selected.values())
+        return {'success': True, 'version': 3, 'engines': snapshots,
+                'orphan_total': orphan_total, 'unverified_total': unverified_total,
                 'match_verified': match_verified, 'observed_at': observed}
 
     @classmethod
     def progress(cls, ids):
         items = []
         for item in db.session.query(ModelDownload).filter(ModelDownload.id.in_(ids[:200]),
-                ModelDownload.status.in_(['uploading', 'local_staging', 'relay_transferring'])).all():
+                or_(ModelDownload.status.in_(['uploading', 'local_staging', 'relay_transferring']),
+                    and_(ModelDownload.status == 'downloaded', ModelDownload.destination_type == 'rclone_simple'))).all():
             stat = FeederUtil.get_rclone_progress(item.id) or {}
-            if stat and time.time() - stat.get('_updated_at', 0) > 30:
+            stale = bool(stat) and time.time() - stat.get('_updated_at', 0) > 30
+            active = bool(stat) and not stale and (
+                (stat.get('downloaded_bytes') or 0) > 0 or (stat.get('download_speed') or 0) > 0)
+            if stale:
                 stat = dict(stat, download_speed=0, speed_str='갱신 지연')
             items.append({'id': item.id, 'status': item.status, 'row_version': cls.serialize(item)['row_version'],
                           'file_size': stat.get('total_bytes') or item.file_size,
-                          **{key: stat[key] for key in ('progress', 'download_speed', 'speed_str', 'downloaded_bytes', 'eta') if key in stat}})
+                          **{key: stat[key] for key in ('progress', 'download_speed', 'speed_str', 'downloaded_bytes') if key in stat},
+                          'eta': (stat.get('eta') if stat.get('eta') is not None else '') if active else '',
+                          'transfer_active': active, 'progress_stale': stale})
         return {'success': True, 'items': items, 'observed_at': time.time()}

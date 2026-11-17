@@ -16,7 +16,7 @@ from .setup import *
 from .model_download import ModelDownload, ModelDownloadStat
 from .util_base import FeederUtil
 from .util_download_activity import DownloadActivity
-from .worker.rclone_logging import redact_log, classify_error, FileQuota
+from .worker.rclone_logging import redact_log, classify_error, classify_auth_error, FileQuota
 
 
 class UploadUtil:
@@ -106,6 +106,11 @@ class UploadUtil:
             FeederUtil.clear_rclone_progress(item_id)
 
     @staticmethod
+    def rclone_stats_options():
+        """실제 바이트 전송에 사용하는 공통 JSON 통계 옵션."""
+        return ['--stats', '1s', '--stats-log-level', 'INFO', '--use-json-log', '--log-level', 'INFO']
+
+    @staticmethod
     def run_rclone(cmd: list[str], description: str = "", log_output: bool = True, item_id=None, file_size=None, watchdog_timeout: int = None, execution_timeout: float = None, quota=None) -> tuple[bool, str]:
         """Rclone 서브프로세스 실행 및 실시간 출력/전송률 캡처"""
         env = os.environ.copy()
@@ -186,26 +191,42 @@ class UploadUtil:
                 line = line.strip()
                 if not line:
                     continue
+                try:
+                    entry = json.loads(line)
+                except (ValueError, TypeError):
+                    entry = None
+                if isinstance(entry, dict):
+                    if quota is not None:
+                        quota.observe(entry)
+                    stats = entry.get('stats')
+                    if isinstance(stats, dict):
+                        transferred = stats.get('bytes') or 0
+                        total = stats.get('totalBytes') or file_size or 0
+                        speed = stats.get('speed') or 0
+                        if transferred > 0:
+                            transfer_started.set()
+                        if item_id:
+                            FeederUtil.report_rclone_progress(item_id, {
+                                'progress': min(100, 100 * transferred / total) if total else 0,
+                                'downloaded_bytes': transferred, 'total_bytes': total,
+                                'download_speed': speed,
+                                'speed_str': FeederUtil.format_bytes(speed) + '/s',
+                                'eta': '' if stats.get('eta') is None else str(stats['eta'])})
+                        # 매초 통계는 누적하지 않고 실제 오류만 종료 요약에 남긴다.
+                        if stats.get('lastError'):
+                            error = redact_log(stats['lastError'])
+                            if error not in output_lines:
+                                output_lines.append(error)
+                        if str(entry.get('level', '')).lower() in ('error', 'critical', 'fatal', 'warning'):
+                            output_lines.append(line)
+                            if log_output:
+                                logger.error('[Rclone Error] %s: %s', safe_description, redact_log(line))
+                        continue
+                    output_lines.append(line)
+                    if log_output and str(entry.get('level', '')).lower() in ('error', 'critical', 'fatal', 'warning'):
+                        logger.error('[Rclone Error] %s: %s', safe_description, redact_log(line))
+                    continue
                 output_lines.append(line)
-                if quota is not None:
-                    try:
-                        entry = json.loads(line)
-                        if isinstance(entry, dict):
-                            quota.observe(entry)
-                            stats = entry.get('stats') or {}
-                            if stats.get('bytes', 0) > 0:
-                                transfer_started.set()
-                            if item_id and stats:
-                                transferred = stats.get('bytes', 0)
-                                total = stats.get('totalBytes') or file_size or 0
-                                FeederUtil.report_rclone_progress(item_id, {
-                                    'progress': min(100, 100 * transferred / total) if total else 0,
-                                    'downloaded_bytes': transferred, 'total_bytes': total,
-                                    'download_speed': stats.get('speed') or 0,
-                                    'speed_str': FeederUtil.format_bytes(stats.get('speed') or 0) + '/s',
-                                    'eta': str(stats.get('eta') or '')})
-                    except (ValueError, TypeError):
-                        pass
 
                 # 실제 전송용 실행 시에만 에러/경고 출력 (lsjson 등 단순 검사 시 오탐 차단)
                 if log_output:
@@ -318,8 +339,32 @@ class UploadUtil:
             self.reset_time_str = P.ModelSetting.get('download_shared_drive_quota_reset_time') or default_yaml.get('shared_drive_quota_reset_time') or '16:00'
 
             self.usage_map = self._get_24h_usage_summary()
-            self.shared_usage = self.usage_map.get('SHARED_DRIVE_UPLOAD', 0)
+            self.shared_quota_start = self._shared_quota_window_start()
+            self.shared_usage = self._get_shared_quota_usage()
             self.blocked_accounts = self._get_blocked_accounts()
+
+        def _shared_quota_window_start(self) -> int:
+            """최근 공유 드라이브 리셋 시각(KST)의 Unix 타임스탬프."""
+            now = datetime.now(pytz.timezone('Asia/Seoul'))
+            try:
+                hour, minute = map(int, self.reset_time_str.split(':'))
+                if not (0 <= hour < 24 and 0 <= minute < 60):
+                    raise ValueError('invalid reset time')
+            except (ValueError, TypeError):
+                hour, minute = 16, 0
+            start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if start > now:
+                start -= timedelta(days=1)
+            return int(start.timestamp())
+
+        def _get_shared_quota_usage(self) -> int:
+            """24시간 통계와 별도로, 현재 쿼터 구간의 사용량·예약만 합산."""
+            total = db.session.query(func.sum(ModelDownloadStat.stat_value)).filter(
+                ModelDownloadStat.stat_type.in_(['gdrive_usage', 'gdrive_reservation']),
+                ModelDownloadStat.stat_key == 'SHARED_DRIVE_DIRECT_UPLOAD',
+                ModelDownloadStat.timestamp >= self.shared_quota_start,
+            ).scalar()
+            return int(total or 0)
 
         def _get_24h_usage_summary(self) -> dict[str, int]:
             cutoff = int(time.time()) - 86400
@@ -352,12 +397,11 @@ class UploadUtil:
         def allocate_account(self, file_size: int, use_pool: bool = True, exclude_accounts=None) -> tuple[str, dict | None, str]:
             with self.lock:
                 # 공유 드라이브 403 쿼터 차단 및 일일 한도 체크
-                if 'SHARED_DRIVE_UPLOAD' in self.blocked_accounts:
-                    return 'skip', None, "공유 드라이브 403 쿼터 초과 차단 중"
-                if self.shared_usage + file_size > self.limit_shared:
-                    return 'skip', None, "공유 드라이브 일일 설정 한도 초과"
-
                 if not use_pool:
+                    if 'SHARED_DRIVE_UPLOAD' in self.blocked_accounts:
+                        return 'skip', None, "공유 드라이브 403 쿼터 초과 차단 중"
+                    if self.shared_usage + file_size > self.limit_shared:
+                        return 'skip', None, "공유 드라이브 일일 설정 한도 초과"
                     pending_cleanup = db.session.query(ModelDownload.upload_state).filter(
                         ModelDownload.status == 'pending_upload', ModelDownload.upload_state.isnot(None)).all()
                     if any((state or {}).get('cleanup_pending') and not (state or {}).get('uses_pool')
@@ -367,6 +411,12 @@ class UploadUtil:
                     return 'shareddrive', None, "기본 리모트 공유 드라이브 직행"
 
                 is_direct_shared = (file_size > self.threshold)
+                # MyDrive 경유 업로드는 공유 드라이브 '직접 업로드' 한도에 포함하지 않는다.
+                if is_direct_shared:
+                    if 'SHARED_DRIVE_UPLOAD' in self.blocked_accounts:
+                        return 'skip', None, "공유 드라이브 403 쿼터 초과 차단 중"
+                    if self.shared_usage + file_size > self.limit_shared:
+                        return 'skip', None, "공유 드라이브 일일 설정 한도 초과"
                 excluded = set(exclude_accounts or ())
                 # 통신 장애로 실행 스레드가 종료돼도 미확인 원격 작업의 계정은 재할당하지 않는다.
                 for checkpoint, status in db.session.query(ModelDownload.upload_state, ModelDownload.status).filter(
@@ -393,8 +443,8 @@ class UploadUtil:
                         if current_u + file_size < self.limit_user:
                             self.busy_accounts.add(uname)
                             self.usage_map[uname] = current_u + file_size
-                            self.shared_usage += file_size
                             if is_direct_shared:
+                                self.shared_usage += file_size
                                 return 'shareddrive', acc, f"대용량 직행 ({uname})"
                             return 'mydrive', acc, f"내 드라이브 바이패스 ({uname})"
 
@@ -489,12 +539,17 @@ class UploadUtil:
         return cls.AccountManager()
 
     @staticmethod
-    def reserve_usage(account, size, download_id=None, attempt_id=None):
-        """시도별 예약 행을 체크포인트와 같은 트랜잭션에 기록한다."""
+    def reserve_usage(account, size, download_id=None, attempt_id=None, mode='shareddrive'):
+        """전체 업로드 통계와 직접 업로드 한도용 예약을 구분해 기록한다."""
         attempt_id = attempt_id or uuid.uuid4().hex
+        # SHARED_DRIVE_UPLOAD은 기존 24시간 총량 통계와의 호환을 위해 유지한다.
+        # 새 직접 업로드 키만 별도 일일 한도에 사용한다.
+        keys = ['SHARED_DRIVE_UPLOAD', account]
+        if mode == 'shareddrive':
+            keys.append('SHARED_DRIVE_DIRECT_UPLOAD')
         rows = [ModelDownloadStat(stat_type='gdrive_reservation', stat_key=key,
                 stat_value=float(size), timestamp=int(time.time()), download_id=download_id, attempt_id=attempt_id)
-                for key in dict.fromkeys(filter(None, ('SHARED_DRIVE_UPLOAD', account)))]
+                for key in dict.fromkeys(filter(None, keys))]
         db.session.add_all(rows)
         db.session.flush()
         return {'stat_ids': [row.id for row in rows], 'attempt_id': attempt_id, 'reserved': int(size), 'settled': False}
@@ -511,7 +566,7 @@ class UploadUtil:
         rows = db.session.query(ModelDownloadStat).filter(
             ModelDownloadStat.id.in_(usage['stat_ids']),
             ModelDownloadStat.stat_type == 'gdrive_reservation').all()
-        adjustments = [(row.stat_key, charged - int(row.stat_value)) for row in rows]
+        adjustments = [(row.stat_key, charged - int(row.stat_value), row.timestamp) for row in rows]
         for row in rows:
             row.stat_type = 'gdrive_usage'
             row.stat_value = float(charged)
@@ -521,10 +576,11 @@ class UploadUtil:
         db.session.commit()
         if manager is not None:
             with manager.lock:
-                for key, delta in adjustments:
-                    if key == 'SHARED_DRIVE_UPLOAD':
-                        manager.shared_usage = max(0, manager.shared_usage + delta)
-                    else:
+                for key, delta, timestamp in adjustments:
+                    if key == 'SHARED_DRIVE_DIRECT_UPLOAD':
+                        if timestamp >= getattr(manager, 'shared_quota_start', 0):
+                            manager.shared_usage = max(0, manager.shared_usage + delta)
+                    elif key != 'SHARED_DRIVE_UPLOAD':
                         manager.usage_map[key] = max(0, manager.usage_map.get(key, 0) + delta)
 
     @classmethod
@@ -642,14 +698,53 @@ class UploadUtil:
         DownloadActivity.record('엔진 전환', f'작업 #{item.id} · {item.error_message.splitlines()[0]}', 'warning')
         return True
 
+    @staticmethod
+    def source_auth_error(item, message, worker_error=None, source_operation=False):
+        state = item.upload_state or {}
+        if not state.get('worker') and not source_operation:
+            return None
+        name = item.current_engine_name
+        source = state.get('download_source') or {}
+        snapshot_name = source.get('engine_name') or state.get('engine_name')
+        snapshot_task = source.get('task_id') or state.get('engine_task_id')
+        if (not name or snapshot_name != name or not snapshot_task or
+                str(snapshot_task) != str(item.engine_task_id)):
+            return None
+        source_path = state.get('local_path') or item.local_path
+        destination_path = state.get('incoming') or state.get('staging_local_path')
+        if state.get('worker'):
+            worker = state['worker']
+            payload = worker.get('payload') or {}
+            if (not isinstance(worker_error, dict) or worker_error.get('status') != 'failed' or
+                    not payload.get('source') or not payload.get('destination') or
+                    worker_error.get('job_id') != worker.get('job_id') or
+                    worker_error.get('source') != payload['source'] or
+                    worker_error.get('destination') != payload['destination']):
+                return None
+            # HTTP API 401 never enters this branch: only a verified failed Rclone job does.
+            message = worker_error.get('error_message')
+            source_path, destination_path = payload['source'], payload['destination']
+        auth = classify_auth_error(message, source_path, destination_path)
+        if not auth or auth['origin'] != 'source':
+            return None
+        if worker_error and (worker_error.get('error_origin', 'source') != 'source' or
+                             worker_error.get('error_code', auth['code']) != auth['code']):
+            return None
+        auth['source_engine_name'] = name
+        return auth
+
     @classmethod
-    def transfer_failed(cls, item_id, message, manager=None, amount=None, retry_status='pending_upload', structured_type=None):
+    def transfer_failed(cls, item_id, message, manager=None, amount=None, retry_status='pending_upload', structured_type=None, worker_error=None, source_operation=False):
         """오류 분류·시도 정산·공간 회수·엔진 대기를 순서대로 적용한다."""
         item = db.session.get(ModelDownload, item_id)
         if not item or item.status in ('blocked', 'cancelled', 'completed'):
             return False
         cls.settle_usage(item, manager, amount)
-        error_type = classify_error(message)
+        auth = cls.source_auth_error(item, message, worker_error, source_operation)
+        if auth:
+            FeederUtil.auto_disable_engine(item.current_engine_name, auth)
+        transfer_auth = classify_auth_error(message)
+        error_type = 'AUTH_ERROR' if auth or transfer_auth else classify_error(message)
         if error_type == 'SOURCE_UNAVAILABLE':
             text = str(message or '').lower()
             network = re.search(r'timeout|timed out|connection reset|\beof\b|connection refused|network is unreachable', text)
@@ -658,9 +753,9 @@ class UploadUtil:
             if network and not definite_source:
                 # 소스 열기라는 접두사만으로 일반 연결 단절을 AD 원본 불가로 확정하지 않는다.
                 error_type = 'NETWORK_ERROR'
-        valid_types = {'SOURCE_UNAVAILABLE', 'DRIVE_SERVER_ERROR', 'DRIVE_STORAGE_QUOTA',
+        valid_types = {'AUTH_ERROR', 'SOURCE_UNAVAILABLE', 'DRIVE_SERVER_ERROR', 'DRIVE_STORAGE_QUOTA',
                        'DRIVE_RATE_LIMIT', 'NETWORK_ERROR', 'UNKNOWN_ERROR'}
-        if structured_type is not None and (not isinstance(structured_type, str) or structured_type not in valid_types or structured_type != error_type):
+        if not auth and structured_type is not None and (not isinstance(structured_type, str) or structured_type not in valid_types or structured_type != error_type):
             safe_type = structured_type if isinstance(structured_type, str) and structured_type in valid_types else 'INVALID'
             logger.warning('[UploadUtil] 작업 %s: 구조화 오류 유형과 원문 분류가 다릅니다 (%s/%s). 보수적으로 보류합니다.', item_id, safe_type, error_type)
             error_type = 'UNKNOWN_ERROR'
@@ -1162,6 +1257,8 @@ class UploadUtil:
     @classmethod
     def retry_failed_upload(cls, item, manager: AccountManager) -> bool:
         """소스가 남으면 재업로드, 없으면 move_failed 이력을 보존하고 성공 종료한다."""
+        if FeederUtil.item_engine_disabled(item):
+            return False
         item_id = item.id
         state = dict(item.upload_state or {})
         source = item.local_path or state.get('local_path') or ''
@@ -1185,10 +1282,14 @@ class UploadUtil:
             db.session.remove()
             return True
         # 재업로드 전에 이전 원격 잔여 파일부터 최종 경로로 보존한다.
+        if FeederUtil.item_engine_disabled(item):
+            return False
         if not cls.recover_failed_remote_files(item_id):
             return False
         item = db.session.query(ModelDownload).filter_by(id=item_id, status='move_failed').first()
         if not item:
+            return False
+        if FeederUtil.item_engine_disabled(item):
             return False
         item.local_path = source
         FeederUtil.clear_transfer_state(item)
@@ -1199,8 +1300,31 @@ class UploadUtil:
         return cls.execute_upload(item, manager)
 
     @classmethod
+    def resolve_ad_source(cls, item, update=True):
+        """Resolve only a new AD transfer; existing copy ownership stays untouched."""
+        from .util_download import DownloadUtil
+        cfg = FeederUtil.get_downloader_by_name(item.current_engine_name) or {}
+        if cfg.get('engine_type') != 'alldebrid' or str(item.local_path or '').startswith('/'):
+            return True
+        engine = DownloadUtil.create_engine(cfg)
+        path = engine.resolved_source(item.engine_task_id, item.infohash) if engine and hasattr(engine, 'resolved_source') else ''
+        if not path:
+            return False
+        if not update:
+            return path == item.local_path
+        state = item.upload_state or {}
+        if state.get('worker') or state.get('phase') in ('copying', 'uploaded', 'shared_incoming', 'moved'):
+            return path == item.local_path
+        item.local_path = path
+        return True
+
+    @classmethod
     def execute_upload(cls, item: ModelDownload, manager: AccountManager) -> bool:
         """소스를 업로드하고, 영속화한 체크포인트부터 원격 이동과 정리를 수행한다."""
+        if item.status != 'completed' and FeederUtil.item_engine_disabled(item):
+            return False
+        if item.status == 'pending_upload':
+            FeederUtil.refresh_transfer_destination(item)
         if item.destination_type == 'remote_worker' or (item.upload_state or {}).get('worker'):
             from .util_remote_worker import RemoteWorker
             return RemoteWorker.execute(item, manager)
@@ -1217,6 +1341,10 @@ class UploadUtil:
         if (item.upload_state or {}).get('phase') == 'copying':
             return cls.transfer_failed(item.id, '이전 업로드 실행이 중단되어 잔여 파일을 먼저 복구합니다.', manager)
 
+        if not cls.resolve_ad_source(item):
+            item.error_message = 'AllDebrid 원본 경로 확인 대기: 다음 실행에서 다시 조회합니다.'
+            db.session.commit()
+            return False
         local_path = item.local_path
         is_remote_source = bool(local_path and not os.path.exists(local_path) and (':' in local_path or local_path.startswith(('http://', 'https://'))))
         if not local_path or (not is_remote_source and not os.path.exists(local_path)):
@@ -1248,16 +1376,6 @@ class UploadUtil:
             return False
         options = FeederUtil.get_upload_options(profile, item.current_engine_name, item)
         use_pool = options['use_gdrive_pool']
-        remote_sa = dest_cfg.get('mydrive_remote_name') or P.ModelSetting.get('download_gdrive_mydrive_remote_name') or rclone_cfg.get('mydrive_remote_name') or ''
-        target_drive_id = dest_cfg.get('shared_drive_id') or item.gdrive_remote_id or P.ModelSetting.get('download_shared_drive_id') or rclone_cfg.get('shared_drive_id', '')
-        if not target_drive_id:
-            item.status = 'failed'
-            item.error_message = '공유 드라이브 ID 누락'
-            db.session.commit()
-            return False
-
-        comp_path = (dest_cfg.get('complete_path') or item.gdrive_complete_path or '').strip('/')
-        up_path = (dest_cfg.get('upload_path') or item.gdrive_upload_path or '').strip('/')
         mode, acc, reason = manager.allocate_account(fsize, use_pool=use_pool)
         if mode in ['wait', 'skip']:
             logger.info(f"[UploadUtil] 업로드 보류 ({reason}): {folder_name}")
@@ -1265,9 +1383,25 @@ class UploadUtil:
         acc_name = acc.get('username') if acc else 'Default_Account'
 
         try:
+            latest_profile = FeederUtil.get_item_profile(item)
+            if (dest_cfg != FeederUtil.get_profile_destination(latest_profile, item=item) or
+                    options != FeederUtil.get_upload_options(latest_profile, item=item)):
+                item.error_message = '계정 할당 중 목적지 설정이 변경되었습니다. 다음 실행에서 최신 설정을 적용합니다.'
+                db.session.commit()
+                return False
+            rclone_cfg = FeederUtil.load_yaml().get('rclone', {})
+            rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or rclone_cfg.get('conf_path', '')
+            remote_sa = dest_cfg.get('mydrive_remote_name') or P.ModelSetting.get('download_gdrive_mydrive_remote_name') or rclone_cfg.get('mydrive_remote_name') or ''
+            target_drive_id = dest_cfg.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or rclone_cfg.get('shared_drive_id', '')
+            if not target_drive_id:
+                item.error_message = '공유 드라이브 ID 누락'
+                db.session.commit()
+                return False
+            comp_path = (dest_cfg.get('complete_path') or '').strip('/')
+            up_path = (dest_cfg.get('upload_path') or '').strip('/')
             use_impersonate = options['use_impersonate']
             if not use_pool:
-                effective_remote = P.ModelSetting.get('download_rclone_upload_remote_name') or remote_sa
+                effective_remote = dest_cfg.get('remote_name') or P.ModelSetting.get('download_rclone_upload_remote_name') or remote_sa
                 impersonate_arg = []
             elif use_impersonate:
                 effective_remote = remote_sa
@@ -1292,33 +1426,41 @@ class UploadUtil:
             }
             item_id = item.id
             item.status = 'uploading'
+            item.error_message = None
+            item.transfer_error_type = None
             item.gdrive_account = acc_name
             item.upload_state = dict(state)
-            state['usage'] = cls.reserve_usage(acc_name if use_pool else None, fsize, item_id)
+            state['usage'] = cls.reserve_usage(acc_name if use_pool else None, fsize, item_id, mode=mode)
             item.upload_state = dict(state)
             item.upload_retry_after = None
             db.session.commit()
             db.session.remove()
 
+            if FeederUtil.item_engine_disabled(db.session.get(ModelDownload, item_id)):
+                return False
             clean_chk = ['rclone', 'lsjson', dest_incoming, '--stat', '--config', rclone_conf] + impersonate_arg
             csuc, cout = cls.run_rclone(clean_chk, log_output=False, item_id=item_id)
             if not csuc and not any(word in cout.lower() for word in ('directory not found', 'object not found', "doesn't exist")):
                 return cls.transfer_failed(item_id, f'incoming 확인 실패: {cout}', manager, 0)
             if csuc and cout.strip() and cout.strip() not in ['{}', '[]']:
+                if FeederUtil.item_engine_disabled(db.session.get(ModelDownload, item_id)):
+                    return False
                 clean_cmd = ['rclone', 'move', dest_incoming, f'{dst_parent}/{folder_name}', '--delete-empty-src-dirs', '--drive-server-side-across-configs', '--drive-use-trash=false', '--config', rclone_conf] + impersonate_arg
                 cleaned, clean_error = cls.run_rclone(clean_cmd, log_output=False, item_id=item_id)
                 if not cleaned:
                     return cls.transfer_failed(item_id, f'incoming 초기화 실패: {clean_error}', manager, 0)
 
-            cmd = ['rclone', 'copy', local_path, dest_incoming, '--config', rclone_conf,
-                   '--stats', '1s', '--use-json-log', '--log-level', 'INFO'] + impersonate_arg
+            cmd = ['rclone', 'copy', local_path, dest_incoming, '--config', rclone_conf] + impersonate_arg
             cmd.extend(FeederUtil.get_rclone_exclude_options())
             cmd.extend(FeederUtil.get_rclone_transfer_options())
+            cmd.extend(cls.rclone_stats_options())
             from .util_block import DownloadBlock
             quota = FileQuota.inspect_source(['rclone', 'lsjson', local_path, '--recursive', '--files-only',
                 '--no-modtime', '--no-mimetype', '--config', rclone_conf,
                 '--retries', '1', '--low-level-retries', '1'] + FeederUtil.get_rclone_exclude_options(),
                 stopped=lambda: DownloadBlock.stopped(item_id))
+            if FeederUtil.item_engine_disabled(db.session.get(ModelDownload, item_id)):
+                return False
             success, out = cls.run_rclone(cmd, f'업로드 {folder_name}', item_id=item_id, file_size=fsize,
                                           watchdog_timeout=300, quota=quota)
             item = db.session.query(ModelDownload).filter_by(id=item_id).first()
@@ -1326,9 +1468,11 @@ class UploadUtil:
                 cls.settle_usage(item, manager, quota.charged_bytes())
             if not item or item.status != 'uploading':
                 return False
+            if FeederUtil.item_engine_disabled(item):
+                return False
 
             if not success:
-                return cls.transfer_failed(item_id, out, manager, quota.charged_bytes())
+                return cls.transfer_failed(item_id, out, manager, quota.charged_bytes(), source_operation=is_remote_source)
 
             state = dict(item.upload_state or {})
             state['phase'] = 'uploaded'
@@ -1370,6 +1514,9 @@ class UploadUtil:
         if item.status == 'completed':
             db.session.remove()
             return True
+        if FeederUtil.item_engine_disabled(item):
+            db.session.remove()
+            return False
         state = dict(item.upload_state or {})
         if state.get('phase') not in ['uploaded', 'shared_incoming', 'moved']:
             cls._mark_move_failure(item_id, '이전 업로드의 단계/경로 기록이 없어 자동 이동을 재개할 수 없습니다. 원격 파일 확인이 필요합니다.')
@@ -1398,6 +1545,8 @@ class UploadUtil:
                 time.sleep(3)
                 moved = False
                 for attempt in range(1, 4):
+                    if FeederUtil.item_engine_disabled(db.session.get(ModelDownload, item_id)):
+                        return False
                     if state['phase'] == 'uploaded' and state['mode'] == 'mydrive':
                         move_cmd = ['rclone', 'move', state['incoming'], state['shared_incoming'],
                                     '--delete-empty-src-dirs', '--drive-server-side-across-configs',
@@ -1410,8 +1559,12 @@ class UploadUtil:
                         if not save_phase('shared_incoming'):
                             return False
                     mkdir_cmd = ['rclone', 'mkdir', state['dest_parent']] + conf_args
+                    if FeederUtil.item_engine_disabled(db.session.get(ModelDownload, item_id)):
+                        return False
                     cls.run_rclone(mkdir_cmd, log_output=False, item_id=item_id)
                     chpar_cmd = ['rclone', 'backend', 'chpar', state['shared_incoming'], state['dest_parent'], '--log-level', 'NOTICE'] + conf_args
+                    if FeederUtil.item_engine_disabled(db.session.get(ModelDownload, item_id)):
+                        return False
                     moved, out = cls.run_rclone(chpar_cmd, f"원자적 부모폴더 변경 {state['folder_name']}", item_id=item_id)
                     if moved:
                         if not save_phase('moved'):
@@ -1424,6 +1577,8 @@ class UploadUtil:
                     return False
 
             # moved 체크포인트는 원본 정리 실패 시에도 보존하므로 재시도 때 이동을 반복하지 않는다.
+            if FeederUtil.item_engine_disabled(db.session.get(ModelDownload, item_id)):
+                return False
             local_path = state['local_path']
             if not state['is_remote_source'] and os.path.exists(local_path):
                 try:
@@ -1436,11 +1591,21 @@ class UploadUtil:
                     return False
 
             downloader_cfg = FeederUtil.get_downloader_by_name(state['engine_name'])
+            cleanup_warning = None
             if downloader_cfg and state['engine_task_id']:
                 try:
                     from .util_download import DownloadUtil
                     engine = DownloadUtil.create_engine(downloader_cfg)
-                    if engine:
+                    if engine and getattr(engine, 'ENGINE_ID', '') == 'pikpak':
+                        target = db.session.get(ModelDownload, item_id)
+                        cleaned, warning = engine.delete_completed_source(state['engine_task_id'],
+                            FeederUtil.get_download_source_subpath(target), local_path if state['is_remote_source'] else None)
+                        if cleaned:
+                            engine.delete_task(state['engine_task_id'])
+                        else:
+                            cleanup_warning = '업로드 완료 · PikPak 원본 정리 보류: ' + warning
+                            logger.warning('[UploadUtil] 작업 #%s %s', item_id, cleanup_warning)
+                    elif engine:
                         engine.delete_task(state['engine_task_id'])
                 except Exception as ex:
                     logger.debug(f'[UploadUtil] 다운로더 히스토리 삭제 실패 (무시): {ex}')
@@ -1450,7 +1615,7 @@ class UploadUtil:
             item.status = 'completed'
             item.mark_video_stored()
             item.completed_time = datetime.now()
-            item.error_message = None
+            item.error_message = cleanup_warning
             item.transfer_error_type = None
             item.source_unavailable_since = None
             item.upload_retry_after = None

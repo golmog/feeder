@@ -88,6 +88,57 @@ def redact_log(value, secrets=(), limit=400):
     return text[:limit]
 
 
+def classify_auth_error(message, source=None, destination=None):
+    """Use explicit operations or filesystem paths verified against both endpoints."""
+    def matches_endpoint(filesystem, endpoint):
+        if not isinstance(endpoint, str):
+            return False
+        # Rclone may initialize an ancestor of the requested path.
+        root = filesystem.rstrip('/')
+        return endpoint.rstrip('/') == root or endpoint.startswith(
+            root if root.endswith(':') else root + '/')
+
+    matches = []
+    for line in str(message or '').splitlines():
+        try:
+            entry = json.loads(line)
+            if isinstance(entry, dict) and isinstance(entry.get('msg'), str):
+                line = entry['msg']
+        except (ValueError, TypeError):
+            pass
+        text = line.lower()
+        if re.search(r'\b(?:403|404|429|500|502|503|504)\b|timeout|timed out|connection reset|connection refused|network is unreachable', text):
+            continue
+        source_open = bool(re.search(r'failed to open source object|error opening source', text))
+        destination_open = bool(re.search(r'googleapi:|google drive|destination', text))
+        locked = bool(re.search(r'account (?:is |has been )?(?:locked|suspended|banned)', text))
+        unauthorized = bool(re.search(r'\b401\b', text))
+        if not (locked or unauthorized):
+            continue
+        origin = 'source' if source_open and not destination_open else 'destination' if destination_open and not source_open else 'unknown'
+        filesystems = re.findall(r'failed to create file system for "([^"\n]+)"', line, re.IGNORECASE)
+        if filesystems:
+            filesystem_origin = 'unknown'
+            if len(filesystems) == 1 and source and destination:
+                source_match = matches_endpoint(filesystems[0], source)
+                destination_match = matches_endpoint(filesystems[0], destination)
+                if source_match != destination_match:
+                    filesystem_origin = 'source' if source_match else 'destination'
+            if (source_open or destination_open) and origin != filesystem_origin:
+                origin = 'unknown'
+            else:
+                origin = filesystem_origin
+        matches.append((origin, 'AUTH_ACCOUNT_LOCKED' if locked else 'AUTH_UNAUTHORIZED'))
+    if not matches:
+        return None
+    origins = {origin for origin, _ in matches}
+    origin = next(iter(origins)) if len(origins) == 1 else 'unknown'
+    code = 'AUTH_ACCOUNT_LOCKED' if all(code == 'AUTH_ACCOUNT_LOCKED' for _, code in matches) else 'AUTH_UNAUTHORIZED'
+    return {'category': 'authentication', 'scope': 'engine', 'code': code,
+            'action': 'disable_engine', 'origin': origin,
+            'message': '계정 잠금' if code == 'AUTH_ACCOUNT_LOCKED' else '인증 오류 (401)'}
+
+
 def classify_error(message):
     """상태 코드만으로 원본 오류를 Drive 오류로 오인하지 않는다."""
     text = str(message or '').lower()

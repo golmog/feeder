@@ -32,22 +32,28 @@
       <option value="all">전체 엔진</option>
     </select>
   </div>
-  <div class="form-inline">
+  <div class="d-flex flex-wrap align-items-center">
     <select id="page_size" name="page_size" class="form-control form-control-sm mr-1">
       <option value="15">15개씩</option>
       <option value="25" selected>25개씩</option>
       <option value="50">50개씩</option>
       <option value="100">100개씩</option>
     </select>
-    <div class="input-group input-group-sm mr-1">
-      <input id="search_word" name="search_word" class="form-control" style="width: 180px;" type="text" placeholder="제목/파일명/링크 검색">
+    <select id="download_search_scope" name="download_search_scope" aria-label="검색 범위" class="form-control form-control-sm mr-1">
+      <option value="all">전체</option>
+      <option value="id">ID</option>
+      <option value="title">제목</option>
+      <option value="file_name">파일명</option>
+      <option value="link">링크</option>
+    </select>
+    <div class="input-group input-group-sm mr-1" style="width: 240px; max-width: 100%;">
+      <input id="search_word" name="search_word" class="form-control" style="min-width: 0;" type="text" placeholder="ID/제목/파일명/링크 검색">
       <div class="input-group-append">
         <button id="search" class="btn btn-primary" type="button">검색</button>
       </div>
     </div>
     <button id="reset_btn" class="btn btn-sm btn-outline-secondary" type="button">리셋</button>
     <button id="batch_link_open_btn" class="btn btn-sm btn-outline-primary ml-1" type="button">링크 추가</button>
-    <button type="button" class="btn btn-sm btn-outline-danger ml-1 blacklist_open_btn">콘텐츠 차단 목록</button>
   </div>
 </form>
 

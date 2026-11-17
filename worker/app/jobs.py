@@ -5,8 +5,8 @@ from datetime import datetime, timezone
 import math
 import re
 import json
-from urllib.parse import unquote
-from rclone_logging import classify_error, validate_extra_args
+from urllib.parse import unquote, urlsplit
+from rclone_logging import classify_error, classify_auth_error, validate_extra_args
 
 
 STATUSES = ('queued', 'running', 'completed', 'failed', 'cancelled')
@@ -21,7 +21,7 @@ class ConflictError(ValueError):
 
 
 def validate_payload(payload, settings) -> dict:
-    if not isinstance(payload, dict) or set(payload) - {'job_id', 'source', 'destination', 'config_version', 'exclude_patterns', 'drive_impersonate', 'rclone_transfers', 'rclone_extra_args', 'session_id'}:
+    if not isinstance(payload, dict) or set(payload) - {'job_id', 'source', 'destination', 'config_version', 'exclude_patterns', 'drive_impersonate', 'rclone_transfers', 'rclone_extra_args', 'session_id', 'source_kind', 'source_files'}:
         raise ValueError('작업 경로·설정 버전·필터·위임·전송 수·추가 옵션의 지원 필드만 지정할 수 있습니다.')
     job_id = payload.get('job_id')
     session_id = payload.get('session_id')
@@ -30,10 +30,17 @@ def validate_payload(payload, settings) -> dict:
     if not isinstance(job_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', job_id):
         raise ValueError('job_id는 영문·숫자로 시작하는 1~128자의 영문·숫자·점·밑줄·하이픈이어야 합니다.')
     remotes = settings.validate_remotes()
+    source_kind = payload.get('source_kind', 'remote')
+    if source_kind not in ('remote', 'url_files'):
+        raise ValueError('지원하지 않는 소스 종류입니다.')
     for field, allowed in remotes.items():
         value = payload.get(field)
         if not isinstance(value, str) or not 1 <= len(value) <= 4096 or any(ord(c) < 32 or ord(c) == 127 for c in value):
             raise ValueError(f'{field}의 경로가 유효하지 않습니다.')
+        if field == 'source' and source_kind == 'url_files':
+            if not value.startswith('cd2:/'):
+                raise ValueError('URL 파일 소스에는 URL이 없는 CD2 논리 경로가 필요합니다.')
+            continue
         match = re.fullmatch(r'([A-Za-z0-9_-]+):(.+)', value)
         if not match or match[1] not in allowed:
             raise ValueError(f'{field}에는 워커 Rclone 설정에 정의된 지원 타입의 리모트 경로를 지정해주세요.')
@@ -50,6 +57,41 @@ def validate_payload(payload, settings) -> dict:
     if type(version) is not int or version < 1:
         raise ValueError('config_version은 양의 정수여야 합니다.')
     result = {**{key: payload[key] for key in ('job_id', 'source', 'destination')}, 'config_version': version}
+    result['source_kind'] = source_kind
+    if source_kind == 'url_files':
+        files = payload.get('source_files')
+        if not isinstance(files, list) or not files:
+            raise ValueError('전송할 파일 목록이 필요합니다.')
+        paths = set()
+        result['source_files'] = []
+        for entry in files:
+            if not isinstance(entry, dict):
+                raise ValueError('파일 정보가 유효하지 않습니다.')
+            relative, url, size, headers = (entry.get(k) for k in ('relative_path', 'url', 'size', 'headers'))
+            if (not isinstance(relative, str) or not relative or relative.startswith(('/', '\\')) or
+                    '\\' in relative or any(p in ('', '.', '..') for p in relative.split('/')) or
+                    any(ord(c) < 32 or ord(c) == 127 for c in relative) or relative in paths):
+                raise ValueError('파일 상대 경로가 유효하지 않거나 중복되었습니다.')
+            paths.add(relative)
+            if not isinstance(url, str) or any(ord(c) < 32 or ord(c) == 127 for c in url):
+                raise ValueError('HTTPS 다운로드 URL이 필요합니다.')
+            try:
+                parsed = urlsplit(url)
+                valid_url = parsed.scheme == 'https' and bool(parsed.hostname) and not parsed.username and not parsed.password
+            except ValueError:
+                valid_url = False
+            if not valid_url:
+                raise ValueError('HTTPS 다운로드 URL이 필요합니다.')
+            if type(size) is not int or not 0 <= size <= 2**63 - 1:
+                raise ValueError('확인된 파일 바이트 크기가 필요합니다.')
+            if (not isinstance(headers, dict) or any(not isinstance(k, str) or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", k) or
+                    not isinstance(v, str) or any(ord(c) < 32 or ord(c) == 127 for c in v) for k, v in headers.items())):
+                raise ValueError('다운로드 헤더 형식이 유효하지 않습니다.')
+            result['source_files'].append(dict(relative_path=relative, url=url, size=size, headers=dict(headers)))
+        if sum(entry['size'] for entry in files) > 2**63 - 1:
+            raise ValueError('전체 파일 크기가 너무 큽니다.')
+    elif payload.get('source_files'):
+        raise ValueError('일반 리모트 소스에는 URL 파일 목록을 지정할 수 없습니다.')
     result['session_id'] = session_id
     if 'rclone_extra_args' not in payload:
         raise ValueError('rclone_extra_args 배열이 필요합니다. 추가 옵션이 없으면 빈 배열을 지정해주세요.')
@@ -80,7 +122,7 @@ def as_dict(row) -> dict:
     job = {field: row[field] for field in ('job_id', 'status', 'source', 'destination', 'created_at',
         'started_at', 'finished_at', 'bytes_transferred', 'total_bytes', 'speed', 'eta', 'error_message',
         'rclone_exit_code', 'config_version', 'cancel_requested', 'exclude_patterns', 'drive_impersonate',
-        'rclone_transfers', 'rclone_extra_args', 'chargeable_bytes', 'error_type', 'session_id')}
+        'rclone_transfers', 'rclone_extra_args', 'chargeable_bytes', 'error_type', 'session_id', 'source_kind')}
     if job.get('rclone_extra_args') is None:
         job.pop('rclone_extra_args', None)
     else:
@@ -95,6 +137,12 @@ def as_dict(row) -> dict:
         'percent': min(100.0, 100 * job['bytes_transferred'] / total) if total else (100.0 if job['status'] == 'completed' else 0.0),
         'speed_bytes_per_sec': job['speed'], 'eta_seconds': job['eta'],
     }
+    auth = classify_auth_error(job.get('error_message'), job['source'], job['destination']) if job['status'] == 'failed' else None
+    # 서명 URL 만료는 CD2 엔진의 계정 인증 실패가 아니다. 다음 제출에서 URL을 재발급한다.
+    if auth and job['source_kind'] == 'url_files' and auth['origin'] == 'source':
+        auth = None
+    job['error_origin'] = auth['origin'] if auth else None
+    job['error_code'] = auth['code'] if auth else None
     return job
 
 
@@ -114,6 +162,7 @@ class JobStore:
             payload = {key: job[key] for key in ('job_id', 'status', 'progress', 'cancel_requested',
                 'created_at', 'started_at', 'finished_at', 'error_message', 'rclone_exit_code', 'config_version',
                 'chargeable_bytes', 'error_type')}
+            payload.update(error_origin=job['error_origin'], error_code=job['error_code'])
             self.events.append(connection, event_type, payload)
 
     def worker_status(self, running, failure=False):
@@ -141,6 +190,8 @@ class JobStore:
                     raise ConflictError('새 작업 ID는 현재 Feeder 세션 ID와 하이픈으로 시작해야 합니다.')
                 row = connection.execute('SELECT * FROM jobs WHERE job_id=?', (data['job_id'],)).fetchone()
                 if row:
+                    if row['source_kind'] != data.get('source_kind', 'remote') or json.loads(row['source_files']) != data.get('source_files', []):
+                        raise ConflictError('동일 job_id의 소스 종류 또는 파일 목록이 다릅니다.')
                     if any(row[key] != data[key] for key in ('source', 'destination', 'config_version')):
                         raise ConflictError('동일 job_id에 다른 작업 내용이 등록되어 있습니다.')
                     if json.loads(row['exclude_patterns']) != data.get('exclude_patterns', []):
@@ -169,6 +220,8 @@ class JobStore:
                 connection.execute('UPDATE jobs SET rclone_extra_args=? WHERE job_id=?',
                     (json.dumps(data['rclone_extra_args'], ensure_ascii=False), data['job_id']))
                 connection.execute('UPDATE jobs SET session_id=? WHERE job_id=?', (data['session_id'], data['job_id']))
+                connection.execute('UPDATE jobs SET source_kind=?,source_files=? WHERE job_id=?',
+                    (data.get('source_kind', 'remote'), json.dumps(data.get('source_files', []), ensure_ascii=False), data['job_id']))
                 self.log(connection, data['job_id'], '작업 등록')
                 self.event(connection, data['job_id'], 'job.queued')
                 self.commit(connection)
@@ -286,7 +339,11 @@ class JobStore:
             self.log(connection, row['job_id'], '전송 시작')
             self.event(connection, row['job_id'], 'job.started')
             self.commit(connection)
-        return self.get(row['job_id'])
+        job = self.get(row['job_id'])
+        # 실행 스레드에만 manifest를 전달하며 조회/API/이벤트에는 포함하지 않는다.
+        if job['source_kind'] == 'url_files':
+            job['source_files'] = json.loads(row['source_files'])
+        return job
 
     def progress(self, job_id, stats):
         def number(key, integer=False):

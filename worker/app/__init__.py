@@ -17,7 +17,7 @@ from .configuration import Configurations
 from .updates import Updates
 
 
-VERSION = '0.13.2'
+VERSION = '0.15.0'
 
 
 def create_app(settings: Settings | None = None) -> Flask:

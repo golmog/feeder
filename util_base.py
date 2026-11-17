@@ -1052,6 +1052,96 @@ class FeederUtil:
         return cls.load_yaml().get('GLOBAL', {})
 
     # Downloaders
+    _downloader_settings_lock = threading.RLock()
+
+    @classmethod
+    @contextmanager
+    def downloader_settings_lock(cls):
+        import fcntl
+        with cls._downloader_settings_lock:
+            with open(cls.CONFIG_FILEPATH + '.downloaders.lock', 'a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+
+    @classmethod
+    def engine_auth_error(cls, engine, error, operation):
+        """Optional semantic engine contract; legacy strings alone carry no authority."""
+        if not error:
+            return False
+        classification = error if isinstance(error, dict) else None
+        classifier = getattr(engine, 'classify_error', None)
+        if classification is None and callable(classifier):
+            try:
+                classification = classifier({'operation': operation, 'error': error,
+                                             'source_engine_name': engine.name})
+            except Exception:
+                return False
+        if not isinstance(classification, dict):
+            return False
+        return cls.auto_disable_engine(getattr(engine, 'name', ''), classification)
+
+    @classmethod
+    def auto_disable_engine(cls, name, error):
+        if (not name or not isinstance(error, dict) or
+                error.get('category') != 'authentication' or error.get('scope') != 'engine' or
+                error.get('action') != 'disable_engine' or
+                error.get('origin') not in ('source', 'service_api') or
+                error.get('code') not in ('AUTH_UNAUTHORIZED', 'HTTP_401', 'AUTH_ACCOUNT_LOCKED', 'AUTH_BAD_APIKEY') or
+                error.get('source_engine_name', name) != name):
+            return False
+        reason = {'AUTH_ACCOUNT_LOCKED': '계정 잠금',
+                  'AUTH_BAD_APIKEY': '계정 접근 차단 · API 키 무효'}.get(error['code'], '인증 오류 (401)')
+        with cls.downloader_settings_lock():
+            data = cls.load_yaml()
+            for config in data.get('DOWNLOADERS', []):
+                if str(config.get('name', '')).strip().lower() != str(name).strip().lower():
+                    continue
+                if not config.get('enabled', True):
+                    return True
+                config['enabled'] = False
+                config['auto_disabled'] = {'code': error['code'], 'category': 'authentication',
+                                           'reason': reason, 'at': datetime.now().isoformat(timespec='seconds'),
+                                           'origin': error['origin']}
+                return cls.save_yaml(data)
+        return False
+
+    @classmethod
+    def auto_disabled_engines(cls):
+        # Never expose arbitrary engine-supplied message/detail or credentials.
+        result = []
+        for config in cls.get_downloaders():
+            meta = config.get('auto_disabled')
+            if config.get('enabled', True) or not isinstance(meta, dict):
+                continue
+            result.append({'name': str(config.get('name', '')),
+                           'reason': {'AUTH_ACCOUNT_LOCKED': '계정 잠금',
+                                      'AUTH_BAD_APIKEY': '계정 접근 차단 · API 키 무효'}.get(meta.get('code'), '인증 오류 (401)'),
+                           'at': str(meta.get('at', ''))})
+        return result
+
+    @classmethod
+    def disabled_engine_names(cls, downloaders=None):
+        """단계별 설정 스냅샷에서 명시적으로 중단된 엔진 이름만 모은다."""
+        configs = cls.get_downloaders() if downloaders is None else downloaders
+        return {str(config.get('name') or '').strip().lower() for config in configs
+                if str(config.get('name') or '').strip() and
+                str(config.get('enabled', True)).strip().lower() in ('false', 'off', '0', '')}
+
+    @classmethod
+    def item_engine_disabled(cls, item, disabled_names=None):
+        """현재 소스 엔진을 우선하며 엔진 미지정·미등록 항목의 기존 정책은 유지한다."""
+        if item is None:
+            return False
+        state = getattr(item, 'upload_state', None) or {}
+        name = (str(getattr(item, 'current_engine_name', None) or '').strip() or
+                str((state.get('download_source') or {}).get('engine_name') or '').strip() or
+                str(state.get('engine_name') or '').strip())
+        disabled = cls.disabled_engine_names() if disabled_names is None else disabled_names
+        return name.lower() in disabled if name else False
+
     @classmethod
     def get_downloaders(cls) -> list[dict]:
         return cls.load_yaml().get('DOWNLOADERS', [])
@@ -1067,6 +1157,7 @@ class FeederUtil:
     @classmethod
     def save_downloader(cls, item: dict) -> str:
         item = dict(item)
+        reenable = item.pop('reenable_auto_disabled', None)
         if not str(item.get('name') or '').strip():
             return 'empty_name'
         if not item.get('engine_type'):
@@ -1095,27 +1186,34 @@ class FeederUtil:
             except (TypeError, ValueError):
                 return 'WebDAV 실패 유예는 0~8760 사이의 정수 시간이어야 합니다.'
             item = dict(item, webdav_failure_timeout_hours=hours)
-        data = cls.load_yaml()
-        items = data.get('DOWNLOADERS', [])
-        target_name = item.get('name', '').strip()
-        if not target_name:
-            return 'empty_name'
+        with cls.downloader_settings_lock():
+            data = cls.load_yaml()
+            items = data.get('DOWNLOADERS', [])
+            target_name = item.get('name', '').strip()
+            if not target_name:
+                return 'empty_name'
 
-        for idx, d in enumerate(items):
-            if str(d.get('name', '')).strip().lower() == target_name.lower():
-                items[idx] = item
-                data['DOWNLOADERS'] = items
-                if not cls.save_yaml(data):
-                    return 'save_failed'
-                logger.info(f"[FeederUtil] 다운로더 설정 갱신: {target_name}")
-                return 'success_update'
+            for idx, d in enumerate(items):
+                if str(d.get('name', '')).strip().lower() == target_name.lower():
+                    item.pop('auto_disabled', None)
+                    if d.get('auto_disabled') and reenable is False:
+                        item['enabled'] = False
+                    if not item.get('enabled', True) and d.get('auto_disabled'):
+                        item['auto_disabled'] = d['auto_disabled']
+                    items[idx] = item
+                    data['DOWNLOADERS'] = items
+                    if not cls.save_yaml(data):
+                        return 'save_failed'
+                    logger.info(f"[FeederUtil] 다운로더 설정 갱신: {target_name}")
+                    return 'success_update'
 
-        items.append(item)
-        data['DOWNLOADERS'] = items
-        if not cls.save_yaml(data):
-            return 'save_failed'
-        logger.info(f"[FeederUtil] 신규 다운로더 추가: {target_name}")
-        return 'success'
+            item.pop('auto_disabled', None)
+            items.append(item)
+            data['DOWNLOADERS'] = items
+            if not cls.save_yaml(data):
+                return 'save_failed'
+            logger.info(f"[FeederUtil] 신규 다운로더 추가: {target_name}")
+            return 'success'
 
     @classmethod
     def delete_downloader(cls, name: str) -> bool:
@@ -1248,6 +1346,18 @@ class FeederUtil:
         if not isinstance(destination, dict):
             return destination
         result = dict(destination)
+        if result.get('type') == 'local':
+            explicit = result.get('complete_path')
+            if explicit is not None and (not isinstance(explicit, str) or explicit.strip()):
+                return result
+            complete = engine.get('complete_root', cls.get_upload_roots()['complete_root'])
+            folder = cls.get_profile_folder(profile)
+            error = cls.relative_path_error(complete) or cls.relative_path_error(folder, single=True)
+            if error:
+                result.update(complete_path='', _path_error=error)
+            else:
+                result['complete_path'] = complete + '/' + folder
+            return result
         if result.get('type') not in ('rclone_simple', 'gdrive_rotation', 'remote_worker'):
             return result
         defaults = cls.get_upload_roots()
@@ -1279,12 +1389,18 @@ class FeederUtil:
         """전송 스냅샷·단건 지정 목적지 또는 현재 엔진 기본값과 오버라이드를 해석한다."""
         if item is not None:
             saved = (item.upload_state or {}).get('destination_snapshot')
-            if isinstance(saved, dict):
+            if isinstance(saved, dict) and cls.transfer_destination_locked(item):
                 return dict(saved)
             routing = (item.upload_state or {}).get('routing') or {}
             if isinstance(routing.get('destination'), dict):
                 destination = dict(routing['destination'])
                 destination.setdefault('type', '')
+                if destination['type'] == 'local':
+                    chain = item.priority_chain or (profile or {}).get('priority_chain') or []
+                    index = item.current_engine_index or 0
+                    name = engine_name or item.current_engine_name or (chain[index] if 0 <= index < len(chain) else '')
+                    engine = (cls.get_downloader_by_name(name) or {}) if engine_config is None else engine_config
+                    return cls.resolve_destination_paths(destination, engine, profile or {})
                 return destination
         profile = profile or {}
         chain = (item.priority_chain if item is not None else None) or profile.get('priority_chain') or []
@@ -1313,7 +1429,7 @@ class FeederUtil:
     @classmethod
     def get_upload_options(cls, profile: dict | None, engine_name: str = '', item=None) -> dict:
         """중앙 목적지 해석 결과를 사용해 전송 스위치의 상속을 적용한다."""
-        if item is not None and (item.upload_state or {}).get('upload_options_snapshot'):
+        if item is not None and cls.transfer_destination_locked(item) and (item.upload_state or {}).get('upload_options_snapshot'):
             return dict(item.upload_state['upload_options_snapshot'])
         profile = profile or {}
         chain = (item.priority_chain if item is not None else None) or profile.get('priority_chain') or []
@@ -1378,9 +1494,34 @@ class FeederUtil:
         return cls.get_download_profile_by_feed(item.feed_name) or {}
 
     @classmethod
+    def transfer_destination_locked(cls, item):
+        """목적지 전송의 소유권이 생긴 뒤에는 기존 경로로 복구한다. 스테이징만으로는 고정하지 않는다."""
+        state = item.upload_state or {}
+        return bool(state.get('phase') or state.get('worker') or state.get('relay_claim_id') or state.get('cleanup_pending') or
+                    getattr(item, 'status', '') in ('uploading', 'relay_transferring', 'move_failed', 'completed'))
+
+    @classmethod
+    def refresh_transfer_destination(cls, item, profile=None):
+        """미시작 작업의 조기 스냅샷만 해제하고 현재 목적지 후보를 갱신한다."""
+        profile = cls.get_item_profile(item) if profile is None else profile
+        if not cls.transfer_destination_locked(item):
+            state = dict(item.upload_state or {})
+            state.pop('destination_snapshot', None)
+            state.pop('upload_options_snapshot', None)
+            if state != (item.upload_state or {}):
+                item.upload_state = state or None
+            destination = cls.get_profile_destination(profile, item=item)
+            item.destination_type = destination.get('type') or ''
+            item.gdrive_upload_path = destination.get('upload_path', '')
+            item.gdrive_complete_path = destination.get('complete_path', '')
+            item.gdrive_remote_id = destination.get('shared_drive_id') or P.ModelSetting.get('download_shared_drive_id') or ''
+            return destination
+        return cls.get_profile_destination(profile, item=item)
+
+    @classmethod
     def pin_transfer_destination(cls, item, profile=None, destination=None, options=None):
         """전송 시작 전 경로와 스위치를 체크포인트에 고정한다."""
-        if (item.upload_state or {}).get('destination_snapshot'):
+        if cls.transfer_destination_locked(item) and (item.upload_state or {}).get('destination_snapshot'):
             return
         profile = cls.get_item_profile(item) if profile is None else profile
         if destination is None:
@@ -1391,8 +1532,9 @@ class FeederUtil:
 
     @staticmethod
     def clear_transfer_state(item):
-        routing = (item.upload_state or {}).get('routing')
-        item.upload_state = {'routing': routing} if routing else None
+        state = item.upload_state or {}
+        kept = {key: state[key] for key in ('routing', 'deferred_remote_cleanup') if state.get(key)}
+        item.upload_state = kept or None
 
     @classmethod
     def save_download_profile(cls, item: dict) -> str:

@@ -170,6 +170,9 @@ class ModelDownload(ModelBase):
 
             status_filter = req.form.get('status_filter', 'all')
             search_word = req.form.get('search_word', '').strip()
+            search_scope = req.form.get('download_search_scope', 'all')
+            if search_scope not in ('all', 'id', 'title', 'file_name', 'link'):
+                search_scope = 'all'
 
             query = db.session.query(cls)
             for name, column in (('feed_select', cls.feed_name), ('engine_select', cls.current_engine_name)):
@@ -195,11 +198,18 @@ class ModelDownload(ModelBase):
                     query = query.filter(cls.status == status_filter)
 
             if search_word:
-                query = query.filter(or_(
-                    cls.title.like(f"%{search_word}%"),
-                    cls.file_name.like(f"%{search_word}%"),
-                    cls.magnet.like(f"%{search_word}%")
-                ))
+                valid_id = (len(search_word) <= 19 and search_word.isascii() and search_word.isdecimal()
+                            and 0 < int(search_word) <= 9223372036854775807)
+                columns = {'title': cls.title, 'file_name': cls.file_name, 'link': cls.magnet}
+                if search_scope == 'id':
+                    query = query.filter(cls.id == int(search_word) if valid_id else cls.id.is_(None))
+                elif search_scope in columns:
+                    query = query.filter(columns[search_scope].like(f"%{search_word}%"))
+                else:
+                    conditions = [column.like(f"%{search_word}%") for column in columns.values()]
+                    if valid_id:
+                        conditions.append(cls.id == int(search_word))
+                    query = query.filter(or_(*conditions))
 
             total_count = query.count()
 

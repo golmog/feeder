@@ -9,6 +9,7 @@ import uuid
 import hashlib
 from datetime import datetime, timedelta
 from contextlib import nullcontext
+from sqlalchemy import or_
 
 from .setup import *
 from .util_base import FeederUtil
@@ -288,14 +289,15 @@ class RemoteWorker:
             logger.warning('기존 워커 인증 파일을 이전하지 못했습니다. 설정 화면에서 토큰을 입력해주세요.')
 
     @staticmethod
-    def client(endpoint=None, token=None):
+    def client(endpoint=None, token=None, network_mode=None):
         if token is None:
             RemoteWorker.migrate_token()
             token = P.ModelSetting.get('download_worker_token') or ''
         address = P.ModelSetting.get('download_worker_url') if endpoint is None else endpoint
         if not address:
             raise WorkerError('원격 워커 주소를 입력해주세요.')
-        return WorkerClient(address, token)
+        mode = (P.ModelSetting.get('download_worker_network_mode') or 'tailscale') if network_mode is None else network_mode
+        return WorkerClient(address, token, network_mode=mode)
 
     @staticmethod
     def is_ad(item):
@@ -304,11 +306,21 @@ class RemoteWorker:
 
     @staticmethod
     def reserves_ad():
-        rows = db.session.query(ModelDownload).filter(ModelDownload.destination_type == 'remote_worker',
-            ModelDownload.status != 'completed').all()
-        reserved = any(row.status in ('downloaded', 'pending_upload', 'uploading') or
-                       bool((row.upload_state or {}).get('worker') and
-                            not (row.upload_state or {})['worker'].get('settled')) for row in rows)
+        rows = db.session.query(ModelDownload).filter(ModelDownload.status != 'completed',
+            or_(ModelDownload.destination_type == 'remote_worker',
+                ModelDownload.status.in_(('downloaded', 'pending_upload', 'uploading')))).all()
+        reserved = False
+        for row in rows:
+            state = row.upload_state or {}
+            remote = state.get('worker') or {}
+            if remote and not remote.get('settled'):
+                reserved = True
+                break
+            destination = (row.destination_type if FeederUtil.transfer_destination_locked(row) else
+                           FeederUtil.get_profile_destination(FeederUtil.get_item_profile(row), item=row).get('type'))
+            if destination == 'remote_worker' and row.status in ('downloaded', 'pending_upload', 'uploading'):
+                reserved = True
+                break
         db.session.rollback()
         return reserved
 
@@ -322,8 +334,13 @@ class RemoteWorker:
     def prepare(cls, item, client, configuration, allocation=None):
         from .util_download import DownloadUtil
         from .util_block import DownloadBlock
+        from .util_upload import UploadUtil
+        if not UploadUtil.resolve_ad_source(item):
+            raise WorkerError('AllDebrid 원본 경로 확인 대기', code='unavailable')
         profile = FeederUtil.get_item_profile(item) or {}
-        dest = FeederUtil.get_profile_destination(profile, item.current_engine_name, item)
+        dest = FeederUtil.refresh_transfer_destination(item, profile)
+        if dest.get('type') != 'remote_worker':
+            raise WorkerError('목적지가 변경되어 신규 원격 제출을 보류합니다. 다음 실행에서 최신 목적지를 적용합니다.', code='configuration')
         options = FeederUtil.get_upload_options(profile, item.current_engine_name, item)
         mode, account = allocation if allocation is not None else ('shareddrive', None)
         impersonate = []
@@ -346,7 +363,14 @@ class RemoteWorker:
             raise WorkerError('원격 서버와 로컬에 동일한 Drive 리모트명과 목적지 드라이브 ID가 필요합니다.')
         source = item.local_path or ''
         if not re.fullmatch(r'[A-Za-z0-9_-]+:.+', source) or source.startswith('/'):
-            raise WorkerError('원격 워커는 WebDAV 리모트 소스만 전송할 수 있습니다.')
+            if not source.startswith('cd2:/'):
+                raise WorkerError('원격 워커에는 Rclone 리모트 또는 CD2 직접 전송 소스가 필요합니다. 로컬 스테이징 파일을 보존하고 목적지 복구 또는 처음부터 다시 받기를 실행해주세요.')
+        source_kind = 'remote'
+        if source.startswith('cd2:/'):
+            engine = DownloadUtil.create_engine(FeederUtil.get_downloader_by_name(item.current_engine_name) or {})
+            if not engine or not hasattr(engine, 'direct_worker_enabled') or not engine.direct_worker_enabled('remote_worker'):
+                raise WorkerError('CD2 직접 URL 전송 설정이 꺼져 있습니다.')
+            source_kind = 'url_files'
         incoming = cls._relative(dest.get('upload_path'))
         final = cls._relative(dest.get('complete_path'))
         if incoming == final or incoming.startswith(final + '/') or final.startswith(incoming + '/'):
@@ -376,6 +400,8 @@ class RemoteWorker:
                    'destination': target, 'config_version': configuration['config_version'],
                    'rclone_transfers': FeederUtil.get_rclone_transfers(),
                    'exclude_patterns': FeederUtil.get_rclone_exclude_options()[1::2]}
+        if source_kind == 'url_files':
+            payload['source_kind'] = source_kind
         try:
             # 로컬 copy/copyto와 동일한 추가 인자. --transfers만 전용 설정으로 관리한다.
             payload['rclone_extra_args'] = validate_extra_args(FeederUtil.get_rclone_transfer_options()[:-2])
@@ -400,10 +426,28 @@ class RemoteWorker:
         item.upload_state = state
         from .util_upload import UploadUtil
         state['usage'] = UploadUtil.reserve_usage(account_name if account else None, item.file_size or 0,
-                                                item.id, payload['job_id'])
+                                                item.id, payload['job_id'], mode=mode)
         item.upload_state = dict(state)
         db.session.commit()
         return state
+
+    @classmethod
+    def submission_payload(cls, item, payload):
+        from .util_upload import UploadUtil
+        is_ad = (FeederUtil.get_downloader_by_name(item.current_engine_name) or {}).get('engine_type') == 'alldebrid'
+        if is_ad and (not UploadUtil.resolve_ad_source(item, update=False) or payload.get('source') != item.local_path):
+            raise WorkerError('신규 제출 소스 확인 대기: 기존 체크포인트를 보존합니다.', code='unavailable')
+        if payload.get('source_kind', 'remote') != 'url_files':
+            return payload
+        from .util_download import DownloadUtil
+        engine = DownloadUtil.create_engine(FeederUtil.get_downloader_by_name(item.current_engine_name) or {})
+        try:
+            if not engine or not engine.direct_worker_enabled('remote_worker'):
+                raise RuntimeError()
+            files = engine.direct_files(payload['source'])
+        except Exception:
+            raise WorkerError('CD2 직접 다운로드 URL 발급 실패: 직접 URL 지원 및 엔진 연결 상태를 확인해주세요.', code='source') from None
+        return dict(payload, source_files=[{k: entry[k] for k in ('relative_path', 'size', 'url', 'headers')} for entry in files])
 
     @classmethod
     def cancel_snapshot(cls, state, timeout=15):
@@ -579,6 +623,8 @@ class RemoteWorker:
         if job.get('job_id') != remote['job_id']:
             raise WorkerError('원격 작업 ID가 저장된 요청과 일치하지 않습니다.', code='configuration')
         payload = remote['payload']
+        if job.get('source_kind', 'remote') != payload.get('source_kind', 'remote'):
+            raise WorkerError('원격 작업의 소스 종류가 저장된 요청과 일치하지 않습니다.', code='configuration')
         if job.get('source') != payload['source'] or job.get('destination') != payload['destination']:
             raise WorkerError('원격 작업의 소스/목적지가 저장된 요청과 일치하지 않습니다.', code='configuration')
         if job.get('drive_impersonate', '') != payload.get('drive_impersonate', ''):
@@ -592,6 +638,10 @@ class RemoteWorker:
     def execute(cls, item, manager, reconcile=False):
         from .util_upload import UploadUtil
         from .util_block import DownloadBlock
+        if item.status == 'completed':
+            return True
+        if FeederUtil.item_engine_disabled(item):
+            return False
         item_id, hub, held_account = item.id, None, None
         keep_progress = False
         try:
@@ -604,6 +654,8 @@ class RemoteWorker:
                 remote = state['worker']
                 client = cls.client(remote['endpoint'])
                 job = client.job(remote['job_id'])
+                if FeederUtil.item_engine_disabled(db.session.get(ModelDownload, item_id)):
+                    return False
                 if job is None:
                     # 재연결된 워커의 확정된 404는 이전 job이 없다는 뜻이다.
                     # 네트워크 단절은 client.job()에서 예외가 나므로 기존 ID를 보존한다.
@@ -638,16 +690,20 @@ class RemoteWorker:
                     if tuple(int(n) for n in health.get('version', '0').split('.')[:3]) < (0, 9, 0):
                         raise WorkerError('오류 분류와 파일 단위 사용량 정산에는 원격 워커 0.9.0 이상이 필요합니다.', code='configuration')
                     target = db.session.get(ModelDownload, item_id)
-                    if not target or DownloadBlock.stopped(item_id): return False
+                    if not target or DownloadBlock.stopped(item_id) or FeederUtil.item_engine_disabled(target): return False
                     profile = FeederUtil.get_item_profile(target)
-                    previous_state = dict(target.upload_state or {})
-                    FeederUtil.pin_transfer_destination(target, profile)
+                    destination = FeederUtil.refresh_transfer_destination(target, profile)
+                    if destination.get('type') != 'remote_worker':
+                        return cls.defer(item_id, '목적지가 변경되어 원격 제출을 보류합니다. 다음 실행에서 최신 목적지를 적용합니다.')
                     options = FeederUtil.get_upload_options(profile, target.current_engine_name, target)
                     mode, account, reason = manager.allocate_account(target.file_size or 0, use_pool=options['use_gdrive_pool'])
                     if mode in ('wait', 'skip'):
-                        target.upload_state = previous_state or None
                         return cls.defer(item_id, '업로드 계정·한도 대기: ' + reason)
                     held_account = account.get('username') if account else None
+                    latest_profile = FeederUtil.get_item_profile(target)
+                    if (destination != FeederUtil.get_profile_destination(latest_profile, item=target) or
+                            options != FeederUtil.get_upload_options(latest_profile, item=target)):
+                        return cls.defer(item_id, '계정 할당 중 목적지 설정이 변경되었습니다. 다음 실행에서 최신 설정을 적용합니다.')
                     state = cls.prepare(target, client, configuration, (mode, account))
                 elif state.get('uses_pool') and not reconcile:
                     if not manager.reserve_existing_account(state['account']):
@@ -673,13 +729,20 @@ class RemoteWorker:
                         cls.cancel_snapshot(state)
                         return False
                     health, configuration = cls.submission_ready(client, manager)
+                    # 서명 URL과 헤더는 제출할 때만 메모리에 만들고 체크포인트에는 넣지 않는다.
+                    target = db.session.get(ModelDownload, item_id)
+                    if FeederUtil.item_engine_disabled(target):
+                        return False
+                    submission = cls.submission_payload(target, remote['payload'])
+                    if FeederUtil.item_engine_disabled(target):
+                        return False
                     remote = dict(remote, submission='uncertain')
                     state['worker'] = remote
                     target = db.session.get(ModelDownload, item_id)
                     target.upload_state = dict(state)
                     db.session.commit()
                     try:
-                        job = client.submit(remote['payload'])
+                        job = client.submit(submission)
                     except WorkerError as exc:
                         if exc.status in (400, 401, 403, 409) or exc.code == 'updating':
                             remote = dict(remote, submission='rejected')
@@ -706,12 +769,16 @@ class RemoteWorker:
                 hub = WorkerEvents.acquire(client)
                 generation = hub.generation
             while True:
+                if FeederUtil.item_engine_disabled(db.session.get(ModelDownload, item_id)):
+                    return False
                 if DownloadBlock.stopped(item_id):
                     if not reconcile:
                         cls.cancel_snapshot(state)
                     return False
                 if not reconcile:
                     job = client.job(remote['job_id'])
+                if FeederUtil.item_engine_disabled(db.session.get(ModelDownload, item_id)):
+                    return False
                 if job is None:
                     if cls.pending_job(item_id, remote) is None:
                         current = db.session.get(ModelDownload, item_id)
@@ -754,7 +821,7 @@ class RemoteWorker:
                         failure = target.error_message
                         db.session.commit()
                         outcome = UploadUtil.transfer_failed(item_id, failure, manager, job.get('chargeable_bytes'),
-                                                             structured_type=job.get('error_type', 'UNKNOWN_ERROR'))
+                                                             structured_type=job.get('error_type', 'UNKNOWN_ERROR'), worker_error=job)
                         current = db.session.get(ModelDownload, item_id)
                         if current and not (current.upload_state or {}).get('cleanup_pending'):
                             cls.acknowledge(state)
@@ -774,6 +841,8 @@ class RemoteWorker:
                 generation = hub.wait(generation)
         except Exception as exc:
             db.session.rollback()
+            if FeederUtil.item_engine_disabled(db.session.get(ModelDownload, item_id)):
+                return False
             if isinstance(exc, WorkerError) and exc.code in ('updating', 'checking', 'full', 'unavailable',
                     'invalid_response', 'auth', 'configuration', 'update_failed', 'missing_job') and 'client' in locals():
                 cached = cls._readiness.get(client.endpoint)

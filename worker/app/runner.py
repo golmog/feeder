@@ -147,17 +147,20 @@ class Worker:
         except ProcessLookupError:
             pass
 
-    def command(self, job):
+    def command(self, job, entry=None):
         options = Configurations(self.store.database, self.store.events).get(job['config_version'])['rclone']
         # 검증해 저장한 작업별 값만 적용하고 경로는 -- 뒤에 둔다.
         return [str(self.settings.rclone_binary), '--config', str(self.settings.rclone_config),
-            'copy', '--transfers', str(job.get('rclone_transfers', options['transfers'])),
+            'copyurl' if entry else 'copy', '--transfers', str(job.get('rclone_transfers', options['transfers'])),
             *job['rclone_extra_args'],
             '--stats', f"{options['stats_interval_seconds']}s", '--stats-log-level', 'INFO',
             '--use-json-log', '--log-level', 'INFO',
             *[value for pattern in job.get('exclude_patterns', []) for value in ('--exclude', pattern)],
             *(['--drive-impersonate', job['drive_impersonate']] if job.get('drive_impersonate') else []),
-            '--', job['source'], job['destination']]
+            *[argument for key, value in (entry or {}).get('headers', {}).items()
+              for argument in (['--user-agent', value] if key.lower() == 'user-agent' else ['--header-download', key + ': ' + value])],
+            '--', entry['url'] if entry else job['source'],
+            job['destination'].rstrip('/') + '/' + entry['relative_path'] if entry else job['destination']]
 
     def _execute(self, job):
         process = None
@@ -168,9 +171,22 @@ class Worker:
         forced = False
         errors = deque(maxlen=8)
         quota = FileQuota()
+        url_mode = job.get('source_kind', 'remote') == 'url_files'
+        files = job.get('source_files', []) if url_mode else [None]
+        completed_bytes = 0
+        total_bytes = sum(entry['size'] for entry in files) if url_mode else None
+        entry = None
+        secrets = [self.settings.api_token]
+        if url_mode:
+            for file in files:
+                secrets.extend([file['url'], *file['headers'].values()])
+
+        def charged():
+            amount = quota.charged_bytes()
+            return completed_bytes + amount if url_mode and amount is not None else amount
 
         def remember(message):
-            message = redact_log(message, (self.settings.api_token,))
+            message = redact_log(message, secrets)
             if message and (not errors or errors[-1] != message):
                 errors.append(message)
 
@@ -185,10 +201,27 @@ class Worker:
                     return
                 if not isinstance(log, dict):
                     return
+                if url_mode:
+                    # copyurl의 로그 객체명 대신 CD2 메타데이터 경로로 파일별 정산한다.
+                    if log.get('object'):
+                        log['object'] = entry['relative_path']
+                    if isinstance(log.get('stats'), dict):
+                        log['stats'] = dict(log['stats'])
+                        log['stats']['transferring'] = [dict(value, name=entry['relative_path'], size=entry['size'])
+                            for value in log['stats'].get('transferring') or [] if isinstance(value, dict)]
                 quota.observe(log)
                 if isinstance(log.get('stats'), dict):
-                    self.store.accounting(job['job_id'], quota.charged_bytes())
-                    self.store.progress(job['job_id'], log['stats'])
+                    stats = dict(log['stats'])
+                    if url_mode:
+                        current_bytes = min(entry['size'], max(0, int(stats.get('bytes') or 0)))
+                        # copyurl은 transferring 배열 없이 바이트 통계만 보낼 수도 있다.
+                        if current_bytes:
+                            quota._start(entry['relative_path'], entry['size'], current_bytes)
+                        stats.update(bytes=completed_bytes + current_bytes, totalBytes=total_bytes)
+                        speed = stats.get('speed') or 0
+                        stats['eta'] = max(0, total_bytes - stats['bytes']) / speed if speed > 0 else None
+                    self.store.accounting(job['job_id'], charged())
+                    self.store.progress(job['job_id'], stats)
                     if log['stats'].get('lastError'):
                         remember(log['stats']['lastError'])
                 if log.get('level') in ('error', 'critical'):
@@ -197,13 +230,13 @@ class Worker:
                 pass
 
         try:
-            validate_payload({k: job[k] for k in ('job_id', 'source', 'destination', 'config_version', 'exclude_patterns', 'drive_impersonate', 'rclone_transfers', 'rclone_extra_args', 'session_id') if k in job}, self.settings)
+            validate_payload({k: job[k] for k in ('job_id', 'source', 'destination', 'config_version', 'exclude_patterns', 'drive_impersonate', 'rclone_transfers', 'rclone_extra_args', 'session_id', 'source_kind', 'source_files') if k in job}, self.settings)
             current = self.store.get(job['job_id'])
             if self._stop.is_set() or current['cancel_requested']:
                 self.store.finish(job['job_id'], None, '서비스 종료로 전송 시작이 중단됐습니다.')
                 return
             # 전송 전 목록은 파일별 쿼터 계산에만 사용하며 실패해도 복사는 계속한다.
-            quota = FileQuota.inspect_source([
+            quota = FileQuota() if url_mode else FileQuota.inspect_source([
                 str(self.settings.rclone_binary), '--config', str(self.settings.rclone_config),
                 'lsjson', '--recursive', '--files-only', '--no-modtime', '--no-mimetype',
                 '--contimeout', '10s', '--timeout', '15s', '--retries', '1', '--low-level-retries', '1',
@@ -214,50 +247,69 @@ class Worker:
                 self.store.accounting(job['job_id'], 0)
                 self.store.finish(job['job_id'], None, '전송 전 목록 조회 중 작업이 중단됐습니다.')
                 return
-            process = subprocess.Popen(
-                [sys.executable, '-B', '-m', 'app.child', str(os.getpid())] + self.command(job),
-                cwd=Path(__file__).resolve().parents[1], stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True,
-                env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'),
-            )
-            os.set_blocking(process.stderr.fileno(), False)
-            selector.register(process.stderr, selectors.EVENT_READ)
-            eof = False
-            while True:
+            for entry in files:
                 current = self.store.get(job['job_id'])
-                if termination is None and (self._stop.is_set() or current['cancel_requested']):
-                    termination = time.monotonic()
-                    if self._stop.is_set() and not current['cancel_requested']:
-                        error = '서비스 종료로 전송이 중단됐습니다.'
-                    self._terminate(process)
-                if termination is not None and not forced and time.monotonic()-termination >= 5:
-                    self._terminate(process, force=True)
-                    forced = True
-                if not eof:
-                    for key, _ in selector.select(timeout=.2):
-                        data = os.read(key.fileobj.fileno(), 16384)
-                        if not data:
-                            selector.unregister(key.fileobj)
-                            eof = True
-                            break
-                        tail.extend(data)
-                        while b'\n' in tail:
-                            line, _, remainder = tail.partition(b'\n')
-                            tail[:] = remainder
-                            if len(line) <= 65536:
-                                consume(line)
-                        if len(tail) > 65536:
-                            tail.clear()
-                else:
-                    time.sleep(.05)
-                if process.poll() is not None and eof:
-                    if tail:
-                        consume(tail)
+                if self._stop.is_set() or current['cancel_requested']:
+                    error = '전송이 중단됐습니다.'
                     break
-            if process.returncode and error is None:
-                error = f'Rclone 종료 코드 {process.returncode}'
-                if errors:
-                    error += '\n' + '\n'.join(errors)
+                if url_mode:
+                    quota = FileQuota({entry['relative_path']: entry['size']})
+                if process is not None:
+                    self._terminate(process, force=True)
+                    process.wait()
+                    process.stderr.close()
+                process = subprocess.Popen(
+                    [sys.executable, '-B', '-m', 'app.child', str(os.getpid())] + (self.command(job, entry) if url_mode else self.command(job)),
+                    cwd=Path(__file__).resolve().parents[1], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, start_new_session=True,
+                    env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'),
+                )
+                os.set_blocking(process.stderr.fileno(), False)
+                selector.register(process.stderr, selectors.EVENT_READ)
+                eof = False
+                tail.clear()
+                while True:
+                    current = self.store.get(job['job_id'])
+                    if termination is None and (self._stop.is_set() or current['cancel_requested']):
+                        termination = time.monotonic()
+                        if self._stop.is_set() and not current['cancel_requested']:
+                            error = '서비스 종료로 전송이 중단됐습니다.'
+                        self._terminate(process)
+                    if termination is not None and not forced and time.monotonic()-termination >= 5:
+                        self._terminate(process, force=True)
+                        forced = True
+                    if not eof:
+                        for key, _ in selector.select(timeout=.2):
+                            data = os.read(key.fileobj.fileno(), 16384)
+                            if not data:
+                                selector.unregister(key.fileobj)
+                                eof = True
+                                break
+                            tail.extend(data)
+                            while b'\n' in tail:
+                                line, _, remainder = tail.partition(b'\n')
+                                tail[:] = remainder
+                                if len(line) <= 65536:
+                                    consume(line)
+                            if len(tail) > 65536:
+                                tail.clear()
+                    else:
+                        time.sleep(.05)
+                    if process.poll() is not None and eof:
+                        if tail:
+                            consume(tail)
+                        break
+                if process.returncode and error is None:
+                    error = f'Rclone 종료 코드 {process.returncode}'
+                    if errors:
+                        error += '\n' + '\n'.join(errors)
+                if error or termination is not None:
+                    break
+                if url_mode:
+                    completed_bytes += entry['size']
+                    quota = FileQuota()
+                    quota.stats_seen = True
+                    self.store.progress(job['job_id'], {'bytes': completed_bytes, 'totalBytes': total_bytes, 'speed': 0})
         except Exception as exc:
             error = f'전송 실행 실패: {type(exc).__name__}'
         finally:
@@ -270,7 +322,7 @@ class Worker:
         if error:
             logger.error('작업 %s: %s', job['job_id'], error)
         try:
-            self.store.accounting(job['job_id'], quota.charged_bytes() if process is not None else 0)
+            self.store.accounting(job['job_id'], charged() if process is not None else 0)
             self.store.finish(job['job_id'], process.returncode if process is not None else None, error)
         except Exception as exc:
             logger.error('작업 %s 결과 저장 미확인 (%s) · 기존 작업 ID를 유지합니다.', job['job_id'], type(exc).__name__)

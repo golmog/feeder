@@ -91,10 +91,7 @@ class Settings:
         try:
             address = ipaddress.ip_address(bind)
         except ValueError:
-            raise ValueError('WORKER_BIND에는 Tailscale IP 또는 루프백 IP를 지정해주세요.') from None
-        tailscale = ipaddress.ip_network('100.64.0.0/10') if address.version == 4 else ipaddress.ip_network('fd7a:115c:a1e0::/48')
-        if not (address.is_loopback or address in tailscale):
-            raise ValueError('공개/전체 인터페이스 바인딩은 허용하지 않습니다. Tailscale IP를 사용해주세요.')
+            raise ValueError('WORKER_BIND에는 유효한 IPv4 또는 IPv6 주소를 지정해주세요.') from None
         log_level = values.get('WORKER_LOG_LEVEL', 'INFO').upper()
         if log_level not in ('DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'):
             raise ValueError('WORKER_LOG_LEVEL이 유효하지 않습니다.')
@@ -135,8 +132,8 @@ class Settings:
             raise ValueError('리모트를 확인할 수 없습니다. 읽을 수 있는 Rclone INI 설정이 필요합니다.') from None
         # 작업에 지정된 이름을 실제 설정과 대조한다. 이전 환경변수의 고정 목록은 사용하지 않는다.
         return {field: tuple(name for name in config.sections()
-                    if re.fullmatch(r'[A-Za-z0-9_-]+', name) and config.get(name, 'type', fallback='') == kind)
-                for field, kind in (('source', 'webdav'), ('destination', 'drive'))}
+                    if re.fullmatch(r'[A-Za-z0-9_-]+', name) and config.get(name, 'type', fallback='') in kinds)
+                for field, kinds in (('source', ('webdav', 'pikpak')), ('destination', ('drive',)))}
 
     def validate_paths(self) -> None:
         if not self.rclone_binary.is_file() or not os.access(self.rclone_binary, os.X_OK):

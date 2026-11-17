@@ -7,6 +7,8 @@ import subprocess
 import threading
 import uuid
 import traceback
+import json
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from sqlalchemy import or_, func, and_, event
@@ -54,13 +56,80 @@ class TaskDownload:
     # 현재 실행 세션 내 실패/중단된 작업 ID 집합 (현재 주기 내 즉시 재시도 차단용)
     failed_ids_in_session = set()
     _run_mutex = threading.Lock()
+    _registration_context = threading.local()
+    _CD2_REGISTRATION_LIMIT = 100
     SINGLE_STATUSES = ('pending', 'downloading', 'pending_local_staging', 'downloaded',
                        'waiting_transporter', 'pending_upload', 'move_failed')
+
+    @staticmethod
+    @contextmanager
+    def _registration_scope():
+        """외부 실행에서만 예산을 만들고 중첩 순회·오류 복구는 같은 값을 사용한다."""
+        context = TaskDownload._registration_context
+        if getattr(context, 'remaining', None) is not None:
+            yield
+            return
+        context.remaining = TaskDownload._CD2_REGISTRATION_LIMIT
+        context.vip_snapshots = {}
+        context.vip_initialized = False
+        try:
+            yield
+        finally:
+            del context.remaining
+            del context.vip_snapshots
+            del context.vip_initialized
+
+    @staticmethod
+    def _init_pikpak_vip_snapshots():
+        snapshots = TaskDownload._registration_context.vip_snapshots
+        if TaskDownload._registration_context.vip_initialized:
+            return
+        TaskDownload._registration_context.vip_initialized = True
+        accounts, shared = {}, {}
+        for config in FeederUtil.get_downloaders():
+            if config.get('engine_type') != 'pikpak' or not config.get('enabled', True):
+                continue
+            account = str(config.get('username') or '').strip().lower() or str(config.get('remote_name') or 'pikpak').strip()
+            if account not in accounts:
+                engine = DownloadUtil.create_engine(config)
+                accounts[account] = engine.registration_eligibility(force=True) if engine else {'state': 'unknown'}
+                auth = getattr(engine, '_auth_error', None) if engine else None
+                if accounts[account]['state'] == 'unknown' and auth:
+                    FeederUtil.engine_auth_error(engine, auth[0], 'vip_status')
+            vip = dict(accounts[account])
+            vip['expired'] = vip['state'] == 'not_vip' or bool(vip.get('expires_at_utc') and
+                datetime.fromisoformat(vip['expires_at_utc']).timestamp() <= time.time())
+            snapshots[config['name']] = vip
+            shared[config['name']] = {key: vip.get(key) for key in ('state', 'checked_at_utc', 'expires_at_utc')}
+            shared[config['name']].update(engine_name=config['name'], config_revision=DownloadUtil.pikpak_config_revision(config))
+        P.ModelSetting.set('download_pikpak_vip_snapshot', json.dumps(shared))
+
+    @staticmethod
+    def _admit_registration(config, consume=True):
+        if str(config.get('engine_type', '')).lower() != 'cd2':
+            return True
+        context = TaskDownload._registration_context
+        if context.remaining <= 0:
+            return False
+        if consume:
+            context.remaining -= 1
+        return True
 
     @staticmethod
     def _selected_query(query):
         item_id = FeederUtil.single_download_id()
         return query.filter(ModelDownload.id == item_id) if item_id is not None else query
+
+    @staticmethod
+    def _enabled_engine_query(query, disabled_names):
+        """LIMIT·수량 집계 전에 공용 판정과 같은 소스 엔진 우선순위로 제외한다."""
+        if not disabled_names:
+            return query
+        source = func.lower(func.coalesce(
+            func.nullif(func.trim(ModelDownload.current_engine_name), ''),
+            func.nullif(func.trim(ModelDownload.upload_state['download_source']['engine_name'].as_string()), ''),
+            func.nullif(func.trim(ModelDownload.upload_state['engine_name'].as_string()), ''), ''))
+        return query.filter(~source.in_(disabled_names))
 
     @staticmethod
     def redownload(item_id):
@@ -127,7 +196,18 @@ class TaskDownload:
             else:
                 UploadUtil.settle_usage(item, None)
                 db.session.commit()
-            DownloadUtil.delete_remote_tasks(cleanup_item, strict=True, verify_absent=True)
+            deferred = list(old_state.get('deferred_remote_cleanup') or [])
+            pending_cleanup = DownloadUtil.delete_remote_tasks(cleanup_item, strict=True, verify_absent=True, defer_errors=True) or []
+            for entry in pending_cleanup:
+                already_known = not entry.get('task_id') and any(
+                    str(old.get('engine_name') or '').strip().lower() == str(entry.get('engine_name') or '').strip().lower() and
+                    old.get('infohash') == entry.get('infohash') for old in deferred)
+                if entry not in deferred and not already_known:
+                    deferred.append(entry)
+            item = db.session.get(ModelDownload, item_id)
+            if deferred:
+                item.upload_state = dict(item.upload_state or {}, deferred_remote_cleanup=deferred)
+                db.session.commit()
             DownloadBlock.cleanup_temporary(snapshot)
             item = db.session.get(ModelDownload, item_id)
             if not item or ModelDownload.is_blocked(item.infohash, item.magnet):
@@ -143,7 +223,7 @@ class TaskDownload:
                           'last_move_attempt_time', 'error_message', 'transfer_error_type',
                           'source_unavailable_since', 'upload_retry_after'):
                 setattr(item, field, None)
-            item.upload_state = {'routing': routing} if routing else None
+            FeederUtil.clear_transfer_state(item)
             item.file_name = item.source_file_name or item.title
             item.file_size = 0
             item.video_manifest = None
@@ -154,8 +234,9 @@ class TaskDownload:
             item.status = 'pending'
             db.session.commit()
             TaskDownload.failed_ids_in_session.discard(item_id)
-            DownloadActivity.record('처음부터 다시 받기', f'작업 #{item_id} · 첫 엔진 다운로드 대기열 등록')
-            return {'ret': 'success', 'msg': '프로필 엔진 큐의 삭제 확인과 임시 파일 정리를 마치고 1순위 엔진 다운로드 대기열에 등록했습니다. 중단 상태라면 개별 실행 또는 작업 재개를 눌러주세요.'}
+            cleanup_message = '원격 정리 보류(계정 복구 후 정리)' if deferred else '원격 정리 완료'
+            DownloadActivity.record('처음부터 다시 받기', f'작업 #{item_id} · {cleanup_message} · 첫 엔진 다운로드 대기열 등록')
+            return {'ret': 'success', 'msg': f'{cleanup_message}. 임시 파일 정리 후 1순위 엔진 다운로드 대기열에 등록했습니다. 중단 상태라면 개별 실행 또는 작업 재개를 눌러주세요.'}
         except Exception as exc:
             db.session.rollback()
             message = redact_log(str(exc)) if isinstance(exc, (ValueError, WorkerError, RuntimeError)) else '기존 작업 또는 임시 파일 정리가 끝나지 않았습니다. 플랫폼 로그를 확인해주세요.'
@@ -180,6 +261,8 @@ class TaskDownload:
             raise ValueError('실행 가능한 대기 항목이 아닙니다. 실패 항목은 먼저 재시도해주세요.')
         if ModelDownload.is_blocked(item.infohash, item.magnet):
             raise ValueError('차단된 항목은 실행할 수 없습니다.')
+        if item.status != 'pending' and FeederUtil.item_engine_disabled(item):
+            raise ValueError('소스 엔진이 중단된 항목입니다. 엔진을 활성화한 뒤 실행해주세요.')
         db.session.rollback()
         owner = f'single:{item_id}:{uuid.uuid4().hex}'
         FeederUtil.init_runtime_locks()
@@ -207,8 +290,12 @@ class TaskDownload:
                 item = db.session.get(ModelDownload, item_id)
                 if not item or item.status not in TaskDownload.SINGLE_STATUSES or ModelDownload.is_blocked(item.infohash, item.magnet):
                     return
+                if item.status != 'pending' and FeederUtil.item_engine_disabled(item):
+                    DownloadActivity.record('개별 실행', f'작업 #{item_id} 소스 엔진 중단 · 실행 보류', 'warning')
+                    return
                 db.session.remove()
-                with FeederUtil.single_download_scope(item_id):
+                with FeederUtil.single_download_scope(item_id), TaskDownload._registration_scope():
+                    TaskDownload._init_pikpak_vip_snapshots()
                     TaskDownload.failed_ids_in_session.clear()
                     DownloadActivity.record('개별 실행', f'작업 #{item_id} 실행 시작 · 전체 중단 유지')
                     TaskDownload.sync_active_items_with_profiles()
@@ -220,6 +307,9 @@ class TaskDownload:
                                   TaskDownload.process_uploads, TaskDownload.retry_move_failed):
                         from .util_block import DownloadBlock
                         if DownloadBlock.stopped(item_id):
+                            break
+                        current = db.session.get(ModelDownload, item_id)
+                        if current and current.status != 'pending' and FeederUtil.item_engine_disabled(current):
                             break
                         stage()
                         db.session.remove()
@@ -260,7 +350,9 @@ class TaskDownload:
                 P.ModelSetting.set('download_is_running', 'True')
                 P.ModelSetting.set('download_running_start_time', str(int(time.time())))
 
-                TaskDownload._run_pipeline_locked(manual=manual)
+                with TaskDownload._registration_scope():
+                    TaskDownload._init_pikpak_vip_snapshots()
+                    TaskDownload._run_pipeline_locked(manual=manual)
             finally:
                 if db_lock_acquired:
                     FeederUtil.release_runtime_lock('download_pipeline', owner)
@@ -653,6 +745,7 @@ class TaskDownload:
         # 이 함수 호출에서만 설정을 재사용하며 이름이 중복되면 첫 엔진을 유지한다.
         all_profiles = FeederUtil.get_download_profiles()
         all_downloaders = FeederUtil.get_downloaders()
+        disabled_engines = FeederUtil.disabled_engine_names(all_downloaders)
         downloaders_by_name = {}
         for downloader in all_downloaders:
             downloaders_by_name.setdefault(str(downloader.get('name', '')).strip().lower(), downloader)
@@ -663,7 +756,9 @@ class TaskDownload:
         for item in DownloadActivity.track('프로필 반영', items):
             # 명시된 프로필명이 없을 때만 기존 순서대로 피드를 매칭한다.
             FeederUtil.cooperate()
-            if (item.upload_state or {}).get('worker') or (item.upload_state or {}).get('destination_snapshot') or item.status in ('uploading', 'local_staging', 'relay_transferring'):
+            if FeederUtil.item_engine_disabled(item, disabled_engines):
+                continue
+            if FeederUtil.transfer_destination_locked(item) or item.status == 'local_staging':
                 # 저장한 원격 작업이 끝나기 전에는 프로필 변경으로 소유권을 옮기지 않는다.
                 continue
             routing = (item.upload_state or {}).get('routing') or {}
@@ -809,6 +904,11 @@ class TaskDownload:
 
     @staticmethod
     def _retry_engine_error(item_id, engine, config, remote, complete=True):
+        with TaskDownload._registration_scope():
+            return TaskDownload._retry_engine_error_scoped(item_id, engine, config, remote, complete)
+
+    @staticmethod
+    def _retry_engine_error_scoped(item_id, engine, config, remote, complete=True):
         """Persisted, bounded error recovery. Unknown remote outcomes always reconcile first."""
         from .util_block import DownloadBlock
 
@@ -838,6 +938,10 @@ class TaskDownload:
         if not item:
             return
         name = config['name']
+        if remote and FeederUtil.engine_auth_error(engine, remote.get('error') or remote.get('error_message'), 'task_status'):
+            return
+        if not (FeederUtil.get_downloader_by_name(name) or {}).get('enabled', True):
+            return
         index = item.current_engine_index or 0
         expected_tid, expected_status = item.engine_task_id, item.status
         expected_source = (item.infohash, item.magnet)
@@ -860,6 +964,8 @@ class TaskDownload:
         # A fresh complete list also detects duplicate hashes and accepted timeout RPCs.
         try:
             rows, status_error = engine.get_status()
+            if FeederUtil.engine_auth_error(engine, status_error, 'get_status'):
+                return
         except Exception:
             rows, status_error = [], '조회 실패'
         item = current()
@@ -984,6 +1090,8 @@ class TaskDownload:
                 return
             try:
                 rows, err = engine.get_status()
+                if FeederUtil.engine_auth_error(engine, err, 'get_status'):
+                    return
             except Exception:
                 rows, err = [], '조회 실패'
             item = current()
@@ -1018,6 +1126,8 @@ class TaskDownload:
             retry.update(stage='cleanup', next_at=now + 60)
             record('목적지 경로 확인 필요 · 재등록 보류')
             return
+        if not TaskDownload._admit_registration(config, consume=False):
+            return
         retry.update(stage='uncertain', next_at=now + 60, upload_path=upload_path)
         item.status = 'pending'
         expected_status = 'pending'
@@ -1025,7 +1135,11 @@ class TaskDownload:
         if current() is None:
             return
         try:
+            if not TaskDownload._admit_registration(config):
+                return
             success, new_tid, err = DownloadUtil.add_magnet(engine, item.magnet, title=item.title, upload_path=upload_path)
+            if not success and FeederUtil.engine_auth_error(engine, err, 'add_magnet'):
+                return
         except Exception:
             success, new_tid, err = False, None, '재등록 응답 미확인'
         item = current()
@@ -1054,6 +1168,61 @@ class TaskDownload:
 
     @staticmethod
     def dispatch_pending_downloads():
+        with TaskDownload._registration_scope():
+            if FeederUtil.is_download_paused():
+                return
+            TaskDownload._init_pikpak_vip_snapshots()
+            return TaskDownload._dispatch_pending_downloads_scoped()
+
+    @staticmethod
+    def _clear_registration_wait(item):
+        state = dict(item.upload_state or {})
+        state.pop('registration_wait', None)
+        item.upload_state = state
+
+    @staticmethod
+    def _registration_wait(item, config, error, uncertain=False):
+        """등록 확인 대기를 기록하고 PikPak 다운로드 타이머와 분리한다."""
+        now = datetime.now()
+        engine_name = config.get('name')
+        index = item.current_engine_index or 0
+        previous = (item.upload_state or {}).get('registration_wait') or {}
+        if previous.get('engine') != engine_name or previous.get('index') != index:
+            previous = {}
+        first = datetime.fromisoformat(previous['first_failed_at']) if previous else now
+        uncertain = bool(uncertain or previous.get('uncertain'))
+        wait = dict(previous, engine=engine_name, index=index,
+                    first_failed_at=first.isoformat(), next_check_at=(now + timedelta(seconds=60)).isoformat(),
+                    uncertain=uncertain, last_error=DownloadUtil.engine_error_detail(None, error, limit=700))
+        item.upload_state = dict(item.upload_state or {}, registration_wait=wait)
+        hours = max(0, int(config.get('stalled_timeout_hours', 24)))
+        elapsed = max(0, (now - first).total_seconds())
+        limit_text = f'{hours}시간' if hours else '무제한'
+        reason = '접수 여부 불명 · 원격 ID/hash 수동 확인 필요 · 재등록/폴백 보류' if uncertain else '현재 엔진 재연결 대기'
+        if config.get('engine_type') == 'pikpak':
+            item.error_message = f'[{engine_name}] {reason} · 다음 주기 재확인: {wait["last_error"]}'
+        else:
+            item.error_message = f'[{engine_name}] {reason} · 경과 {int(elapsed // 60)}분 / 제한 {limit_text} · 다음 주기 재확인: {wait["last_error"]}'
+        db.session.commit()
+        return bool(config.get('engine_type') != 'pikpak' and hours and elapsed >= hours * 3600 and not uncertain)
+
+    @staticmethod
+    def _registration_fallback(item, engine_name, error):
+        profile = FeederUtil.get_item_profile(item)
+        item.current_engine_index = (item.current_engine_index or 0) + 1
+        item.status = 'pending'
+        item.engine_task_id = None
+        chain = item.priority_chain or []
+        if item.current_engine_index < len(chain):
+            next_dest = FeederUtil.get_profile_destination(profile, chain[item.current_engine_index], item)
+            item.destination_type = next_dest.get('type') or ''
+        TaskDownload._clear_registration_wait(item)
+        item.error_message = f'[{engine_name}] 추가 실패 ({TaskDownload._engine_retry_text(error)}) -> 다음 엔진 폴백'
+        db.session.commit()
+        logger.warning('[DownloadDispatch] 작업 #%s %s', item.id, item.error_message)
+
+    @staticmethod
+    def _dispatch_pending_downloads_scoped():
         from .util_block import DownloadBlock
 
         def pending_item(item_id):
@@ -1090,9 +1259,45 @@ class TaskDownload:
         full_engines = set()
         engine_instances = {}
         engine_status_maps = {}
+        engine_errors = {}
 
-        downloaders = FeederUtil.get_downloaders()
-        downloader_map = {config.get('name'): config for config in downloaders}
+        # Invocation-local lookup: stat is cheap even for large pending queues.
+        # Capture the signature before reading so a concurrent edit during the read
+        # is detected on the next lookup. No global/TTL YAML cache is involved.
+        downloader_map = {}
+        config_signature = None
+
+        def refresh_downloaders(force=False):
+            nonlocal downloader_map, config_signature
+            try:
+                stat = os.stat(FeederUtil.get_filepath())
+                signature = (stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                signature = None
+            if force or signature != config_signature:
+                config_signature = signature
+                downloaders = FeederUtil.get_downloaders()
+                downloader_map = {}
+                for config in downloaders:
+                    downloader_map.setdefault(str(config.get('name', '')).strip().lower(), config)
+                return downloaders
+
+        def downloader_by_name(name):
+            refresh_downloaders()
+            return downloader_map.get(str(name).strip().lower())
+
+        def next_available_engine(chain, index, link):
+            protocol = 'ed2k' if str(link).lower().startswith('ed2k://') else 'magnet'
+            for next_index in range(index + 1, len(chain)):
+                candidate = downloader_by_name(chain[next_index])
+                if candidate and candidate.get('enabled', True):
+                    candidate_engine = engine_instances.get(chain[next_index]) or DownloadUtil.create_engine(candidate)
+                    if candidate_engine and protocol in getattr(candidate_engine, 'SUPPORTED_PROTOCOLS', ['magnet']):
+                        engine_instances[chain[next_index]] = candidate_engine
+                        return next_index, chain[next_index], candidate
+            return None
+
+        downloaders = refresh_downloaders(force=True)
         for engine_index, dl in enumerate(downloaders, 1):
             FeederUtil.cooperate()
             e_name = dl.get('name')
@@ -1111,6 +1316,11 @@ class TaskDownload:
                 try:
                     DownloadActivity.record('다운로드 작업 등록', f'엔진 목록 사전 조회 {engine_index}/{len(downloaders)} · 항목 검토 0/{total_items}건')
                     remote_tasks, status_error = engine_inst.get_status()
+                    if FeederUtil.engine_auth_error(engine_inst, status_error, 'get_status'):
+                        refresh_downloaders(force=True)
+                        continue
+                    if status_error:
+                        engine_errors[e_name] = DownloadUtil.log_engine_error(engine_inst, 'get_status · 신규 등록 대기', status_error)
                     if not status_error:
                         task_map = {}
                         for t in remote_tasks:
@@ -1127,7 +1337,8 @@ class TaskDownload:
                             full_engines.add(e_name)
                             logger.info(f"[DownloadDispatch] [{e_name}] 원격 진행중 큐 한도({e_limit}건) 도달 (현재 In Progress: {in_prog_cnt}건) -> 신규 추가 일시 대기")
                 except Exception as chk_err:
-                    logger.debug(f"[DownloadDispatch] [{e_name}] 원격 큐 사전 점검 예외: {chk_err}")
+                    engine_errors[e_name] = DownloadUtil.log_engine_error(engine_inst, 'get_status · 신규 등록 대기',
+                        f'{type(chk_err).__name__}: {chk_err}')
 
         # 원격 조회가 불가했던 엔진용 로컬 DB 백업 집계
         if any(name not in engine_in_progress_counts for name in engine_instances):
@@ -1145,6 +1356,7 @@ class TaskDownload:
 
         last_activity = time.monotonic()
         capacity_waiting = 0
+        cd2_waiting = 0
         for item_index, snapshot in enumerate(pending_snapshots, 1):
             FeederUtil.cooperate()
             if FeederUtil.is_download_paused():
@@ -1153,11 +1365,12 @@ class TaskDownload:
             curr_idx = snapshot['current_engine_index']
             if curr_idx < len(chain):
                 name = chain[curr_idx]
-                config = downloader_map.get(name) or {}
+                config = downloader_by_name(name) or {}
                 cached_engine = engine_instances.get(name)
                 limit = DownloadUtil.get_queue_limit(config)
                 protocol = 'ed2k' if str(snapshot['magnet']).lower().startswith('ed2k://') else 'magnet'
                 if (config.get('enabled', True) and cached_engine and
+                        getattr(TaskDownload._registration_context, 'vip_snapshots', {}).get(name, {}).get('state') not in ('not_vip', 'cutoff') and
                         (name in full_engines or (limit > 0 and engine_in_progress_counts.get(name, 0) >= limit)) and
                         protocol in getattr(cached_engine, 'SUPPORTED_PROTOCOLS', ['magnet']) and
                         not engine_status_maps.get(name, {}).get(snapshot['target_hash'])):
@@ -1167,12 +1380,19 @@ class TaskDownload:
                 DownloadActivity.record('다운로드 작업 등록', f'검토 {item_index - 1}/{total_items}건 · 신규 등록 {registered_count}건 · 기존 연동 {linked_count}건 · 현재 작업 #{snapshot["id"]}')
                 last_activity = time.monotonic()
             item_id = snapshot['id']
-            if pending_item(item_id) is None:
+            protected = pending_item(item_id)
+            if protected is None:
                 continue
+            protected_state = protected.upload_state or {}
+            source_owned = bool(protected.engine_task_id or protected.local_path or
+                    (protected_state.get('download_source') or {}).get('task_id') or
+                    any(protected_state.get(key) for key in ('worker', 'destination_snapshot', 'phase')))
             chain = snapshot['priority_chain']
             curr_idx = snapshot['current_engine_index']
 
             if curr_idx >= len(chain):
+                if source_owned:
+                    continue
                 item = pending_item(item_id)
                 if not item:
                     continue
@@ -1184,11 +1404,24 @@ class TaskDownload:
 
             engine_name = chain[curr_idx]
 
-            downloader_cfg = FeederUtil.get_downloader_by_name(engine_name)
+            downloader_cfg = downloader_by_name(engine_name)
             if not downloader_cfg or not downloader_cfg.get('enabled', True):
-                # 엔진 일시 비활성 시 다음 엔진으로 폴백하지 않고 대기(pending) 유지
-                logger.debug(f"[DownloadDispatch] 다운로더 [{engine_name}] 비활성 상태 -> 대기열(pending) 유지: {snapshot['title']}")
-                continue
+                setting = P.ModelSetting.get('download_skip_disabled_engines')
+                skip = str('True' if setting is None else setting).lower() in ('true', '1', 'on')
+                registration = protected_state.get('registration_wait') or {}
+                unconfirmed = (registration.get('engine') == engine_name and
+                               registration.get('index') == curr_idx and registration.get('uncertain'))
+                if not skip or source_owned or unconfirmed:
+                    continue
+                next_engine = next_available_engine(chain, curr_idx, snapshot['magnet'])
+                if next_engine is None:
+                    continue
+                curr_idx, engine_name, downloader_cfg = next_engine
+                item = pending_item(item_id)
+                if not item:
+                    continue
+                item.current_engine_index = curr_idx
+                db.session.commit()
 
             engine_limit = DownloadUtil.get_queue_limit(downloader_cfg)
             current_count = engine_in_progress_counts.get(engine_name, 0)
@@ -1201,8 +1434,7 @@ class TaskDownload:
             if not engine:
                 continue
 
-            # Ordinary registration retains the local-count fallback on lookup failure.
-            # Only error recovery below requires a successful, complete remote list.
+            # 성공한 목록의 hash 대조만 기존 작업 연동과 접수 여부 확인에 사용한다.
             target_hash_lower = snapshot['target_hash']
             existing_task = engine_status_maps.get(engine_name, {}).get(target_hash_lower) if target_hash_lower else None
 
@@ -1213,6 +1445,7 @@ class TaskDownload:
             if retry.get('engine') == engine_name and retry.get('index') == curr_idx and retry.get('stage') != 'exhausted':
                 TaskDownload._retry_engine_error(item_id, engine, downloader_cfg, existing_task,
                     engine_name in engine_status_maps and getattr(engine, 'status_list_complete', True))
+                refresh_downloaders(force=config_signature is None)
                 continue
 
             # 모든 엔진 공통: 원격 엔진에 이미 존재하는 작업인 경우 표준 규격에 따라 연동/재시작
@@ -1223,8 +1456,11 @@ class TaskDownload:
                 std_status = existing_task.get('status')
 
                 if std_status == 'error':
+                    TaskDownload._clear_registration_wait(item)
+                    db.session.commit()
                     TaskDownload._retry_engine_error(item_id, engine, downloader_cfg, existing_task,
                         engine_name in engine_status_maps and getattr(engine, 'status_list_complete', True))
+                    refresh_downloaders(force=config_signature is None)
                     continue
                 if std_status == 'completed':
                     logger.info(f"[DownloadDispatch] [{engine_name}] 원격 엔진에 이미 완료 상태로 존재하는 작업 감지 -> 작업 연동: {snapshot['title']} (TaskID: {existing_tid})")
@@ -1245,6 +1481,7 @@ class TaskDownload:
                     item.last_status_time = datetime.now()
                     item.remote_missing_since = None
                     item.error_message = None
+                    TaskDownload._clear_registration_wait(item)
 
                     # 할당된 엔진의 개별 목적지 설정 즉시 반영
                     profile = FeederUtil.get_item_profile(item) or {}
@@ -1257,6 +1494,49 @@ class TaskDownload:
                     # 원격 조회에서 이미 집계된 작업의 연동은 신규 큐 슬롯을 소비하지 않는다.
                     db.session.commit()
                     linked_count += 1
+                continue
+
+            if source_owned:
+                continue
+
+            wait = (item.upload_state or {}).get('registration_wait') or {}
+            if wait.get('engine') != engine_name or wait.get('index') != curr_idx:
+                wait = {}
+            if wait.get('uncertain'):
+                if (target_hash_lower and engine_name in engine_status_maps and
+                        getattr(engine, 'status_list_complete', True) and
+                        getattr(engine, 'REGISTRATION_HASH_LOOKUP', False)):
+                    wait = dict(wait, uncertain=False)
+                    item.upload_state = dict(item.upload_state or {}, registration_wait=wait)
+                    db.session.commit()
+                else:
+                    TaskDownload._registration_wait(item, downloader_cfg,
+                        engine_errors.get(engine_name) or wait.get('last_error', '원격 접수 여부 확인 불가'), uncertain=True)
+                    continue
+            if getattr(engine, 'ENGINE_ID', '') == 'pikpak':
+                vip = TaskDownload._registration_context.vip_snapshots.get(engine_name, {'state': 'unknown', 'reason': 'VIP 미확인'})
+                message = engine.vip_summary(vip)
+                if vip['state'] in ('not_vip', 'cutoff'):
+                    TaskDownload._clear_registration_wait(item)
+                    setting = P.ModelSetting.get('download_skip_disabled_engines')
+                    skip = str('True' if setting is None else setting).lower() in ('true', '1', 'on')
+                    next_engine = next_available_engine(chain, curr_idx, snapshot['magnet']) if skip else None
+                    if next_engine is not None:
+                        item.current_engine_index = next_engine[0]
+                        profile = FeederUtil.get_item_profile(item)
+                        next_dest = FeederUtil.get_profile_destination(profile, next_engine[1], item)
+                        item.destination_type = next_dest.get('type') or ''
+                    item.error_message = message
+                    db.session.commit()
+                    continue
+                if vip['state'] == 'unknown':
+                    TaskDownload._registration_wait(item, downloader_cfg, message)
+                    continue
+            if engine_name in engine_errors:
+                if TaskDownload._registration_wait(item, downloader_cfg, engine_errors[engine_name]):
+                    TaskDownload._registration_fallback(item, engine_name, engine_errors[engine_name])
+                continue
+            if wait.get('next_check_at') and datetime.fromisoformat(wait['next_check_at']) > datetime.now():
                 continue
 
             # 링크 프로토콜(ed2k vs magnet) 지원 여부 판별
@@ -1295,11 +1575,34 @@ class TaskDownload:
 
             if pending_item(item_id) is None:
                 continue
+            if getattr(engine, 'ENGINE_ID', '') == 'pikpak':
+                cached, cache_reason = engine.cached_magnet(snapshot['magnet'])
+                db.session.expire_all()
+                item = pending_item(item_id)
+                if item is None or (item.current_engine_index or 0) != curr_idx:
+                    continue
+                current_state = item.upload_state or {}
+                if (item.engine_task_id or item.local_path or
+                        (current_state.get('download_source') or {}).get('task_id') or
+                        any(current_state.get(key) for key in ('worker', 'destination_snapshot', 'phase')) or
+                        (current_state.get('registration_wait') or {}).get('uncertain')):
+                    continue
+                if cached == 'miss':
+                    TaskDownload._registration_fallback(item, engine_name, cache_reason)
+                    continue
+                if cached == 'unknown':
+                    TaskDownload._registration_wait(item, downloader_cfg, cache_reason)
+                    continue
+            if not TaskDownload._admit_registration(downloader_cfg):
+                cd2_waiting += 1
+                continue
             success, task_id, err = DownloadUtil.add_magnet(
                 engine,
                 snapshot['magnet'],
                 title=snapshot['title'],
-                upload_path=current_upload_path
+                upload_path=current_upload_path,
+                new_registration=True,
+                vip_snapshot=TaskDownload._registration_context.vip_snapshots.get(engine_name)
             )
             db.session.expire_all()
             item = pending_item(item_id)
@@ -1327,6 +1630,7 @@ class TaskDownload:
                 item.gdrive_remote_id = dest_cfg.get('shared_drive_id') or ''
 
                 state = dict(item.upload_state or {})
+                state.pop('registration_wait', None)
                 state['download_source'] = {'engine_name': engine_name, 'task_id': str(task_id),
                                             'upload_path': current_upload_path}
                 item.upload_state = state
@@ -1340,38 +1644,123 @@ class TaskDownload:
                 registered_count += 1
                 logger.info(f"[DownloadDispatch] [{engine_name}] 작업 추가 성공: {snapshot['title']} (TaskID: {task_id})")
             else:
-                err_str = str(err)
-                err_lower = err_str.lower()
-                is_limit_error = any(k in err_lower for k in ["maximum allowed", "limit", "too many", "active magnets", "trial", "queue full"])
+                if FeederUtil.engine_auth_error(engine, err, 'add_magnet'):
+                    refresh_downloaders(force=True)
+                    item.error_message = '엔진 인증 오류 · 비활성 엔진 처리 대기'
+                    db.session.commit()
+                    continue
+                failure = DownloadUtil.registration_failure(engine, err)
+                safe_err = DownloadUtil.engine_error_detail(engine, err)
+                err_str = TaskDownload._engine_retry_text(safe_err)
 
-                if is_limit_error:
+                if failure['kind'] == 'queue':
                     full_engines.add(engine_name)
                     item.error_message = f"[{engine_name}] 큐 한도 도달 대기: {err_str}"
                     db.session.commit()
                     logger.info(f"[DownloadDispatch] [{engine_name}] 원격 엔진 활성 한도 도달 ({err_str}) -> 신규 추가 일시 중단 및 대기열(pending) 유지: {snapshot['title']}")
+                elif failure['kind'] == 'permanent':
+                    TaskDownload._registration_fallback(item, engine_name, safe_err)
                 else:
-                    # no peer, 토렌트 오류 등으로 추가 거부된 경우 다음 우선순위 엔진으로 즉시 폴백
-                    item.current_engine_index = curr_idx + 1
-                    item.status = 'pending'
-                    item.engine_task_id = None
-                    
-                    # 차순위 엔진이 존재하면 해당 엔진의 목적지 설정으로 선제 동기화
-                    if curr_idx + 1 < len(chain):
-                        next_engine = chain[curr_idx + 1]
-                        next_dest_cfg = FeederUtil.get_profile_destination(profile, next_engine, item)
-                        item.destination_type = next_dest_cfg.get('type') or ''
-
-                    item.error_message = f"[{engine_name}] 추가 실패 ({err_str}) -> 다음 엔진 폴백"
-                    db.session.commit()
-                    logger.warning(f"[DownloadDispatch] [{engine_name}] 마그넷 추가 불가 ({err_str}) -> 다음 엔진 폴백: {snapshot['title']}")
+                    engine_errors[engine_name] = safe_err
+                    expired = TaskDownload._registration_wait(item, downloader_cfg, safe_err,
+                        uncertain=not failure.get('not_submitted', False))
+                    if expired:
+                        TaskDownload._registration_fallback(item, engine_name, safe_err)
 
         db.session.commit()
         if capacity_waiting:
             logger.info('[DownloadDispatch] 포화 엔진의 신규 등록 %s건 일괄 대기 · 기존 작업 연동과 다른 엔진은 계속 처리합니다.', capacity_waiting)
+        if cd2_waiting:
+            message = f'CD2 회차당 신규 등록 시도 {TaskDownload._CD2_REGISTRATION_LIMIT}건 한도 · {cd2_waiting}건 다음 실행 대기'
+            logger.info('[DownloadDispatch] %s', message)
+            DownloadActivity.record('다운로드 작업 등록', message)
         DownloadActivity.record('다운로드 작업 등록', f'검토 완료 · {total_items}/{total_items}건 · 신규 등록 {registered_count}건 · 기존 연동 {linked_count}건')
 
     @staticmethod
+    def _poll_deferred_remote_cleanup(engine_name, engine, rows):
+        """새 보관 완료 뒤 이전 작업 ID만 정리하고 다음 전체 목록으로 부재를 확인한다."""
+        if FeederUtil.single_download_id() is not None:
+            return set(), set()
+        protected, targets, unresolved = set(), set(), set()
+        key = str(engine_name).strip().lower()
+        complete = getattr(engine, 'status_list_complete', True) is True
+        active_ids = {str(tid) for (tid,) in db.session.query(ModelDownload.engine_task_id).filter(
+            func.lower(func.trim(ModelDownload.current_engine_name)) == key,
+            ModelDownload.status != 'completed', ModelDownload.engine_task_id.isnot(None)).all()}
+
+        def stored(item):
+            if item.status != 'completed':
+                return False
+            proof = item.video_manifest or {}
+            if not isinstance(proof, dict):
+                return False
+            if not proof:
+                return True
+            if proof.get('duplicate_of'):
+                if type(proof['duplicate_of']) is not int:
+                    return False
+                minimum = FileDedup.minimum_bytes()
+                sizes = FileDedup.selected_sizes(proof, minimum)
+                if not proof.get('source_key') or not sizes:
+                    return False
+                original = db.session.get(ModelDownload, proof['duplicate_of'])
+                source = (original.video_manifest or {}) if original else {}
+                return bool(original and original.status == 'completed' and isinstance(source, dict) and
+                            source.get('stored') is True and not source.get('duplicate_of') and
+                            source.get('source_key') == proof['source_key'] and FileDedup.selected_sizes(source, minimum) == sizes)
+            return proof.get('stored') is True
+
+        items = db.session.query(ModelDownload).filter(
+            ModelDownload.upload_state['deferred_remote_cleanup'].as_string().isnot(None)).all()
+        changed = False
+        for item in items:
+            kept = []
+            for entry in (item.upload_state or {}).get('deferred_remote_cleanup') or []:
+                if not isinstance(entry, dict):
+                    kept.append(entry)
+                    continue
+                if str(entry.get('engine_name') or '').strip().lower() != key:
+                    kept.append(entry)
+                    continue
+                tid = str(entry.get('task_id') or '')
+                content = DownloadUtil._queue_hash(entry.get('infohash'))
+                if tid:
+                    protected.add(tid)
+                if str(item.current_engine_name or '').strip().lower() == key and item.engine_task_id:
+                    protected.add(str(item.engine_task_id))
+                for remote in rows:
+                    if content and DownloadUtil._queue_match(remote, content, '', False) is True:
+                        protected.add(str(remote.get('task_id') or remote.get('id') or ''))
+                matches = [row for row in rows if str(row.get('task_id') or row.get('id') or '') == tid] if tid else []
+                if not (complete and tid and stored(item)):
+                    kept.append(entry)
+                    unresolved.add(tid)
+                elif not matches:
+                    changed = True
+                else:
+                    kept.append(entry)
+                    if len(matches) == 1 and tid not in active_ids and DownloadUtil._queue_match(matches[0], content, tid, True) is True:
+                        targets.add(tid)
+                    else:
+                        unresolved.add(tid)
+            if kept != (item.upload_state or {}).get('deferred_remote_cleanup'):
+                state = dict(item.upload_state or {})
+                if kept:
+                    state['deferred_remote_cleanup'] = kept
+                else:
+                    state.pop('deferred_remote_cleanup', None)
+                item.upload_state = state or None
+        if changed:
+            db.session.commit()
+        return protected, targets - unresolved
+
+    @staticmethod
     def poll_active_downloads():
+        with TaskDownload._registration_scope():
+            return TaskDownload._poll_active_downloads_scoped()
+
+    @staticmethod
+    def _poll_active_downloads_scoped():
         from .util_block import DownloadBlock
         now = datetime.now()
         enabled_downloaders = [d for d in FeederUtil.get_downloaders() if d.get('enabled', True)]
@@ -1407,14 +1796,25 @@ class TaskDownload:
             if FeederUtil.single_download_id() is not None and not engine_items:
                 continue
             DownloadActivity.record('다운로더 상태 확인', f'{engine_name} 원격 목록 조회 중 · 할당된 작업 {len(engine_items)}건')
-            status_list, err = engine.get_status()
+            try:
+                status_list, err = engine.get_status()
+            except Exception as exc:
+                status_list, err = [], DownloadUtil.log_engine_error(engine, 'get_status',
+                    f'{type(exc).__name__}: {exc}')
             DownloadActivity.record('다운로더 상태 확인', f'{engine_name} 원격 목록 조회 ' + ('실패' if err else f'완료 · 수신 {len(status_list)}건'), 'warning' if err else 'info')
             if err:
+                FeederUtil.engine_auth_error(engine, err, 'get_status')
+                DownloadUtil.log_engine_error(engine, 'get_status · 상태 재확인 대기', err)
+                err = TaskDownload._engine_retry_text(err)
                 logger.warning(f"[DownloadPoll] [{engine_name}] 상태 조회 실패: {err}")
                 for it in engine_items:
                     FeederUtil.cooperate()
                     it.remote_missing_since = None
                 db.session.commit()
+                continue
+
+            if any(FeederUtil.engine_auth_error(engine, row.get('error') or row.get('error_message'), 'task_status')
+                   for row in status_list if row.get('status') == 'error'):
                 continue
 
             # 클라우드 마운트 엔진(CD2): 완료 작업이 위치한 임시 업로드 서브폴더만 특정하여 캐시 선제 갱신
@@ -1440,6 +1840,7 @@ class TaskDownload:
             # - Feeder DB에서 이미 다른 엔진으로 이관된 작업의 에러 잔여물도 원격 엔진에서 삭제 정리
             all_remote_hashes = [s.get('hash').lower() for s in status_list if s.get('hash')]
             all_remote_tids = [str(s.get('task_id')) for s in status_list if s.get('task_id')]
+            deferred_protected, deferred_targets = TaskDownload._poll_deferred_remote_cleanup(engine_name, engine, status_list)
 
             # Confirmed history entries retain ownership-checked cleanup on partial lists.
             # Error retry/re-registration separately requires complete lists in _retry_engine_error().
@@ -1465,7 +1866,7 @@ class TaskDownload:
                     )
                 ).all()
 
-                cleanup_targets = set()
+                cleanup_targets = set(deferred_targets)
                 for r_hash, r_tid, r_status, r_engine in done_or_migrated_rows:
                     FeederUtil.cooperate()
                     target_key = (r_hash or '').lower()
@@ -1476,7 +1877,7 @@ class TaskDownload:
                     s_status = s_item.get('status')
 
                     # DB 완료 건은 상태 무관 삭제, 타 엔진 이관 건은 에러 상태인 경우 즉시 삭제
-                    if r_status == 'completed' or s_status == 'error':
+                    if (r_status == 'completed' or s_status == 'error') and s_tid not in deferred_protected:
                         cleanup_targets.add(s_tid or target_key)
 
                 manual_targets = set()
@@ -1494,7 +1895,7 @@ class TaskDownload:
                                 func.lower(ModelDownload.engine_task_id).in_(candidates))
                         ).all()
                         owned_ids = {str(value).lower() for row in owned_rows for value in row if value}
-                        manual_targets = candidates - owned_ids - cleanup_targets
+                        manual_targets = candidates - owned_ids - cleanup_targets - deferred_protected
                         cleanup_targets.update(manual_targets)
 
                 if manual_targets and FeederUtil.is_download_paused():
@@ -1591,6 +1992,13 @@ class TaskDownload:
 
                 if std_status == 'completed':
                     source_path = matched_status.get('source_path', '')
+                    if downloader_cfg.get('engine_type') in ('pikpak', 'alldebrid') and not source_path:
+                        it.error_message = ('PikPak' if downloader_cfg.get('engine_type') == 'pikpak' else 'AllDebrid') + ' 다운로드 완료 · 파일 경로 확인 대기: ' + (
+                            matched_status.get('error_message') or '다음 상태 확인에서 다시 조회합니다.')
+                        db.session.commit()
+                        continue
+                    if (it.error_message or '').startswith(('PikPak 다운로드 완료 · 파일 경로 확인 대기:', 'AllDebrid 다운로드 완료 · 파일 경로 확인 대기:')):
+                        it.error_message = None
                     it.local_path = source_path
 
                     # 원격 엔진이 보고한 실제 원본 파일명 보존
@@ -1600,8 +2008,20 @@ class TaskDownload:
                     if FileDedup.check(it):
                         continue
 
-                    # CD2(115 클라우드) 엔진인 경우 마운트 경로 실물 파일 검증 및 경로 매칭
-                    if engine_name == 'cd2' or getattr(engine, 'OUTPUT_TYPE', '') == 'cloud_storage':
+                    profile = FeederUtil.get_item_profile(it) or {}
+                    dest_cfg = FeederUtil.get_profile_destination(profile, engine_name, it)
+                    direct_cd2 = bool(hasattr(engine, 'direct_worker_enabled') and
+                                      engine.direct_worker_enabled(dest_cfg.get('type')))
+                    if direct_cd2:
+                        try:
+                            source_path = engine.direct_source(raw_engine_name, FeederUtil.get_download_source_subpath(it, dest_cfg.get('upload_path') or ''))
+                            it.local_path = source_path
+                        except Exception:
+                            it.error_message = 'CD2 직접 전송 경로 조회 실패: 다음 상태 확인에서 다시 조회합니다.'
+                            continue
+
+                    # 직접 URL 워커 이외의 CD2 경로는 기존 FUSE 실물 확인을 유지한다.
+                    if not direct_cd2 and (engine_name == 'cd2' or getattr(engine, 'OUTPUT_TYPE', '') == 'cloud_storage'):
                         base_mount_root = engine.get_local_mount_path() if hasattr(engine, 'get_local_mount_path') else DownloadUtil.get_local_root(downloader_cfg)
 
                         profile = FeederUtil.get_item_profile(it) or {}
@@ -1744,19 +2164,21 @@ class TaskDownload:
         db.session.commit()
 
     @staticmethod
-    def _get_upload_queue_state(staging_root=None):
+    def _get_upload_queue_state(staging_root=None, disabled_names=None):
         """스테이징·업로드 상태와 잔여 로컬 버퍼를 작업 ID 기준으로 합산한다."""
         try:
             limit = max(0, P.ModelSetting.get_int('download_max_staging_items'))
         except Exception:
             limit = 10
-        occupied = {item_id for (item_id,) in db.session.query(ModelDownload.id).filter(
+        disabled_names = FeederUtil.disabled_engine_names() if disabled_names is None else disabled_names
+        occupied = {item_id for (item_id,) in TaskDownload._enabled_engine_query(db.session.query(ModelDownload.id), disabled_names).filter(
             ModelDownload.status.in_(['local_staging', 'pending_upload', 'uploading'])
         ).all()}
         if staging_root is None:
             staging_root = FeederUtil.get_local_staging_root()
         root_prefix = os.path.abspath(staging_root).rstrip(os.sep) + os.sep
-        staging_paths = db.session.query(ModelDownload.id, ModelDownload.local_path).filter(
+        staging_paths = TaskDownload._enabled_engine_query(db.session.query(ModelDownload.id, ModelDownload.local_path), disabled_names).filter(
+            ModelDownload.status != 'upload_held',
             ModelDownload.local_path.startswith(root_prefix, autoescape=True)
         ).all()
         for item_id, path in DownloadActivity.track('큐 점검', staging_paths, '스테이징 경로', report_start=False):
@@ -1766,11 +2188,11 @@ class TaskDownload:
         return limit, occupied
 
     @staticmethod
-    def _expire_source_failures(query):
+    def _expire_source_failures(query, downloaders=None):
         """원본 실패 유예가 있는 후보만 확인하고 미확정 AD 만료 검토는 생략한다."""
         candidates = query.filter(ModelDownload.transfer_error_type == 'SOURCE_UNAVAILABLE',
                                   ModelDownload.source_unavailable_since.isnot(None))
-        ad_engines = [config['name'] for config in FeederUtil.get_downloaders()
+        ad_engines = [config['name'] for config in (FeederUtil.get_downloaders() if downloaders is None else downloaders)
                       if config.get('name') and config.get('engine_type') == 'alldebrid']
         if ad_engines:
             candidates = candidates.filter(or_(ModelDownload.current_engine_name.is_(None),
@@ -1780,25 +2202,65 @@ class TaskDownload:
             UploadUtil.expire_source_failure(item)
 
     @staticmethod
+    def _apply_pikpak_vip_hold(statuses, phase, downloaders):
+        """실행 시작의 단일 판정으로 시작 전 작업만 보류하고 원래 상태를 복원한다."""
+        snapshots = getattr(TaskDownload._registration_context, 'vip_snapshots', {})
+        for config in downloaders:
+            if config.get('engine_type') != 'pikpak' or not config.get('enabled', True):
+                continue
+            rows = TaskDownload._selected_query(db.session.query(ModelDownload)).filter(
+                ModelDownload.current_engine_name == config['name'],
+                ModelDownload.status.in_(list(statuses) + ['upload_held'])).all()
+            candidates = []
+            for item in rows:
+                state = item.upload_state or {}
+                hold = state.get('hold') or {}
+                if item.status == 'upload_held' and (
+                        hold.get('reason') != 'pikpak_vip' or hold.get('resume_status') not in statuses):
+                    continue
+                remote = state.get('worker') or {}
+                if (remote and remote.get('submission') not in ('new', 'rejected')) or state.get('phase') in ('uploaded', 'shared_incoming', 'moved'):
+                    continue
+                candidates.append(item)
+            if not candidates:
+                continue
+            vip = snapshots.get(config['name'], {'state': 'unknown'})
+            known = vip['state'] in ('eligible', 'cutoff', 'not_vip')
+            expired = vip.get('expired', vip['state'] == 'not_vip')
+            for item in candidates:
+                state = dict(item.upload_state or {})
+                if expired and item.status != 'upload_held':
+                    state['hold'] = {'reason': 'pikpak_vip', 'resume_status': item.status}
+                    item.status = 'upload_held'
+                elif known and not expired and item.status == 'upload_held':
+                    item.status = state.pop('hold')['resume_status']
+                else:
+                    continue
+                item.upload_state = state
+            db.session.commit()
+
+    @staticmethod
     def process_local_staging():
         if FeederUtil.is_download_paused():
             return
+        downloaders = FeederUtil.get_downloaders()
+        disabled_engines = FeederUtil.disabled_engine_names(downloaders)
         # 이전 비정상 종료로 멈춘 고아 local_staging 작업을 pending_local_staging으로 자동 복구
-        stuck_staging = TaskDownload._selected_query(db.session.query(ModelDownload)).filter_by(status='local_staging').all()
+        stuck_staging = TaskDownload._enabled_engine_query(TaskDownload._selected_query(db.session.query(ModelDownload)), disabled_engines).filter_by(status='local_staging').all()
         if stuck_staging:
             for s_it in stuck_staging:
                 FeederUtil.cooperate()
                 s_it.status = 'pending_local_staging'
             db.session.commit()
             logger.info(f"[LocalStaging] 멈춰있던 스테이징 작업 {len(stuck_staging)}건을 대기열(pending_local_staging)로 자동 복구했습니다.")
+        TaskDownload._apply_pikpak_vip_hold(('pending_local_staging',), 'staging', downloaders)
 
         # 로컬 스테이징 기본 루트 디렉터리 준비
         staging_root = FeederUtil.get_local_staging_root()
-        os.makedirs(staging_root, exist_ok=True)
 
-        query = TaskDownload._selected_query(db.session.query(ModelDownload)).filter(ModelDownload.status == 'pending_local_staging')
-        TaskDownload._expire_source_failures(query)
-        queue_limit, occupied = TaskDownload._get_upload_queue_state(staging_root)
+        query = TaskDownload._enabled_engine_query(TaskDownload._selected_query(db.session.query(ModelDownload)), disabled_engines).filter(ModelDownload.status == 'pending_local_staging')
+        TaskDownload._expire_source_failures(query, downloaders)
+        queue_limit, occupied = TaskDownload._get_upload_queue_state(staging_root, disabled_engines)
         if queue_limit > 0 and len(occupied) >= queue_limit:
             logger.info(f"[LocalStaging] Google Drive 업로드 최대 큐({queue_limit}건) 도달 (현재: {len(occupied)}건). 신규 스테이징을 대기합니다.")
             DownloadActivity.record('로컬 스테이징', f'업로드 최대 큐 {len(occupied)}/{queue_limit}건 · 새 스테이징 대기')
@@ -1823,6 +2285,7 @@ class TaskDownload:
 
         if not items:
             return
+        os.makedirs(staging_root, exist_ok=True)
         item_ids = [item.id for item in items]
         db.session.rollback()
         db.session.remove()
@@ -1840,12 +2303,18 @@ class TaskDownload:
                 target_item = db.session.query(ModelDownload).filter_by(id=item_id).first()
                 if not target_item or target_item.status != 'pending_local_staging':
                     return
+                if FeederUtil.item_engine_disabled(target_item):
+                    return
                 if FileDedup.check(target_item):
                     return
                 destination = FeederUtil.get_profile_destination(FeederUtil.get_item_profile(target_item), item=target_item)
                 destination_error = FeederUtil.validate_destination(destination)
                 if destination_error:
                     target_item.error_message = destination_error
+                    db.session.commit()
+                    return
+                if not UploadUtil.resolve_ad_source(target_item):
+                    target_item.error_message = 'AllDebrid 원본 경로 확인 대기'
                     db.session.commit()
                     return
                 target_item.status = 'local_staging'
@@ -1871,9 +2340,12 @@ class TaskDownload:
                     db.session.commit()
                     return
                 staging_path = os.path.relpath(os.path.dirname(item_staging_dir), staging_root)
-                FeederUtil.pin_transfer_destination(target_item, profile)
-                target_item.upload_state = dict(target_item.upload_state or {}, staging_local_path=item_staging_dir)
+                target_item.upload_state = dict(target_item.upload_state or {}, staging_local_path=item_staging_dir,
+                                                       engine_name=current_engine_name, engine_task_id=engine_task_id)
                 db.session.commit()
+                if FeederUtil.item_engine_disabled(target_item):
+                    db.session.remove()
+                    return
                 if os.path.exists(item_staging_dir):
                     shutil.rmtree(item_staging_dir, ignore_errors=True)
                 os.makedirs(item_staging_dir, exist_ok=True)
@@ -1888,21 +2360,23 @@ class TaskDownload:
                 logger.info(f"[LocalStaging] 다운로드 시작: {staging_path}/{target_folder_name} (명령: {rclone_cmd_type})")
 
                 rclone_conf = P.ModelSetting.get('download_rclone_conf_path') or FeederUtil.load_yaml().get('rclone', {}).get('conf_path', '')
-                cmd = [
-                    "rclone", rclone_cmd_type, src_path, dest_download_path,
-                    "--stats", "1s", "--stats-one-line", "--log-level", "INFO"
-                ]
+                cmd = ["rclone", rclone_cmd_type, src_path, dest_download_path]
                 if rclone_conf:
                     cmd.extend(["--config", rclone_conf])
 
                 cmd.extend(FeederUtil.get_rclone_exclude_options())
                 cmd.extend(FeederUtil.get_rclone_transfer_options())
+                cmd.extend(UploadUtil.rclone_stats_options())
 
                 db.session.remove()
 
                 success = False
                 out = ""
                 try:
+                    current = db.session.get(ModelDownload, target_item_id)
+                    if FeederUtil.item_engine_disabled(current):
+                        db.session.remove()
+                        return
                     success, out = UploadUtil.run_rclone(
                         cmd,
                         f"로컬 스테이징 {target_folder_name}",
@@ -1919,6 +2393,9 @@ class TaskDownload:
                 # 다운로드 종료 후 다시 세션을 열어 최종 상태만 원자적으로 갱신하고 즉시 닫기
                 with F.app.app_context():
                     it_update = db.session.query(ModelDownload).filter_by(id=target_item_id).first()
+                    if FeederUtil.item_engine_disabled(it_update):
+                        db.session.remove()
+                        return
                     if it_update and it_update.status == 'blocked':
                         from .util_block import DownloadBlock
                         DownloadBlock.remove_staging(item_staging_dir)
@@ -1927,7 +2404,7 @@ class TaskDownload:
                             downloader_cfg = FeederUtil.get_downloader_by_name(current_engine_name)
                             if downloader_cfg:
                                 engine = DownloadUtil.create_engine(downloader_cfg)
-                                if engine and engine_task_id:
+                                if engine and engine_task_id and getattr(engine, 'ENGINE_ID', '') != 'pikpak':
                                     try:
                                         if engine.delete_task(engine_task_id) is not True:
                                             logger.warning('[LocalStaging] 작업 %s: 엔진 히스토리 삭제 미확인 · ID를 보존하고 업로드 후 다시 정리합니다.', target_item_id)
@@ -1947,7 +2424,7 @@ class TaskDownload:
                                 shutil.rmtree(item_staging_dir, ignore_errors=True)
                             TaskDownload.failed_ids_in_session.add(it_update.id)
                             UploadUtil.transfer_failed(it_update.id, out or '로컬 스테이징 Rclone 전송 실패',
-                                                       retry_status='pending_local_staging')
+                                                       retry_status='pending_local_staging', source_operation=True)
                             it_update = db.session.get(ModelDownload, target_item_id)
                             logger.warning('[LocalStaging] %s 스테이징 실패 처리 · 상태: %s', target_folder_name, it_update.status)
                         db.session.commit()
@@ -1961,7 +2438,7 @@ class TaskDownload:
                 logger.error(f"[LocalStaging] 워커 스레드 예외 (ID: {item_id}): {th_err}")
                 with F.app.app_context():
                     failed_item = db.session.query(ModelDownload).filter_by(id=item_id).first()
-                    if failed_item and failed_item.status == 'local_staging':
+                    if failed_item and failed_item.status == 'local_staging' and not FeederUtil.item_engine_disabled(failed_item):
                         failed_item.status = 'pending_local_staging'
                         failed_item.error_message = f"로컬 스테이징 워커 예외: {str(th_err)[:150]}"
                         TaskDownload.failed_ids_in_session.add(item_id)
@@ -2008,8 +2485,10 @@ class TaskDownload:
     def route_completed_downloads(wait_summaries=None):
         if FeederUtil.is_download_paused():
             return
-        queue_limit, occupied = TaskDownload._get_upload_queue_state()
-        query = TaskDownload._selected_query(db.session.query(ModelDownload)).filter(ModelDownload.status.in_(['downloaded', 'waiting_transporter']))
+        disabled_engines = FeederUtil.disabled_engine_names()
+        TaskDownload._apply_pikpak_vip_hold(('downloaded', 'waiting_transporter'), 'route', FeederUtil.get_downloaders())
+        queue_limit, occupied = TaskDownload._get_upload_queue_state(disabled_names=disabled_engines)
+        query = TaskDownload._enabled_engine_query(TaskDownload._selected_query(db.session.query(ModelDownload)), disabled_engines).filter(ModelDownload.status.in_(['downloaded', 'waiting_transporter']))
         item_ids, deferred = TaskDownload._route_candidate_ids(query, queue_limit, occupied)
         db.session.rollback()
         db.session.remove()
@@ -2040,12 +2519,14 @@ class TaskDownload:
             item = db.session.query(ModelDownload).filter_by(id=item_id).first()
             if not item or item.status not in ['downloaded', 'waiting_transporter']:
                 continue
+            if FeederUtil.item_engine_disabled(item, disabled_engines):
+                continue
             profile = FeederUtil.get_item_profile(item) or {}
             dest_cfg = FeederUtil.get_profile_destination(profile, item.current_engine_name, item)
             dest_type = dest_cfg.get('type') or ''
             source_path = item.local_path
             if dest_type in ('gdrive_rotation', 'remote_worker') and queue_limit > 0:
-                queue_limit, occupied = TaskDownload._get_upload_queue_state()
+                queue_limit, occupied = TaskDownload._get_upload_queue_state(disabled_names=disabled_engines)
                 if item_id not in occupied and queue_limit > 0 and len(occupied) >= queue_limit:
                     db.session.rollback()
                     deferred += 1
@@ -2056,6 +2537,8 @@ class TaskDownload:
                 continue
             db.session.refresh(item)
             if item.status not in ('downloaded', 'waiting_transporter'):
+                continue
+            if FeederUtil.item_engine_disabled(item):
                 continue
             profile = FeederUtil.get_item_profile(item) or {}
             dest_cfg = FeederUtil.get_profile_destination(profile, item.current_engine_name, item)
@@ -2096,7 +2579,7 @@ class TaskDownload:
             # 구글 드라이브 계정 풀의 경우 멀티스레드 업로드 큐(pending_upload)로 넘겨 process_uploads에서 전담 처리
             if dest_type in ('gdrive_rotation', 'remote_worker'):
                 if queue_limit > 0:
-                    queue_limit, occupied = TaskDownload._get_upload_queue_state()
+                    queue_limit, occupied = TaskDownload._get_upload_queue_state(disabled_names=disabled_engines)
                     if queue_limit > 0 and item_id not in occupied and len(occupied) >= queue_limit:
                         db.session.rollback()
                         deferred += 1
@@ -2118,6 +2601,8 @@ class TaskDownload:
             logger.info(f"[RouteComplete] 이송 핸들러 [{dest_type}] 호출 시작: {title}")
             DownloadActivity.record('완료 항목 이송', f'작업 #{item_id} 이송 처리 중 · {item_index}/{len(item_ids)}번째 항목')
             try:
+                if FeederUtil.item_engine_disabled(item):
+                    continue
                 success, next_status, msg = transporter.transport(item, source_path, dest_cfg)
                 moved_path = getattr(item, 'local_path', source_path)
                 db.session.remove()
@@ -2159,18 +2644,21 @@ class TaskDownload:
     def process_uploads():
         if FeederUtil.is_download_paused():
             return
+        downloaders = FeederUtil.get_downloaders()
+        disabled_engines = FeederUtil.disabled_engine_names(downloaders)
         # 이전 비정상 종료로 멈춘 uploading 작업을 pending_upload로 자동 복구
-        stuck_uploads = TaskDownload._selected_query(db.session.query(ModelDownload)).filter_by(status='uploading').all()
+        stuck_uploads = TaskDownload._enabled_engine_query(TaskDownload._selected_query(db.session.query(ModelDownload)), disabled_engines).filter_by(status='uploading').all()
         if stuck_uploads:
             for u_it in stuck_uploads:
                 FeederUtil.cooperate()
                 u_it.status = 'pending_upload'
             db.session.commit()
             logger.info(f"[UploadUtil] 멈춰있던 업로드 작업 {len(stuck_uploads)}건을 대기열(pending_upload)로 자동 복구했습니다.")
+        TaskDownload._apply_pikpak_vip_hold(('pending_upload',), 'upload', downloaders)
 
         # 현재 세션에서 실패한 항목은 쿼리에서 안전하게 제외하고, 미시도 작업을 우선 정렬
-        query = TaskDownload._selected_query(db.session.query(ModelDownload)).filter(ModelDownload.status == 'pending_upload')
-        TaskDownload._expire_source_failures(query)
+        query = TaskDownload._enabled_engine_query(TaskDownload._selected_query(db.session.query(ModelDownload)), disabled_engines).filter(ModelDownload.status == 'pending_upload')
+        TaskDownload._expire_source_failures(query, downloaders)
         if FeederUtil.single_download_id() is None:
             query = query.filter(or_(ModelDownload.upload_retry_after.is_(None),
                                      ModelDownload.upload_retry_after <= datetime.now()))
@@ -2179,21 +2667,27 @@ class TaskDownload:
 
         # 최근 실패한 작업은 뒤로 미루고, 한 번도 실패하지 않은 대기 작업을 1순위로 조회
         items = query.order_by(ModelDownload.last_status_time.asc().nullsfirst(), ModelDownload.id.asc()).all()
+        def destination_type(item):
+            if (item.upload_state or {}).get('worker'):
+                return 'remote_worker'
+            if FeederUtil.transfer_destination_locked(item):
+                return item.destination_type
+            return FeederUtil.get_profile_destination(FeederUtil.get_item_profile(item), item=item).get('type') or ''
         if RemoteWorker.reserves_ad():
-            items = [item for item in items if item.destination_type == 'remote_worker' or not RemoteWorker.is_ad(item)]
+            items = [item for item in items if destination_type(item) == 'remote_worker' or not RemoteWorker.is_ad(item)]
         item_ids = [item.id for item in items]
         # 기존 접수 작업은 신규 제출 게이트와 별도로 먼저 조회한다.
         remote_items = {}
         for item in items:
             state = item.upload_state or {}
             remote = state.get('worker') or {}
-            if item.destination_type == 'remote_worker' or remote:
+            if destination_type(item) == 'remote_worker' or remote:
                 remote_items[item.id] = dict(remote)
         # 신규 제출이 기다리더라도 기존 접수 작업의 조회·정산을 먼저 진행한다.
         item_ids.sort(key=lambda item_id: not bool(remote_items.get(item_id) and
             remote_items[item_id].get('submission') not in ('new', 'rejected')))
         existing_jobs = []
-        for item in TaskDownload._selected_query(db.session.query(ModelDownload)).filter(
+        for item in TaskDownload._enabled_engine_query(TaskDownload._selected_query(db.session.query(ModelDownload)), disabled_engines).filter(
                 ModelDownload.status.in_(['pending_upload', 'uploading']), ModelDownload.upload_state.isnot(None)).all():
             remote = (item.upload_state or {}).get('worker') or {}
             if remote and not remote.get('settled') and remote.get('submission') not in ('new', 'rejected'):
@@ -2241,6 +2735,11 @@ class TaskDownload:
                 for identity, job_id in entries:
                     if FeederUtil.is_download_paused():
                         return
+                    current = db.session.get(ModelDownload, identity)
+                    if FeederUtil.item_engine_disabled(current):
+                        reconcile_pending.pop(identity, None)
+                        db.session.remove()
+                        continue
                     current = RemoteWorker.pending_job(identity, reconcile_pending[identity])
                     if current is None:
                         checked_jobs.add(identity)
@@ -2276,18 +2775,24 @@ class TaskDownload:
         def check_assignment(item_id):
             db.session.remove()
             current = db.session.get(ModelDownload, item_id)
-            if not current or current.status != 'pending_upload':
+            if not current or current.status != 'pending_upload' or FeederUtil.item_engine_disabled(current):
                 db.session.remove()
                 return False
-            destination_type = current.destination_type
+            current_type = destination_type(current)
             state = current.upload_state or {}
             latest_remote = state.get('worker') or {}
+            if current_type != 'remote_worker' and not latest_remote:
+                db.session.remove()
+                return True
+            if not FeederUtil.transfer_destination_locked(current) and not re.fullmatch(r'[A-Za-z0-9_-]+:.+', current.local_path or ''):
+                current.error_message = '원격 워커에는 원격 소스가 필요합니다. 로컬 스테이징 파일은 보존했습니다. 목적지를 복구하거나 처음부터 다시 받기를 실행해주세요.'
+                db.session.commit()
+                db.session.remove()
+                return False
             db.session.remove()
-            remote = remote_items.get(item_id)
-            if remote is None:
-                return destination_type != 'remote_worker' and not latest_remote
+            remote = remote_items.get(item_id, {})
             if (not RemoteWorker.same_job(latest_remote, remote) or
-                    (not latest_remote and destination_type != 'remote_worker')):
+                    (not latest_remote and current_type != 'remote_worker')):
                 return False
             remote = latest_remote
             if remote.get('settled') and state.get('phase') in ('uploaded', 'shared_incoming', 'moved'):
@@ -2379,22 +2884,36 @@ class TaskDownload:
                 target_item = db.session.query(ModelDownload).filter_by(id=item_id).first()
                 if not target_item or target_item.status != 'pending_upload':
                     return
+                if FeederUtil.item_engine_disabled(target_item):
+                    return
                 if FileDedup.check(target_item):
                     return True
                 state = target_item.upload_state or {}
-                destination = FeederUtil.get_profile_destination(FeederUtil.get_item_profile(target_item), item=target_item)
+                destination = FeederUtil.refresh_transfer_destination(target_item)
                 if not (state.get('worker') or state.get('phase')):
                     destination_error = FeederUtil.validate_destination(destination)
                     if destination_error:
                         target_item.error_message = destination_error
                         db.session.commit()
                         return
+                    options = FeederUtil.get_upload_options(FeederUtil.get_item_profile(target_item), item=target_item)
+                    if target_item.destination_type not in ('gdrive_rotation', 'remote_worker'):
+                        target_item.status = 'downloaded'
+                        db.session.commit()
+                        return None
+                    if (target_item.destination_type != 'remote_worker' and options['use_local_staging'] and
+                            target_item.local_path and not os.path.exists(target_item.local_path) and ':' in target_item.local_path):
+                        target_item.status = 'pending_local_staging'
+                        db.session.commit()
+                        return None
                 file_name = target_item.file_name
                 DownloadActivity.record('업로드', f'작업 #{item_id} 업로드 처리 시작')
                 if target_item.destination_type == 'remote_worker' or (target_item.upload_state or {}).get('worker'):
                     success = RemoteWorker.execute(target_item, manager)
                 else:
                     success = UploadUtil.execute_upload(target_item, manager)
+                if FeederUtil.item_engine_disabled(db.session.get(ModelDownload, item_id)):
+                    return
                 expected = existing_by_id.get(item_id)
                 if expected and RemoteWorker.pending_job(item_id, expected) is None:
                     checked_jobs.add(item_id)
@@ -2446,9 +2965,10 @@ class TaskDownload:
         if FeederUtil.is_download_paused():
             return
         one_hour_ago = datetime.now() - timedelta(hours=1)
-        queue_limit, occupied = TaskDownload._get_upload_queue_state()
+        disabled_engines = FeederUtil.disabled_engine_names()
+        queue_limit, occupied = TaskDownload._get_upload_queue_state(disabled_names=disabled_engines)
         item_ids = [row[0] for row in (
-            TaskDownload._selected_query(db.session.query(ModelDownload))
+            TaskDownload._enabled_engine_query(TaskDownload._selected_query(db.session.query(ModelDownload)), disabled_engines)
             .filter(
                 ModelDownload.status == 'move_failed',
                 ModelDownload.completed_time.is_(None),
@@ -2477,13 +2997,16 @@ class TaskDownload:
                 deferred += 1
                 continue
             if queue_limit > 0:
-                queue_limit, occupied = TaskDownload._get_upload_queue_state()
+                queue_limit, occupied = TaskDownload._get_upload_queue_state(disabled_names=disabled_engines)
                 if queue_limit > 0 and item_id not in occupied and len(occupied) >= queue_limit:
                     db.session.remove()
                     deferred += 1
                     continue
             target = db.session.query(ModelDownload).filter_by(id=item_id, status='move_failed').first()
             if not target:
+                db.session.remove()
+                continue
+            if FeederUtil.item_engine_disabled(target):
                 db.session.remove()
                 continue
             target.last_move_attempt_time = datetime.now()
@@ -2495,7 +3018,7 @@ class TaskDownload:
                 UploadUtil.retry_failed_upload(target, manager)
                 if queue_limit > 0:
                     db.session.remove()
-                    queue_limit, occupied = TaskDownload._get_upload_queue_state()
+                    queue_limit, occupied = TaskDownload._get_upload_queue_state(disabled_names=disabled_engines)
         if deferred:
             message = f'업로드 최대 큐 {len(occupied)}/{queue_limit} · 이동 복구 신규 슬롯 {deferred}건 일괄 대기'
             logger.info('[UploadUtil] %s', message)
@@ -2507,8 +3030,10 @@ class TaskDownload:
         if FeederUtil.is_download_paused():
             return
         try:
-            busy_count = db.session.query(ModelDownload).filter_by(status='relay_transferring').count()
-            pending_items = db.session.query(ModelDownload).filter_by(status='pending_relay').all()
+            disabled_engines = FeederUtil.disabled_engine_names()
+            query = TaskDownload._enabled_engine_query(db.session.query(ModelDownload), disabled_engines)
+            busy_count = query.filter_by(status='relay_transferring').count()
+            pending_items = query.filter_by(status='pending_relay').all()
 
             if not pending_items and busy_count == 0:
                 return
@@ -2534,6 +3059,8 @@ class TaskDownload:
                 transporter = DownloadUtil.get_transporter(dest_type)
 
                 if transporter and hasattr(transporter, 'resume_relay'):
+                    if FeederUtil.item_engine_disabled(it):
+                        continue
                     DownloadActivity.record('릴레이 점검', f'작업 #{it.id}의 릴레이 워커 기동 요청 중')
                     transporter.resume_relay(dest_cfg)
                     triggered_dest_types.add(dest_type)

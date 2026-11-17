@@ -39,25 +39,42 @@ class WorkerError(RuntimeError):
         self.code = code or ('updating' if status == 202 else 'unavailable')
 
 
-def validate_endpoint(value):
+def validate_endpoint(value, network_mode='tailscale'):
+    if network_mode not in ('tailscale', 'general'):
+        raise WorkerError('워커 네트워크 방식은 Tailscale 또는 일반 네트워크로 선택해주세요.')
     try:
         url = urlsplit(str(value).rstrip('/'))
-        address = ipaddress.ip_address(url.hostname or '')
-        network = ipaddress.ip_network('100.64.0.0/10' if address.version == 4 else 'fd7a:115c:a1e0::/48')
-        if (url.scheme not in ('http', 'https') or url.username or url.password or url.query or url.fragment
-                or url.path not in ('', '/api/v1') or not (address.is_loopback or address in network)
-                or not 1 <= (url.port or (443 if url.scheme == 'https' else 80)) <= 65535):
+        host = url.hostname or ''
+        if (url.scheme not in ('http', 'https') or url.username is not None or url.password is not None or url.query or url.fragment
+                or url.path not in ('', '/api/v1')
+                or not 1 <= (url.port if url.port is not None else (443 if url.scheme == 'https' else 80)) <= 65535):
             raise ValueError
+        if network_mode == 'tailscale':
+            address = ipaddress.ip_address(host)
+            network = ipaddress.ip_network('100.64.0.0/10' if address.version == 4 else 'fd7a:115c:a1e0::/48')
+            if not (address.is_loopback or address in network):
+                raise ValueError
+        else:
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                domain = host.encode('idna').decode('ascii').rstrip('.')
+                if (not domain or len(domain) > 253 or re.fullmatch(r'[0-9.]+', domain)
+                        or not all(re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', label)
+                                   for label in domain.split('.'))):
+                    raise ValueError
     except (ValueError, TypeError):
-        raise WorkerError('워커 주소에는 인증 정보 없는 Tailscale 또는 루프백 주소를 지정해주세요.') from None
+        message = ('워커 주소에는 인증 정보 없는 Tailscale 또는 루프백 주소를 지정해주세요.' if network_mode == 'tailscale'
+                   else '워커 주소에는 인증 정보 없는 올바른 HTTP(S) IP 또는 도메인 주소를 지정해주세요.')
+        raise WorkerError(message) from None
     return f'{url.scheme}://{url.netloc}/api/v1'
 
 
 class WorkerClient:
     _updates_lock = threading.Lock()
     _update_attempts = {}
-    def __init__(self, endpoint, token):
-        self.endpoint = validate_endpoint(endpoint)
+    def __init__(self, endpoint, token, network_mode='tailscale'):
+        self.endpoint = validate_endpoint(endpoint, network_mode)
         if not isinstance(token, str) or not re.fullmatch(r'[A-Za-z0-9_.~-]{32,512}', token):
             raise WorkerError('워커 설치 시 안내된 인증 토큰을 입력해주세요 (32~512자).')
         self._headers = {'Authorization': 'Bearer ' + token}

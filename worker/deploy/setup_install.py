@@ -69,7 +69,7 @@ def configure(args):
                 result = subprocess.run(['tailscale', 'ip', '-4'], capture_output=True, text=True, timeout=10, check=True)
                 bind = result.stdout.strip().splitlines()[0]
             except (OSError, subprocess.SubprocessError, IndexError):
-                bind = choose(None, [], 'Tailscale IP (--bind)')
+                bind = choose(None, [], '수신 IP (--bind)')
         values = {
             'WORKER_API_TOKEN': secrets.token_urlsafe(48),
             'WORKER_BIND': bind, 'WORKER_PORT': str(args.port or 8000),

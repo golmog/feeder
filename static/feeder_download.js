@@ -6,6 +6,7 @@ var feeder_dashboard = null;
 var queue_page_closed = false;
 var queue_page_started = false;
 var queue_page_generation = 0;
+var queue_scroll_restoration = null;
 var download_activity_request = null;
 var pipeline_control_request = null;
 var pipeline_control_change_request = null;
@@ -35,6 +36,48 @@ var modal_engine_destinations = {};
 var available_engine_schemas = [];
 var available_transporter_schemas = [];
 var download_list_filter_ids = ['feed_select', 'engine_select'];
+var download_list_restore_scroll = 0;
+
+// 리스트 화면에서만 공통 검색 함수를 감싸 큐/크롤링/피드에는 영향 없이 새로고침 중 높이를 유지한다.
+function init_download_list_search() {
+  var commonSearch = window.globalRequestSearch;
+  var firstSearch = true;
+  window.globalRequestSearch = function (page, preserveScroll) {
+    if (preserveScroll === true) {
+      var rows = $('#download_list_tbody').html();
+      var topPage = $('#page1').html();
+      var bottomPage = $('#page2').html();
+      localStorage.setItem(sub + '_scroll_y', String(window.scrollY || 0));
+      commonSearch(page, true);
+      // 공통 검색 함수가 임시 스켈레톤으로 교체한 DOM은 응답 전 즉시 원상 복구한다.
+      $('#download_list_tbody').html(rows);
+      $('#page1').html(topPage);
+      $('#page2').html(bottomPage);
+      return;
+    }
+    if (firstSearch) firstSearch = false;
+    else {
+      download_list_restore_scroll = 0;
+      localStorage.setItem(sub + '_scroll_y', '0');
+    }
+    commonSearch(page, false);
+  };
+}
+
+function restore_download_list_scroll() {
+  var y = download_list_restore_scroll;
+  download_list_restore_scroll = 0;
+  if (y > 0) setTimeout(function () { window.scrollTo({top:y, behavior:'instant'}); }, 10);
+}
+
+function update_worker_network_help() {
+  var general = $('input[name="worker_network_mode"]:checked').val() === 'general';
+  $('#worker_network_help').text(general
+    ? '일반 LAN·공인 IP·도메인을 사용할 수 있습니다. 예: https://worker.example.net, http://192.168.0.10:8000'
+    : 'Tailscale 또는 루프백 주소를 사용합니다. 예: http://100.64.0.10:8000');
+  $('#worker_connection_url').attr('placeholder', general ? 'https://worker.example.net' : 'http://100.64.0.10:8000');
+}
+$(document).on('change', 'input[name="worker_network_mode"]', update_worker_network_help);
 
 $(document).on('click', '#test_remote_worker_btn, #save_remote_worker_btn', function () {
   var save = this.id === 'save_remote_worker_btn';
@@ -42,13 +85,17 @@ $(document).on('click', '#test_remote_worker_btn, #save_remote_worker_btn', func
   buttons.prop('disabled', true);
   $('#remote_worker_result').text(save ? '연결 설정을 저장합니다…' : '워커 접속과 인증을 확인합니다…');
   $.ajax({url: '/' + package_name + '/ajax/' + sub + '/' + (save ? 'save_remote_worker' : 'test_remote_worker'), type: 'POST', timeout: 30000,
-    data: {worker_url: $('#worker_connection_url').val().trim(), worker_token: $('#worker_connection_token').val().trim()},
+    data: {worker_url: $('#worker_connection_url').val().trim(), worker_token: $('#worker_connection_token').val().trim(),
+      worker_network_mode: $('input[name="worker_network_mode"]:checked').val() || 'tailscale'},
     success: function (data) {
-      $('#remote_worker_result').text(data.msg);
+      var message = !save && data.ret === 'success' && !data.updating
+        ? data.msg + ' · 연결 테스트에 성공했습니다. 변경 내용을 유지하려면 ‘연결 설정 저장’을 눌러주세요. 상단 ‘설정 저장’과는 별개입니다.'
+        : data.msg;
+      $('#remote_worker_result').text(message);
       if (save && data.ret === 'success') $('#worker_connection_token').val('').attr('placeholder', '저장된 토큰 사용 · 변경할 때만 입력');
       $.notify(data.msg, {type: data.ret === 'success' ? 'success' : 'warning'});
     },
-    error: function () { $('#remote_worker_result').text('워커 연결 상태를 확인하지 못했습니다. 서버 상태와 Tailscale 연결을 확인해주세요.'); },
+    error: function () { $('#remote_worker_result').text('워커 연결 상태를 확인하지 못했습니다. 서버 상태와 네트워크 연결을 확인해주세요.'); },
     complete: function () { buttons.prop('disabled', false); }
   });
 });
@@ -72,6 +119,7 @@ var TRANSPORTER_SKELETON = '# -*- coding: utf-8 -*-\n' +
 // 초기화 분기 (Queue 화면 vs List 화면 vs Setting 화면 자동 감지)
 // -----------------------------------------------------------------------------
 $(document).ready(function () {
+  update_worker_network_help();
   try {
     sync_feeder_header_navbar();
   } catch (err) {}
@@ -99,10 +147,17 @@ $(document).ready(function () {
     var saved_size = localStorage.getItem(sub + '_page_size') || '25';
     var saved_word = localStorage.getItem(sub + '_search_word') || '';
     var saved_page = localStorage.getItem(sub + '_current_page') || '1';
+    var saved_scroll = Math.max(0, parseInt(localStorage.getItem(sub + '_scroll_y'), 10) || 0);
+    download_list_restore_scroll = saved_scroll;
+    init_download_list_search();
+    window.addEventListener('pagehide', function () {
+      localStorage.setItem(sub + '_scroll_y', String(window.scrollY || 0));
+    });
 
     $('#status_filter').val(saved_status);
     $('#page_size').val(saved_size);
     $('#search_word').val(saved_word);
+    set_download_search_scope(localStorage.getItem(sub + '_download_search_scope'));
 
     load_retry_profiles();
     load_download_list_filters(saved_page);
@@ -132,6 +187,7 @@ $(document).ready(function () {
 // -----------------------------------------------------------------------------
 function load_download_list_filters(page) {
   var titles = {feed_select: '전체 피드', engine_select: '전체 엔진'};
+  var filterChanged = false;
   download_list_filter_ids.forEach(function (id) { $('#' + id).prop('disabled', true); });
   function finish(data) {
     download_list_filter_ids.forEach(function (id) {
@@ -147,10 +203,14 @@ function load_download_list_filters(page) {
       values.forEach(function (value) { append(value, value); });
       var saved = localStorage.getItem(sub + '_' + id) || 'all';
       var selected = values.indexOf(saved) >= 0 ? saved : 'all';
-      if (saved !== selected) page = '1';
+      if (saved !== selected) { page = '1'; filterChanged = true; }
       select.val(selected).prop('disabled', false);
       localStorage.setItem(sub + '_' + id, selected);
     });
+    if (filterChanged) {
+      download_list_restore_scroll = 0;
+      localStorage.setItem(sub + '_scroll_y', '0');
+    }
     window.globalRequestSearch(page, false);
   }
   $.ajax({url: '/' + package_name + '/ajax/' + sub + '/list_filter_options', type: 'POST', dataType: 'json',
@@ -271,6 +331,10 @@ function init_sse_listener() {
 function start_queue_page() {
   if (!$('#active_queue_tbody').length || (queue_page_started && !queue_page_closed)) return;
   queue_page_generation++;
+  if (window.history && 'scrollRestoration' in window.history) {
+    queue_scroll_restoration = window.history.scrollRestoration;
+    window.history.scrollRestoration = 'manual';
+  }
   queue_page_started = true;
   queue_page_closed = false;
   download_activity_loading = false;
@@ -287,11 +351,22 @@ function start_queue_page() {
 }
 
 window.addEventListener('pageshow', function (event) {
-  // BFCache는 ready를 다시 실행하지 않으므로 큐의 조회·구독만 재개한다.
+  // BFCache 복귀도 새 큐 진입: 첫 40건과 최상단에서 시작한다.
   if (event.persisted === true && queue_page_closed) start_queue_page();
+  if (queue_page_started && !queue_page_closed && window.scrollTo) {
+    window.scrollTo({top:0, behavior:'instant'});
+    var generation = queue_page_generation;
+    if (window.requestAnimationFrame) window.requestAnimationFrame(function () {
+      if (!queue_page_closed && generation === queue_page_generation) window.scrollTo({top:0, behavior:'instant'});
+    });
+  }
 });
 
 window.addEventListener('pagehide', function () {
+  if (queue_scroll_restoration !== null && window.history) {
+    window.history.scrollRestoration = queue_scroll_restoration;
+    queue_scroll_restoration = null;
+  }
   queue_page_closed = true;
   queue_page_started = false;
   queue_page_generation++;
@@ -455,19 +530,32 @@ function queue_progress_percent(value) {
 }
 
 function queue_eta_text(value) {
-  var text = String(value == null ? '' : value).trim();
-  // 워커/구조화된 Rclone 통계는 초 숫자이고, 일반 Rclone 로그는 시간 단위가 붙어 있다.
-  if (!/^\d+(?:\.\d+)?s?$/.test(text)) return text;
-  var seconds = Math.ceil(Number(text.replace(/s$/, '')));
-  if (!Number.isFinite(seconds)) return '';
+  var raw = String(value == null ? '' : value).trim();
+  if (!raw) return '';
+  // Rclone 통계가 ETA 뒤에 이어져도 첫 줄의 시간값만 표시한다.
+  var text = raw.split(/[\r\n]/, 1)[0].replace(
+    /(?:,\s*|\s+)(?:Checks|Transferred|Errors|Elapsed time)\s*:.*$/i, ''
+  ).trim();
+  var seconds;
+  if (/^\d+(?:\.\d+)?$/.test(text)) {
+    // 원격 워커와 JSON 통계는 초 숫자를 보낸다.
+    seconds = Math.ceil(Number(text));
+  } else {
+    // Rclone 문자열은 h/m/s 조합으로 전달된다.
+    var parts = text.match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?$/i);
+    if (!parts || !parts[0]) return '';
+    seconds = Math.ceil(Number(parts[1] || 0) * 3600 +
+      Number(parts[2] || 0) * 60 + Number(parts[3] || 0));
+  }
+  if (!Number.isSafeInteger(seconds)) return '';
   var hours = Math.floor(seconds / 3600);
   var minutes = Math.floor(seconds % 3600 / 60);
   var remaining = seconds % 60;
-  var parts = [];
-  if (hours) parts.push(hours + '시간');
-  if (minutes) parts.push(minutes + '분');
-  if (remaining || !parts.length) parts.push(remaining + '초');
-  return parts.join(' ');
+  var result = [];
+  if (hours) result.push(hours + 'h');
+  if (minutes) result.push(minutes + 'm');
+  if (remaining || !result.length) result.push(remaining + 's');
+  return result.join('');
 }
 
 function render_queue_speed_badge(speeds) {
@@ -522,6 +610,7 @@ function render_queue_rows(list, activeStage, queueTime) {
   }
   var order = stages.concat(stages.map(function (stage) { return waiting[stage]; }),
     ['downloaded', 'waiting_transporter', 'downloading', 'pending']);
+  order.splice(order.indexOf('pending_upload') + 1, 0, 'upload_held');
   var ranks = {};
   order.forEach(function (status, rank) { ranks[status] = rank; });
   function rank(item) {
@@ -596,6 +685,8 @@ function render_queue_rows(list, activeStage, queueTime) {
       statusBadge = '<span class="badge badge-secondary">' + engBadgeName + ' 미등록 (잔여)</span>';
     }
     else if (it.status === 'pending_upload') statusBadge = '<span class="badge badge-warning">' + pending_upload_label(it) + '</span>';
+    else if (it.status === 'upload_held') statusBadge = '<span class="badge badge-warning">업로드 보류</span>' +
+      (it.hold_reason === 'pikpak_vip' ? '<div class="small text-warning">PikPak VIP 만료 · 복구 대기</div>' : '');
     else if (it.status === 'uploading') statusBadge = '<span class="badge badge-primary">업로드 중</span>';
     else if (it.status === 'completed') statusBadge = it.duplicate_of ? '<span class="badge badge-warning">중복 · 전송 생략</span>' : '<span class="badge badge-success">최종 완료</span>';
     else if (it.status === 'failed') statusBadge = '<span class="badge badge-danger">실패</span>';
@@ -669,14 +760,16 @@ function render_queue_rows(list, activeStage, queueTime) {
       detailHtml += '    <div class="progress-bar progress-bar-striped progress-bar-animated bg-info" role="progressbar" style="width: ' + progVal + '%; font-size: 0.72rem; line-height: 12px;" aria-valuenow="' + progVal + '" aria-valuemin="0" aria-valuemax="100">' + (progVal > 8 ? progVal + '%' : '') + '</div>';
       detailHtml += '  </div>';
       detailHtml += '</div>';
-    } else if (it.status === 'uploading') {
+    } else if (it.status === 'uploading' || (it.transfer_active &&
+        (it.status === 'relay_transferring' || (it.status === 'downloaded' && it.destination_type === 'rclone_simple')))) {
       var progVal = queue_progress_percent(it.progress);
       var speedStr = it.speed_str || (it.download_speed ? format_bytes(it.download_speed) + '/s' : '전송 준비중');
       var dlBytesStr = it.downloaded_bytes ? format_bytes(it.downloaded_bytes) : '0 B';
       var totalBytesStr = it.file_size ? format_bytes(it.file_size) : '확인 중';
       var etaText = queue_eta_text(it.eta);
       var etaStr = etaText ? ' (ETA: ' + etaText + ')' : '';
-      var uploadTargetTitle = (it.destination_type === 'rclone_simple') ? 'Rclone 전송' : 'Google Drive 업로드';
+      var uploadTargetTitle = it.status === 'relay_transferring' ? '원격 릴레이 전송'
+        : it.destination_type === 'rclone_simple' ? 'Rclone 전송 중' : 'Google Drive 업로드';
 
       detailHtml += '<div class="mt-1 p-1 px-2 rounded" style="background: rgba(40, 167, 69, 0.08); border: 1px solid rgba(40, 167, 69, 0.25);">';
       detailHtml += '  <div class="d-flex justify-content-between align-items-center mb-1 small font-weight-bold">';
@@ -782,7 +875,7 @@ function render_queue_rows(list, activeStage, queueTime) {
 
 $('#queue_refresh_btn').click(function (e) {
   e.preventDefault();
-  request_active_queue();
+  if (!queue_page_closed && feeder_dashboard) feeder_dashboard.refresh(false, true);
 });
 
 function redownload_button(item, actionClass) {
@@ -836,6 +929,11 @@ $(document).on('click', '.queue_action_btn', function (e) {
 $(document).on('click', '.adopt_orphan_btn', function (e) {
   e.preventDefault();
   var btn = $(this);
+  request_engine_sync_preview('adopt_orphan_preview',
+    {engine_name: btn.data('engine'), task_id: String(btn.data('task-id')), hash: btn.data('hash')},
+    function () { open_orphan_profile(btn); });
+});
+function open_orphan_profile(btn) {
   var targetEngine = (btn.data('engine') || '').trim();
   var title = btn.data('title');
   var fsize = parseInt(btn.data('file-size')) || 0;
@@ -875,6 +973,131 @@ $(document).on('click', '.adopt_orphan_btn', function (e) {
   }
 
   $('#adopt_orphan_modal').modal('show');
+}
+
+var ad_reabsorb_candidates = [];
+var engine_sync = {generation:0, preview:null, reading:false, applying:false, ready:false};
+function update_engine_sync_controls() {
+  var busy = engine_sync.reading || engine_sync.applying, selected = $('.ad-reabsorb-choice:checked').length;
+  $('.ad-reabsorb-choice').prop('disabled', busy || !engine_sync.ready);
+  $('#ad_reabsorb_all_btn, #ad_reabsorb_none_btn, #ad_reabsorb_safe_btn').prop('disabled', busy || !engine_sync.ready || !ad_reabsorb_candidates.length);
+  $('#ad_reabsorb_apply_btn').prop('disabled', busy || !engine_sync.ready || !selected);
+  $('#engine_sync_select, #engine_sync_preview_btn').prop('disabled', engine_sync.applying);
+  $('#engine_sync_selected_count').text('선택 ' + selected + '건');
+  $('#ad_reabsorb_rows').attr('aria-busy', busy ? 'true' : 'false');
+}
+function engine_sync_loading(loading, message) {
+  if (message) $('#engine_sync_loading_text').text(message);
+  $('#engine_sync_loading').toggle(loading).attr('aria-hidden', loading ? 'false' : 'true');
+  update_engine_sync_controls();
+}
+function cancel_engine_sync_preview() {
+  engine_sync.generation++;
+  var pending = engine_sync.preview;
+  engine_sync.preview = null; engine_sync.reading = false; engine_sync.ready = false;
+  if (pending) pending.abort();
+  engine_sync_loading(false);
+}
+function reset_engine_sync_preview(message) {
+  cancel_engine_sync_preview();
+  ad_reabsorb_candidates = [];
+  $('#ad_reabsorb_rows').empty();
+  $('#ad_reabsorb_result').text(message || '대상 엔진을 선택하고 미리보기 조회를 눌러주세요.');
+  update_engine_sync_controls();
+}
+function request_engine_sync_preview(command, data, onNew) {
+  $('#ad_reabsorb_modal').modal('show');
+  if (engine_sync.applying) { engine_sync_loading(true, '적용 결과 확인 중…'); return; }
+  cancel_engine_sync_preview();
+  var generation = engine_sync.generation;
+  engine_sync.reading = true;
+  engine_sync_loading(true, '미리보기 조회 중…');
+  engine_sync.preview = $.ajax({url: '/' + package_name + '/ajax/' + sub + '/' + command,
+    type:'POST', dataType:'json', global:false, data:data,
+    success:function (result) {
+      if (generation !== engine_sync.generation) return;
+      if (result.ret === 'new' && onNew) { $('#ad_reabsorb_modal').modal('hide'); onNew(); }
+      else if (result.ret === 'success') show_ad_reabsorb_preview(result);
+      else $('#ad_reabsorb_result').text(result.msg || '미리보기 조회 실패 · 다시 조회해주세요.');
+    }, error:function () {
+      if (generation === engine_sync.generation) $('#ad_reabsorb_result').text('미리보기 조회 실패 · 다시 조회해주세요.');
+    }, complete:function () {
+      if (generation !== engine_sync.generation) return;
+      engine_sync.preview = null; engine_sync.reading = false;
+      engine_sync_loading(false);
+    }});
+}
+function show_ad_reabsorb_preview(data) {
+  var all = data.candidates || [];
+  ad_reabsorb_candidates = all.filter(function (candidate) { return ['merge', 'manual_merge', 'delete'].indexOf(candidate.action) >= 0; });
+  engine_sync.ready = true;
+  $('#engine_sync_select').val(data.engine_name || '');
+  var table = $('<table class="table table-sm"><thead><tr><th>선택</th><th>작업 정보</th></tr></thead></table>');
+  var body = $('<tbody>');
+  ad_reabsorb_candidates.forEach(function (candidate, index) {
+    var row = $('<tr>');
+    row.append($('<td>').append($('<input type="checkbox" class="ad-reabsorb-choice">').val(index)
+      .prop('checked', candidate.action === 'merge')));
+    var info = $('<td class="engine-sync-info">');
+    info.append($('<div>').text((candidate.item_id ? '#' + candidate.item_id + ' ' : '') + (candidate.title || candidate.filename || '') +
+      ' · ' + candidate.engine_name + '/' + candidate.task_id));
+    info.append($('<div class="small text-muted mt-1">').text(candidate.reason));
+    row.append(info); body.append(row);
+  });
+  table.append(body); $('#ad_reabsorb_rows').empty().append(table);
+  if (!ad_reabsorb_candidates.length) $('#ad_reabsorb_rows').empty().text('현재 실행 가능한 항목 없음');
+  $('#ad_reabsorb_result').text('선택 가능 ' + ad_reabsorb_candidates.length + '건 / 조회 ' + all.length + '건 · 제외 ' +
+    (all.length - ad_reabsorb_candidates.length) + '건 · 삭제 후보는 별도 확인이 필요합니다.');
+  update_engine_sync_controls(); $('#ad_reabsorb_modal').modal('show');
+}
+$(document).on('click', '#ad_reabsorb_preview_btn', function () {
+  reset_engine_sync_preview(engine_sync.applying ? '이전 적용 결과를 확인 중입니다. 종료 후 미리보기를 조회해주세요.' : '');
+  $('#ad_reabsorb_modal').modal('show');
+});
+$(document).on('click', '#engine_sync_preview_btn', function () {
+  request_engine_sync_preview('engine_sync_preview', {engine_name: $('#engine_sync_select').val() || ''});
+});
+$(document).on('change', '#engine_sync_select', function () {
+  reset_engine_sync_preview('선택한 엔진의 미리보기를 조회해주세요.');
+});
+$(document).on('hide.bs.modal', '#ad_reabsorb_modal', function () {
+  reset_engine_sync_preview();
+});
+$(document).on('change', '.ad-reabsorb-choice', update_engine_sync_controls);
+$(document).on('click', '#ad_reabsorb_all_btn', function () {
+  $('.ad-reabsorb-choice').prop('checked', true); update_engine_sync_controls();
+});
+$(document).on('click', '#ad_reabsorb_none_btn', function () {
+  $('.ad-reabsorb-choice').prop('checked', false); update_engine_sync_controls();
+});
+$(document).on('click', '#ad_reabsorb_safe_btn', function () {
+  $('.ad-reabsorb-choice').each(function () { $(this).prop('checked', ad_reabsorb_candidates[Number($(this).val())].action === 'merge'); });
+  update_engine_sync_controls();
+});
+$(document).on('click', '#ad_reabsorb_apply_btn', function () {
+  if (engine_sync.applying || engine_sync.reading || !engine_sync.ready) return;
+  var selected = [];
+  $('.ad-reabsorb-choice:checked').each(function () {
+    selected.push(Object.assign({}, ad_reabsorb_candidates[Number($(this).val())], {manual_confirm: true}));
+  });
+  if (!selected.length) { notify('실행할 항목을 선택하세요.', 'warning'); return; }
+  var deletes = selected.filter(function (c) { return c.action === 'delete'; });
+  var message = '기존 행 연결 ' + (selected.length - deletes.length) + '건, 원격 잔여 작업·원본 삭제 ' + deletes.length + '건을 실행할까요?';
+  if (deletes.length) message += '\n삭제 대상: ' + deletes.map(function (c) { return c.engine_name + '/' + c.task_id; }).join(', ');
+  var manual = selected.filter(function (c) { return c.action === 'manual_merge'; });
+  if (manual.length) message += '\n수동 연결 대상: ' + manual.map(function (c) { return c.engine_name + '/' + c.task_id; }).join(', ');
+  if (!window.confirm(message)) return;
+  engine_sync.applying = true; engine_sync.ready = false;
+  engine_sync_loading(true, '선택 항목 적용 중…');
+  $.ajax({url: '/' + package_name + '/ajax/' + sub + '/engine_sync_apply', type: 'POST', dataType: 'json', global:false,
+    data: {selected: JSON.stringify(selected), confirm_delete: deletes.length ? 'true' : 'false', engine_name: $('#engine_sync_select').val() || ''},
+    success: function (data) {
+      if (data.ret !== 'success') { $('#ad_reabsorb_result').text(data.msg || '적용 결과를 확인하지 못했습니다. 미리보기를 다시 조회하세요.'); return; }
+      $('#ad_reabsorb_result').text('성공 ' + data.success_count + ' / 실패 ' + data.failed_count + ' / 스킵 ' + data.skip_count +
+        ' / 충돌 ' + data.conflict_count + ' · ' + data.results.map(function (r) { return r.task_id + ': ' + r.reason; }).join(' · '));
+      request_active_queue();
+    }, error: function () { $('#ad_reabsorb_result').text('실행 결과 확인 실패. 미리보기를 다시 조회하세요.'); },
+    complete: function () { engine_sync.applying = false; engine_sync_loading(false); }});
 });
 
 // 고아 작업 큐 흡수 실행 확인
@@ -903,7 +1126,9 @@ $(document).on('click', '#btn_confirm_adopt_orphan', function (e) {
     },
     dataType: 'json',
     success: function (data) {
-      if (data.ret === 'success') {
+      if (data.ret === 'preview') {
+        $('#adopt_orphan_modal').modal('hide'); show_ad_reabsorb_preview(data);
+      } else if (data.ret === 'success') {
         notify(data.msg || '작업이 큐에 성공적으로 등록되었습니다.', 'success');
         $('#adopt_orphan_modal').modal('hide');
         request_active_queue();
@@ -1092,6 +1317,7 @@ function make_list(list) {
   if (!tbody.length) return;
   if (!list || list.length === 0) {
     tbody.html('<tr><td colspan="3" class="py-4 text-muted">검색 조건에 일치하는 다운로드 이력이 없습니다.</td></tr>');
+    restore_download_list_scroll();
     return;
   }
 
@@ -1116,7 +1342,9 @@ function make_list(list) {
     else statusBadge = '<span class="badge badge-secondary">' + it.status + '</span>';
 
     var engineInfo = it.current_engine_name ? '<br><small class="text-muted">엔진: ' + it.current_engine_name + '</small>' : '';
-    var errorMsg = it.error_message ? '<div class="mt-1 small ' + (it.status === 'pending_upload' || it.duplicate_of ? 'text-warning' : 'text-danger') + ' font-weight-bold"><i class="fa fa-exclamation-triangle mr-1"></i>' + it.error_message + '</div>' : '';
+    var waitingNotice = (it.status === 'pending' && /현재 엔진 재연결 대기|접수 여부 불명/.test(it.error_message || '')) ||
+      (it.status === 'downloading' && (it.error_message || '').indexOf('PikPak 다운로드 완료 · 파일 경로 확인 대기:') === 0);
+    var errorMsg = it.error_message ? '<div class="mt-1 small ' + (it.status === 'pending_upload' || it.duplicate_of || waitingNotice ? 'text-warning' : 'text-danger') + ' font-weight-bold"><i class="fa fa-exclamation-triangle mr-1"></i>' + it.error_message + '</div>' : '';
     var timeStr = it.completed_time || it.updated_time || it.created_time || '';
     var pathDisplay = it.local_path ? '<code>' + it.local_path + '</code>' : '<span class="text-muted">-</span>';
 
@@ -1165,7 +1393,24 @@ function make_list(list) {
     str += '</tr>';
   }
   tbody.html(str);
+  restore_download_list_scroll();
 }
+
+function set_download_search_scope(value) {
+  var placeholders = {all:'ID/제목/파일명/링크 검색', id:'작업 ID 정확히 입력',
+    title:'제목 검색', file_name:'파일명 검색', link:'Magnet/ED2K 링크 검색'};
+  if (!Object.prototype.hasOwnProperty.call(placeholders, value)) value = 'all';
+  $('#download_search_scope').val(value);
+  $('#search_word').attr('placeholder', placeholders[value]);
+  localStorage.setItem(sub + '_download_search_scope', value);
+}
+
+$(document).on('change', '#download_search_scope', function () {
+  if ($('#download_list_tbody').length === 0) return;
+  set_download_search_scope($(this).val());
+  localStorage.setItem(sub + '_current_page', '1');
+  window.globalRequestSearch('1', false);
+});
 
 $(document).on('change', '#status_filter, #feed_select, #engine_select', function () {
   if ($('#download_list_tbody').length === 0) return;
@@ -1187,6 +1432,7 @@ $('#reset_btn').click(function (e) {
 
   $('#status_filter').val('all');
   $('#search_word').val('');
+  set_download_search_scope('all');
   $('#page_size').val('25');
   download_list_filter_ids.forEach(function (id) {
     $('#' + id).val('all');
@@ -1426,6 +1672,19 @@ function load_all_download_config() {
   });
 }
 
+function downloader_enabled(value) {
+  if (value === undefined || value === null) return true;
+  return value === true || value === 1 || ['true', 'on', '1'].indexOf(String(value).trim().toLowerCase()) !== -1;
+}
+
+function set_downloader_enabled(value) {
+  var enabled = downloader_enabled(value);
+  var checkbox = $('#dl_enabled');
+  checkbox.prop('checked', enabled);
+  try { checkbox.bootstrapToggle(enabled ? 'on' : 'off'); } catch (err) { checkbox.trigger('change'); }
+  checkbox.data('initial-enabled', enabled);
+}
+
 function render_downloaders(data) {
   var tbody = $('#downloader_list_tbody');
   if (!tbody.length) return;
@@ -1436,7 +1695,7 @@ function render_downloaders(data) {
   var str = '';
   for (var i = 0; i < data.length; i++) {
     var item = data[i];
-    var isEnabled = (item.enabled === true || item.enabled === 'True' || item.enabled === 'on');
+    var isEnabled = downloader_enabled(item.enabled);
     var statusBadge = isEnabled ? '<span class="badge badge-success">활성</span>' : '<span class="badge badge-secondary">중지</span>';
     var rawTimeout = (item.stalled_timeout_hours !== undefined && item.stalled_timeout_hours !== null && item.stalled_timeout_hours !== '') ? parseInt(item.stalled_timeout_hours) : 24;
     var timeoutStr = (rawTimeout <= 0) ? '<span class="text-info font-weight-bold">타임아웃 무제한</span>' : rawTimeout + '시간 타임아웃';
@@ -1469,7 +1728,7 @@ function render_downloaders(data) {
     str += '  <td class="text-left small">' + connDetail + '</td>';
     str += '  <td>';
     str += '    <div class="btn-group btn-group-sm">';
-    str += '      <button type="button" class="btn btn-primary text-white edit_dl_btn" data-index="' + i + '">수정</button>';
+    str += '      <button type="button" class="btn btn-primary text-white edit_dl_btn" data-index="' + i + '" data-name="' + queue_escape_html(item.name) + '">수정</button>';
     str += '      <button type="button" class="btn btn-danger text-white delete_dl_btn" data-name="' + item.name + '">삭제</button>';
     str += '    </div>';
     str += '  </td>';
@@ -1523,11 +1782,21 @@ function render_dynamic_engine_fields(engine_id, current_values) {
 
     if (f.type === 'checkbox') {
       var isChk = (val === true || val === 'true' || val === 'On' || val === 'on') ? 'checked' : '';
+      if (engine_id === 'pikpak' && f.name === 'cached_only') {
+        isChk = ['false', '0', 'off', 'no'].indexOf(String(val).trim().toLowerCase()) < 0 ? 'checked' : '';
+      }
       html += '    <div><input type="checkbox" id="dl_field_' + f.name + '" data-toggle="toggle" data-on="On" data-off="Off" data-size="small" ' + isChk + '></div>';
     } else if (f.type === 'number') {
       html += '    <input type="number" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + queue_escape_html(val) + '" placeholder="' + ph + '"' + (f.min !== undefined ? ' min="' + f.min + '"' : '') + (f.max !== undefined ? ' max="' + f.max + '"' : '') + (f.step !== undefined ? ' step="' + f.step + '"' : '') + '>';
     } else if (f.type === 'password') {
       html += '    <input type="password" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + queue_escape_html(val) + '" placeholder="' + ph + '">';
+    } else if (engine_id === 'pikpak' && f.name === 'remote_name') {
+      html += '<div class="input-group input-group-sm flex-wrap">';
+      html += '<input type="text" id="dl_field_remote_name" class="form-control form-control-sm" style="flex:0 1 190px;min-width:120px;max-width:100%" value="' + queue_escape_html(val) + '" placeholder="' + queue_escape_html(ph) + '">';
+      html += '<div class="input-group-append flex-wrap">';
+      html += '<button type="button" class="btn btn-outline-info pikpak_rclone_auth_btn" data-action="validate">Rclone 설정 검증</button>';
+      html += '<button type="button" class="btn btn-secondary ml-2 pikpak_rclone_auth_btn" data-action="import">인증 정보 가져오기</button></div></div>';
+      html += '<small id="pikpak_rclone_auth_result" class="form-text text-muted" role="status"></small>';
     } else {
       html += '    <input type="text" id="dl_field_' + f.name + '" class="form-control form-control-sm" value="' + queue_escape_html(val) + '" placeholder="' + ph + '">';
     }
@@ -1547,12 +1816,49 @@ $('#dl_engine_type').change(function () {
   render_dynamic_engine_fields($(this).val(), null);
 });
 
+$(document).on('input change', '#dl_field_remote_name, #dl_field_username', function () {
+  if ($('#dl_engine_type').val() === 'pikpak') $('#pikpak_rclone_auth_result').text('');
+});
+
+$(document).on('click', '.pikpak_rclone_auth_btn', function (e) {
+  e.preventDefault();
+  if ($('#dl_engine_type').val() !== 'pikpak') return;
+  var remote = $('#dl_field_remote_name').val().trim();
+  var username = $('#dl_field_username').val().trim();
+  var action = $(this).data('action');
+  var buttons = $('.pikpak_rclone_auth_btn');
+  var result = $('#pikpak_rclone_auth_result');
+  if (buttons.prop('disabled')) return;
+  if (!remote) { result.text('Rclone 리모트명을 입력해주세요.'); return; }
+  function is_current() {
+    return $('#dl_engine_type').val() === 'pikpak' && $('#dl_field_remote_name').val().trim() === remote && $('#dl_field_username').val().trim() === username;
+  }
+  buttons.prop('disabled', true);
+  result.text(action === 'validate' ? 'Rclone 설정·연결 확인 중...' : 'Rclone 인증 정보 확인 중...');
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/pikpak_rclone_auth', type: 'POST', dataType: 'json',
+    data: {remote_name: remote, username: username, action: action},
+    success: function (data) {
+      if (!is_current()) return;
+      if (data.ret === 'success' && action === 'import' && data.user) {
+        if (username && username.toLowerCase() !== String(data.user).toLowerCase()) {
+          result.text('PikPak 계정 불일치: 입력한 계정을 확인해주세요.'); return;
+        }
+        if (!username) $('#dl_field_username').val(data.user);
+      }
+      result.text(data.msg || 'Rclone 인증 정보를 확인하지 못했습니다.');
+    },
+    error: function () { if (is_current()) result.text('Rclone 인증 정보를 불러오지 못했습니다.'); },
+    complete: function () { buttons.prop('disabled', false); }
+  });
+});
+
 $(document).on('click', '#downloader_add_btn', function (e) {
   e.preventDefault();
   $('#downloader_modal_title').text('다운로더 엔진 추가');
   $('#downloader_mode').val('add');
   $('#dl_name').val('').prop('readonly', false);
-  $('#dl_enabled').prop('checked', true);
+  set_downloader_enabled(true);
 
   var default_engine = available_engine_schemas.length > 0 ? available_engine_schemas[0].engine_id : '';
   update_engine_type_dropdown(default_engine);
@@ -1567,12 +1873,32 @@ $(document).on('click', '#downloader_add_btn', function (e) {
 $(document).on('click', '.edit_dl_btn', function (e) {
   e.preventDefault();
   var idx = $(this).data('index');
-  var item = current_downloaders[idx];
+  var name = $(this).data('name') || (current_downloaders[idx] || {}).name;
+  if (!name) { notify('엔진 목록을 다시 조회한 뒤 수정해주세요.', 'warning'); return; }
+  $.ajax({
+    url: '/' + package_name + '/ajax/' + sub + '/load_downloaders',
+    type: 'POST', dataType: 'json',
+    success: function (data) {
+      if (!data || !Array.isArray(data.downloaders)) { notify('최신 엔진 설정을 확인하지 못했습니다.', 'warning'); return; }
+      current_downloaders = data.downloaders;
+      if (data.schemas) available_engine_schemas = data.schemas;
+      if (data.transporter_schemas) available_transporter_schemas = data.transporter_schemas;
+      if (data.upload_roots) configured_upload_roots = data.upload_roots;
+      if (data.local_staging_root) configured_local_staging_root = data.local_staging_root;
+      render_downloaders(current_downloaders);
+      var item = current_downloaders.find(function (engine) { return String(engine.name).trim().toLowerCase() === String(name).trim().toLowerCase(); });
+      if (!item) { notify('해당 엔진 설정이 없어 수정할 수 없습니다.', 'warning'); return; }
+      open_downloader_editor(item);
+    },
+    error: function () { notify('최신 엔진 설정을 불러오지 못했습니다.', 'warning'); }
+  });
+});
 
+function open_downloader_editor(item) {
   $('#downloader_modal_title').text('다운로더 엔진 수정: ' + item.name);
   $('#downloader_mode').val('edit');
   $('#dl_name').val(item.name).prop('readonly', true);
-  $('#dl_enabled').prop('checked', item.enabled);
+  set_downloader_enabled(item.enabled);
 
   update_engine_type_dropdown(item.engine_type);
   render_dynamic_engine_fields(item.engine_type, item);
@@ -1581,7 +1907,7 @@ $(document).on('click', '.edit_dl_btn', function (e) {
   set_engine_roots(item);
 
   $('#downloader_modal').modal('show');
-});
+}
 
 $(document).on('click', '#downloader_test_btn', function (e) {
   e.preventDefault();
@@ -1634,7 +1960,8 @@ $(document).on('click', '#downloader_save_btn', function (e) {
   var cfg = {
     name: name,
     engine_type: e_type,
-    enabled: $('#dl_enabled').is(':checked')
+    enabled: $('#dl_enabled').is(':checked'),
+    reenable_auto_disabled: $('#dl_enabled').is(':checked') && $('#dl_enabled').data('initial-enabled') === false
   };
 
   var schemaObj = available_engine_schemas.find(function (s) { return s.engine_id === e_type; });

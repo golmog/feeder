@@ -7,7 +7,7 @@ import sqlite3
 import uuid
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 
 class Database:
@@ -75,6 +75,10 @@ class Database:
                     connection.execute('ALTER TABLE jobs ADD COLUMN chargeable_bytes INTEGER')
                 if 'error_type' not in columns:
                     connection.execute('ALTER TABLE jobs ADD COLUMN error_type TEXT')
+                if 'source_kind' not in columns:
+                    connection.execute("ALTER TABLE jobs ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'remote'")
+                if 'source_files' not in columns:
+                    connection.execute("ALTER TABLE jobs ADD COLUMN source_files TEXT NOT NULL DEFAULT '[]'")
                 connection.execute('''CREATE TABLE IF NOT EXISTS job_logs (
                     id INTEGER PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(job_id),
                     timestamp TEXT NOT NULL, message TEXT NOT NULL

@@ -128,6 +128,12 @@ class ModuleCrawl(PluginModuleBase):
             return jsonify({'ret': 'error', 'msg': str(e)})
 
     def process_command(self, command, arg1, arg2, arg3, req):
+        if command in ('yaml_editor_read', 'yaml_editor_save'):
+            from .util_yaml_editor import FeederYamlEditor
+            result = (FeederYamlEditor.read() if command == 'yaml_editor_read' else
+                      FeederYamlEditor.save(req.form.get('content', ''), req.form.get('revision', '')))
+            return jsonify(result)
+
         if command == 'manual_crawl':
             if TaskCrawl.is_running():
                 return jsonify({'ret': 'running', 'msg': '현재 다른 수집 작업이 이미 실행 중입니다.'})

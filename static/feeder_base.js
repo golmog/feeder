@@ -215,6 +215,10 @@ window.globalRequestSearch = function (page, preserveScroll) {
     localStorage.setItem(storage_pfx + 'feed_select', feed_select);
     postData.feed_select = feed_select;
   } else if (sub === 'download') {
+    var search_scope = $('#download_search_scope').length ? $('#download_search_scope').val() : localStorage.getItem(storage_pfx + 'download_search_scope');
+    if (['all', 'id', 'title', 'file_name', 'link'].indexOf(search_scope) < 0) search_scope = 'all';
+    localStorage.setItem(storage_pfx + 'download_search_scope', search_scope);
+    postData.download_search_scope = search_scope;
     ['feed_select', 'engine_select'].forEach(function (name) {
       var value = $('#' + name).length ? ($('#' + name).val() || 'all') : (localStorage.getItem(storage_pfx + name) || 'all');
       localStorage.setItem(storage_pfx + name, value);

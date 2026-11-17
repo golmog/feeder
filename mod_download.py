@@ -2,7 +2,9 @@
 import os
 import re
 import json
+import math
 import time
+import uuid
 import traceback
 from datetime import datetime, timedelta
 from flask import render_template, request, jsonify, Response, stream_with_context
@@ -11,12 +13,13 @@ import sqlite3
 import shutil
 import subprocess
 import threading
+import hashlib
 
 from .setup import *
 from .model_download import ModelDownload, ModelDownloadStat, ModelDownloadBlock
 from .util_block import DownloadBlock
 from .util_base import FeederUtil
-from .util_download import DownloadUtil
+from .util_download import DownloadUtil, PikPakEngine
 from .task_download import TaskDownload, TaskDownloadBase
 from .util_upload import UploadUtil
 from .util_remote_worker import RemoteWorker
@@ -28,6 +31,238 @@ name = 'download'
 
 
 class ModuleDownload(PluginModuleBase):
+
+    @staticmethod
+    def _ad_hash(value):
+        value = str(value or '').strip()
+        normalized = (FeederUtil.extract_info_hash('magnet:?xt=urn:btih:' + value) or '').lower()
+        return normalized if re.fullmatch(r'[0-9a-f]{40}', normalized) else ''
+
+    @staticmethod
+    def _ad_revision(item):
+        return hashlib.sha256(json.dumps({column.name: getattr(item, column.name)
+            for column in ModelDownload.__table__.columns}, sort_keys=True, default=str).encode()).hexdigest()
+
+    @staticmethod
+    def _ad_candidates(engine_name=None):
+        """선택 엔진 목록을 infohash로 비교한다. 작업 ID는 원격 명령의 대상으로만 사용한다."""
+        remote, engines = [], {}
+        for config in FeederUtil.get_downloaders():
+            if (not config.get('enabled', True) or
+                    config.get('engine_type') not in ('alldebrid', 'qbittorrent', 'cd2', 'pikpak') or
+                    (engine_name is None and config.get('engine_type') != 'alldebrid') or
+                    (engine_name and config.get('name') != engine_name)):
+                continue
+            engine = DownloadUtil.create_engine(config)
+            if engine is None:
+                raise ValueError(f'{config["name"]} 엔진을 준비하지 못했습니다.')
+            tasks, error = engine.get_status()
+            if (error or not isinstance(tasks, list) or
+                    (not getattr(engine, 'status_list_complete', True) and config['engine_type'] != 'cd2')):
+                raise ValueError(f'{config["name"]} 원격 목록 오류/불완전: 실행을 보류합니다.')
+            engines[config['name']] = engine
+            for task in tasks:
+                if not isinstance(task, dict) or not task.get('task_id'):
+                    raise ValueError(f'{config["name"]} 원격 목록 형식 오류: 실행을 보류합니다.')
+                if engine_name is not None or task.get('status') == 'completed':
+                    remote.append(dict(task, engine_name=config['name'], engine_type=config['engine_type']))
+        if not engines:
+            raise ValueError('선택한 활성 엔진이 없습니다.')
+        rows = db.session.query(ModelDownload).populate_existing().all()
+        by_hash = {}
+        for item in rows:
+            value = ModuleDownload._ad_hash(item.infohash)
+            if value:
+                by_hash.setdefault(value, []).append(item)
+        remote_hashes = {}
+        for task in remote:
+            value = ModuleDownload._ad_hash(task.get('hash'))
+            key = (task['engine_name'], value)
+            remote_hashes[key] = remote_hashes.get(key, 0) + 1
+        candidates = []
+        for task in remote:
+            value = ModuleDownload._ad_hash(task.get('hash'))
+            candidate = {k: task.get(k) for k in ('engine_name', 'engine_type', 'task_id', 'source_path', 'filename')}
+            candidate.update(hash=value, action='skip', reason='미등록: 대응 DB 기록 없음', item_id=None)
+            matches = by_hash.get(value, []) if value else []
+            candidate['registered'] = bool(matches)
+            if not value:
+                candidate['reason'] = '원격 infohash 미확인 · ID만으로 병합/삭제하지 않으며 기존 후처리는 유지합니다.'
+            elif len(matches) > 1 or remote_hashes[(task['engine_name'], value)] > 1:
+                candidate['reason'] = '동일 해시의 복수 DB 또는 같은 엔진 후보'
+            elif len(matches) == 1:
+                item = matches[0]
+                state = item.upload_state or {}
+                source = state.get('download_source') or {}
+                name, tid = task['engine_name'], str(task['task_id'])
+                path = str(task.get('source_path') or '').rstrip('/')
+                candidate.update(item_id=item.id, title=item.title, status=item.status,
+                    revision=ModuleDownload._ad_revision(item))
+                worker = state.get('worker') or {}
+                busy = bool(state.get('phase') or (worker and not worker.get('settled') and
+                    worker.get('submission') not in ('new', 'rejected')))
+                shared = False
+                for other in rows:
+                    other_state = other.upload_state or {}
+                    if other.id == item.id or (other.status in ('completed', 'cancelled', 'blocked', 'failed') and not other_state.get('worker')):
+                        continue
+                    other_path = str(other.local_path or other_state.get('local_path') or '').rstrip('/')
+                    # Pending legacy AD paths may be stale; use the same full, hash-based snapshot.
+                    if (task['engine_type'] == 'alldebrid' and other.current_engine_name == name and
+                            not other_state.get('worker') and not other_state.get('phase')):
+                        other_sources = [r for r in remote if r['engine_name'] == name and
+                                         ModuleDownload._ad_hash(r.get('hash')) == ModuleDownload._ad_hash(other.infohash)]
+                        if len(other_sources) == 1 and other_sources[0].get('source_path'):
+                            other_path = str(other_sources[0]['source_path']).rstrip('/')
+                    if path and other_path and (path == other_path or path.startswith(other_path + '/') or other_path.startswith(path + '/')):
+                        shared = True
+                        break
+                source_names = [str(task.get('filename') or '')]
+                if task['engine_type'] == 'alldebrid':
+                    source_names.append(f"{task.get('filename')} ({tid})")
+                source_ok = bool(path and task.get('filename') and ':' in path and
+                                 path.rsplit('/', 1)[-1] in source_names)
+                if shared or busy:
+                    candidate['reason'] = '다른 활성 작업과 소스 공유/워커·전송 진행 충돌'
+                elif item.status == 'completed':
+                    if item.destination_type == 'local':
+                        candidate['reason'] = '로컬 최종 완료: 보존'
+                    elif (item.destination_type and item.completed_time and item.gdrive_complete_path and
+                          (item.video_manifest or {}).get('stored') is True):
+                        candidate.update(action='delete', reason='비로컬 최종 보관 완료: 원격 잔여·원본 삭제 후보')
+                    else:
+                        candidate['reason'] = '최종 보관 완료 증거 미확정: 보존'
+                elif (item.current_engine_name == name and str(item.engine_task_id) == tid and
+                      item.status != 'pending'):
+                    candidate['reason'] = '이미 같은 엔진 작업에 연결됨'
+                elif task.get('status') != 'completed':
+                    candidate['reason'] = '원격 다운로드 진행/대기: 보존'
+                elif task['engine_type'] == 'alldebrid' and not source_ok:
+                    candidate['reason'] = '원본 경로 미확정'
+                elif item.status not in ('pending', 'upload_held', 'downloaded', 'waiting_transporter',
+                                          'pending_local_staging', 'pending_upload', 'pending_relay'):
+                    candidate['reason'] = '다운로드/워커 진행 또는 부적합한 상태'
+                elif name not in (item.priority_chain or []):
+                    candidate['reason'] = '기존 프로필 체인에 해당 엔진 없음'
+                elif (state.get('registration_wait') or {}).get('uncertain'):
+                    candidate['reason'] = '원격 접수 여부 미확정'
+                else:
+                    foreign = ((source.get('task_id') and (source.get('engine_name') != name or str(source.get('task_id')) != tid)) or
+                               (item.engine_task_id and (item.current_engine_name != name or str(item.engine_task_id) != tid)))
+                    if foreign:
+                        candidate.update(action='manual_merge' if item.status == 'pending' else 'skip',
+                            reason='다른 원격 체크포인트 충돌: ' + str(source.get('engine_name') or item.current_engine_name) +
+                                   ' / ' + str(source.get('task_id') or item.engine_task_id) + ' · 항목별 선택 확인 필요')
+                    else:
+                        candidate.update(action='merge', reason='유일 해시: 기존 행을 업로드 경로로 연결')
+            candidates.append(candidate)
+        if engine_name is not None:
+            observed = {(task['engine_name'], str(task['task_id'])) for task in remote}
+            for item in rows:
+                if (item.current_engine_name in engines and item.engine_task_id and
+                        getattr(engines[item.current_engine_name], 'status_list_complete', True) and
+                        item.status not in ('completed', 'cancelled', 'blocked', 'failed') and
+                        (item.current_engine_name, str(item.engine_task_id)) not in observed):
+                    candidates.append(dict(engine_name=item.current_engine_name, task_id=str(item.engine_task_id),
+                        hash=ModuleDownload._ad_hash(item.infohash), source_path=item.local_path,
+                        filename=item.file_name, item_id=item.id, title=item.title, status=item.status,
+                        revision=ModuleDownload._ad_revision(item), action='skip',
+                        reason='DB 활성 작업만 존재 · 원격 전체 목록에서 미발견: 기존 작업 보존'))
+            for name, engine in engines.items():
+                if not getattr(engine, 'status_list_complete', True):
+                    candidates.append(dict(engine_name=name, task_id='', item_id=None, action='skip',
+                        reason='부분 목록 · 수신한 작업만 확인하며, 미수신 DB 작업의 부재는 판단하지 않습니다.'))
+        return candidates, engines
+
+    @staticmethod
+    def _ad_reabsorb(selected=None, confirm_delete=False, engine_name=None):
+        owner = 'ad-reabsorb:' + uuid.uuid4().hex
+        locked = False
+        try:
+            if selected is not None:
+                control = FeederUtil.get_download_control_state()
+                if not control['pause_requested'] or control['running']:
+                    raise ValueError('전체 작업이 완전히 중단된 뒤 연결할 수 있습니다. 중단 잠금은 유지됩니다.')
+                db.session.rollback()
+                locked = FeederUtil.acquire_runtime_lock('download_pipeline', owner, stale_after=None)
+                if not locked:
+                    raise ValueError('다른 파이프라인 작업이 실행 중입니다.')
+            candidates, engines = ModuleDownload._ad_candidates(engine_name)
+            if selected is None:
+                return {'ret': 'success', 'candidates': candidates, 'engine_name': engine_name or ''}
+            results = []
+            for chosen in selected:
+                candidate = next((c for c in candidates if all(c.get(k) == chosen.get(k) for k in
+                    ('engine_name', 'task_id', 'hash', 'source_path', 'item_id', 'revision', 'action'))), None)
+                result = dict(engine_name=chosen.get('engine_name'), task_id=chosen.get('task_id'), result='skip')
+                current = db.session.get(ModelDownload, candidate['item_id'], populate_existing=True) if candidate and candidate['item_id'] else None
+                if candidate is None or candidate['action'] not in ('merge', 'manual_merge', 'delete'):
+                    result['reason'] = '미리보기 이후 변경/이미 처리/안전 후보 아님'
+                elif current is None or ModuleDownload._ad_revision(current) != candidate['revision']:
+                    result['reason'] = '미리보기 이후 DB 변경/이미 처리'
+                elif candidate['action'] == 'delete':
+                    if not confirm_delete:
+                        result['reason'] = '원격 잔여·원본 삭제 명시적 확인 없음'
+                    else:
+                        # 삭제 직전 같은 ID/hash/완료를 다시 확인한다. 다른 ID로 대체하지 않는다.
+                        refreshed, engines = ModuleDownload._ad_candidates(engine_name)
+                        if not any(c == candidate for c in refreshed):
+                            result['reason'] = '삭제 직전 DB/소스 귀속 변경'
+                            results.append(result)
+                            continue
+                        engine = engines[candidate['engine_name']]
+                        tasks, error = engine.get_status()
+                        exact = [t for t in tasks if str(t.get('task_id')) == str(candidate['task_id']) and
+                                 ModuleDownload._ad_hash(t.get('hash')) == candidate['hash']]
+                        if (error or len(exact) != 1 or (not getattr(engine, 'status_list_complete', True) and
+                                                       candidate['engine_type'] != 'cd2')):
+                            result['reason'] = '삭제 직전 원격 상태 불일치/불완전'
+                        else:
+                            options = {'delete_files': True} if candidate['engine_type'] in ('qbittorrent', 'cd2', 'pikpak') else {}
+                            ok = engine.delete_task(str(candidate['task_id']), **options)
+                            result.update(result='success' if ok else 'fail', reason='원격 잔여·원본 삭제' if ok else '원격 삭제 실패')
+                elif candidate['action'] == 'manual_merge' and not chosen.get('manual_confirm'):
+                    result['reason'] = '다른 원격 체크포인트의 항목별 확인 없음'
+                else:
+                    item = db.session.get(ModelDownload, candidate['item_id'])
+                    state = dict(item.upload_state or {})
+                    previous = state.get('download_source') or {}
+                    if previous and (previous.get('engine_name') != candidate['engine_name'] or
+                                     str(previous.get('task_id')) != str(candidate['task_id'])):
+                        state['source_history'] = list(state.get('source_history') or []) + [dict(previous,
+                            local_path=item.local_path, current_engine_name=item.current_engine_name, engine_task_id=item.engine_task_id)]
+                    elif item.engine_task_id and (item.current_engine_name != candidate['engine_name'] or
+                                                 str(item.engine_task_id) != str(candidate['task_id'])):
+                        state['source_history'] = list(state.get('source_history') or []) + [{
+                            'engine_name': item.current_engine_name, 'task_id': item.engine_task_id, 'local_path': item.local_path}]
+                    state['download_source'] = {'engine_name': candidate['engine_name'], 'task_id': str(candidate['task_id']),
+                                                'source_path': candidate['source_path'], 'upload_path': item.gdrive_upload_path}
+                    state.pop('registration_wait', None)
+                    state.pop('hold', None)
+                    item.upload_state = state
+                    item.current_engine_name = candidate['engine_name']
+                    item.current_engine_index = item.priority_chain.index(candidate['engine_name'])
+                    item.engine_task_id = str(candidate['task_id'])
+                    item.local_path = candidate['source_path']
+                    # 경로 해석·스테이징·릴레이 판정은 기존 완료 폴링에 맡긴다.
+                    item.status = 'downloading'
+                    item.error_message = None
+                    item.last_status_time = datetime.now()
+                    db.session.commit()
+                    result.update(result='success', reason='기존 행 연결 → 기존 다운로드 완료 후처리 대기')
+                results.append(result)
+                logger.info('[엔진·DB 동기화] %s/%s %s · %s', result['engine_name'], result['task_id'], result['result'], result.get('reason', ''))
+            return {'ret': 'success', 'results': results, 'success_count': sum(r['result'] == 'success' for r in results),
+                    'failed_count': sum(r['result'] == 'fail' for r in results),
+                    'skip_count': sum(r['result'] == 'skip' for r in results),
+                    'conflict_count': sum(c['action'] == 'manual_merge' for c in candidates)}
+        except Exception as exc:
+            db.session.rollback()
+            logger.exception('[엔진·DB 동기화] 처리 실패')
+            return {'ret': 'fail', 'msg': str(exc) if isinstance(exc, ValueError) else '엔진·DB 동기화 실패: 플랫폼 로그 확인'}
+        finally:
+            if locked:
+                FeederUtil.release_runtime_lock('download_pipeline', owner)
 
     def __init__(self, P):
         super(ModuleDownload, self).__init__(P, 'setting', name=name, scheduler_desc="Feeder - 오프라인/로컬 다운로드 및 클라우드 업로드")
@@ -50,6 +285,7 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_complete_root": "uploads",
             f"{self.name}_exclude_pattern": "",
             f"{self.name}_enable_sse": "True",
+            f"{self.name}_skip_disabled_engines": "True",
             f"{self.name}_rclone_conf_path": "",
             f"{self.name}_rclone_remote_name": "",
             f"{self.name}_rclone_upload_remote_name": "",
@@ -66,6 +302,7 @@ class ModuleDownload(PluginModuleBase):
             f"{self.name}_shared_drive_quota_reset_time": "16:00",
             f"{self.name}_rclone_extra_options": "--drive-chunk-size 256M --timeout 60m",
             f"{self.name}_worker_url": "",
+            f"{self.name}_worker_network_mode": "tailscale",
             f"{self.name}_worker_token": "",
             f"{self.name}_worker_token_path": "",
             f"{self.name}_worker_session_id": "",
@@ -148,6 +385,8 @@ class ModuleDownload(PluginModuleBase):
             arg = P.ModelSetting.to_dict()
             arg['download_worker_token_saved'] = bool(arg.pop('download_worker_token', ''))
             arg.pop('download_worker_token_path', None)
+            arg.setdefault('download_skip_disabled_engines', 'True')
+            arg['auto_disabled_engines'] = FeederUtil.auto_disabled_engines()
             arg['package_name'] = P.package_name
             arg['sub'] = self.name
             arg['current_page'] = page_name
@@ -161,6 +400,8 @@ class ModuleDownload(PluginModuleBase):
                 return render_template(f'{P.package_name}_{self.name}_setting.html', arg=arg)
 
             elif page_name == 'queue':
+                arg['sync_engines'] = [c['name'] for c in FeederUtil.get_downloaders() if c.get('enabled', True) and
+                                       c.get('engine_type') in ('alldebrid', 'qbittorrent', 'cd2', 'pikpak')]
                 return render_template(f'{P.package_name}_{self.name}_queue.html', arg=arg)
 
             return render_template(f'{P.package_name}_{self.name}_list.html', arg=arg)
@@ -203,7 +444,7 @@ class ModuleDownload(PluginModuleBase):
                         result = Dashboard.queue(cursor=req.form.get('cursor') if command == 'queue_page' else None,
                             known=json.loads(req.form.get('known') or '{}'))
                     elif command == 'queue_engines':
-                        result = Dashboard.engine_view()
+                        result = Dashboard.engine_view(visible=json.loads(req.form.get('visible') or '[]'))
                     elif command == 'queue_progress':
                         ids = [int(i) for i in json.loads(req.form.get('ids') or '[]') if str(i).isdigit()]
                         result = Dashboard.progress(ids)
@@ -295,6 +536,10 @@ class ModuleDownload(PluginModuleBase):
                 ret = FeederUtil.save_downloader(item_data)
                 return jsonify({'ret': ret, 'downloaders': FeederUtil.get_downloaders()})
 
+            elif command == 'pikpak_rclone_auth':
+                return jsonify(PikPakEngine.rclone_auth_action(req.form.get('remote_name', ''),
+                    req.form.get('username', ''), req.form.get('action', '')))
+
             elif command == 'test_downloader':
                 cfg_json = req.form.get('downloader_json', '{}')
                 item_data = json.loads(cfg_json)
@@ -308,12 +553,15 @@ class ModuleDownload(PluginModuleBase):
                 try:
                     endpoint = req.form.get('worker_url')
                     token = req.form.get('worker_token', '').strip() or None
-                    client = RemoteWorker.client(endpoint=endpoint.strip() if endpoint is not None else None, token=token)
+                    network_mode = req.form.get('worker_network_mode', P.ModelSetting.get('download_worker_network_mode') or 'tailscale')
+                    client = RemoteWorker.client(endpoint=endpoint.strip() if endpoint is not None else None, token=token,
+                                                 network_mode=network_mode)
                     if command == 'save_remote_worker':
                         RemoteWorker._write_settings({
                             'download_worker_token': token or P.ModelSetting.get('download_worker_token'),
                             'download_worker_url': (endpoint if endpoint is not None else P.ModelSetting.get('download_worker_url')).strip(),
                             'download_worker_token_path': '',
+                            'download_worker_network_mode': network_mode,
                         })
                         return jsonify({'ret': 'success', 'msg': '워커 연결 설정을 저장했습니다.'})
                     health = client.ensure_version(force_update=True)
@@ -468,6 +716,27 @@ class ModuleDownload(PluginModuleBase):
                 logger.info(f"[{self.name}] 구글 드라이브 계정 풀 일괄 등록: {added_count}개 추가됨")
                 return jsonify({'ret': 'success', 'added_count': added_count, 'accounts': accounts})
 
+            elif command == 'adopt_orphan_preview':
+                config = FeederUtil.get_downloader_by_name(req.form.get('engine_name', '')) or {}
+                if config.get('engine_type') not in ('alldebrid', 'qbittorrent', 'cd2', 'pikpak'):
+                    return jsonify({'ret': 'new'})
+                preview = ModuleDownload._ad_reabsorb(engine_name=config['name'])
+                if preview['ret'] == 'success':
+                    preview['candidates'] = [c for c in preview['candidates'] if c['engine_name'] == config['name'] and
+                        str(c['task_id']) == req.form.get('task_id')]
+                    if not any(c.get('registered') or c.get('item_id') for c in preview['candidates']):
+                        return jsonify({'ret': 'new'})
+                return jsonify(preview)
+
+            elif command in ('ad_reabsorb_preview', 'ad_reabsorb_apply', 'engine_sync_preview', 'engine_sync_apply'):
+                selected = None
+                if command.endswith('_apply'):
+                    selected = json.loads(req.form.get('selected', '[]'))
+                    if not isinstance(selected, list):
+                        return jsonify({'ret': 'fail', 'msg': '선택 목록 형식 오류'})
+                engine_name = req.form.get('engine_name', '') if command.startswith('engine_sync_') else None
+                return jsonify(ModuleDownload._ad_reabsorb(selected, req.form.get('confirm_delete') == 'true', engine_name))
+
             elif command == 'adopt_orphan':
                 task_id = req.form.get('task_id', '').strip()
                 thash = req.form.get('hash', '').strip().lower()
@@ -481,6 +750,25 @@ class ModuleDownload(PluginModuleBase):
                     fsize = int(req.form.get('file_size', 0))
                 except Exception:
                     fsize = 0
+
+                config = FeederUtil.get_downloader_by_name(engine_name) or {}
+                if config.get('engine_type') in ('alldebrid', 'qbittorrent', 'cd2', 'pikpak'):
+                    preview = ModuleDownload._ad_reabsorb(engine_name=engine_name)
+                    if preview['ret'] != 'success':
+                        return jsonify(preview)
+                    preview['candidates'] = [c for c in preview['candidates'] if
+                        c['engine_name'] == engine_name and str(c['task_id']) == task_id]
+                    if any(c.get('registered') or c.get('item_id') for c in preview['candidates']):
+                        preview['ret'] = 'preview'
+                        return jsonify(preview)
+
+                if config.get('engine_type') == 'alldebrid' and raw_status == 'completed':
+                    candidates, _ = ModuleDownload._ad_candidates()
+                    remote = next((c for c in candidates if c['engine_name'] == engine_name and
+                                   str(c['task_id']) == task_id and c['hash'] == ModuleDownload._ad_hash(thash)), None)
+                    if not remote or not remote.get('hash') or not remote.get('source_path') or not remote.get('filename'):
+                        return jsonify({'ret': 'fail', 'msg': 'AD 완료 원본 경로/해시를 확인하지 못했습니다.'})
+                    source_path = remote['source_path']
 
                 # 중복 등록 검증
                 existing = None
@@ -530,6 +818,9 @@ class ModuleDownload(PluginModuleBase):
                 item.file_size = fsize
                 item.priority_chain = chain
                 item.upload_state = {'routing': {'profile_name': profile_name}}
+                if config.get('engine_type') == 'alldebrid':
+                    item.upload_state['download_source'] = {
+                        'engine_name': engine_name, 'task_id': str(task_id), 'upload_path': dest_cfg.get('upload_path', '')}
                 item.current_engine_index = 0
                 item.current_engine_name = engine_name
                 item.engine_task_id = str(task_id)
@@ -1067,6 +1358,8 @@ class ModuleDownload(PluginModuleBase):
                 return self._handle_relay_claim(req)
             elif sub == 'relay_report':
                 return self._handle_relay_report(req)
+            elif sub == 'relay_progress':
+                return self._handle_relay_progress(req)
             elif sub == 'progress_update':
                 return self._handle_progress_update(req)
             return jsonify({'ret': 'fail', 'msg': f'알 수 없는 API 명령: {sub}'}), 404
@@ -1127,7 +1420,9 @@ class ModuleDownload(PluginModuleBase):
             return jsonify({'ret': 'fail', 'msg': error}), 400
         FeederUtil.pin_transfer_destination(item, destination=destination)
         item.status = 'relay_transferring'
+        item.upload_state = dict(item.upload_state or {}, relay_claim_id=uuid.uuid4().hex)
         db.session.commit()
+        FeederUtil.clear_rclone_progress(item.id)
 
         rclone_conf_path = P.ModelSetting.get('download_rclone_conf_path') or FeederUtil.load_yaml().get('rclone', {}).get('conf_path', '')
         rclone_conf_text = ""
@@ -1225,6 +1520,7 @@ class ModuleDownload(PluginModuleBase):
 
         task_data = {
             'id': item.id,
+            'claim_id': item.upload_state['relay_claim_id'],
             'title': item.title,
             'file_name': source_name,
             'output_folder_name': folder_name,
@@ -1244,6 +1540,47 @@ class ModuleDownload(PluginModuleBase):
             'rclone_conf': rclone_conf_text,
             'sa_files': sa_files
         })
+
+    def _handle_relay_progress(self, req):
+        """현재 선점한 릴레이 작업의 유효한 전송 통계만 반영한다."""
+        if not self._verify_api_auth(req):
+            return jsonify({'ret': 'fail', 'msg': 'API 인증 실패'}), 401
+        data = req.get_json(silent=True) or req.form or {}
+        try:
+            task_id = int(data.get('id', -1))
+            values = {}
+            for key, maximum in (('bytes_transferred', 2**63 - 1), ('total_bytes', 2**63 - 1),
+                                 ('speed_bytes_per_sec', 2**63 - 1), ('eta_seconds', 2**31 - 1)):
+                value = data.get(key)
+                if key == 'eta_seconds' and value is None:
+                    values[key] = None
+                    continue
+                if isinstance(value, bool):
+                    raise ValueError()
+                value = float(value)
+                if not math.isfinite(value) or not 0 <= value <= maximum:
+                    raise ValueError()
+                if key in ('bytes_transferred', 'total_bytes') and not value.is_integer():
+                    raise ValueError()
+                values[key] = value
+            transferred, total = values['bytes_transferred'], values['total_bytes']
+            if total and transferred > total:
+                raise ValueError()
+        except (ValueError, TypeError, OverflowError):
+            return jsonify({'ret': 'fail', 'msg': '진행 통계가 올바르지 않습니다.'}), 400
+        item = db.session.get(ModelDownload, task_id)
+        if not item:
+            return jsonify({'ret': 'fail', 'msg': '해당 작업 ID를 찾을 수 없습니다.'}), 404
+        claim_id = (item.upload_state or {}).get('relay_claim_id')
+        if item.status != 'relay_transferring' or not claim_id or data.get('claim_id') != claim_id:
+            return jsonify({'ret': 'fail', 'msg': '현재 릴레이 선점과 일치하지 않습니다.'}), 409
+        speed, eta = values['speed_bytes_per_sec'], values['eta_seconds']
+        FeederUtil.set_rclone_progress(item.id, {
+            'progress': min(100, 100 * transferred / total) if total else 0,
+            'downloaded_bytes': int(transferred), 'total_bytes': int(total),
+            'download_speed': speed, 'speed_str': FeederUtil.format_bytes(speed) + '/s',
+            'eta': '' if eta is None else str(eta)})
+        return jsonify({'ret': 'success'})
 
     def _handle_relay_report(self, req):
         """원격 릴레이 워커의 작업 완료/실패 결과 수신 API"""
@@ -1267,6 +1604,9 @@ class ModuleDownload(PluginModuleBase):
         item = db.session.query(ModelDownload).filter_by(id=task_id).first()
         if not item:
             return jsonify({'ret': 'fail', 'msg': '해당 작업 ID를 찾을 수 없습니다.'}), 404
+        claim_id = (item.upload_state or {}).get('relay_claim_id')
+        if item.status != 'relay_transferring' or (claim_id and data.get('claim_id') != claim_id):
+            return jsonify({'ret': 'fail', 'msg': '현재 릴레이 선점과 일치하지 않습니다.'}), 409
 
         if is_success:
             item.status = 'completed'
@@ -1291,7 +1631,11 @@ class ModuleDownload(PluginModuleBase):
             item.error_message = f"릴레이 전송 실패: {error_msg}"
             logger.warning(f"[{self.name}] [Relay API] 원격 릴레이 전송 실패 보고: {item.title} ({error_msg})")
 
+        state = dict(item.upload_state or {})
+        state.pop('relay_claim_id', None)
+        item.upload_state = state
         db.session.commit()
+        FeederUtil.clear_rclone_progress(item.id)
         return jsonify({'ret': 'success'})
 
     def get_upload_queue_counts(self) -> dict:
@@ -1369,7 +1713,7 @@ class ModuleDownload(PluginModuleBase):
             .all()
         )
         usage_map = {r[0]: int(r[1]) for r in usage_rows if r[0]}
-        account_total = sum(v for k, v in usage_map.items() if k != 'SHARED_DRIVE_UPLOAD')
+        account_total = sum(v for k, v in usage_map.items() if k not in ('SHARED_DRIVE_UPLOAD', 'SHARED_DRIVE_DIRECT_UPLOAD'))
         total_24h = usage_map.get('SHARED_DRIVE_UPLOAD', account_total)
 
         blocked_rows = (
